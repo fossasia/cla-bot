@@ -1,0 +1,66 @@
+# Copy this file to .github/workflows/cla.yml in any repository that should
+# enforce CLA signing. This is the canonical, tested config - it's meant to
+# be copied as-is, only the `with:` values under "Run CLA bot" need filling
+# in for your setup.
+#
+# ⚠️ The `uses: fossasia/cla-bot@vX.Y.Z` line only works once that exact tag
+# has been pushed to github.com/fossasia/cla-bot - see CONTRIBUTING.md's
+# "Releasing a new version" section. Check
+# https://github.com/fossasia/cla-bot/tags before copying, and use whatever
+# tag is actually latest if it differs from what's written below.
+#
+# Full setup walkthrough (creating the GitHub App, the signatures repo,
+# secrets, etc.) is in "SETUP_GUIDE.md" in this repo.
+
+name: "CLA Bot"
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, reopened, closed]
+
+# See action.yml's github-token input for exactly why each of these is
+# needed. In short: "pull-requests: read" is enough since this action only
+# reads PR/commit metadata; "issues: write" covers both comments and locking
+# (both are Issues-API endpoints even on a PR); "contents" isn't granted
+# here because the normal setup (a GitHub App writing to a separate
+# signatures repo) never touches this repo's contents.
+permissions:
+  pull-requests: read
+  issues: write
+  statuses: write
+
+# Without this, two events landing close together for the same PR (e.g. a
+# push arriving right as someone signs) can run as overlapping jobs and
+# race each other - not just duplicate comments, but a slower run posting a
+# stale "not signed" status after a faster run already posted "signed".
+# This queues overlapping runs instead, so each one sees the up-to-date
+# result of the one before it.
+concurrency:
+  group: cla-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  cla-check:
+    runs-on: ubuntu-latest
+    steps:
+      # `uses: fossasia/cla-bot@vX.Y.Z` fetches the action from that repo
+      # automatically; no separate checkout step needed. Replace vX.Y.Z
+      # with whatever tag actually exists - check
+      # https://github.com/fossasia/cla-bot/tags. Don't leave the literal
+      # "vX.Y.Z" here; it's a placeholder.
+      - name: Run CLA bot
+        uses: fossasia/cla-bot@vX.Y.Z # <-- replace with a real, existing tag
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          signatures-owner: fossasia
+          signatures-repo: cla-signatures
+          signatures-path: signatures/cla.json
+          cla-document-url: https://github.com/fossasia/cla-signatures/blob/main/CLA.md
+          allowlist: dependabot[bot],renovate[bot],github-actions[bot]
+          # Short-lived GitHub App token for writing to the signatures repo.
+          # These are org secrets scoped to "Selected repositories" only -
+          # see "SETUP_GUIDE.md" for how to create the App and set these up.
+          app-id: ${{ secrets.CLA_APP_ID }}
+          app-private-key: ${{ secrets.CLA_APP_PRIVATE_KEY }}
