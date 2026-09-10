@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # 18/20 are past End-of-Life (see package.json's engines field). 22
+        # is current Maintenance LTS, 24 is Active LTS - testing both catches
+        # anything that only breaks on the newer runtime early.
+        node-version: ["22", "24"]
+    steps:
+      # Pinned to a commit SHA, not a tag - tags can be repointed later, a
+      # SHA can't. Check https://github.com/actions/checkout/releases before
+      # bumping this.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # We only read our own code to run our own tests; no later step
+          # needs a live git credential sitting on disk.
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm"
+
+      # package-lock.json pins js-yaml (used below, only to validate
+      # action.yml) to an exact version. `npm ci` installs exactly what's
+      # locked instead of resolving fresh, and `--ignore-scripts` stops any
+      # dependency from running install-time scripts.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Syntax check
+        run: node --check src/cla-bot.js
+
+      - name: Run unit tests
+        run: npm test
+
+      - name: Validate action.yml structure
+        run: |
+          node -e "
+            const yaml = require('js-yaml');
+            const fs = require('fs');
+            const doc = yaml.load(fs.readFileSync('action.yml', 'utf8'));
+            if (typeof doc !== 'object' || doc === null) {
+              throw new Error('action.yml did not parse to an object');
+            }
+            for (const key of ['name', 'description', 'inputs', 'runs']) {
+              if (!(key in doc)) throw new Error('Missing required top-level key: ' + key);
+            }
+            // A raw substring check would pass this even if 'runs:' only
+            // showed up inside a string value - parsing properly avoids that.
+            const isPlainObject = (v) =>
+              typeof v === 'object' && v !== null && !Array.isArray(v);
+
+            if (!isPlainObject(doc.inputs)) {
+              throw new Error('inputs must be a mapping of input name to its spec');
+            }
+
+            if (!isPlainObject(doc.runs) || typeof doc.runs.using !== 'string') {
+              throw new Error('runs must be a top-level mapping with a string using field');
+            }
+            const VALID_USING = ['composite', 'node16', 'node18', 'node20', 'node22', 'node24', 'docker'];
+            if (!VALID_USING.includes(doc.runs.using)) {
+              throw new Error('runs.using must be one of: ' + VALID_USING.join(', ') + ' (got ' + doc.runs.using + ')');
+            }
+            if (doc.runs.using === 'composite') {
+              if (!Array.isArray(doc.runs.steps) || doc.runs.steps.length === 0) {
+                throw new Error('composite actions must define a non-empty runs.steps array');
+              }
+            } else if (doc.runs.using === 'docker') {
+              if (typeof doc.runs.image !== 'string' || !doc.runs.image) {
+                throw new Error('docker actions must define a runs.image string');
+              }
+            } else {
+              // node16/node18/node20/node22/node24
+              if (typeof doc.runs.main !== 'string' || !doc.runs.main) {
+                throw new Error('JavaScript actions must define a runs.main string');
+              }
+            }
+            console.log('action.yml is valid YAML with the required structure');
+          "

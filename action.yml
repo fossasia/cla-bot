@@ -1,0 +1,88 @@
+name: "FOSSASIA CLA Bot"
+description: "Self-written, dependency-free CLA automation for FOSSASIA repositories."
+author: "FOSSASIA"
+branding:
+  icon: "check-square"
+  color: "blue"
+
+inputs:
+  github-token:
+    description: >-
+      Token for comments/status/locking on this repo - usually
+      secrets.GITHUB_TOKEN. The calling workflow must grant it "issues: write"
+      (comments and locking are Issues-API endpoints even for PRs),
+      "pull-requests: read" (this action only reads PR data, never writes to
+      a PR itself), and "statuses: write". "contents" is only needed if
+      you're not using a GitHub App (app-id/app-private-key left empty) and
+      signatures-repo is the same repo running this workflow - in that
+      fallback mode this token reads and writes the signature file directly,
+      so it needs "contents: read" and "contents: write". With the normal
+      setup (a GitHub App writing to a separate signatures repo), "contents"
+      isn't needed at all.
+    required: true
+  signatures-owner:
+    description: "Org/user owning the central signatures repo, e.g. fossasia"
+    required: true
+  signatures-repo:
+    description: "Name of the private central signatures repo, e.g. cla-signatures"
+    required: true
+  signatures-path:
+    description: "Path to the JSON file inside the signatures repo"
+    required: false
+    default: "signatures/cla.json"
+  cla-document-url:
+    description: "Full URL to the CLA text contributors must read before signing"
+    required: true
+  allowlist:
+    description: "Comma-separated EXACT usernames/bot names exempt from signing. No wildcard support by design."
+    required: false
+    default: ""
+  app-id:
+    description: "GitHub App ID used to mint short-lived tokens for cross-repo signature writes. Leave empty to fall back to github-token (only works if signatures-repo equals the current repo)."
+    required: false
+    default: ""
+  app-private-key:
+    description: "GitHub App private key (PEM). Must come from a secret never hardcode this."
+    required: false
+    default: ""
+  node-version:
+    description: "Node.js version to run the bot on. Must be 22 or later - older versions make the script exit with an error. Defaults to a current LTS."
+    required: false
+    default: "22"
+  require-verified-commits:
+    description: >-
+      When "true", a commit's author is only trusted when that same account
+      is also its cryptographically verified committer. GitHub only ever
+      verifies the committer, never the author, so a validly signed commit
+      can still carry a forged author (e.g. via a public ID+username noreply
+      address) unless both checks agree. An unverified or author != committer
+      commit is flagged for manual review, even if that author already
+      signed the CLA. Off by default so unsigned-commit workflows (the
+      common case) keep working unchanged.
+    required: false
+    default: "false"
+
+runs:
+  using: "composite"
+  steps:
+    # Installs a known Node version explicitly rather than assuming the
+    # runner's PATH has one - self-hosted runners may not. This is a
+    # composite action, not a JS action (node22/node24), so it isn't tied to
+    # GitHub's periodic JS-action-runtime deprecation cycle (see CHANGELOG).
+    - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Run CLA bot
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        SIG_OWNER: ${{ inputs.signatures-owner }}
+        SIG_REPO: ${{ inputs.signatures-repo }}
+        SIG_PATH: ${{ inputs.signatures-path }}
+        CLA_DOCUMENT_URL: ${{ inputs.cla-document-url }}
+        ALLOWLIST: ${{ inputs.allowlist }}
+        SIG_APP_ID: ${{ inputs.app-id }}
+        SIG_APP_PRIVATE_KEY: ${{ inputs.app-private-key }}
+        REQUIRE_VERIFIED_COMMITS: ${{ inputs.require-verified-commits }}
+      run: node "${{ github.action_path }}/src/cla-bot.js"
