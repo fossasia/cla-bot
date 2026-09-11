@@ -1015,4 +1015,5 @@ module.exports = {
   getSignaturesToken,
   postComment,
   validateConfig,
+  lockPR,
 };
