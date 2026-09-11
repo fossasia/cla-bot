@@ -6,7 +6,7 @@
   "license": "Apache-2.0",
   "main": "src/cla-bot.js",
   "scripts": {
-    "test": "node test/logic.test.js && node test/http.test.js && node test/integration.test.js && node test/bot-identity.test.js && node test/bot-identity-success.test.js"
+    "test": "node test/logic.test.js && node test/http.test.js && node test/integration.test.js && node test/bot-identity.test.js && node test/bot-identity-success.test.js && node test/e2e.test.js"
   },
   "engines": {
     "node": ">=22.0.0"

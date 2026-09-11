@@ -765,6 +765,138 @@ function fakeResponse(status, jsonBody, headers = {}) {
     );
   });
 
+  await test("writeSignatures gives up after repeatedly hitting 409 conflicts (4 attempts) and throws, instead of retrying forever", async () => {
+    const originalSetTimeout = global.setTimeout;
+    // writeSignatures' own retry backoff (attempt * 800ms: 800/1600/2400ms
+    // between the 4 attempts) is separate from gh()'s transient-retry
+    // backoff - stub it too, or this single test adds ~4.8s to every run.
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let putAttempts = 0;
+    try {
+      global.fetch = async (url, opts) => {
+        const method = (opts && opts.method) || "GET";
+        if (method === "PUT") {
+          putAttempts += 1;
+          return fakeResponse(409, { message: "Conflict" });
+        }
+        // Every re-read looks the same - the point is that the writer NEVER
+        // wins, no matter how many times it retries.
+        return fakeResponse(200, {
+          sha: "always-stale-sha",
+          content: b64({ version: 1, signatures: [] }),
+          encoding: "base64",
+        });
+      };
+      let caught = null;
+      try {
+        await writeSignatures(
+          "tok",
+          (data) => ({
+            ...data,
+            signatures: [...data.signatures, { login: "someone" }],
+          }),
+          "someone signs",
+        );
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(
+        caught,
+        "expected writeSignatures to eventually give up and throw, not retry forever",
+      );
+      assert.strictEqual(caught.status, 409);
+      assert.strictEqual(
+        putAttempts,
+        4,
+        "expected exactly 4 PUT attempts (the hardcoded retry cap) before giving up",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("writeSignatures does NOT retry a non-conflict PUT failure (e.g. 403 permissions error) - it throws immediately", async () => {
+    let putAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts && opts.method) || "GET";
+      if (method === "PUT") {
+        putAttempts += 1;
+        return fakeResponse(403, { message: "Resource not accessible" });
+      }
+      return fakeResponse(200, {
+        sha: "x",
+        content: b64({ version: 1, signatures: [] }),
+        encoding: "base64",
+      });
+    };
+    let caught = null;
+    try {
+      await writeSignatures(
+        "tok",
+        (data) => ({
+          ...data,
+          signatures: [...data.signatures, { login: "someone" }],
+        }),
+        "someone signs",
+      );
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected writeSignatures to throw");
+    assert.strictEqual(caught.status, 403);
+    assert.strictEqual(
+      putAttempts,
+      1,
+      "a genuine permissions error is not a write-conflict race - it must not be retried at all",
+    );
+  });
+
+  await test('writeSignatures\' first-write-race detection safely falls back to "" when the 422 error body is non-JSON/empty, and does not mistake it for a retryable race', async () => {
+    let putAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts && opts.method) || "GET";
+      if (method === "PUT") {
+        putAttempts += 1;
+        // A 422 with no parseable body at all (e.g. a proxy/gateway
+        // mangled it) - e.body ends up null, not an object with .message.
+        return {
+          ok: false,
+          status: 422,
+          text: async () => "",
+          headers: { get: () => null },
+        };
+      }
+      // sha === null path: readSignatures itself 404s (file doesn't exist
+      // yet), which is what makes writeSignatures pass sha: null to the PUT.
+      return {
+        ok: false,
+        status: 404,
+        text: async () => JSON.stringify({ message: "Not Found" }),
+        headers: { get: () => null },
+      };
+    };
+    let caught = null;
+    try {
+      await writeSignatures(
+        "tok",
+        (data) => ({
+          ...data,
+          signatures: [...data.signatures, { login: "someone" }],
+        }),
+        "someone signs",
+      );
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected writeSignatures to throw");
+    assert.strictEqual(caught.status, 422);
+    assert.strictEqual(
+      putAttempts,
+      1,
+      "a 422 with an unparseable body must not be mistaken for the first-write sha race and retried",
+    );
+  });
+
   console.log(`\n${passed} test(s) passed.`);
   if (process.exitCode) {
     console.error("\nSOME TESTS FAILED.");

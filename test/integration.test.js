@@ -24,6 +24,7 @@ const {
   handleIssueComment,
   handlePullRequestTarget,
   lockPR,
+  postComment,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -92,7 +93,14 @@ function makeFakeGitHub({
       return res(404, { message: "Not Found" });
     }
     if (url.includes("/pulls/1/commits")) {
-      return res(200, url.includes("page=2") ? [] : commits);
+      // Real pagination: slice `commits` into pages of 100 based on the
+      // `page=` query param, so tests can exercise the loop-continuation
+      // branch with a genuinely large commit list, not just a canned
+      // "page=2 -> []" shortcut.
+      const pageMatch = url.match(/[&?]page=(\d+)/);
+      const pageNum = pageMatch ? Number(pageMatch[1]) : 1;
+      const start = (pageNum - 1) * 100;
+      return res(200, commits.slice(start, start + 100));
     }
     if (url.includes("/pulls/1") && !url.includes("/commits")) {
       return res(200, { head: { sha: "head-sha-abc" } });
@@ -119,8 +127,12 @@ function makeFakeGitHub({
       }
     }
     if (url.includes("/issues/1/comments")) {
-      if (method === "GET")
-        return res(200, url.includes("page=2") ? [] : state.comments);
+      if (method === "GET") {
+        const pageMatch = url.match(/[&?]page=(\d+)/);
+        const pageNum = pageMatch ? Number(pageMatch[1]) : 1;
+        const start = (pageNum - 1) * 100;
+        return res(200, state.comments.slice(start, start + 100));
+      }
       if (method === "POST") {
         const { body } = JSON.parse(opts.body);
         // Real GitHub always attributes comments made via GITHUB_TOKEN to
@@ -1246,6 +1258,529 @@ function makeFakeGitHub({
       !lastComment.includes("private@example.com"),
       "the raw commit email must never be posted publicly",
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // Pagination: previously every mock had <100 items, so the "there might
+  // be another page" continuation branch in listPRCommitAuthors() and
+  // getExistingBotComments() never actually ran.
+  // ---------------------------------------------------------------------
+  await test("listPRCommitAuthors pages through more than 100 commits on a single PR", async () => {
+    const commits = [];
+    for (let i = 0; i < 150; i++) {
+      commits.push({
+        sha: `c${i}`,
+        author: { id: 10000 + i, login: `author-${i}` },
+        parents: [{ sha: "p" }],
+        commit: { author: { email: `a${i}@example.com` } },
+      });
+    }
+    const initialSignatures = {
+      version: 1,
+      // Everyone except the very last author (on page 2) has already signed.
+      signatures: commits
+        .slice(0, 149)
+        .map((c) => ({ id: c.author.id, login: c.author.login })),
+    };
+    const gh = makeFakeGitHub({ commits, initialSignatures });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(
+      gh.statuses[gh.statuses.length - 1].state,
+      "failure",
+      "the one unsigned author living on page 2 (commit #150) must still be found and required to sign",
+    );
+    const lastComment = gh.comments[gh.comments.length - 1].body;
+    assert.ok(
+      lastComment.includes("@author-149"),
+      "the missing signer from the second page of commits must be named",
+    );
+  });
+
+  await test("getExistingBotComments pages through more than 100 existing comments when checking for duplicates", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "alice" }],
+      },
+    });
+    // Pad the comment list past 100 with unrelated comments from other
+    // users, then put the bot's most recent real comment last (on page 2).
+    for (let i = 0; i < 120; i++) {
+      gh.comments.push({
+        id: i + 1,
+        body: `unrelated comment #${i}`,
+        user: { login: "some-other-user" },
+      });
+    }
+    gh.comments.push({
+      id: 121,
+      body: "<!-- fossasia-cla-bot:v1 -->\nAll contributors have signed the CLA. \u2705",
+      user: { login: "github-actions[bot]" },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 1, login: "alice" },
+        body: "recheck",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    };
+    await handleIssueComment(payload);
+
+    // The identical "all signed" comment already exists on page 2 - the
+    // dedupe check must find it there and skip posting a new one, proving
+    // pagination actually walked past page 1's 100 unrelated comments.
+    const botComments = gh.comments.filter(
+      (c) => c.user.login === "github-actions[bot]",
+    );
+    assert.strictEqual(
+      botComments.length,
+      1,
+      "the existing duplicate on page 2 should have been found, so no new comment should have been posted",
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // postComment's duplicate-cleanup step is explicitly best-effort (same
+  // pattern as lockPR) - a failure there must not fail the run.
+  // ---------------------------------------------------------------------
+  await test("postComment's duplicate-cleanup failure is caught and logged as a warning, without failing the run", async () => {
+    // The cleanup step (dedupeIdenticalTrailingComments) already catches
+    // and warns on a per-comment DELETE failure internally (it's meant to
+    // survive one duplicate being already gone). The failure mode that
+    // actually reaches postComment's own try/catch is the cleanup's GET
+    // call itself failing outright (e.g. retries exhausted) - so that's
+    // what this simulates: the dedupe pre-check GET succeeds, the POST
+    // succeeds, but the cleanup step's own re-fetch of comments fails
+    // persistently.
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let getCount = 0;
+    try {
+      global.fetch = async (url, opts = {}) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (url.includes("/issues/1/comments")) {
+          if (method === "GET") {
+            getCount += 1;
+            if (getCount === 1) return res(200, []); // dedupe pre-check: nothing exists yet
+            return res(500, { message: "Internal Server Error" }); // cleanup's re-fetch, always fails
+          }
+          if (method === "POST") {
+            return res(201, {
+              id: 1,
+              body: JSON.parse(opts.body).body,
+              user: { login: "github-actions[bot]" },
+            });
+          }
+        }
+        throw new Error(`unexpected call: ${method} ${url}`);
+      };
+
+      const originalWarn = console.warn;
+      let warned = "";
+      console.warn = (msg) => {
+        warned = msg;
+      };
+      try {
+        await assert.doesNotReject(
+          () => postComment(1, "a brand new message, not a duplicate"),
+          "a cleanup failure must not surface as a thrown error - the comment itself already succeeded",
+        );
+      } finally {
+        console.warn = originalWarn;
+      }
+      assert.ok(
+        warned.includes("Duplicate-comment cleanup failed"),
+        `expected a specific warning about the cleanup failure, got: ${warned}`,
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // Co-author id/login resolution: the "can't resolve" and "cached" edges.
+  // ---------------------------------------------------------------------
+  await test("a co-author in noreply-email format whose id/login cannot be resolved (e.g. a deleted account) is flagged for manual review, not silently dropped", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "deadc0ffee",
+          author: { id: 1, login: "primary-author" },
+          parents: [{ sha: "p1" }],
+          commit: {
+            author: { email: "primary@example.com" },
+            // Well-formed new-style noreply trailer, but usersById has no
+            // entry for 999999 - GitHub itself can't resolve this id
+            // (account deleted, or never existed).
+            message:
+              "Add feature\n\nCo-authored-by: Ghost <999999+ghost-login@users.noreply.github.com>",
+          },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "primary-author" }],
+      },
+      usersById: {}, // deliberately empty - 999999 does not resolve
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    const lastComment = gh.comments[gh.comments.length - 1].body;
+    assert.ok(
+      lastComment.includes("deadc0f"),
+      "the commit must be flagged for manual review by SHA when its co-author can't be resolved",
+    );
+    assert.ok(
+      !lastComment.includes("ghost-login"),
+      "an unresolved trailer's claimed login must never be trusted or surfaced - it was never verified against GitHub",
+    );
+  });
+
+  await test("resolving the same co-author id across two different commits in one PR only makes one /user/{id} lookup (result is cached)", async () => {
+    const trailer =
+      "Add feature\n\nCo-authored-by: Helper <55555+helper@users.noreply.github.com>";
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "primary-author" },
+          parents: [{ sha: "p1" }],
+          commit: {
+            author: { email: "primary@example.com" },
+            message: trailer,
+          },
+        },
+        {
+          sha: "c2",
+          author: { id: 1, login: "primary-author" },
+          parents: [{ sha: "p1" }],
+          commit: {
+            author: { email: "primary@example.com" },
+            message: trailer,
+          },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [
+          { id: 1, login: "primary-author" },
+          { id: 55555, login: "helper" },
+        ],
+      },
+      usersById: { 55555: { id: 55555, login: "helper" } },
+    });
+    let lookupCount = 0;
+    const innerFetch = gh.fetch;
+    global.fetch = async (url, opts) => {
+      if (/\/user\/\d+(?:$|\?)/.test(url)) lookupCount += 1;
+      return innerFetch(url, opts);
+    };
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      lookupCount,
+      1,
+      "the same co-author id appearing on two commits in one run should only be looked up once, not twice",
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // Grammar/edge cases in checkPR's output.
+  // ---------------------------------------------------------------------
+  await test("more than one unresolvable commit produces correctly pluralized wording in the PR comment ('commits' / 'them', not 'commit' / 'it')", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "aaaaaaa1111",
+          author: null,
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+        {
+          sha: "bbbbbbb2222",
+          author: null,
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "b@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    const lastComment = gh.comments[gh.comments.length - 1].body;
+    assert.ok(
+      lastComment.includes("2 commits could not be automatically attributed"),
+      `expected plural "commits", got: ${lastComment}`,
+    );
+    assert.ok(
+      lastComment.includes("verify them manually"),
+      `expected plural "them", got: ${lastComment}`,
+    );
+  });
+
+  await test("a sign-phrase comment event with no body field at all does not crash - it is simply treated as neither a sign nor a recheck", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 1, login: "alice" },
+        // body intentionally omitted
+        html_url: "x",
+        author_association: "NONE",
+      },
+    };
+    await assert.doesNotReject(() => handleIssueComment(payload));
+    assert.strictEqual(
+      gh.statuses.length,
+      0,
+      "a missing comment body must not be treated as a sign or a recheck",
+    );
+  });
+
+  await test("a co-author in OLD-STYLE noreply-email format whose login cannot be resolved (e.g. a deleted/renamed account) is flagged for manual review, not silently dropped", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "cafef00d123",
+          author: { id: 1, login: "primary-author" },
+          parents: [{ sha: "p1" }],
+          commit: {
+            author: { email: "primary@example.com" },
+            // Old-style noreply trailer (no id embedded) for a login that
+            // GET /users/{login} does not know about.
+            message:
+              "Add feature\n\nCo-authored-by: Ghost <ghost-login@users.noreply.github.com>",
+          },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "primary-author" }],
+      },
+      users: {}, // deliberately empty - "ghost-login" does not resolve
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    const lastComment = gh.comments[gh.comments.length - 1].body;
+    assert.ok(
+      lastComment.includes("cafef00"),
+      "the commit must be flagged for manual review by SHA when its old-style co-author login can't be resolved",
+    );
+  });
+
+  await test("a co-author trailer repeated twice in the same commit message is counted once and only looked up once (cached within the commit)", async () => {
+    let lookupCount = 0;
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "primary-author" },
+          parents: [{ sha: "p1" }],
+          commit: {
+            author: { email: "primary@example.com" },
+            message:
+              "Add feature\n\n" +
+              "Co-authored-by: Helper <60000+helper@users.noreply.github.com>\n" +
+              "Co-authored-by: Helper <60000+helper@users.noreply.github.com>",
+          },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [
+          { id: 1, login: "primary-author" },
+          { id: 60000, login: "helper" },
+        ],
+      },
+      usersById: { 60000: { id: 60000, login: "helper" } },
+    });
+    const innerFetch = gh.fetch;
+    global.fetch = async (url, opts) => {
+      if (/\/user\/\d+(?:$|\?)/.test(url)) lookupCount += 1;
+      return innerFetch(url, opts);
+    };
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      lookupCount,
+      1,
+      "a co-author trailer duplicated within one commit message must only trigger one lookup",
+    );
+  });
+
+  await test("the same OLD-STYLE noreply co-author login used across two different commits only makes one /users/{login} lookup (result is cached)", async () => {
+    const trailer =
+      "Add feature\n\nCo-authored-by: Helper <old-style-helper@users.noreply.github.com>";
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "primary-author" },
+          parents: [{ sha: "p1" }],
+          commit: {
+            author: { email: "primary@example.com" },
+            message: trailer,
+          },
+        },
+        {
+          sha: "c2",
+          author: { id: 1, login: "primary-author" },
+          parents: [{ sha: "p1" }],
+          commit: {
+            author: { email: "primary@example.com" },
+            message: trailer,
+          },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [
+          { id: 1, login: "primary-author" },
+          { id: 70000, login: "old-style-helper" },
+        ],
+      },
+      users: {
+        "old-style-helper": { id: 70000, login: "old-style-helper" },
+      },
+    });
+    let lookupCount = 0;
+    const innerFetch = gh.fetch;
+    global.fetch = async (url, opts) => {
+      if (url.includes("/users/old-style-helper")) lookupCount += 1;
+      return innerFetch(url, opts);
+    };
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      lookupCount,
+      1,
+      "the same old-style noreply login appearing on two commits should only be looked up once, not twice",
+    );
+  });
+
+  await test("listPRCommitAuthors terminates by fetching one genuinely empty page when the total commit count is an exact multiple of 100 (doesn't hang or keep paging forever)", async () => {
+    const commits = [];
+    for (let i = 0; i < 200; i++) {
+      commits.push({
+        sha: `c${i}`,
+        author: { id: 20000 + i, login: `author-${i}` },
+        parents: [{ sha: "p" }],
+        commit: { author: { email: `a${i}@example.com` } },
+      });
+    }
+    // Everyone already signed - this test isolates pagination termination
+    // itself (page request count/sequence), not signer detection, which is
+    // already covered by the >100-commits test above.
+    const initialSignatures = {
+      version: 1,
+      signatures: commits.map((c) => ({
+        id: c.author.id,
+        login: c.author.login,
+      })),
+    };
+    const gh = makeFakeGitHub({ commits, initialSignatures });
+    const innerFetch = gh.fetch;
+    const pageRequests = [];
+    global.fetch = async (url, opts) => {
+      const m = url.match(/\/pulls\/1\/commits\?.*[&?]page=(\d+)/);
+      if (m) {
+        const pageNum = Number(m[1]);
+        pageRequests.push(pageNum);
+        // If the empty-page termination branch ever regresses, this turns
+        // an infinite-loop hang into an immediate, clear test failure
+        // instead of timing out the whole suite.
+        if (pageNum > 3) {
+          throw new Error(
+            `pagination did not terminate - requested page ${pageNum}, expected it to stop right after the empty page 3`,
+          );
+        }
+      }
+      return innerFetch(url, opts);
+    };
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.deepStrictEqual(
+      pageRequests,
+      [1, 2, 3],
+      "expected exactly 3 page requests - two full 100-item pages, then one genuinely empty page to terminate - not more and not fewer",
+    );
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
   });
 
   console.log(`\n${passed} test(s) passed.`);
