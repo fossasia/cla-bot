@@ -1,0 +1,16 @@
+name: "cla-bot advanced CodeQL config"
+
+queries:
+  - uses: security-extended
+  - uses: security-and-quality
+
+paths:
+  - src
+  - test
+  - action.yml
+  - .github/workflows
+
+paths-ignore:
+  - "**/*.md"
+  - CHANGELOG.md
+  - LICENSE
