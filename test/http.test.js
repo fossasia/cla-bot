@@ -530,6 +530,241 @@ function fakeResponse(status, jsonBody, headers = {}) {
     );
   });
 
+  // -------------------------------------------------------------------------
+  // Timeout behavior. ghRaw() wires every fetch() to an AbortController that
+  // fires after REQUEST_TIMEOUT_MS (15s) - a hung call must not stall the
+  // job forever, and the resulting AbortError must be treated as transient
+  // by gh()'s retry loop just like a 5xx. REQUEST_TIMEOUT_MS is a fixed
+  // constant (not env-configurable), so rather than actually waiting 15
+  // real seconds per attempt, these tests stub global.setTimeout to fire
+  // immediately - the real AbortController/signal wiring and retry logic
+  // still run for real, only the wall-clock wait is skipped.
+  // -------------------------------------------------------------------------
+  await test("a hung request is aborted after the configured timeout, and the AbortError is retried like other transient failures until it propagates", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let fetchCalls = 0;
+    try {
+      global.fetch = (url, opts) =>
+        new Promise((resolve, reject) => {
+          fetchCalls += 1;
+          // A request that never resolves on its own - the only way it
+          // ever settles is via the abort signal ghRaw() attaches, exactly
+          // like a real hung connection behaves under fetch+AbortController.
+          opts.signal.addEventListener("abort", () => {
+            const err = new Error("This operation was aborted");
+            err.name = "AbortError";
+            reject(err);
+          });
+        });
+
+      let caught = null;
+      try {
+        await readSignatures("tok");
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught, "expected the call to eventually throw");
+      assert.strictEqual(caught.name, "AbortError");
+      assert.strictEqual(
+        fetchCalls,
+        3,
+        "AbortError must be retried up to MAX_RETRIES (3 total attempts), not thrown immediately and not retried forever",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("the per-request abort timer is cleared after a normal (non-hung) response, not left dangling", async () => {
+    const originalClearTimeout = global.clearTimeout;
+    let clearedCount = 0;
+    global.clearTimeout = (id) => {
+      clearedCount += 1;
+      return originalClearTimeout(id);
+    };
+    try {
+      global.fetch = async () =>
+        fakeResponse(200, {
+          sha: "x",
+          content: b64({ version: 1, signatures: [] }),
+          encoding: "base64",
+        });
+      await readSignatures("tok");
+      assert.strictEqual(
+        clearedCount,
+        1,
+        "expected exactly one clearTimeout call for the one request readSignatures made - a leaked timer keeps the process alive longer than necessary",
+      );
+    } finally {
+      global.clearTimeout = originalClearTimeout;
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // gh()'s generic transient-failure retry loop (distinct from the
+  // 409-specific compare-and-swap retry inside writeSignatures tested above).
+  // -------------------------------------------------------------------------
+  await test("a transient 503 is retried and the call eventually succeeds", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let calls = 0;
+    try {
+      global.fetch = async () => {
+        calls += 1;
+        if (calls < 3)
+          return fakeResponse(503, { message: "Service Unavailable" });
+        return fakeResponse(200, {
+          sha: "recovered-sha",
+          content: b64({ version: 1, signatures: [] }),
+          encoding: "base64",
+        });
+      };
+      const { sha } = await readSignatures("tok");
+      assert.strictEqual(sha, "recovered-sha");
+      assert.strictEqual(
+        calls,
+        3,
+        "expected 2 failed attempts before the 3rd one succeeds",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("a 429 rate-limit response is retried the same way as a 5xx", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let calls = 0;
+    try {
+      global.fetch = async () => {
+        calls += 1;
+        if (calls === 1) return fakeResponse(429, { message: "rate limited" });
+        return fakeResponse(200, {
+          sha: "x",
+          content: b64({ version: 1, signatures: [] }),
+          encoding: "base64",
+        });
+      };
+      await readSignatures("tok");
+      assert.strictEqual(calls, 2);
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("gh() honors the Retry-After header for the backoff delay on a secondary rate limit (403 + retry-after), instead of the default attempt*1000 delay", async () => {
+    const originalSetTimeout = global.setTimeout;
+    const delaysSeen = [];
+    global.setTimeout = (fn, ms) => {
+      delaysSeen.push(ms);
+      return originalSetTimeout(fn, 0); // fast-forward so the test doesn't actually wait
+    };
+    let calls = 0;
+    try {
+      global.fetch = async () => {
+        calls += 1;
+        if (calls === 1)
+          return fakeResponse(
+            403,
+            { message: "secondary rate limit" },
+            { "retry-after": "2" },
+          );
+        return fakeResponse(200, {
+          sha: "x",
+          content: b64({ version: 1, signatures: [] }),
+          encoding: "base64",
+        });
+      };
+      await readSignatures("tok");
+      // Two kinds of setTimeout calls happen here: the 15s abort timer for
+      // each fetch, and the one retry backoff delay between attempt 1 and
+      // attempt 2. That backoff delay should be retryAfter*1000 = 2000, not
+      // the default attempt*1000 = 1000.
+      assert.ok(
+        delaysSeen.includes(2000),
+        `expected a 2000ms backoff delay honoring Retry-After: 2, saw: ${delaysSeen}`,
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("a POST (e.g. posting a comment) is NOT retried by default on a transient 5xx, since a blind retry could create a duplicate", async () => {
+    let postAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "GET" && url.includes("/comments")) {
+        return fakeResponse(200, []); // dedupe pre-check: no existing comments
+      }
+      if (method === "POST") {
+        postAttempts += 1;
+        return fakeResponse(500, { message: "Internal Server Error" });
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    let caught = null;
+    try {
+      await postComment(1, "hello");
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected postComment to throw");
+    assert.strictEqual(caught.status, 500);
+    assert.strictEqual(
+      postAttempts,
+      1,
+      "a POST must be attempted exactly once on a transient failure - retrying it automatically risks creating a duplicate comment",
+    );
+  });
+
+  await test("a persistently-failing transient error (503) is retried up to MAX_RETRIES then propagates, not retried forever", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let calls = 0;
+    try {
+      global.fetch = async () => {
+        calls += 1;
+        return fakeResponse(503, { message: "Service Unavailable" });
+      };
+      let caught = null;
+      try {
+        await readSignatures("tok");
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught, "expected the call to eventually throw");
+      assert.strictEqual(caught.status, 503);
+      assert.strictEqual(
+        calls,
+        3,
+        "expected exactly MAX_RETRIES (3) attempts, not unlimited retries and not fewer",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test('readSignatures throws a descriptive error when the stored file\'s "signatures" field is not an array (corrupted/hand-edited data)', async () => {
+    global.fetch = async () =>
+      fakeResponse(200, {
+        sha: "corrupt-sha",
+        content: b64({ version: 1, signatures: { not: "an array" } }),
+        encoding: "base64",
+      });
+    let caught = null;
+    try {
+      await readSignatures("tok");
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected readSignatures to throw on corrupted data");
+    assert.ok(
+      /signatures.*is not an array/i.test(caught.message),
+      `expected a descriptive error naming the field, got: ${caught.message}`,
+    );
+  });
+
   console.log(`\n${passed} test(s) passed.`);
   if (process.exitCode) {
     console.error("\nSOME TESTS FAILED.");

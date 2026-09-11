@@ -23,6 +23,7 @@ process.env.ALLOWLIST = "";
 const {
   handleIssueComment,
   handlePullRequestTarget,
+  lockPR,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -56,12 +57,15 @@ function makeFakeGitHub({
   initialSignatures,
   users = {},
   usersById = {},
+  lockShouldFail = false,
 }) {
   const state = {
     signatures: initialSignatures,
     sha: "sha-0",
     comments: [],
     statuses: [],
+    lockCalls: [],
+    lockShouldFail,
   };
 
   state.fetch = async (url, opts = {}) => {
@@ -144,8 +148,21 @@ function makeFakeGitHub({
     }
     if (url.includes("/statuses/")) {
       const payload = JSON.parse(opts.body);
-      state.statuses.push(payload);
+      // sha is only in the URL, not the body - capture it too so tests can
+      // assert which commit a status was posted against.
+      state.statuses.push({ ...payload, sha: url.split("/statuses/")[1] });
       return res(201, {});
+    }
+    if (url.includes("/lock")) {
+      if (method === "PUT") {
+        state.lockCalls.push(JSON.parse(opts.body || "{}"));
+        if (state.lockShouldFail) {
+          return res(403, {
+            message: "Resource not accessible by integration",
+          });
+        }
+        return res(204, null);
+      }
     }
     throw new Error(`Unhandled mock request: ${method} ${url}`);
   };
@@ -1022,6 +1039,212 @@ function makeFakeGitHub({
         );
         return true;
       },
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // lockPR: direct coverage. Production code is deliberately best-effort
+  // here (see lockPR's comment in src/cla-bot.js) - a failed lock call must
+  // never fail the whole run, only warn. Neither the success path nor the
+  // failure path had any dedicated coverage before.
+  // ---------------------------------------------------------------------
+  await test("lockPR locks the PR with lock_reason 'resolved'", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    await lockPR(1);
+
+    assert.strictEqual(
+      gh.lockCalls.length,
+      1,
+      "expected exactly one lock call",
+    );
+    assert.strictEqual(gh.lockCalls[0].lock_reason, "resolved");
+  });
+
+  await test("lockPR is best-effort: an API failure is caught, logged as a warning, and does NOT throw or fail the run", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+      lockShouldFail: true,
+    });
+    global.fetch = gh.fetch;
+
+    const originalWarn = console.warn;
+    let warned = "";
+    console.warn = (msg) => {
+      warned = msg;
+    };
+    try {
+      await assert.doesNotReject(
+        () => lockPR(1),
+        "lockPR must never throw, even when the underlying API call fails - locking is nice-to-have hardening, not core to CLA correctness",
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.strictEqual(
+      gh.lockCalls.length,
+      1,
+      "the lock attempt should still have been made before it failed",
+    );
+    assert.ok(
+      warned.includes("Could not lock PR #1"),
+      `expected a warning naming the PR, got: ${warned}`,
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // handlePullRequestTarget: direct dispatch coverage. Previously only the
+  // malformed-payload guard was tested here - the real event-routing logic
+  // (opened/synchronize/reopened -> checkPR, closed+merged -> lockPR,
+  // everything else -> no-op) had no coverage at all.
+  // ---------------------------------------------------------------------
+  await test("handlePullRequestTarget locks the PR when a 'closed' event reports it was merged", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "closed",
+      pull_request: { number: 1, merged: true, head: { sha: "head-sha-x" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(
+      gh.lockCalls.length,
+      1,
+      "a merged, closed PR should be locked",
+    );
+    assert.strictEqual(
+      gh.statuses.length,
+      0,
+      "locking a merged PR must not also trigger a CLA status check",
+    );
+  });
+
+  await test("handlePullRequestTarget does nothing when a 'closed' event reports the PR was NOT merged", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "closed",
+      pull_request: { number: 1, merged: false, head: { sha: "head-sha-x" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(
+      gh.lockCalls.length,
+      0,
+      "a PR closed without merging must not be locked",
+    );
+    assert.strictEqual(gh.statuses.length, 0);
+  });
+
+  await test("handlePullRequestTarget does nothing for actions it doesn't care about (e.g. 'labeled')", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "labeled",
+      pull_request: { number: 1, merged: false, head: { sha: "x" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.lockCalls.length, 0);
+    assert.strictEqual(gh.statuses.length, 0);
+  });
+
+  for (const action of ["opened", "synchronize", "reopened"]) {
+    await test(`handlePullRequestTarget on '${action}' checks the PR using the sha already on the webhook payload, without an extra GET /pulls lookup`, async () => {
+      const gh = makeFakeGitHub({
+        commits: [
+          {
+            sha: "c1",
+            author: { id: 1, login: "author" },
+            parents: [{ sha: "p1" }],
+            commit: { author: { email: "a@example.com" } },
+          },
+        ],
+        initialSignatures: {
+          version: 1,
+          signatures: [{ id: 1, login: "author" }],
+        },
+      });
+      // If checkPR() ever stopped using the sha already carried on the
+      // payload and fell back to fetching the PR itself, this would throw -
+      // that's the proof the payload's own head.sha is what actually got
+      // used, not a redundant lookup.
+      const innerFetch = gh.fetch;
+      global.fetch = async (url, opts) => {
+        if (url.includes("/pulls/1") && !url.includes("/commits")) {
+          throw new Error(
+            "must not call GET /pulls/1 when the head sha was already supplied on the webhook payload",
+          );
+        }
+        return innerFetch(url, opts);
+      };
+
+      const payload = {
+        action,
+        pull_request: { number: 1, head: { sha: "webhook-head-sha" } },
+      };
+      await handlePullRequestTarget(payload);
+
+      assert.strictEqual(gh.statuses.length, 1);
+      assert.strictEqual(gh.statuses[0].state, "success");
+      assert.strictEqual(
+        gh.statuses[0].sha,
+        "webhook-head-sha",
+        "the status must be posted against the sha from the webhook payload",
+      );
+    });
+  }
+
+  await test("a commit whose primary author has no linked GitHub account (e.g. a privacy-enabled email) is flagged for manual review by SHA, not silently skipped", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "deadbee123456",
+          author: null, // GitHub could not match the commit's git email to any account
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "private@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    const lastComment = gh.comments[gh.comments.length - 1].body;
+    assert.ok(
+      lastComment.includes("deadbee"), // short-sha form (first 7 chars)
+      "the unresolved commit's SHA must be surfaced so a maintainer can find and inspect it",
+    );
+    assert.ok(
+      lastComment.includes("could not be automatically attributed"),
+      "an author GitHub can't resolve must be flagged for manual review, never silently dropped from consideration",
+    );
+    assert.ok(
+      !lastComment.includes("private@example.com"),
+      "the raw commit email must never be posted publicly",
     );
   });
 
