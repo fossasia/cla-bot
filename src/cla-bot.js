@@ -1004,7 +1004,7 @@ async function handleIssueComment(payload) {
           ],
         };
       },
-      `${commenter} signed the CLA via ${REPO_OWNER}/${REPO_NAME}#${prNumber}`,
+      `${commenter} signed the CLA`,
     );
 
     if (alreadySigned) {
