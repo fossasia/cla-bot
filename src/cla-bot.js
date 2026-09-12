@@ -902,9 +902,11 @@ async function checkPR(prNumber, headSha) {
     missing.forEach((a) => lines.push(`- @${a.login}`));
     lines.push(
       "",
-      "Please comment on this PR with **exactly** the following text to sign:",
+      "To sign, **reply to this comment** with **exactly** the following text:",
       "",
       `> ${SIGN_PHRASE}`,
+      "",
+      "A plain new comment that doesn't quote this one will not be accepted.",
       "",
       "Signing once covers **all** FOSSASIA repositories - you will not be asked again.",
     );
@@ -948,6 +950,45 @@ function isPrivileged(payload, commenter) {
   return ["OWNER", "MEMBER", "COLLABORATOR"].includes(association);
 }
 
+// A sign-phrase comment only counts as a sign if it's shown to be a reply
+// to this bot's own comment - see handleIssueComment() below for why.
+// GitHub's Conversation tab has no real reply/thread id on issue_comment
+// webhooks (a roadmap request for that was closed as "not planned" - see
+// github/roadmap#552), so "reply" is approximated the only way the raw text
+// makes possible: a leading blockquoted block that itself quotes
+// BOT_MARKER. That's exactly what GitHub's own "Quote reply" inserts, and
+// it's also what a contributor gets if they manually quote the comment by
+// hand instead - both produce the same shape, so one check covers both.
+function isQuotedBotReply(rawBody) {
+  return rawBody.split("\n").some((line) => {
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith(">")) return false;
+    // Strip all leading '>' markers (handles a nested quote too, e.g. the
+    // sign phrase in our own comment is itself already inside a '>' block,
+    // so quoting our whole comment back to us produces '> > ...' there).
+    return trimmed.replace(/^(>\s?)+/, "").includes(BOT_MARKER);
+  });
+}
+
+// The part of the comment the contributor actually typed themselves: GitHub
+// (and a contributor manually mimicking the same shape) puts the quoted
+// block first and the new text below it, so this strips the leading run of
+// blank/quoted lines from the very start of the comment and returns
+// whatever's left, trimmed.
+function replyText(rawBody) {
+  const lines = rawBody.split("\n");
+  let i = 0;
+  while (i < lines.length) {
+    const trimmed = lines[i].trimStart();
+    if (trimmed === "" || trimmed.startsWith(">")) {
+      i++;
+    } else {
+      break;
+    }
+  }
+  return lines.slice(i).join("\n").trim();
+}
+
 async function handleIssueComment(payload) {
   if (!payload.issue || !payload.issue.pull_request) return; // comment on a plain issue, not a PR
   if (
@@ -966,10 +1007,17 @@ async function handleIssueComment(payload) {
     payload.issue.number,
     "issue_comment payload issue.number",
   );
-  const body = (payload.comment.body || "").trim();
+  const rawBody = payload.comment.body || "";
+  const body = rawBody.trim();
   const commenter = payload.comment.user.login;
 
-  if (body.toLowerCase() === SIGN_PHRASE.toLowerCase()) {
+  // Must be a reply (quoting this bot's comment - see isQuotedBotReply())
+  // whose own typed text is exactly the sign phrase - a bare new comment
+  // that just happens to say the phrase, with nothing quoted, is ignored.
+  if (
+    isQuotedBotReply(rawBody) &&
+    replyText(rawBody).toLowerCase() === SIGN_PHRASE.toLowerCase()
+  ) {
     const sigToken = await getSignaturesToken();
     // The webhook already carries the commenter's numeric id - recording
     // that, not just the login, is what lets the signature survive a later
@@ -1105,11 +1153,8 @@ module.exports = {
   postComment,
   validateConfig,
   lockPR,
-  // Exported for tests only, same as everything above - not part of the
-  // action's public contract. Covered directly in test/logic.test.js so a
-  // future change to either validator's character rules (e.g. UNSAFE_URL_
-  // SEGMENT_RE) fails immediately and specifically, rather than only being
-  // caught indirectly through the webhook-handler integration tests.
   assertValidPRNumber,
   assertValidSha,
+  isQuotedBotReply,
+  replyText,
 };

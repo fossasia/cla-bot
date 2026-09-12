@@ -215,7 +215,10 @@ function makeFakeGitHub({
       issue: { number: 1, pull_request: {}, user: { login: "alice" } },
       comment: {
         user: { id: 1001, login: "alice" },
-        body: "I have read the CLA Document and I hereby sign the CLA",
+        // Simulates GitHub's "Quote reply" (or a contributor manually
+        // quoting the bot's comment): a leading '>' block quoting the
+        // bot's marker, then the sign phrase below it.
+        body: "> <!-- fossasia-cla-bot:v1 -->\n> Please comment on this PR to sign.\n\nI have read the CLA Document and I hereby sign the CLA",
         html_url: "https://github.com/fossasia/testrepo/pull/1#issuecomment-1",
         author_association: "NONE",
       },
@@ -262,7 +265,7 @@ function makeFakeGitHub({
       issue: { number: 1, pull_request: {}, user: { login: "real-author" } },
       comment: {
         user: { id: 9999, login: "random-commenter" }, // NOT the commit author
-        body: "I have read the CLA Document and I hereby sign the CLA",
+        body: "> <!-- fossasia-cla-bot:v1 -->\n> Please comment on this PR to sign.\n\nI have read the CLA Document and I hereby sign the CLA",
         html_url: "https://github.com/fossasia/testrepo/pull/1#issuecomment-2",
         author_association: "NONE",
       },
@@ -280,6 +283,14 @@ function makeFakeGitHub({
     assert.ok(
       lastComment.includes("@real-author"),
       "the missing-signer list must name the real author, not the commenter",
+    );
+    assert.ok(
+      lastComment.includes("reply to this comment"),
+      "the sign instructions must tell contributors to reply, matching the quoted-reply gate in handleIssueComment",
+    );
+    assert.ok(
+      !lastComment.includes("comment on this PR with"),
+      "the old (pre quoted-reply) instruction wording must not still be present",
     );
   });
 
@@ -886,7 +897,7 @@ function makeFakeGitHub({
       issue: { number: 1, pull_request: {}, user: { login: "alice" } },
       comment: {
         user: { id: 8001, login: "alice" },
-        body: "I have read the CLA Document and I hereby sign the CLA",
+        body: "> <!-- fossasia-cla-bot:v1 -->\n> Please comment on this PR to sign.\n\nI have read the CLA Document and I hereby sign the CLA",
         html_url: "x",
         author_association: "NONE",
       },
@@ -902,6 +913,102 @@ function makeFakeGitHub({
     // First call: 1 "all signed" comment. Second call: 1 "already signed" comment.
     assert.strictEqual(gh.comments.length, 2);
     assert.ok(gh.comments[1].body.includes("already signed"));
+  });
+
+  // -------------------------------------------------------------------
+  // Quoted-reply sign gate: negative paths. handleIssueComment() must
+  // treat every one of these exactly like an unrelated comment - no
+  // signature written, no comment posted, no status set, and (via
+  // fetchThatMustNotBeCalled) no network call made at all. Positive-path
+  // coverage (a real quoted reply signing successfully) is the "sole
+  // commit author" and "signing twice" tests above; the pure matching
+  // logic (isQuotedBotReply/replyText) has its own unit tests in
+  // test/logic.test.js.
+  // -------------------------------------------------------------------
+  const BOT_MARKER = "<!-- fossasia-cla-bot:v1 -->";
+
+  async function assertSignIsIgnored(name, body) {
+    await test(name, async () => {
+      global.fetch = fetchThatMustNotBeCalled;
+      const payload = {
+        action: "created",
+        issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+        comment: {
+          user: { id: 1, login: "alice" },
+          body,
+          html_url: "x",
+          author_association: "NONE",
+        },
+      };
+      // Must not throw, and - proven by fetchThatMustNotBeCalled above -
+      // must not make any network request either (no write, no comment,
+      // no status).
+      await assert.doesNotReject(() => handleIssueComment(payload));
+    });
+  }
+
+  await assertSignIsIgnored(
+    "a plain sign-phrase comment with NO quote at all is ignored, not treated as a sign",
+    "I have read the CLA Document and I hereby sign the CLA",
+  );
+
+  await assertSignIsIgnored(
+    "a quoted comment whose quoted block does NOT contain the bot marker is ignored (quoting some other comment doesn't count)",
+    "> this is someone else's comment, not the bot's\n\nI have read the CLA Document and I hereby sign the CLA",
+  );
+
+  await assertSignIsIgnored(
+    "a properly quoted reply with extra trailing text after the sign phrase is ignored - the phrase must be exact",
+    `> ${BOT_MARKER}\n\nI have read the CLA Document and I hereby sign the CLA, thanks!`,
+  );
+
+  await assertSignIsIgnored(
+    "a properly quoted reply with extra leading text before the sign phrase is ignored - the phrase must be exact",
+    `> ${BOT_MARKER}\n\nOk, I have read the CLA Document and I hereby sign the CLA`,
+  );
+
+  await assertSignIsIgnored(
+    "the sign phrase typed BEFORE the quoted block (reversed order) is ignored - only a LEADING quote block is recognized",
+    `I have read the CLA Document and I hereby sign the CLA\n\n> ${BOT_MARKER}`,
+  );
+
+  await assertSignIsIgnored(
+    "a properly quoted bot marker with nothing typed after it is ignored - quoting alone is not a sign",
+    `> ${BOT_MARKER}\n> Please comment on this PR to sign.`,
+  );
+
+  await test("a quoted reply with the sign phrase in a different case still signs successfully - case-insensitivity survives the new quote-reply gate", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 7001, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 7001, login: "alice" },
+        body: `> ${BOT_MARKER}\n\ni HAVE READ the cla document and i hereby SIGN the cla`,
+        html_url: "x",
+        author_association: "NONE",
+      },
+    };
+    await handleIssueComment(payload);
+
+    assert.strictEqual(
+      gh.signatures.signatures.length,
+      1,
+      "signature should still be recorded despite the case difference",
+    );
+    assert.strictEqual(gh.signatures.signatures[0].login, "alice");
   });
 
   await test("a spoofed comment from a regular user cannot fool the dedupe check into suppressing the real bot comment", async () => {

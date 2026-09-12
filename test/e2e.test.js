@@ -353,7 +353,7 @@ function baseEnv(apiUrl) {
       },
       comment: {
         user: { id: 42, login: "e2e-author" },
-        body: "I have read the CLA Document and I hereby sign the CLA",
+        body: "> <!-- fossasia-cla-bot:v1 -->\n> Please comment on this PR to sign.\n\nI have read the CLA Document and I hereby sign the CLA",
         html_url: "https://example.com/comment",
         author_association: "NONE",
       },

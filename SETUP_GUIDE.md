@@ -137,12 +137,15 @@ access control from Step 2.
 2. Open a test PR - ideally from a second GitHub account, so you're
    testing what a real external contributor would see.
 3. The bot should comment listing the missing signers.
-4. Sign by commenting exactly: `I have read the CLA Document and I hereby sign the CLA`
+4. Sign by replying to the bot's comment with exactly:
+   `I have read the CLA Document and I hereby sign the CLA`.
+   A plain new comment will not count.
 5. Confirm a new entry showed up in `cla-signatures`.
-6. **Impersonation test**: on a different PR, comment the sign phrase from
-   a third account and check the PR does _not_ get marked as signed
-   (unless that commenter is actually the PR's commit author). This is
-   already covered by the bot's own test suite, but it's worth confirming
+6. **Impersonation test**: on a different PR, reply to the bot's comment
+   with the sign phrase from a third account and check the PR does _not_
+   get marked as signed (unless that commenter is actually the PR's commit
+   author). This is already covered by the bot's own test suite, but it's
+   worth confirming
    once against a real PR too.
 
 ## Step 8 - Roll out across the whole org
