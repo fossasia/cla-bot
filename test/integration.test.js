@@ -26,6 +26,7 @@ const {
   lockPR,
   postComment,
   checkPR,
+  assertValidSha,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -2116,6 +2117,53 @@ function makeFakeGitHub({
     await assert.doesNotReject(() => handlePullRequestTarget(payload));
 
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+  });
+
+  // ---------------------------------------------------------------------
+  // encodeURIComponent() at the point of URL construction (see ghRaw()'s
+  // callers): assertValidSha's blocklist rejects structurally dangerous
+  // characters (/, .., ?, #, %, whitespace) but, by design, doesn't
+  // enforce hex-only content - so a sha containing e.g. "&" legitimately
+  // passes validation. Unencoded, that "&" would be able to inject or
+  // override query parameters on any request built from it. This test
+  // proves percent-encoding is genuinely applied at the sink (not just
+  // present in the source and inert), by checking the literal bytes that
+  // reach fetch().
+  // ---------------------------------------------------------------------
+  await test("checkPR percent-encodes a validator-legal but URL-significant sha (containing '&') before it ever reaches fetch(), so it can't inject or override a query parameter", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    const trickySha = "abc&page=999&per_page=1";
+    assert.doesNotThrow(
+      () => assertValidSha(trickySha, "sanity check"),
+      "this test only proves something if the tricky value is legal input to begin with",
+    );
+
+    let observedRawUrl = null;
+    const innerFetch = gh.fetch;
+    global.fetch = async (url, opts) => {
+      if (url.includes("/statuses/")) observedRawUrl = url;
+      return innerFetch(url, opts);
+    };
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: trickySha } },
+    };
+    await assert.doesNotReject(() => handlePullRequestTarget(payload));
+
+    assert.ok(observedRawUrl, "expected a status request to have been made");
+    assert.strictEqual(
+      observedRawUrl.split("/statuses/")[1],
+      encodeURIComponent(trickySha),
+      "the sha must reach fetch() percent-encoded, not as raw, URL-significant characters",
+    );
+    assert.strictEqual(
+      gh.statuses[gh.statuses.length - 1].sha,
+      encodeURIComponent(trickySha),
+    );
   });
 
   console.log(`\n${passed} test(s) passed.`);

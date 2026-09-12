@@ -554,7 +554,7 @@ async function resolveLoginById(id) {
   if (_loginByIdCache.has(id)) return _loginByIdCache.get(id);
   let login = null;
   try {
-    const user = await gh(`/user/${id}`, GITHUB_TOKEN);
+    const user = await gh(`/user/${encodeURIComponent(id)}`, GITHUB_TOKEN);
     if (user && typeof user.login === "string" && user.login.length > 0) {
       login = user.login;
     }
@@ -639,7 +639,7 @@ async function listPRCommitAuthors(prNumber) {
   let page = 1;
   for (;;) {
     const commits = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}/commits?per_page=100&page=${page}`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}/commits?per_page=100&page=${page}`,
       GITHUB_TOKEN,
     );
     if (!commits.length) break;
@@ -716,7 +716,7 @@ async function getExistingBotComments(prNumber) {
   let page = 1;
   for (;;) {
     const comments = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/comments?per_page=100&page=${page}`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?per_page=100&page=${page}`,
       GITHUB_TOKEN,
     );
     if (!comments.length) break;
@@ -748,7 +748,7 @@ async function postComment(prNumber, body, dedupe = true) {
     if (last && last.body === full) return; // nothing changed, don't spam the thread
   }
   await gh(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/comments`,
+    `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments`,
     GITHUB_TOKEN,
     {
       method: "POST",
@@ -795,7 +795,7 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
   for (const dup of matching.slice(0, -1)) {
     try {
       await gh(
-        `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${dup.id}`,
+        `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${encodeURIComponent(dup.id)}`,
         GITHUB_TOKEN,
         { method: "DELETE" },
       );
@@ -811,18 +811,22 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
 }
 
 async function setStatus(sha, state, description) {
-  await gh(`/repos/${REPO_OWNER}/${REPO_NAME}/statuses/${sha}`, GITHUB_TOKEN, {
-    method: "POST",
-    // Posting the same status twice has no visible effect - GitHub only
-    // shows the latest status per context - so it's fine to let gh() retry
-    // a transient failure here.
-    idempotent: true,
-    body: JSON.stringify({
-      state,
-      description: description.slice(0, 140),
-      context: STATUS_CONTEXT,
-    }),
-  });
+  await gh(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/statuses/${encodeURIComponent(sha)}`,
+    GITHUB_TOKEN,
+    {
+      method: "POST",
+      // Posting the same status twice has no visible effect - GitHub only
+      // shows the latest status per context - so it's fine to let gh() retry
+      // a transient failure here.
+      idempotent: true,
+      body: JSON.stringify({
+        state,
+        description: description.slice(0, 140),
+        context: STATUS_CONTEXT,
+      }),
+    },
+  );
 }
 
 async function lockPR(prNumber) {
@@ -834,7 +838,7 @@ async function lockPR(prNumber) {
     // contract intact.
     assertValidPRNumber(prNumber, "lockPR(prNumber)");
     await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/lock`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/lock`,
       GITHUB_TOKEN,
       {
         method: "PUT",
@@ -854,7 +858,7 @@ async function checkPR(prNumber, headSha) {
   assertValidPRNumber(prNumber, "checkPR(prNumber)");
   if (!headSha) {
     const pr = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}`,
       GITHUB_TOKEN,
     );
     headSha = assertValidSha(
