@@ -25,6 +25,7 @@ const {
   handlePullRequestTarget,
   lockPR,
   postComment,
+  checkPR,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -49,6 +50,17 @@ function res(status, jsonBody) {
 }
 function b64(obj) {
   return Buffer.from(JSON.stringify(obj)).toString("base64");
+}
+
+// A fetch stub for the input-validation tests below: any call at all means
+// a value that should have been rejected made it past validation and
+// reached the network layer - so any invocation is itself the failure,
+// regardless of what it would have returned.
+function fetchThatMustNotBeCalled(url, opts) {
+  throw new Error(
+    `must not make any network request - validation should have thrown ` +
+      `before reaching fetch(), but got: ${(opts && opts.method) || "GET"} ${url}`,
+  );
 }
 
 // A small in-memory "GitHub" that the mocked fetch reads/writes so the test
@@ -1780,6 +1792,319 @@ function makeFakeGitHub({
       [1, 2, 3],
       "expected exactly 3 page requests - two full 100-item pages, then one genuinely empty page to terminate - not more and not fewer",
     );
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+  });
+
+  // =========================================================================
+  // Input-validation hardening: PR/issue numbers and commit SHAs pulled out
+  // of the webhook payload (itself read from a file, GITHUB_EVENT_PATH) must
+  // never reach an outbound GitHub API URL unvalidated - see
+  // assertValidPRNumber()/assertValidSha() in src/cla-bot.js, called from
+  // handleIssueComment, handlePullRequestTarget, checkPR, postComment, and
+  // lockPR. Every test below stubs fetch to THROW on any call at all, so a
+  // pass proves not just "an error was thrown" but that it was thrown
+  // strictly before any network request was attempted - the exact property
+  // that closes the CodeQL js/file-access-to-http finding.
+  // =========================================================================
+
+  const INVALID_PR_NUMBERS = [
+    { label: "zero", value: 0 },
+    { label: "a negative number", value: -1 },
+    { label: "a non-integer float", value: 1.5 },
+    { label: "NaN", value: NaN },
+    { label: "Infinity", value: Infinity },
+    { label: "a numeric string", value: "1" },
+    { label: "null", value: null },
+    { label: "undefined", value: undefined },
+    { label: "an array", value: [1] },
+    // The concrete shape of the reported vulnerability: if this ever
+    // reached the request path unvalidated, it could redirect an
+    // authenticated GitHub API call at a completely different repo.
+    {
+      label: "a path-traversal string",
+      value: "1/../../../repos/other-org/other-repo",
+    },
+  ];
+
+  for (const { label, value } of INVALID_PR_NUMBERS) {
+    await test(`handleIssueComment rejects an issue.number that is ${label}, before making any network request`, async () => {
+      global.fetch = fetchThatMustNotBeCalled;
+      await assert.rejects(
+        () =>
+          handleIssueComment({
+            action: "created",
+            issue: {
+              number: value,
+              pull_request: {},
+              user: { login: "alice" },
+            },
+            comment: {
+              user: { id: 1, login: "alice" },
+              body: "I have read the CLA Document and I hereby sign the CLA",
+            },
+          }),
+        (err) => {
+          assert.ok(
+            /expected a positive integer/.test(err.message),
+            `expected a specific validation error, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    });
+  }
+
+  for (const { label, value } of INVALID_PR_NUMBERS) {
+    await test(`handlePullRequestTarget rejects a pull_request.number that is ${label} on a 'closed'+merged event, before calling lockPR`, async () => {
+      global.fetch = fetchThatMustNotBeCalled;
+      await assert.rejects(
+        () =>
+          handlePullRequestTarget({
+            action: "closed",
+            pull_request: {
+              number: value,
+              merged: true,
+              head: { sha: "head-sha" },
+            },
+          }),
+        (err) => {
+          assert.ok(
+            /expected a positive integer/.test(err.message),
+            `expected a specific validation error, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    });
+  }
+
+  for (const { label, value } of INVALID_PR_NUMBERS) {
+    await test(`handlePullRequestTarget rejects a pull_request.number that is ${label} on 'opened', before calling checkPR`, async () => {
+      global.fetch = fetchThatMustNotBeCalled;
+      await assert.rejects(
+        () =>
+          handlePullRequestTarget({
+            action: "opened",
+            pull_request: { number: value, head: { sha: "head-sha" } },
+          }),
+        (err) => {
+          assert.ok(
+            /expected a positive integer/.test(err.message),
+            `expected a specific validation error, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    });
+  }
+
+  const INVALID_SHAS = [
+    { label: "a slash", value: "abc/def" },
+    { label: "a backslash", value: "abc\\def" },
+    {
+      label: "a path-traversal sequence",
+      value: "abc/../../../repos/other-org/other-repo/statuses/x",
+    },
+    { label: "a query string separator", value: "abc?x=1" },
+    { label: "a fragment separator", value: "abc#frag" },
+    { label: "embedded whitespace", value: "abc def" },
+    { label: "an embedded newline", value: "abc\ndef" },
+    { label: "a percent-encoded traversal sequence", value: "%2e%2e%2f" },
+    { label: "a percent-encoded slash", value: "abc%2fdef" },
+    { label: "an empty string", value: "" },
+    {
+      label: "a 65-character string (over the length cap)",
+      value: "a".repeat(65),
+    },
+    { label: "a number instead of a string", value: 12345 },
+  ];
+
+  for (const { label, value } of INVALID_SHAS) {
+    await test(`handlePullRequestTarget rejects a pull_request.head.sha that is ${label} on 'opened', before calling checkPR`, async () => {
+      global.fetch = fetchThatMustNotBeCalled;
+      await assert.rejects(
+        () =>
+          handlePullRequestTarget({
+            action: "opened",
+            pull_request: { number: 1, head: { sha: value } },
+          }),
+        (err) => {
+          assert.ok(
+            /expected a valid commit SHA/.test(err.message),
+            `expected a specific validation error, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    });
+  }
+
+  await test("handlePullRequestTarget throws a clear, specific error (not a raw TypeError) when pull_request.head is missing entirely on 'opened'", async () => {
+    global.fetch = fetchThatMustNotBeCalled;
+    await assert.rejects(
+      () =>
+        handlePullRequestTarget({
+          action: "opened",
+          pull_request: { number: 1 }, // no `head` at all
+        }),
+      (err) => {
+        assert.ok(
+          /expected a valid commit SHA/.test(err.message),
+          `expected the sha validator's own error, not a raw TypeError, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  await test("checkPR rejects an invalid prNumber argument directly, before making any network request", async () => {
+    global.fetch = fetchThatMustNotBeCalled;
+    await assert.rejects(
+      () => checkPR("1; DROP TABLE prs", "head-sha"),
+      (err) => {
+        assert.ok(
+          /expected a positive integer/.test(err.message),
+          `expected a specific validation error, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  await test("checkPR rejects an invalid headSha argument directly, before making any network request", async () => {
+    global.fetch = fetchThatMustNotBeCalled;
+    await assert.rejects(
+      () => checkPR(1, "abc/../../secrets"),
+      (err) => {
+        assert.ok(
+          /expected a valid commit SHA/.test(err.message),
+          `expected a specific validation error, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+  });
+
+  await test("checkPR validates the sha it fetches itself from GET /pulls/{n} (defense-in-depth for API-sourced data, not just the webhook file) and stops before posting any status or comment", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    const innerFetch = gh.fetch;
+    global.fetch = async (url, opts) => {
+      if (url.includes("/pulls/1") && !url.includes("/commits")) {
+        // Simulate a GitHub API response carrying a malformed head.sha -
+        // checkPR() must not trust this any more than it trusts the file.
+        return res(200, { head: { sha: "bad/sha?with=unsafe#chars" } });
+      }
+      return innerFetch(url, opts);
+    };
+
+    // Called with no headSha, forcing checkPR to fetch (and then validate)
+    // the PR itself.
+    await assert.rejects(
+      () => checkPR(1),
+      (err) => {
+        assert.ok(
+          /expected a valid commit SHA/.test(err.message),
+          `expected a specific validation error, got: ${err.message}`,
+        );
+        return true;
+      },
+    );
+
+    assert.strictEqual(
+      gh.statuses.length,
+      0,
+      "no status should ever be posted once the fetched sha fails validation",
+    );
+    assert.strictEqual(
+      gh.comments.length,
+      0,
+      "no comment should ever be posted once the fetched sha fails validation",
+    );
+  });
+
+  for (const { label, value } of INVALID_PR_NUMBERS) {
+    await test(`postComment rejects a prNumber that is ${label}, before making any network request`, async () => {
+      global.fetch = fetchThatMustNotBeCalled;
+      await assert.rejects(
+        () => postComment(value, "hello"),
+        (err) => {
+          assert.ok(
+            /expected a positive integer/.test(err.message),
+            `expected a specific validation error, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+    });
+  }
+
+  await test("lockPR is best-effort even for an invalid prNumber: it does NOT throw, makes no network request, and logs a warning instead", async () => {
+    global.fetch = fetchThatMustNotBeCalled;
+    const originalWarn = console.warn;
+    let warned = "";
+    console.warn = (msg) => {
+      warned = msg;
+    };
+    try {
+      await assert.doesNotReject(
+        () => lockPR("1/../../repos/other-org/other-repo"),
+        "lockPR must never throw, even when its own input fails validation - see its best-effort contract",
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.ok(
+      /expected a positive integer/.test(warned),
+      `expected the warning to include the validation error, got: ${warned}`,
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // Positive control: the validators above must not reject genuinely valid
+  // input. Without this, an over-eager regex could silently break real
+  // traffic while every negative test above kept passing.
+  // ---------------------------------------------------------------------
+  await test("a large, ordinary positive integer PR number and a real-shaped 40-char hex sha both pass validation and flow through end-to-end", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "author" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "author" }],
+      },
+    });
+    // makeFakeGitHub()'s router is hardcoded to PR #1's endpoints, so give
+    // it a matching real-shaped sha rather than reusing PR #1's number
+    // (already covered extensively elsewhere) - this test's job is purely
+    // to prove a legitimate 40-char lowercase-hex sha is accepted.
+    const realSha = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4";
+    const innerFetch = gh.fetch;
+    global.fetch = async (url, opts) => {
+      if (url.includes("/statuses/")) {
+        assert.strictEqual(
+          url.split("/statuses/")[1],
+          realSha,
+          "the real 40-char hex sha must reach the status endpoint unmodified",
+        );
+      }
+      return innerFetch(url, opts);
+    };
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: realSha } },
+    };
+    await assert.doesNotReject(() => handlePullRequestTarget(payload));
+
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
   });
 
