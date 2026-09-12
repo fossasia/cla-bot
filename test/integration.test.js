@@ -1817,6 +1817,16 @@ function makeFakeGitHub({
     { label: "null", value: null },
     { label: "undefined", value: undefined },
     { label: "an array", value: [1] },
+    // An "integer" too large to be a safe integer: Number.isInteger()
+    // alone accepts this (every double past 2^53 has no fractional part),
+    // but it can't reliably represent a real PR number - see the
+    // dedicated Number.isSafeInteger() unit tests in test/logic.test.js
+    // for the full boundary sweep; this one entry keeps that same class
+    // of value covered end-to-end through the actual webhook handlers too.
+    {
+      label: "an unsafe integer (Number.MAX_SAFE_INTEGER + 1)",
+      value: Number.MAX_SAFE_INTEGER + 1,
+    },
     // The concrete shape of the reported vulnerability: if this ever
     // reached the request path unvalidated, it could redirect an
     // authenticated GitHub API call at a completely different repo.

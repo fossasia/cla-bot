@@ -137,8 +137,21 @@ const GITHUB_REPO_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
 // unvalidated from the file ever reaches a request URL - a malformed or
 // unexpected event file fails loudly here instead of being interpolated
 // into an outbound API call.
+//
+// Number.isSafeInteger(), not Number.isInteger(): every double beyond
+// 2^53 is still "an integer" with no fractional part, so Number.isInteger
+// happily accepts values like 1e100 or Number.MAX_SAFE_INTEGER + 1 - which
+// then serialize into a URL as garbage (e.g. "1e+100") instead of a real
+// PR number. Worse, JSON.parse() itself silently rounds an out-of-range
+// integer literal in the source JSON to the nearest representable double
+// (JSON.parse("9007199254740993") === 9007199254740992) - by the time
+// this function sees the value, that corruption has already happened, so
+// isSafeInteger is the only check that reliably tells us we're not one of
+// those rounded, no-longer-faithful values. No real GitHub PR/issue number
+// is ever remotely close to this boundary, so this is strictly tighter
+// with zero risk to legitimate input.
 function assertValidPRNumber(value, context) {
-  if (!Number.isInteger(value) || value <= 0) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(
       `${context}: expected a positive integer issue/PR number, got ${JSON.stringify(value)}`,
     );

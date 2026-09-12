@@ -460,6 +460,54 @@ for (const { label, value } of [
   });
 }
 
+// Dedicated unsafe-integer boundary tests. Number.isInteger() alone is not
+// enough here: every double past 2^53 has no fractional part, so
+// Number.isInteger() calls it "an integer" even though it can't reliably
+// represent the real value - these three values would each have slipped
+// past a Number.isInteger()-only check. assertValidPRNumber uses
+// Number.isSafeInteger() specifically to reject them, and each test below
+// proves that with an explicit assert.ok(Number.isInteger(...)) sanity
+// check, so a regression back to Number.isInteger() fails immediately and
+// specifically here rather than only turning up as a garbled URL later.
+for (const { label, value } of [
+  {
+    label:
+      "Number.MAX_SAFE_INTEGER + 1 (still passes Number.isInteger, but not Number.isSafeInteger)",
+    value: Number.MAX_SAFE_INTEGER + 1,
+  },
+  {
+    label:
+      "1e100 (a huge float with no fractional part, but nowhere near a real PR number)",
+    value: 1e100,
+  },
+  {
+    label:
+      "9007199254740993, which JSON.parse() itself already silently rounds to a different integer (9007199254740992)",
+    value: 9007199254740993,
+  },
+]) {
+  test(`assertValidPRNumber rejects ${label}`, () => {
+    // Confirms this specific value really is the kind Number.isInteger()
+    // alone would wrongly accept - otherwise this test would prove nothing
+    // about the isSafeInteger() vs isInteger() distinction.
+    assert.ok(
+      Number.isInteger(value),
+      "expected this value to be a case Number.isInteger() alone would accept",
+    );
+    assert.throws(
+      () => assertValidPRNumber(value, "ctx"),
+      /expected a positive integer/,
+    );
+  });
+}
+
+test("assertValidPRNumber accepts Number.MAX_SAFE_INTEGER itself (the boundary, not the offender)", () => {
+  assert.strictEqual(
+    assertValidPRNumber(Number.MAX_SAFE_INTEGER, "ctx"),
+    Number.MAX_SAFE_INTEGER,
+  );
+});
+
 test("assertValidSha accepts a real 40-character lowercase-hex sha1 and returns it unchanged", () => {
   const sha = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4";
   assert.strictEqual(assertValidSha(sha, "ctx"), sha);
