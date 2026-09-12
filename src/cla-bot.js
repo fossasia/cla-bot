@@ -125,6 +125,63 @@ const GITHUB_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
 // Repo names are looser: letters, digits, '.', '-', '_', up to 100 chars.
 const GITHUB_REPO_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
 
+// ---------------------------------------------------------------------------
+// Webhook-payload sanitizers.
+//
+// EVENT_PATH (see main()) is a JSON file GitHub itself writes before the job
+// starts, but it's still external, file-provided data - a PR/issue number or
+// commit SHA read out of it flows straight into the path of every gh()/fetch
+// call below (postComment, checkPR, lockPR, setStatus, ...). These two
+// checks are called right where that data is first pulled out of the parsed
+// payload (handleIssueComment, handlePullRequestTarget), so nothing
+// unvalidated from the file ever reaches a request URL - a malformed or
+// unexpected event file fails loudly here instead of being interpolated
+// into an outbound API call.
+//
+// Number.isSafeInteger(), not Number.isInteger(): every double beyond
+// 2^53 is still "an integer" with no fractional part, so Number.isInteger
+// happily accepts values like 1e100 or Number.MAX_SAFE_INTEGER + 1 - which
+// then serialize into a URL as garbage (e.g. "1e+100") instead of a real
+// PR number. Worse, JSON.parse() itself silently rounds an out-of-range
+// integer literal in the source JSON to the nearest representable double
+// (JSON.parse("9007199254740993") === 9007199254740992) - by the time
+// this function sees the value, that corruption has already happened, so
+// isSafeInteger is the only check that reliably tells us we're not one of
+// those rounded, no-longer-faithful values. No real GitHub PR/issue number
+// is ever remotely close to this boundary, so this is strictly tighter
+// with zero risk to legitimate input.
+function assertValidPRNumber(value, context) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `${context}: expected a positive integer issue/PR number, got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
+// Real git commit SHAs are lowercase hex (40 chars for sha1, 64 for
+// sha256), but test/tooling code sometimes uses opaque placeholder strings
+// in their place, so this deliberately doesn't require hex - it only
+// rejects what would actually be dangerous as a URL path segment: slashes,
+// "..", "?"/"#" (which would truncate or redirect the request path/query),
+// whitespace/control characters, and "%" (blocks a percent-encoded
+// bypass of the checks above, e.g. "%2e%2e" or "%2f" - a real SHA never
+// contains one either way, so this costs nothing).
+const UNSAFE_URL_SEGMENT_RE = /[/\\?#%\s\x00-\x1f]|\.\./;
+function assertValidSha(value, context) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 64 ||
+    UNSAFE_URL_SEGMENT_RE.test(value)
+  ) {
+    throw new Error(
+      `${context}: expected a valid commit SHA, got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
 function validateConfig() {
   for (const [name, val] of [
     ["GITHUB_TOKEN", GITHUB_TOKEN],
@@ -679,6 +736,11 @@ async function getExistingBotComments(prNumber) {
 }
 
 async function postComment(prNumber, body, dedupe = true) {
+  // Defense-in-depth: postComment is exported and callable directly (not
+  // only via the validated handleIssueComment/handlePullRequestTarget entry
+  // points), so it re-checks its own input rather than trusting every
+  // caller to have validated it first.
+  assertValidPRNumber(prNumber, "postComment(prNumber)");
   const full = `${BOT_MARKER}\n${body}`;
   if (dedupe) {
     const existing = await getExistingBotComments(prNumber);
@@ -765,6 +827,12 @@ async function setStatus(sha, state, description) {
 
 async function lockPR(prNumber) {
   try {
+    // Defense-in-depth, same reasoning as postComment(): lockPR is exported
+    // and callable directly. Validating inside the try means a bad
+    // prNumber is handled exactly like any other lock failure - logged and
+    // swallowed, never thrown - keeping lockPR's "never fails the run"
+    // contract intact.
+    assertValidPRNumber(prNumber, "lockPR(prNumber)");
     await gh(
       `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/lock`,
       GITHUB_TOKEN,
@@ -783,12 +851,18 @@ async function lockPR(prNumber) {
 // Core: evaluate one PR and bring its status/comment up to date.
 // ---------------------------------------------------------------------------
 async function checkPR(prNumber, headSha) {
+  assertValidPRNumber(prNumber, "checkPR(prNumber)");
   if (!headSha) {
     const pr = await gh(
       `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}`,
       GITHUB_TOKEN,
     );
-    headSha = pr.head.sha;
+    headSha = assertValidSha(
+      pr.head.sha,
+      `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.head.sha)`,
+    );
+  } else {
+    assertValidSha(headSha, "checkPR(headSha)");
   }
 
   // Read signatures last, right before deciding: listPRCommitAuthors() can
@@ -884,7 +958,10 @@ async function handleIssueComment(payload) {
       "issue_comment payload is missing comment.user.login - malformed or unexpected webhook delivery.",
     );
   }
-  const prNumber = payload.issue.number;
+  const prNumber = assertValidPRNumber(
+    payload.issue.number,
+    "issue_comment payload issue.number",
+  );
   const body = (payload.comment.body || "").trim();
   const commenter = payload.comment.user.login;
 
@@ -961,12 +1038,20 @@ async function handlePullRequestTarget(payload) {
       "pull_request_target payload is missing pull_request - malformed or unexpected webhook delivery.",
     );
   }
+  const prNumber = assertValidPRNumber(
+    payload.pull_request.number,
+    "pull_request_target payload pull_request.number",
+  );
   if (payload.action === "closed" && payload.pull_request.merged) {
-    await lockPR(payload.pull_request.number);
+    await lockPR(prNumber);
     return;
   }
   if (["opened", "synchronize", "reopened"].includes(payload.action)) {
-    await checkPR(payload.pull_request.number, payload.pull_request.head.sha);
+    const headSha = assertValidSha(
+      payload.pull_request.head && payload.pull_request.head.sha,
+      "pull_request_target payload pull_request.head.sha",
+    );
+    await checkPR(prNumber, headSha);
   }
 }
 
@@ -1016,4 +1101,11 @@ module.exports = {
   postComment,
   validateConfig,
   lockPR,
+  // Exported for tests only, same as everything above - not part of the
+  // action's public contract. Covered directly in test/logic.test.js so a
+  // future change to either validator's character rules (e.g. UNSAFE_URL_
+  // SEGMENT_RE) fails immediately and specifically, rather than only being
+  // caught indirectly through the webhook-handler integration tests.
+  assertValidPRNumber,
+  assertValidSha,
 };

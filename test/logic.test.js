@@ -21,6 +21,8 @@ const {
   isAllowlisted,
   createAppJWT,
   isPrivileged,
+  assertValidPRNumber,
+  assertValidSha,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -420,6 +422,170 @@ test("isPrivileged does not throw when payload.issue or payload.comment is missi
   );
   assert.strictEqual(isPrivileged({ issue: {} }, "someone"), false);
   assert.strictEqual(isPrivileged({}, "someone"), false);
+});
+
+// --- assertValidPRNumber / assertValidSha: direct unit-level regression ---
+// contract for UNSAFE_URL_SEGMENT_RE and the PR-number integer check.
+//
+// These call the validators straight (no webhook simulation, no fetch
+// mocking) precisely so that if either check is ever loosened - e.g. a
+// character accidentally dropped from UNSAFE_URL_SEGMENT_RE's class - the
+// failure is immediate, synchronous, and named after the exact character
+// that stopped being rejected, rather than surfacing only indirectly deep
+// inside an async webhook-handler integration test.
+
+test("assertValidPRNumber accepts an ordinary positive integer and returns it unchanged", () => {
+  assert.strictEqual(assertValidPRNumber(42, "ctx"), 42);
+});
+
+for (const { label, value } of [
+  { label: "zero", value: 0 },
+  { label: "a negative integer", value: -1 },
+  { label: "a non-integer float", value: 1.5 },
+  { label: "NaN", value: NaN },
+  { label: "Infinity", value: Infinity },
+  { label: "-Infinity", value: -Infinity },
+  { label: "a numeric string", value: "1" },
+  { label: "null", value: null },
+  { label: "undefined", value: undefined },
+  { label: "an array", value: [1] },
+  { label: "a plain object", value: {} },
+  { label: "a boolean", value: true },
+]) {
+  test(`assertValidPRNumber rejects ${label}`, () => {
+    assert.throws(
+      () => assertValidPRNumber(value, "ctx"),
+      /expected a positive integer/,
+    );
+  });
+}
+
+// Dedicated unsafe-integer boundary tests. Number.isInteger() alone is not
+// enough here: every double past 2^53 has no fractional part, so
+// Number.isInteger() calls it "an integer" even though it can't reliably
+// represent the real value - these three values would each have slipped
+// past a Number.isInteger()-only check. assertValidPRNumber uses
+// Number.isSafeInteger() specifically to reject them, and each test below
+// proves that with an explicit assert.ok(Number.isInteger(...)) sanity
+// check, so a regression back to Number.isInteger() fails immediately and
+// specifically here rather than only turning up as a garbled URL later.
+for (const { label, value } of [
+  {
+    label:
+      "Number.MAX_SAFE_INTEGER + 1 (still passes Number.isInteger, but not Number.isSafeInteger)",
+    value: Number.MAX_SAFE_INTEGER + 1,
+  },
+  {
+    label:
+      "1e100 (a huge float with no fractional part, but nowhere near a real PR number)",
+    value: 1e100,
+  },
+  {
+    label:
+      "9007199254740993, which JSON.parse() itself already silently rounds to a different integer (9007199254740992)",
+    value: 9007199254740993,
+  },
+]) {
+  test(`assertValidPRNumber rejects ${label}`, () => {
+    // Confirms this specific value really is the kind Number.isInteger()
+    // alone would wrongly accept - otherwise this test would prove nothing
+    // about the isSafeInteger() vs isInteger() distinction.
+    assert.ok(
+      Number.isInteger(value),
+      "expected this value to be a case Number.isInteger() alone would accept",
+    );
+    assert.throws(
+      () => assertValidPRNumber(value, "ctx"),
+      /expected a positive integer/,
+    );
+  });
+}
+
+test("assertValidPRNumber accepts Number.MAX_SAFE_INTEGER itself (the boundary, not the offender)", () => {
+  assert.strictEqual(
+    assertValidPRNumber(Number.MAX_SAFE_INTEGER, "ctx"),
+    Number.MAX_SAFE_INTEGER,
+  );
+});
+
+test("assertValidSha accepts a real 40-character lowercase-hex sha1 and returns it unchanged", () => {
+  const sha = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4";
+  assert.strictEqual(assertValidSha(sha, "ctx"), sha);
+});
+
+test("assertValidSha accepts a real 64-character lowercase-hex sha256", () => {
+  const sha = "a".repeat(64);
+  assert.strictEqual(assertValidSha(sha, "ctx"), sha);
+});
+
+test("assertValidSha accepts opaque non-hex placeholder strings (test/tooling convention, not just real hex shas)", () => {
+  assert.strictEqual(assertValidSha("head-sha-abc", "ctx"), "head-sha-abc");
+});
+
+// One test per individual member of UNSAFE_URL_SEGMENT_RE's character
+// class, plus the ".." alternation - so if a future edit ever drops just
+// one of them, exactly one narrowly-named test fails and points straight
+// at what changed.
+for (const { label, value } of [
+  { label: "a forward slash", value: "abc/def" },
+  { label: "a backslash", value: "abc\\def" },
+  { label: "a question mark", value: "abc?def" },
+  { label: "a hash/fragment marker", value: "abc#def" },
+  { label: "a percent sign", value: "abc%def" },
+  { label: "a space", value: "abc def" },
+  { label: "a tab", value: "abc\tdef" },
+  { label: "a newline", value: "abc\ndef" },
+  { label: "a NUL byte", value: "abc\x00def" },
+  { label: "a literal '..' traversal segment", value: "abc..def" },
+]) {
+  test(`assertValidSha rejects a sha containing ${label}`, () => {
+    assert.throws(
+      () => assertValidSha(value, "ctx"),
+      /expected a valid commit SHA/,
+    );
+  });
+}
+
+// Dedicated, explicitly-named percent-encoding bypass tests. Unencoded
+// "/", "..", "?", "#" are already covered above and by the integration
+// suite; a percent-encoded form of the same attack (e.g. "%2f" for "/",
+// "%2e%2e" for "..") contains none of those literal characters, so it can
+// ONLY be caught by the "%" member of the character class - these two
+// tests exist specifically to fail if that "%" is ever removed, even
+// though no other character in the value would trip any other check.
+test("assertValidSha rejects a percent-encoded '/' (\"%2f\") even though it contains no literal slash", () => {
+  assert.doesNotMatch("abc%2fdef", /[/\\?#\s\x00-\x1f]|\.\./);
+  assert.throws(
+    () => assertValidSha("abc%2fdef", "ctx"),
+    /expected a valid commit SHA/,
+  );
+});
+
+test("assertValidSha rejects a percent-encoded '../' traversal (\"%2e%2e%2f\") even though it contains no literal dot-dot or slash", () => {
+  assert.doesNotMatch("%2e%2e%2f", /[/\\?#\s\x00-\x1f]|\.\./);
+  assert.throws(
+    () => assertValidSha("%2e%2e%2f", "ctx"),
+    /expected a valid commit SHA/,
+  );
+});
+
+test("assertValidSha rejects an empty string", () => {
+  assert.throws(() => assertValidSha("", "ctx"), /expected a valid commit SHA/);
+});
+
+test("assertValidSha rejects a non-string value", () => {
+  assert.throws(
+    () => assertValidSha(12345, "ctx"),
+    /expected a valid commit SHA/,
+  );
+});
+
+test("assertValidSha accepts exactly 64 characters (the sha256 boundary) but rejects 65", () => {
+  assert.strictEqual(assertValidSha("a".repeat(64), "ctx"), "a".repeat(64));
+  assert.throws(
+    () => assertValidSha("a".repeat(65), "ctx"),
+    /expected a valid commit SHA/,
+  );
 });
 
 console.log(`\n${passed} test(s) passed.`);
