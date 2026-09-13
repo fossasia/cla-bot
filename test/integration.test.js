@@ -238,8 +238,10 @@ function makeFakeGitHub({
     assert.strictEqual(gh.statuses[0].state, "success");
     assert.strictEqual(gh.comments.length, 1);
     assert.ok(
-      gh.comments[0].body.includes("All contributors have signed"),
-      "expected the all-signed comment",
+      gh.comments[0].body.includes(
+        "@alice Thank you for signing the CLA! We look forward to your contributions.",
+      ),
+      "the sole (and completing) signer must be thanked by name, not shown the generic 'All contributors have signed' announcement",
     );
   });
 
@@ -1342,7 +1344,15 @@ function makeFakeGitHub({
     }
     gh.comments.push({
       id: 121,
-      body: "<!-- fossasia-cla-bot:v1 -->\nAll contributors have signed the CLA. \u2705",
+      // Deliberately built to match whatever the current code would freshly
+      // compose for this exact case (BOT_MARKER + SUCCESS_MESSAGE, which
+      // itself now embeds SUCCESS_MARKER - see its doc comment in
+      // src/cla-bot.js) rather than a hardcoded literal, so this test keeps
+      // validating what it's actually for (pagination reaching page 2's
+      // dedupe match) instead of silently starting to test a DIFFERENT
+      // thing (whether a preexisting comment in the OLD, pre-marker wording
+      // still gets deduped) every time the exact success wording evolves.
+      body: `<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:success -->\nAll contributors have signed the CLA. \u2705`,
       user: { login: "github-actions[bot]" },
     });
     global.fetch = gh.fetch;
@@ -1996,12 +2006,18 @@ function makeFakeGitHub({
     );
     assert.ok(
       gh.comments[gh.comments.length - 1].body.includes(
-        "All contributors have signed",
+        "@late-signer Thank you for signing the CLA! We look forward to your contributions.",
       ),
+      "the specific signer who completed the PR's requirement must be thanked by name, not shown the generic 'All contributors have signed' announcement",
     );
 
     // A later, redundant synchronize (no new commits, same head) that
     // re-confirms the already-announced success must not spam a duplicate.
+    // This automatic trigger has no specific signer to address, so it would
+    // fall back to the generic SUCCESS_MESSAGE if it posted anything at all
+    // - but classifyBotComment() must still recognize the personalized
+    // thank-you above as a "success" comment (via SUCCESS_MARKER) so this
+    // stays quiet exactly as it would have with the old generic wording.
     await handlePullRequestTarget({
       action: "synchronize",
       pull_request: { number: 1, head: { sha: "sha-1" } },
@@ -2230,29 +2246,30 @@ function makeFakeGitHub({
     });
 
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
-    // Count stays at 3, not 4: this new success announcement has the exact
-    // same body as the one already posted after carol signed, so
-    // postComment()'s pre-existing self-healing cleanup removes that now-
-    // stale earlier copy once the fresh one lands - same mechanism that
-    // already keeps identical successive comments from piling up anywhere
-    // else in this bot. What matters here is that a fresh copy exists at
-    // all - i.e. the second recovery genuinely got announced, not silently
-    // dropped just because a first one already happened earlier.
+    // Count goes to 4, not 3: unlike the old generic SUCCESS_MESSAGE (which
+    // was byte-for-byte identical every time, so postComment()'s self-
+    // healing dedupe collapsed successive copies down to one), each
+    // announcement here is personalized to the signer who completed the
+    // requirement that time around - carol's "@carol Thank you..." and
+    // dave's "@dave Thank you..." are different bodies, so both stand as
+    // their own distinct, genuine announcements instead of one being
+    // mistaken for a stale duplicate of the other.
     assert.strictEqual(
       gh.comments.length,
-      3,
-      "a second, genuine block-and-resolve cycle must still be announced, even though an earlier resolution was already announced once for this same PR (the now-stale first copy is cleaned up by the pre-existing self-healing dedupe)",
+      4,
+      "a second, genuine block-and-resolve cycle must still be announced, even though an earlier resolution was already announced once for this same PR",
     );
     assert.ok(
       gh.comments[gh.comments.length - 1].body.includes(
-        "All contributors have signed",
+        "@dave Thank you for signing the CLA! We look forward to your contributions.",
       ),
+      "the second recovery must thank the specific person (dave) who completed it this time",
     );
-    assert.strictEqual(
-      gh.comments.filter((c) => c.body.includes("All contributors have signed"))
-        .length,
-      1,
-      "only one (the freshest) copy of the success announcement should be present",
+    assert.ok(
+      gh.comments[1].body.includes(
+        "@carol Thank you for signing the CLA! We look forward to your contributions.",
+      ),
+      "the first recovery's personalized announcement (carol's) must remain untouched by the second one",
     );
   });
 
@@ -2817,6 +2834,220 @@ function makeFakeGitHub({
     assert.strictEqual(
       gh.statuses[gh.statuses.length - 1].sha,
       encodeURIComponent(trickySha),
+    );
+  });
+
+  // =========================================================================
+  // Per-signer personalized thank-you comments (replaces the old, anonymous
+  // "All contributors have signed the CLA. ✅" announcement whenever we
+  // know exactly who just signed via a comment - see checkPR's `signer`
+  // option and personalSuccessMessage() in src/cla-bot.js).
+  // =========================================================================
+  await test("on a PR with 3 contributors, each one signing via a comment gets their OWN personalized thank-you - not the generic 'All contributors have signed' announcement", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 7001, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+        {
+          sha: "c2",
+          author: { id: 7002, login: "bob" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "bob@example.com" } },
+        },
+        {
+          sha: "c3",
+          author: { id: 7003, login: "carol" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "carol@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const signAs = (id, login) => ({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id, login },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: `https://github.com/fossasia/testrepo/pull/1#issuecomment-${id}`,
+        author_association: "NONE",
+      },
+    });
+
+    // Alice signs first. Two others (bob, carol) still haven't - the PR
+    // stays blocked, but alice must still be personally thanked right away
+    // for the action she just took, alongside the usual "who's still
+    // missing" list.
+    await handleIssueComment(signAs(7001, "alice"));
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 1);
+    assert.ok(
+      gh.comments[0].body.includes(
+        "@alice Thank you for signing the CLA! We look forward to your contributions.",
+      ),
+      "alice must be thanked by name immediately for her own sign action",
+    );
+    assert.ok(
+      gh.comments[0].body.includes("@bob") &&
+        gh.comments[0].body.includes("@carol"),
+      "bob and carol must still be listed as needing to sign",
+    );
+    assert.ok(
+      !gh.comments[0].body.includes("All contributors have signed"),
+      "the PR isn't fully signed yet, so the completion announcement must not appear",
+    );
+
+    // Bob signs next. Still blocked (carol hasn't signed), so bob gets his
+    // own personal thank-you, and only carol remains in the pending list.
+    await handleIssueComment(signAs(7002, "bob"));
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 2);
+    assert.ok(
+      gh.comments[1].body.includes(
+        "@bob Thank you for signing the CLA! We look forward to your contributions.",
+      ),
+    );
+    assert.ok(gh.comments[1].body.includes("@carol"));
+    assert.ok(!gh.comments[1].body.includes("@bob you have already"));
+    assert.ok(
+      !gh.comments[1].body.includes("@alice"),
+      "alice already signed and must not reappear in the still-missing list",
+    );
+
+    // Carol signs last, completing the PR. She gets her OWN personalized
+    // thank-you in place of the old generic "All contributors have signed"
+    // announcement - exactly the behaviour this fix is for.
+    await handleIssueComment(signAs(7003, "carol"));
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(gh.comments.length, 3);
+    assert.ok(
+      gh.comments[2].body.includes(
+        "@carol Thank you for signing the CLA! We look forward to your contributions.",
+      ),
+      "carol, who completed the PR's requirement, must be thanked by name",
+    );
+    assert.ok(
+      !gh.comments[2].body.includes("All contributors have signed"),
+      "the generic, anonymous announcement must not be used when we know exactly who completed it",
+    );
+
+    assert.strictEqual(gh.signatures.signatures.length, 3);
+  });
+
+  await test("a signer's personalized completion comment is still correctly recognized as 'success' history, so a later automatic recheck with no specific signer stays quiet", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 7101, login: "dana" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "dana@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    // Opened unsigned - the bot asks.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.comments.length, 1);
+
+    // Dana signs - completes the PR, gets a personalized thank-you instead
+    // of the generic announcement.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "dana" } },
+      comment: {
+        user: { id: 7101, login: "dana" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.comments.length, 2);
+    assert.ok(
+      gh.comments[1].body.includes("@dana Thank you for signing the CLA"),
+    );
+
+    // An unrelated later push (no new commits, same head) triggers the
+    // automatic, quiet-by-default pull_request_target check again - this
+    // has no specific signer to address, so if it posted anything at all it
+    // would fall back to the generic SUCCESS_MESSAGE. It must recognize
+    // dana's personalized thank-you (via SUCCESS_MARKER) as the PR's
+    // already-announced success and stay silent instead of posting a
+    // second, generic "All contributors have signed" comment on top of it.
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(
+      gh.comments.length,
+      2,
+      "no extra comment should appear - the personalized thank-you already counts as the success announcement",
+    );
+  });
+
+  await test("an unrelated commenter signing the CLA on an already-fully-signed PR is NOT credited with completing that PR", async () => {
+    // Regression test: alice is the PR's only commit author and has
+    // already signed (e.g. on some earlier PR - signatures are global).
+    // mallory then comments the sign phrase on THIS pr even though she has
+    // no commits on it at all. Her signature is real and gets recorded,
+    // but it had zero effect on this PR's own requirement, which was
+    // already satisfied before she ever commented - so the resulting
+    // comment must NOT thank her as if she completed it.
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 8001, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 8001, login: "alice" }],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 9001, login: "mallory" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(gh.comments.length, 1);
+    assert.ok(
+      !gh.comments[0].body.includes("@mallory"),
+      "mallory must not be personally credited - she isn't a commit author on this PR, so her signing didn't complete anything here",
+    );
+    assert.ok(
+      gh.comments[0].body.includes("All contributors have signed"),
+      "falls back to the generic, anonymous announcement instead",
+    );
+
+    // Her signature is still genuinely recorded, though - future PRs where
+    // she IS an actual commit author will correctly see her as signed.
+    assert.ok(
+      gh.signatures.signatures.some(
+        (s) => s.id === 9001 && s.login === "mallory",
+      ),
     );
   });
 

@@ -117,7 +117,10 @@ I have read the CLA Document and I hereby sign the CLA
 
 Within a few seconds you should see:
 
-- A new bot comment: "All contributors have signed the CLA. ✅"
+- A new bot comment thanking you by name: "@your-username Thank you for
+  signing the CLA! We look forward to your contributions." (if someone
+  else's commit is still unsigned, you'll instead see that same personal
+  thank-you followed by the list of who else still needs to sign)
 - The status check turning green
 - A new commit in the `cla-test` repo that creates/updates
   `signatures/cla.json` (check the Code tab)
@@ -206,15 +209,15 @@ Add secrets to both repos (`Settings → Secrets and variables → Actions`):
 
 ### 2.5 Edge case tests (checking specific fixes)
 
-| Test                       | How to do it                                                                                                                                          | Expected result                                                                                                                                          |
-| -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Impersonation guard        | From a second/alt GitHub account, comment the sign phrase on a PR where you are the commit author                                                    | The PR should **not** turn green - only the commenter signed, not the real author                                                                       |
-| `recheck` authorization    | From an alt account (not the PR author), comment `recheck` on a PR                                                                                    | The bot should give **no response** (silently ignored)                                                                                                  |
-| `recheck` legitimate       | The PR author themselves comments `recheck`                                                                                                            | The bot re-evaluates and responds                                                                                                                        |
-| Merge-commit exclusion     | Click GitHub's "Update branch" button on a PR (this creates a merge commit)                                                                            | The person who clicked that button should not be asked to sign                                                                                          |
-| Malformed-entry resilience | Manually edit `signatures/cla.json` in `cla-signatures`, remove the `login` field from one entry, commit it                                            | The next PR check should still work normally (no crash), and the Actions logs should show a `::warning::` about the malformed entry                    |
+| Test                       | How to do it                                                                                                                                          | Expected result                                                                                                                                           |
+| -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Impersonation guard        | From a second/alt GitHub account, comment the sign phrase on a PR where you are the commit author                                                     | The PR should **not** turn green - only the commenter signed, not the real author                                                                         |
+| `recheck` authorization    | From an alt account (not the PR author), comment `recheck` on a PR                                                                                    | The bot should give **no response** (silently ignored)                                                                                                    |
+| `recheck` legitimate       | The PR author themselves comments `recheck`                                                                                                           | The bot re-evaluates and responds                                                                                                                         |
+| Merge-commit exclusion     | Click GitHub's "Update branch" button on a PR (this creates a merge commit)                                                                           | The person who clicked that button should not be asked to sign                                                                                            |
+| Malformed-entry resilience | Manually edit `signatures/cla.json` in `cla-signatures`, remove the `login` field from one entry, commit it                                           | The next PR check should still work normally (no crash), and the Actions logs should show a `::warning::` about the malformed entry                       |
 | First-write race           | Open PRs in two different consumer repos that have never had anyone sign before, and have two different people sign on each at close to the same time | Both signatures should end up recorded - neither should be lost, even though both writes are trying to create the signatures file for the very first time |
-| Duplicate-signature race   | (Optional, advanced) Try sending the same sign comment twice in quick succession                                                                      | `signatures/cla.json` should not end up with a duplicate entry - this is already covered by the code-level tests, so this manual check is optional      |
+| Duplicate-signature race   | (Optional, advanced) Try sending the same sign comment twice in quick succession                                                                      | `signatures/cla.json` should not end up with a duplicate entry - this is already covered by the code-level tests, so this manual check is optional        |
 
 For the alt account: any second GitHub account works (a friend's, or a
 second account of your own) - all it needs to do is comment on your
