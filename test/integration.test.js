@@ -2087,7 +2087,7 @@ function makeFakeGitHub({
     );
   });
 
-  await test("a redundant 'already signed' reply interjecting after a genuinely-blocked PR resolves does not stop a later automatic check from correctly re-confirming success", async () => {
+  await test("a redundant 'already signed' reply interjecting after a genuinely-blocked PR resolves does NOT cause a later automatic check to re-announce success (nothing new happened since the last announcement)", async () => {
     const gh = makeFakeGitHub({
       commits: [
         {
@@ -2122,8 +2122,11 @@ function makeFakeGitHub({
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
     assert.strictEqual(gh.comments.length, 2);
+    const successCommentId = gh.comments[1].id;
 
-    // Bob redundantly signs again - personal reply, third comment.
+    // Bob redundantly signs again - personal reply, third comment. This is
+    // NOT a new block, so it must not reset the "already announced"
+    // tracking.
     await handleIssueComment({
       action: "created",
       issue: { number: 1, pull_request: {}, user: { login: "bob" } },
@@ -2137,13 +2140,12 @@ function makeFakeGitHub({
     assert.strictEqual(gh.comments.length, 3);
     assert.ok(gh.comments[2].body.includes("already signed the CLA"));
 
-    // A later, ordinary synchronize while still fully compliant re-confirms
-    // success because this PR really was blocked once (comment #1 carries
-    // the pending marker) - but note the *count* stays at 3, not 4: the
-    // self-healing cleanup in postComment() finds the old "All contributors
-    // have signed" comment (posted back in step 2) has the exact same body
-    // as this new one and removes it, keeping only the newest copy. Net
-    // effect: the stale duplicate is gone, one fresh copy remains.
+    // A later, ordinary synchronize while still fully compliant must stay
+    // silent: the most recent "pending" comment (the very first ask) is
+    // still older than the most recent "success" comment, so nothing new
+    // has happened since success was last announced - the interjecting
+    // personal reply must not trigger a fresh (duplicate-in-spirit)
+    // announcement.
     await handlePullRequestTarget({
       action: "synchronize",
       pull_request: { number: 1, head: { sha: "sha-2" } },
@@ -2153,19 +2155,104 @@ function makeFakeGitHub({
     assert.strictEqual(
       gh.comments.length,
       3,
-      "the PR was genuinely blocked once, so success is correctly re-announced, and the self-healing cleanup removes the now-stale earlier copy rather than leaving both",
+      "no new comment should be posted - the PR's compliant state hasn't changed since success was already announced",
+    );
+    assert.strictEqual(
+      gh.comments[1].id,
+      successCommentId,
+      "the original success comment must be untouched, not replaced by a fresh duplicate",
+    );
+  });
+
+  await test("a genuine SECOND block-and-resolve cycle on the same PR is still correctly announced, even though an earlier resolution was already announced once", async () => {
+    // Mutated in place to simulate a new, unsigned committer's commit
+    // landing after the PR had already been fully resolved once.
+    const commits = [
+      {
+        sha: "c1",
+        author: { id: 5901, login: "carol" },
+        parents: [{ sha: "p1" }],
+        commit: { author: { email: "c@example.com" } },
+      },
+    ];
+    const gh = makeFakeGitHub({
+      commits,
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    // First block-and-resolve cycle.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "carol" } },
+      comment: {
+        user: { id: 5901, login: "carol" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(gh.comments.length, 2);
+
+    // A second, new, unsigned committer's commit lands - a genuinely new
+    // block.
+    commits.push({
+      sha: "c2",
+      author: { id: 5902, login: "dave" },
+      parents: [{ sha: "p1" }],
+      commit: { author: { email: "d@example.com" } },
+    });
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-2" } },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 3);
+    assert.ok(gh.comments[2].body.includes("@dave"));
+
+    // Dave signs too - a second, genuinely new recovery. This MUST be
+    // announced, even though success was already announced once before.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "dave" } },
+      comment: {
+        user: { id: 5902, login: "dave" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    // Count stays at 3, not 4: this new success announcement has the exact
+    // same body as the one already posted after carol signed, so
+    // postComment()'s pre-existing self-healing cleanup removes that now-
+    // stale earlier copy once the fresh one lands - same mechanism that
+    // already keeps identical successive comments from piling up anywhere
+    // else in this bot. What matters here is that a fresh copy exists at
+    // all - i.e. the second recovery genuinely got announced, not silently
+    // dropped just because a first one already happened earlier.
+    assert.strictEqual(
+      gh.comments.length,
+      3,
+      "a second, genuine block-and-resolve cycle must still be announced, even though an earlier resolution was already announced once for this same PR (the now-stale first copy is cleaned up by the pre-existing self-healing dedupe)",
     );
     assert.ok(
       gh.comments[gh.comments.length - 1].body.includes(
         "All contributors have signed",
       ),
-      "this PR really was blocked at some point, so re-announcing success on the next automatic check is correct, not noise",
     );
     assert.strictEqual(
       gh.comments.filter((c) => c.body.includes("All contributors have signed"))
         .length,
       1,
-      "only the freshest copy of the success announcement should survive - the stale duplicate must be cleaned up",
+      "only one (the freshest) copy of the success announcement should be present",
     );
   });
 
@@ -2216,6 +2303,67 @@ function makeFakeGitHub({
       gh.comments.length,
       2,
       "a PR that was blocked purely by a manual-review flag is still a genuinely-blocked PR, so its resolution must be announced too",
+    );
+    assert.ok(gh.comments[1].body.includes("All contributors have signed"));
+  });
+
+  // -------------------------------------------------------------------------
+  // Migration/backward-compatibility: a PR that was blocked under an OLDER
+  // deployment of this bot - one that predates PENDING_MARKER and simply
+  // wrote the same "need to sign our CLA" / "could not be automatically
+  // attributed" wording without any invisible marker - must still be
+  // recognized as having been genuinely blocked once this fix is deployed.
+  // Without this, upgrading the bot mid-flight on an already-open,
+  // already-blocked PR would silently swallow that PR's eventual recovery
+  // announcement, because its one and only "ask" comment predates the
+  // marker.
+  // -------------------------------------------------------------------------
+  await test("a PR blocked by an OLDER deployment of the bot (a 'needs to sign' comment with no PENDING_MARKER at all) is still recognized as having been blocked, so its resolution is announced after an upgrade", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 6001, login: "erin" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "e@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 6001, login: "erin" }],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    // Seed a comment exactly as the OLD (pre-PENDING_MARKER) code would
+    // have written it - same wording, only missing the new marker line -
+    // to simulate a PR that was already blocked before this fix shipped.
+    gh.comments.push({
+      id: 1,
+      body:
+        "<!-- fossasia-cla-bot:v1 -->\n" +
+        "The following contributor(s) need to sign our [CLA](https://example.com/CLA.md) before this PR can be merged:\n\n" +
+        "- @erin\n\n" +
+        "Please comment on this PR with **exactly** the following text to sign:\n\n" +
+        "> I have read the CLA Document and I hereby sign the CLA\n\n" +
+        "Signing once covers **all** FOSSASIA repositories - you will not be asked again.",
+      user: { login: "github-actions[bot]" },
+    });
+
+    // Erin has since signed (the signature store already reflects that),
+    // and the bot has just been upgraded to this fixed version. The next
+    // automatic check must recognize the pre-existing comment as a genuine
+    // past block and announce the recovery, not silently swallow it.
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-2" } },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      2,
+      "a PR blocked under the old, marker-less code must still get its resolution announced after upgrading",
     );
     assert.ok(gh.comments[1].body.includes("All contributors have signed"));
   });
