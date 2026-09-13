@@ -753,7 +753,10 @@ async function resolveBotLogin() {
   return _cachedBotLogin;
 }
 
-async function getExistingBotComments(prNumber) {
+async function getExistingBotComments(
+  prNumber,
+  { anyBotIdentity = false } = {},
+) {
   const botLogin = await resolveBotLogin();
   const all = [];
   let page = 1;
@@ -764,13 +767,48 @@ async function getExistingBotComments(prNumber) {
     );
     if (!comments.length) break;
     all.push(
-      ...comments.filter(
-        (c) =>
-          c.user &&
-          c.user.login === botLogin &&
-          c.body &&
-          c.body.includes(BOT_MARKER),
-      ),
+      ...comments.filter((c) => {
+        if (!c.user || !c.body || !c.body.includes(BOT_MARKER)) return false;
+        if (c.user.login === botLogin) return true;
+        // Broader match, opt-in via `anyBotIdentity` - used ONLY for the
+        // block/recovery history check in checkPR's quietIfNeverFlagged
+        // logic, never for postComment()'s own dedupe (which intentionally
+        // stays strict to the currently resolved identity - see
+        // bot-identity-success.test.js, which relies on a differently-
+        // identified past comment NOT counting as an already-said
+        // duplicate).
+        //
+        // Without this, a consumer that switches GITHUB_TOKEN from the
+        // default Actions token to a PAT or a separate GitHub App
+        // installation token (or back) mid-flight would have every comment
+        // posted under the OLD identity silently excluded here, since
+        // resolveBotLogin() only ever reports the CURRENT run's identity.
+        // A PR genuinely blocked before the switch would then look like it
+        // was never flagged, and its recovery announcement would be
+        // wrongly suppressed once it becomes fully signed.
+        //
+        // `type === "Bot"` is a field GitHub itself sets on the comment
+        // author and cannot be spoofed by an ordinary contributor's own
+        // account (see the spoofed-comment test below, whose fake commenter
+        // has no such type and so still fails this check) - it covers the
+        // default GITHUB_TOKEN identity and any GitHub-App-based custom
+        // token, regardless of which exact bot login was in use at the
+        // time. DEFAULT_BOT_LOGIN is checked too, as a defense-in-depth
+        // fallback for the single most common case (plain GITHUB_TOKEN) in
+        // case `type` is ever missing from a response - GitHub reserves
+        // the `[bot]`-suffixed login namespace for bot accounts, so an
+        // ordinary user can't take that exact login either. The one gap
+        // neither check can close is a PAT identity rotating to a
+        // DIFFERENT PAT-owned account: both report as an ordinary `type:
+        // "User"` account with an unreserved login, indistinguishable from
+        // any other GitHub user, so that specific switch still can't
+        // recover cross-identity history - a narrow, documented
+        // limitation (see CHANGELOG.md).
+        return (
+          anyBotIdentity &&
+          (c.user.type === "Bot" || c.user.login === DEFAULT_BOT_LOGIN)
+        );
+      }),
     );
     if (comments.length < 100) break;
     page += 1;
@@ -986,7 +1024,9 @@ async function checkPR(
       // genuine second block-and-resolve cycle, while staying quiet when
       // nothing has changed since the last announcement - see the
       // function-level comment above.
-      const existing = await getExistingBotComments(prNumber);
+      const existing = await getExistingBotComments(prNumber, {
+        anyBotIdentity: true,
+      });
       const lastPendingIdx = existing.findLastIndex(
         (c) => classifyBotComment(c.body) === "pending",
       );
