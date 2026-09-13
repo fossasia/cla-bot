@@ -79,6 +79,28 @@ const ALLOWLIST = (process.env.ALLOWLIST || "")
 const SIGN_PHRASE = "I have read the CLA Document and I hereby sign the CLA";
 const STATUS_CONTEXT = "cla/fossasia";
 const BOT_MARKER = "<!-- fossasia-cla-bot:v1 -->";
+// Embedded (in addition to BOT_MARKER) in the comment checkPR posts when a
+// PR genuinely needs action - someone still needs to sign, or a commit
+// needs manual review. Together with the two legacy text fragments below,
+// this is how a later, automatically triggered checkPR call recognizes
+// "this PR was actually blocked at some point" - see classifyBotComment()
+// and quietIfNeverFlagged.
+const PENDING_MARKER = "<!-- fossasia-cla-bot:pending -->";
+// The exact fragments that appear in the "please sign" and "needs manual
+// review" comment templates below (see the `lines` array in checkPR).
+// Defined once and referenced from both the template text and
+// classifyBotComment() so the two can never silently drift apart - and,
+// importantly, so a PR blocked by an OLDER deployment of this bot (from
+// before PENDING_MARKER existed, which only ever wrote this same wording)
+// is still correctly recognized as having been blocked. PENDING_MARKER
+// alone would miss those pre-existing comments entirely on the very first
+// run of the upgraded code.
+const NEEDS_SIGN_FRAGMENT = "need to sign our";
+const NEEDS_REVIEW_FRAGMENT = "could not be automatically attributed";
+// The exact success text, defined once and shared between the place that
+// posts it and classifyBotComment() below, for the same single-source-of-
+// truth reason.
+const SUCCESS_MESSAGE = "All contributors have signed the CLA. ✅";
 // Optional hardening, off by default so normal unsigned-commit workflows
 // keep working. GitHub attributes a commit's author to an account purely by
 // matching the commit's git email - for the noreply format that's
@@ -517,6 +539,27 @@ function isAllowlisted(login) {
   return ALLOWLIST.some((a) => a.toLowerCase() === l);
 }
 
+// Classifies one of the bot's own comments (see getExistingBotComments -
+// only ever called on comments already confirmed to be from the bot) as
+// either "pending" (a real "you still need to sign" / "needs manual
+// review" comment - the PR was genuinely blocked when this was posted),
+// "success" (the "All contributors have signed" announcement), or neither
+// (e.g. the personal, non-blocking "you already signed the CLA, nothing
+// more to do here" reply someone gets for redundantly re-submitting the
+// sign phrase). Used by checkPR's quietIfNeverFlagged logic to tell a real
+// block apart from unrelated bot chatter on the same thread.
+function classifyBotComment(body) {
+  if (
+    body.includes(PENDING_MARKER) ||
+    body.includes(NEEDS_SIGN_FRAGMENT) ||
+    body.includes(NEEDS_REVIEW_FRAGMENT)
+  ) {
+    return "pending";
+  }
+  if (body.includes(SUCCESS_MESSAGE)) return "success";
+  return "other";
+}
+
 // ---------------------------------------------------------------------------
 // Repo-local helpers (comments / status / lock) - always use GITHUB_TOKEN,
 // never the signatures token.
@@ -710,7 +753,10 @@ async function resolveBotLogin() {
   return _cachedBotLogin;
 }
 
-async function getExistingBotComments(prNumber) {
+async function getExistingBotComments(
+  prNumber,
+  { anyBotIdentity = false } = {},
+) {
   const botLogin = await resolveBotLogin();
   const all = [];
   let page = 1;
@@ -721,13 +767,48 @@ async function getExistingBotComments(prNumber) {
     );
     if (!comments.length) break;
     all.push(
-      ...comments.filter(
-        (c) =>
-          c.user &&
-          c.user.login === botLogin &&
-          c.body &&
-          c.body.includes(BOT_MARKER),
-      ),
+      ...comments.filter((c) => {
+        if (!c.user || !c.body || !c.body.includes(BOT_MARKER)) return false;
+        if (c.user.login === botLogin) return true;
+        // Broader match, opt-in via `anyBotIdentity` - used ONLY for the
+        // block/recovery history check in checkPR's quietIfNeverFlagged
+        // logic, never for postComment()'s own dedupe (which intentionally
+        // stays strict to the currently resolved identity - see
+        // bot-identity-success.test.js, which relies on a differently-
+        // identified past comment NOT counting as an already-said
+        // duplicate).
+        //
+        // Without this, a consumer that switches GITHUB_TOKEN from the
+        // default Actions token to a PAT or a separate GitHub App
+        // installation token (or back) mid-flight would have every comment
+        // posted under the OLD identity silently excluded here, since
+        // resolveBotLogin() only ever reports the CURRENT run's identity.
+        // A PR genuinely blocked before the switch would then look like it
+        // was never flagged, and its recovery announcement would be
+        // wrongly suppressed once it becomes fully signed.
+        //
+        // `type === "Bot"` is a field GitHub itself sets on the comment
+        // author and cannot be spoofed by an ordinary contributor's own
+        // account (see the spoofed-comment test below, whose fake commenter
+        // has no such type and so still fails this check) - it covers the
+        // default GITHUB_TOKEN identity and any GitHub-App-based custom
+        // token, regardless of which exact bot login was in use at the
+        // time. DEFAULT_BOT_LOGIN is checked too, as a defense-in-depth
+        // fallback for the single most common case (plain GITHUB_TOKEN) in
+        // case `type` is ever missing from a response - GitHub reserves
+        // the `[bot]`-suffixed login namespace for bot accounts, so an
+        // ordinary user can't take that exact login either. The one gap
+        // neither check can close is a PAT identity rotating to a
+        // DIFFERENT PAT-owned account: both report as an ordinary `type:
+        // "User"` account with an unreserved login, indistinguishable from
+        // any other GitHub user, so that specific switch still can't
+        // recover cross-identity history - a narrow, documented
+        // limitation (see CHANGELOG.md).
+        return (
+          anyBotIdentity &&
+          (c.user.type === "Bot" || c.user.login === DEFAULT_BOT_LOGIN)
+        );
+      }),
     );
     if (comments.length < 100) break;
     page += 1;
@@ -853,8 +934,52 @@ async function lockPR(prNumber) {
 
 // ---------------------------------------------------------------------------
 // Core: evaluate one PR and bring its status/comment up to date.
-// ---------------------------------------------------------------------------
-async function checkPR(prNumber, headSha) {
+//
+// `quietIfNeverFlagged` (only ever passed `true` by the automatic
+// pull_request_target handler - see handlePullRequestTarget) controls
+// whether a clean result gets announced with a comment:
+//
+// - A brand new PR whose commit authors had ALL already signed the CLA
+//   before this PR ever existed needs no comment at all - nothing was
+//   ever required of anyone here, so saying "All contributors have signed
+//   the CLA ✅" on a PR the bot has never spoken on before is pure noise.
+//   The commit status is still set to "success" either way, since that's
+//   what merge protection actually reads.
+// - The moment this PR ever *did* need a signer or manual review (a
+//   comment classifyBotComment() recognizes as "pending" was posted for
+//   it, at any point in its history) and it later becomes fully signed,
+//   that transition is worth announcing - people watched this PR go from
+//   blocked to unblocked. A personal, non-blocking reply (e.g. "you
+//   already signed, nothing more to do here" from someone re-submitting
+//   the sign phrase) doesn't count as ever having been blocked - it says
+//   nothing about the PR's own state.
+// - Once that transition has already been announced, later fully-signed
+//   checks stay quiet again even if some unrelated comment (like that same
+//   personal reply) lands afterward - re-announcing "all signed" every
+//   time something unrelated gets posted would just reintroduce the same
+//   noise this whole feature exists to remove. Concretely: this compares
+//   the position of the *most recent* "pending" comment against the most
+//   recent "success" one - success is only (re-)announced when a pending
+//   comment is the more recent of the two, i.e. a real block happened
+//   since the last time success was announced (or it's never been
+//   announced at all).
+// - An explicit human trigger (the sign-phrase comment, or the `recheck`
+//   command handled in handleIssueComment) always gets an answer, quiet
+//   or not: the caller took an action and asked a direct question, so
+//   `checkPR` is invoked there without this flag and always comments,
+//   regardless of what's already been said on the thread (aside from the
+//   ordinary immediately-preceding-comment dedupe every postComment() call
+//   already does).
+//
+// This is what makes "new committers joining an already-compliant PR"
+// behave as silently as the very first check: as long as this PR has never
+// actually needed asking (or that need was already fully announced as
+// resolved), a still-fully-signed result just stays quiet.
+async function checkPR(
+  prNumber,
+  headSha,
+  { quietIfNeverFlagged = false } = {},
+) {
   assertValidPRNumber(prNumber, "checkPR(prNumber)");
   if (!headSha) {
     const pr = await gh(
@@ -889,14 +1014,35 @@ async function checkPR(prNumber, headSha) {
       "success",
       "All contributors have signed the CLA.",
     );
-    await postComment(prNumber, "All contributors have signed the CLA. ✅");
+    if (quietIfNeverFlagged) {
+      // GET comments come back in creation order (oldest first), so the
+      // *last* match in the array for each category is the most recent
+      // one of that kind - findLastIndex() (Node 22+, per the version
+      // guard at the top of this file) gets us that directly. Comparing
+      // those two positions (rather than just "does a pending comment
+      // exist anywhere") is what correctly re-announces success after a
+      // genuine second block-and-resolve cycle, while staying quiet when
+      // nothing has changed since the last announcement - see the
+      // function-level comment above.
+      const existing = await getExistingBotComments(prNumber, {
+        anyBotIdentity: true,
+      });
+      const lastPendingIdx = existing.findLastIndex(
+        (c) => classifyBotComment(c.body) === "pending",
+      );
+      const lastSuccessIdx = existing.findLastIndex(
+        (c) => classifyBotComment(c.body) === "success",
+      );
+      if (lastPendingIdx <= lastSuccessIdx) return;
+    }
+    await postComment(prNumber, SUCCESS_MESSAGE);
     return;
   }
 
-  const lines = [];
+  const lines = [PENDING_MARKER];
   if (missing.length) {
     lines.push(
-      `The following contributor(s) need to sign our [CLA](${CLA_DOCUMENT_URL}) before this PR can be merged:`,
+      `The following contributor(s) ${NEEDS_SIGN_FRAGMENT} [CLA](${CLA_DOCUMENT_URL}) before this PR can be merged:`,
       "",
     );
     missing.forEach((a) => lines.push(`- @${a.login}`));
@@ -918,7 +1064,7 @@ async function checkPR(prNumber, headSha) {
     const n = unresolved.length;
     lines.push(
       "",
-      `⚠️ ${n} commit${n === 1 ? "" : "s"} could not be automatically attributed to a GitHub account. A maintainer will need to verify ${n === 1 ? "it" : "them"} manually: ${shaList}`,
+      `⚠️ ${n} commit${n === 1 ? "" : "s"} ${NEEDS_REVIEW_FRAGMENT} to a GitHub account. A maintainer will need to verify ${n === 1 ? "it" : "them"} manually: ${shaList}`,
     );
   }
 
@@ -1055,7 +1201,11 @@ async function handlePullRequestTarget(payload) {
       payload.pull_request.head && payload.pull_request.head.sha,
       "pull_request_target payload pull_request.head.sha",
     );
-    await checkPR(prNumber, headSha);
+    // Automatic trigger (PR opened/pushed to/reopened), not a human asking
+    // a direct question - stay quiet on an already-compliant result unless
+    // this PR previously needed action. See checkPR's quietIfNeverFlagged
+    // doc comment above for the full reasoning.
+    await checkPR(prNumber, headSha, { quietIfNeverFlagged: true });
   }
 }
 
@@ -1112,4 +1262,10 @@ module.exports = {
   // caught indirectly through the webhook-handler integration tests.
   assertValidPRNumber,
   assertValidSha,
+  // Exported for tests only, same reasoning: classifyBotComment() is the
+  // exact piece that tells a genuine block apart from unrelated bot
+  // chatter for checkPR's quietIfNeverFlagged logic, so it gets direct
+  // unit coverage in test/logic.test.js in addition to the end-to-end
+  // integration tests exercising it indirectly.
+  classifyBotComment,
 };

@@ -23,6 +23,7 @@ const {
   isPrivileged,
   assertValidPRNumber,
   assertValidSha,
+  classifyBotComment,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -586,6 +587,48 @@ test("assertValidSha accepts exactly 64 characters (the sha256 boundary) but rej
     () => assertValidSha("a".repeat(65), "ctx"),
     /expected a valid commit SHA/,
   );
+});
+
+// --- classifyBotComment ----------------------------------------------------
+// Used by checkPR's quietIfNeverFlagged logic to tell a genuine "this PR
+// was blocked" comment apart from unrelated bot chatter on the same
+// thread. See src/cla-bot.js for the full reasoning.
+
+test("classifyBotComment recognizes a current-format 'needs to sign' comment (with PENDING_MARKER) as pending", () => {
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:pending -->\n" +
+    "The following contributor(s) need to sign our [CLA](https://example.com/CLA.md) before this PR can be merged:\n\n- @alice";
+  assert.strictEqual(classifyBotComment(body), "pending");
+});
+
+test("classifyBotComment recognizes a LEGACY 'needs to sign' comment with NO PENDING_MARKER at all as pending (backward compatibility with PRs blocked by an older deployment)", () => {
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\n" +
+    "The following contributor(s) need to sign our [CLA](https://example.com/CLA.md) before this PR can be merged:\n\n- @alice";
+  assert.strictEqual(classifyBotComment(body), "pending");
+});
+
+test("classifyBotComment recognizes a 'needs manual review' (unresolved commit) comment as pending, current and legacy wording alike", () => {
+  const current =
+    "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:pending -->\n" +
+    "⚠️ 1 commit could not be automatically attributed to a GitHub account. A maintainer will need to verify it manually: abc1234";
+  const legacy =
+    "<!-- fossasia-cla-bot:v1 -->\n" +
+    "⚠️ 1 commit could not be automatically attributed to a GitHub account. A maintainer will need to verify it manually: abc1234";
+  assert.strictEqual(classifyBotComment(current), "pending");
+  assert.strictEqual(classifyBotComment(legacy), "pending");
+});
+
+test("classifyBotComment recognizes the success announcement as success", () => {
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\nAll contributors have signed the CLA. \u2705";
+  assert.strictEqual(classifyBotComment(body), "success");
+});
+
+test("classifyBotComment treats the personal 'already signed, nothing more to do' reply as neither pending nor success", () => {
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\n@alice you have already signed the CLA. Nothing more to do here.";
+  assert.strictEqual(classifyBotComment(body), "other");
 });
 
 console.log(`\n${passed} test(s) passed.`);
