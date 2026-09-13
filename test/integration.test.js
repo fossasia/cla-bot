@@ -2013,6 +2013,213 @@ function makeFakeGitHub({
     );
   });
 
+  // -------------------------------------------------------------------------
+  // Regression: "any bot comment exists" is NOT the same thing as "this PR
+  // was previously blocked". A PR that was compliant from the very start can
+  // still pick up a bot comment that has nothing to do with its own status -
+  // e.g. the personal, non-blocking "you already signed the CLA, nothing
+  // more to do here" reply someone gets for redundantly re-submitting the
+  // sign phrase. That reply must not be mistaken for proof the PR itself was
+  // ever blocked.
+  // -------------------------------------------------------------------------
+  await test("a redundant 'already signed' reply on an always-compliant PR does NOT make a later automatic check wrongly announce success", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 5601, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 5601, login: "alice" }],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    // PR opens fully compliant - silent, as expected.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(
+      gh.comments.length,
+      0,
+      "sanity check: the PR must start out silent",
+    );
+
+    // Alice redundantly re-submits the sign phrase even though she's
+    // already signed. This produces exactly one bot comment - the personal
+    // "nothing more to do here" reply - but it says nothing about whether
+    // THIS PR was ever blocked, since it isn't even routed through checkPR.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 5601, login: "alice" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.comments.length, 1);
+    assert.ok(gh.comments[0].body.includes("already signed the CLA"));
+    assert.ok(
+      !gh.comments[0].body.includes("All contributors have signed"),
+      "the personal reply must not itself be the success announcement",
+    );
+
+    // A later, ordinary synchronize while the PR is still fully compliant
+    // must stay just as silent as it would have if the redundant reply had
+    // never happened - the PR itself was never blocked.
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-2" } },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      1,
+      "a non-blocking bot comment (the redundant 'already signed' reply) must not be mistaken for proof the PR was ever blocked - no new comment should appear",
+    );
+  });
+
+  await test("a redundant 'already signed' reply interjecting after a genuinely-blocked PR resolves does not stop a later automatic check from correctly re-confirming success", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 5701, login: "bob" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "b@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    // Opened unsigned - genuinely blocked, bot asks.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 1);
+
+    // Bob signs - transition announced.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "bob" } },
+      comment: {
+        user: { id: 5701, login: "bob" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(gh.comments.length, 2);
+
+    // Bob redundantly signs again - personal reply, third comment.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "bob" } },
+      comment: {
+        user: { id: 5701, login: "bob" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.comments.length, 3);
+    assert.ok(gh.comments[2].body.includes("already signed the CLA"));
+
+    // A later, ordinary synchronize while still fully compliant re-confirms
+    // success because this PR really was blocked once (comment #1 carries
+    // the pending marker) - but note the *count* stays at 3, not 4: the
+    // self-healing cleanup in postComment() finds the old "All contributors
+    // have signed" comment (posted back in step 2) has the exact same body
+    // as this new one and removes it, keeping only the newest copy. Net
+    // effect: the stale duplicate is gone, one fresh copy remains.
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-2" } },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      3,
+      "the PR was genuinely blocked once, so success is correctly re-announced, and the self-healing cleanup removes the now-stale earlier copy rather than leaving both",
+    );
+    assert.ok(
+      gh.comments[gh.comments.length - 1].body.includes(
+        "All contributors have signed",
+      ),
+      "this PR really was blocked at some point, so re-announcing success on the next automatic check is correct, not noise",
+    );
+    assert.strictEqual(
+      gh.comments.filter((c) => c.body.includes("All contributors have signed"))
+        .length,
+      1,
+      "only the freshest copy of the success announcement should survive - the stale duplicate must be cleaned up",
+    );
+  });
+
+  await test("a PR blocked only by an unresolved (needs-manual-review) commit is also correctly tracked as 'genuinely blocked' - once superseded by a resolvable commit, success is announced", async () => {
+    // Mutated in place between checks, same pattern as the earlier
+    // mutate-in-place tests - simulates a force-push/rebase that replaces
+    // the unresolved commit with one GitHub can attribute normally.
+    const commits = [
+      {
+        sha: "unresolved-sha",
+        author: null, // GitHub could not match this commit's email to any account
+        parents: [{ sha: "p1" }],
+        commit: { author: { email: "private@example.com" } },
+      },
+    ];
+    const gh = makeFakeGitHub({
+      commits,
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 1);
+    assert.ok(gh.comments[0].body.includes("could not be automatically"));
+
+    // Rebase: the unresolved commit is replaced by one from a signed,
+    // resolvable author.
+    commits.length = 0;
+    commits.push({
+      sha: "resolved-sha",
+      author: { id: 5801, login: "resolved-author" },
+      parents: [{ sha: "p1" }],
+      commit: { author: { email: "r@example.com" } },
+    });
+    gh.signatures.signatures.push({ id: 5801, login: "resolved-author" });
+
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-2" } },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      2,
+      "a PR that was blocked purely by a manual-review flag is still a genuinely-blocked PR, so its resolution must be announced too",
+    );
+    assert.ok(gh.comments[1].body.includes("All contributors have signed"));
+  });
+
   await test("an explicit 'recheck' request always answers, even when the PR was compliant from the start and the bot never said anything before", async () => {
     const gh = makeFakeGitHub({
       commits: [

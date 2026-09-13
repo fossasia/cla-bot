@@ -79,6 +79,18 @@ const ALLOWLIST = (process.env.ALLOWLIST || "")
 const SIGN_PHRASE = "I have read the CLA Document and I hereby sign the CLA";
 const STATUS_CONTEXT = "cla/fossasia";
 const BOT_MARKER = "<!-- fossasia-cla-bot:v1 -->";
+// Embedded (in addition to BOT_MARKER) only in the comment checkPR posts
+// when a PR genuinely needs action - someone still needs to sign, or a
+// commit needs manual review. This is what lets a later, automatically
+// triggered checkPR call tell "this PR was actually blocked at some point"
+// apart from any other bot comment that happens to exist on the thread
+// (the personal, non-blocking "you have already signed the CLA, nothing
+// more to do here" reply someone can trigger by re-submitting the sign
+// phrase, or the success announcement itself) - see quietIfNeverFlagged.
+// Merely counting "any bot comment at all" would wrongly treat that
+// personal reply as proof the PR was once blocked, when it says nothing
+// about the PR's own state.
+const PENDING_MARKER = "<!-- fossasia-cla-bot:pending -->";
 // Optional hardening, off by default so normal unsigned-commit workflows
 // keep working. GitHub attributes a commit's author to an account purely by
 // matching the commit's git email - for the noreply format that's
@@ -864,18 +876,23 @@ async function lockPR(prNumber) {
 //   the CLA ✅" on a PR the bot has never spoken on before is pure noise.
 //   The commit status is still set to "success" either way, since that's
 //   what merge protection actually reads.
-// - The moment this PR ever *did* need a signer (the bot posted a
-//   "please sign" comment for it, at any point in its history) and it
-//   later becomes fully signed, that transition is worth announcing -
-//   people watched this PR go from blocked to unblocked.
+// - The moment this PR ever *did* need a signer or manual review (the bot
+//   posted a comment carrying PENDING_MARKER for it, at any point in its
+//   history) and it later becomes fully signed, that transition is worth
+//   announcing - people watched this PR go from blocked to unblocked.
+//   Whether that ever happened is judged by PENDING_MARKER specifically,
+//   not "does any bot comment exist" - a PR can already have a bot comment
+//   on it (e.g. the personal "you already signed the CLA, nothing more to
+//   do here" reply someone gets for re-submitting the sign phrase) without
+//   ever having actually been blocked.
 // - An explicit human trigger (the sign-phrase comment, or the `recheck`
 //   command handled in handleIssueComment) always gets an answer, quiet
 //   or not: the caller took an action and asked a direct question, so
 //   `checkPR` is invoked there without this flag and always comments.
 //
 // This is what makes "new committers joining an already-compliant PR"
-// behave as silently as the very first check: as long as nothing has ever
-// needed asking on this PR, a still-fully-signed result just stays quiet.
+// behave as silently as the very first check: as long as this PR has never
+// actually needed asking, a still-fully-signed result just stays quiet.
 async function checkPR(
   prNumber,
   headSha,
@@ -916,18 +933,27 @@ async function checkPR(
       "All contributors have signed the CLA.",
     );
     if (quietIfNeverFlagged) {
-      // Only announce success if the bot has said *something* on this PR
-      // before (e.g. an earlier "please sign" comment this now resolves).
-      // No prior bot comment at all means every author was already signed
-      // up front - nothing changed, nothing to tell anyone.
+      // Only announce success if this PR was genuinely blocked at some
+      // point - i.e. the bot previously posted an actual "you still need
+      // to sign" / "needs manual review" comment here (identified by
+      // PENDING_MARKER, not just "any bot comment exists"). A personal,
+      // non-blocking reply (e.g. "you already signed, nothing more to do
+      // here" from someone re-submitting the sign phrase) or an earlier
+      // success announcement doesn't count - neither says anything about
+      // whether this PR itself was ever blocked. No matching pending
+      // comment means every author was already signed up front: nothing
+      // changed, so there's nothing to announce.
       const existing = await getExistingBotComments(prNumber);
-      if (existing.length === 0) return;
+      const wasEverBlocked = existing.some((c) =>
+        c.body.includes(PENDING_MARKER),
+      );
+      if (!wasEverBlocked) return;
     }
     await postComment(prNumber, "All contributors have signed the CLA. ✅");
     return;
   }
 
-  const lines = [];
+  const lines = [PENDING_MARKER];
   if (missing.length) {
     lines.push(
       `The following contributor(s) need to sign our [CLA](${CLA_DOCUMENT_URL}) before this PR can be merged:`,
