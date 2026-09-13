@@ -97,10 +97,61 @@ const PENDING_MARKER = "<!-- fossasia-cla-bot:pending -->";
 // run of the upgraded code.
 const NEEDS_SIGN_FRAGMENT = "need to sign our";
 const NEEDS_REVIEW_FRAGMENT = "could not be automatically attributed";
-// The exact success text, defined once and shared between the place that
-// posts it and classifyBotComment() below, for the same single-source-of-
-// truth reason.
-const SUCCESS_MESSAGE = "All contributors have signed the CLA. ✅";
+// The exact legacy success wording, kept as its own constant so
+// classifyBotComment() can still recognize a plain-text success comment
+// posted by an OLDER deployment of this bot, from before SUCCESS_MARKER
+// existed (same reasoning as the two NEEDS_*_FRAGMENT constants above for
+// the "pending" case) - see the fallback check in classifyBotComment.
+const LEGACY_SUCCESS_TEXT = "All contributors have signed the CLA. ✅";
+// The full body of a "success" comment as posted by a version of this bot
+// from before SUCCESS_MARKER existed: back then, a success comment's
+// entire content beyond BOT_MARKER was always nothing more than this one
+// fixed string, with nothing else ever appended - unlike NEEDS_SIGN_FRAGMENT/
+// NEEDS_REVIEW_FRAGMENT above, which are genuinely partial fragments of a
+// longer, variable comment (one that also lists specific missing
+// contributors or unresolved commit SHAs, so no fixed whole-body string
+// exists to match against). Since the full legacy body IS fixed and known,
+// classifyBotComment checks it with an exact equality match rather than a
+// substring search - substring matching here would risk a false positive on
+// some unrelated future bot comment that merely happens to quote or mention
+// this exact phrase.
+const LEGACY_SUCCESS_COMMENT = `${BOT_MARKER}\n${LEGACY_SUCCESS_TEXT}`;
+// Embedded (in addition to BOT_MARKER) in EVERY comment this bot posts that
+// announces a PR as fully signed. classifyBotComment() looks for this
+// marker first, falling back to LEGACY_SUCCESS_COMMENT only for comments
+// predating it, so that checkPR's quietIfNeverFlagged history check keeps
+// recognizing "this PR's completion was already announced" even though the
+// visible wording now varies per signer instead of always being the one
+// fixed string it used to be. SUCCESS_MESSAGE below is built FROM this
+// marker (rather than the marker being appended separately at each call
+// site) specifically so that guarantee can never be broken by editing the
+// generic wording without also remembering to touch classifyBotComment.
+// Unlike LEGACY_SUCCESS_COMMENT above, this marker is matched with a
+// substring search rather than exact equality - it's a purpose-built,
+// distinctive HTML-comment sentinel (not a plain English phrase that could
+// plausibly appear elsewhere), and the personalized variant it also appears
+// in (personalSuccessMessage()) has a variable "@login" suffix that an
+// exact whole-body match couldn't account for anyway.
+const SUCCESS_MARKER = "<!-- fossasia-cla-bot:success -->";
+// Only ever used when checkPR() has no specific signer to credit (an
+// automatic pull_request_target check, or the human-triggered `recheck`
+// command) - see personalSuccessMessage() below for the normal, per-signer
+// case.
+const SUCCESS_MESSAGE = `${SUCCESS_MARKER}\n${LEGACY_SUCCESS_TEXT}`;
+// The per-signer announcement checkPR() posts when the person who *just*
+// signed (via the sign-phrase comment) is themselves one of the PR's
+// required (non-allowlisted) commit authors AND their signing is what
+// makes the PR fully signed. Replaces the one-size-fits-all SUCCESS_MESSAGE
+// for that specific case, so the contributor who unblocked the PR is
+// thanked by name instead of an anonymous "All contributors..."
+// announcement. See checkPR()'s `signer` option and the
+// `signerCompletedRequirement` check there for why this is NOT used
+// whenever `signer` is merely present - crediting a completely unrelated
+// commenter (someone who isn't even a commit author on this PR) with
+// "completing" a PR they had no bearing on would be actively misleading.
+function personalSuccessMessage(login) {
+  return `${SUCCESS_MARKER}\n@${login} Thank you for signing the CLA! We look forward to your contributions.`;
+}
 // Optional hardening, off by default so normal unsigned-commit workflows
 // keep working. GitHub attributes a commit's author to an account purely by
 // matching the commit's git email - for the noreply format that's
@@ -539,6 +590,56 @@ function isAllowlisted(login) {
   return ALLOWLIST.some((a) => a.toLowerCase() === l);
 }
 
+// Same "prefer numeric id, fall back to a case-insensitive login compare"
+// matching rule as isSigned() above (kept as its own small function rather
+// than shared code, so a future change to either doesn't have to reason
+// about the other) - applied here to answer a different question: not
+// "has this identity signed anywhere", but "is this identity one of THIS
+// PR's own commit authors". Used by checkPR to tell a genuine required
+// signer apart from a bystander whose sign-phrase comment didn't actually
+// unblock this particular PR (see the `signerCompletedRequirement` check
+// there, and personalSuccessMessage()'s doc comment for why that
+// distinction matters).
+function isSameContributor(a, b) {
+  if (!a || !b) return false;
+  if (typeof a.id === "number" && typeof b.id === "number") {
+    return a.id === b.id;
+  }
+  return (
+    typeof a.login === "string" &&
+    typeof b.login === "string" &&
+    a.login.toLowerCase() === b.login.toLowerCase()
+  );
+}
+
+// Was `signer` actually a required (non-allowlisted) commit author among
+// `authors` (a PR's own commit authors, as returned by
+// listPRCommitAuthors())? Extracted as its own top-level function - rather
+// than an expression inlined into checkPR - specifically so it has ONE
+// definition that's directly unit-testable on its own (see
+// test/logic.test.js), instead of being duplicated between production code
+// and a re-typed copy of the same expression in its tests, which could
+// silently drift out of sync with each other over time.
+//
+// checkPR calls this only after confirming `missing.length === 0 &&
+// unresolved.length === 0` (the PR IS now fully signed), and only ever
+// passes a `signer` who just recorded a BRAND NEW signature (handleIssueComment
+// only passes `signer` after confirming they weren't already signed - see
+// there). So if `signer` really is a required author here, they were
+// necessarily among `missing` a moment ago and are not anymore: their
+// comment is genuinely what moved this PR's own requirement forward. If
+// not - an allowlisted account, or someone who never authored a commit on
+// this PR at all - their signing had zero effect on this PR's `missing`
+// list either way, so they get no credit for "completing" it (see
+// personalSuccessMessage()'s doc comment for why that distinction matters).
+function signerCompletedRequirement(authors, signer) {
+  return (
+    !!signer &&
+    !isAllowlisted(signer.login) &&
+    authors.some((a) => isSameContributor(a, signer))
+  );
+}
+
 // Classifies one of the bot's own comments (see getExistingBotComments -
 // only ever called on comments already confirmed to be from the bot) as
 // either "pending" (a real "you still need to sign" / "needs manual
@@ -556,7 +657,20 @@ function classifyBotComment(body) {
   ) {
     return "pending";
   }
-  if (body.includes(SUCCESS_MESSAGE)) return "success";
+  // SUCCESS_MARKER covers both the generic SUCCESS_MESSAGE and the
+  // personalized per-signer thank-you (personalSuccessMessage()), since
+  // SUCCESS_MESSAGE is built directly from this marker (see its doc
+  // comment) - so this ALSO catches any future change to the generic
+  // wording, as long as it keeps going through SUCCESS_MESSAGE. The
+  // LEGACY_SUCCESS_COMMENT check is a separate, deliberately EXACT
+  // (not substring) fallback: it's the only thing that still recognizes a
+  // genuinely pre-marker comment (one posted by an older deployment of
+  // this bot, whose entire body was always just that one fixed string with
+  // nothing else appended - see LEGACY_SUCCESS_COMMENT's doc comment for
+  // why exact equality is correct, and safer, here specifically).
+  if (body.includes(SUCCESS_MARKER) || body === LEGACY_SUCCESS_COMMENT) {
+    return "success";
+  }
   return "other";
 }
 
@@ -975,10 +1089,43 @@ async function lockPR(prNumber) {
 // behave as silently as the very first check: as long as this PR has never
 // actually needed asking (or that need was already fully announced as
 // resolved), a still-fully-signed result just stays quiet.
+//
+// `signer` (only ever passed by handleIssueComment, right after recording a
+// BRAND NEW signature - never by the automatic pull_request_target trigger
+// or the `recheck` command, neither of which has any one specific person to
+// address) is the `{ id, login }` of whoever just signed. When present, it
+// changes how checkPR names the person(s) it addresses, without changing
+// the underlying pass/fail logic at all:
+//   - Still missing other signers/reviews: the pending comment leads with a
+//     personal "@signer Thank you for signing..." line, in addition to
+//     (not instead of) the usual list of who else still needs to sign - so
+//     the contributor who just acted gets acknowledged even though the PR
+//     as a whole isn't clear yet. This is always accurate regardless of
+//     who `signer` turns out to be, since reaching checkPR with a `signer`
+//     at all already means that exact identity just recorded a brand new
+//     signature (see handleIssueComment) - it says nothing about whether
+//     they were required here, just that they did in fact sign.
+//   - Now fully signed AND `signer` is one of THIS PR's own required
+//     (non-allowlisted) commit authors: that person is thanked by name
+//     (personalSuccessMessage()) INSTEAD OF the generic, anonymous
+//     SUCCESS_MESSAGE - see personalSuccessMessage()'s doc comment. This is
+//     the fix for a PR with several contributors: each one signing via a
+//     comment gets their own "@username Thank you for signing the CLA! We
+//     look forward to your contributions." rather than everyone just seeing
+//     one generic "All contributors have signed the CLA. ✅" once the last
+//     person signs.
+//   - Now fully signed but `signer` is NOT one of this PR's required
+//     authors (an allowlisted account, or - just as easily - someone with
+//     no connection to this PR at all who happened to comment the sign
+//     phrase on it): falls back to the generic SUCCESS_MESSAGE. Crediting
+//     that person with "completing" a PR their signature had no bearing on
+//     would be actively misleading, especially since the PR may well have
+//     already been fully signed before they ever commented - see
+//     `signerCompletedRequirement` below.
 async function checkPR(
   prNumber,
   headSha,
-  { quietIfNeverFlagged = false } = {},
+  { quietIfNeverFlagged = false, signer = null } = {},
 ) {
   assertValidPRNumber(prNumber, "checkPR(prNumber)");
   if (!headSha) {
@@ -1035,11 +1182,32 @@ async function checkPR(
       );
       if (lastPendingIdx <= lastSuccessIdx) return;
     }
-    await postComment(prNumber, SUCCESS_MESSAGE);
+    // See checkPR's doc comment above and signerCompletedRequirement(): only
+    // address the signer by name when their own signature is what actually
+    // completed this PR's requirement, never merely because a `signer` was
+    // passed at all.
+    await postComment(
+      prNumber,
+      signerCompletedRequirement(authors, signer)
+        ? personalSuccessMessage(signer.login)
+        : SUCCESS_MESSAGE,
+    );
     return;
   }
 
-  const lines = [PENDING_MARKER];
+  const lines = [];
+  if (signer) {
+    // The PR isn't fully clear yet (someone else still needs to sign, or a
+    // commit needs manual review), but this specific person DID just sign
+    // successfully - acknowledge that up front, separately from the list of
+    // what's still outstanding below, so they're not left wondering whether
+    // their own comment did anything.
+    lines.push(
+      `@${signer.login} Thank you for signing the CLA! We look forward to your contributions.`,
+      "",
+    );
+  }
+  lines.push(PENDING_MARKER);
   if (missing.length) {
     lines.push(
       `The following contributor(s) ${NEEDS_SIGN_FRAGMENT} [CLA](${CLA_DOCUMENT_URL}) before this PR can be merged:`,
@@ -1163,8 +1331,13 @@ async function handleIssueComment(payload) {
       return;
     }
 
-    // Re-evaluate the PR now that one more person has signed.
-    await checkPR(prNumber);
+    // Re-evaluate the PR now that one more person has signed. Passing
+    // `signer` is what makes checkPR() address THIS specific person by name
+    // (either in a personal thank-you leading the pending list, or - if
+    // they're the one who just completed the requirement - in place of the
+    // generic "All contributors have signed" announcement). See checkPR's
+    // doc comment for the full reasoning.
+    await checkPR(prNumber, undefined, { signer: commenterIdentity });
     return;
   }
 
@@ -1268,4 +1441,20 @@ module.exports = {
   // unit coverage in test/logic.test.js in addition to the end-to-end
   // integration tests exercising it indirectly.
   classifyBotComment,
+  // Exported for tests only, same reasoning: the exact per-signer wording
+  // is a single source of truth used both when posting and when asserting
+  // in tests, so a future wording tweak can't silently drift between them.
+  personalSuccessMessage,
+  // Exported for tests only, same reasoning as isSigned/isAllowlisted
+  // above: this is the exact piece checkPR relies on to decide whether a
+  // signer was actually one of a PR's own commit authors (as opposed to an
+  // unrelated bystander), so it gets direct unit coverage of its id-first,
+  // login-fallback matching rule in test/logic.test.js.
+  isSameContributor,
+  // Exported for tests only, same reasoning: this is checkPR's actual,
+  // single-source-of-truth definition of "did this signer's own signature
+  // complete the PR's requirement" - tests call this function directly
+  // instead of re-typing the same expression themselves, so the two can
+  // never drift out of sync with each other.
+  signerCompletedRequirement,
 };

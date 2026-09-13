@@ -24,6 +24,9 @@ const {
   assertValidPRNumber,
   assertValidSha,
   classifyBotComment,
+  personalSuccessMessage,
+  isSameContributor,
+  signerCompletedRequirement,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -619,16 +622,138 @@ test("classifyBotComment recognizes a 'needs manual review' (unresolved commit) 
   assert.strictEqual(classifyBotComment(legacy), "pending");
 });
 
-test("classifyBotComment recognizes the success announcement as success", () => {
+test("classifyBotComment recognizes the exact legacy success announcement as success", () => {
   const body =
     "<!-- fossasia-cla-bot:v1 -->\nAll contributors have signed the CLA. \u2705";
   assert.strictEqual(classifyBotComment(body), "success");
+});
+
+test("classifyBotComment recognizes a current-format (SUCCESS_MARKER) success announcement as success, generic and personalized wording alike", () => {
+  const generic =
+    "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:success -->\nAll contributors have signed the CLA. \u2705";
+  const personalized =
+    "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:success -->\n@alice Thank you for signing the CLA! We look forward to your contributions.";
+  assert.strictEqual(classifyBotComment(generic), "success");
+  assert.strictEqual(classifyBotComment(personalized), "success");
+});
+
+test("classifyBotComment does NOT treat arbitrary bot text merely CONTAINING the legacy success phrase as a success announcement", () => {
+  // Regression test: the legacy fallback used to be a plain body.includes()
+  // substring search, which would have wrongly matched here just because
+  // this text happens to quote/mention the exact legacy phrase somewhere
+  // inside a longer, unrelated comment. It must now require the comment's
+  // ENTIRE body to be nothing more than that fixed legacy string (see
+  // LEGACY_SUCCESS_COMMENT's doc comment in src/cla-bot.js) - a substring
+  // match here is a false positive, since this comment doesn't actually
+  // represent this PR ever having reached a genuine success state.
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\n" +
+    "FYI, once everyone signs you'll see a comment saying " +
+    '"All contributors have signed the CLA. \u2705" - just a heads up, ' +
+    "nobody has signed yet.";
+  assert.strictEqual(classifyBotComment(body), "other");
 });
 
 test("classifyBotComment treats the personal 'already signed, nothing more to do' reply as neither pending nor success", () => {
   const body =
     "<!-- fossasia-cla-bot:v1 -->\n@alice you have already signed the CLA. Nothing more to do here.";
   assert.strictEqual(classifyBotComment(body), "other");
+});
+
+// --- personalSuccessMessage / SUCCESS_MARKER --------------------------------
+// The per-signer completion announcement (checkPR's `signer` option) that
+// replaces the generic SUCCESS_MESSAGE whenever we know exactly who just
+// completed the PR's signing requirement.
+
+test("personalSuccessMessage addresses the given login by name and invites their contributions", () => {
+  const body = personalSuccessMessage("carol");
+  assert.ok(
+    body.includes(
+      "@carol Thank you for signing the CLA! We look forward to your contributions.",
+    ),
+    `expected a personalized thank-you for carol, got: ${body}`,
+  );
+});
+
+test("personalSuccessMessage embeds SUCCESS_MARKER so classifyBotComment recognizes it as a success announcement, even though its visible text differs per signer", () => {
+  const body = `<!-- fossasia-cla-bot:v1 -->\n${personalSuccessMessage("dave")}`;
+  assert.strictEqual(classifyBotComment(body), "success");
+});
+
+test("two personalSuccessMessage() calls for different logins produce different bodies (so they are never mistaken for duplicates of each other)", () => {
+  assert.notStrictEqual(
+    personalSuccessMessage("alice"),
+    personalSuccessMessage("bob"),
+  );
+});
+
+// --- isSameContributor -------------------------------------------------
+// Used by checkPR's `signerCompletedRequirement` check to tell whether the
+// person who just signed via a comment is actually one of a PR's own
+// commit authors (as opposed to an unrelated bystander) - see its doc
+// comment in src/cla-bot.js for why that distinction matters.
+
+test("isSameContributor matches by numeric id even when the logins differ (a renamed account)", () => {
+  assert.strictEqual(
+    isSameContributor(
+      { id: 42, login: "old-name" },
+      { id: 42, login: "new-name" },
+    ),
+    true,
+  );
+});
+
+test("isSameContributor falls back to a case-insensitive login match when either side has no id", () => {
+  assert.strictEqual(
+    isSameContributor({ login: "Alice" }, { login: "alice" }),
+    true,
+  );
+});
+
+test("isSameContributor returns false for genuinely different identities", () => {
+  assert.strictEqual(
+    isSameContributor({ id: 1, login: "alice" }, { id: 2, login: "bob" }),
+    false,
+  );
+});
+
+test("isSameContributor fails closed (false, never throws) on null/undefined input", () => {
+  assert.strictEqual(isSameContributor(null, { login: "alice" }), false);
+  assert.strictEqual(isSameContributor({ login: "alice" }, undefined), false);
+});
+
+// --- signerCompletedRequirement (checkPR) --------------------------------
+// checkPR's own, single-source-of-truth definition of "did this signer's
+// own signature complete the PR's requirement" - see its doc comment in
+// src/cla-bot.js. Tests call the REAL exported function directly (rather
+// than re-typing its expression here) so these can never silently drift
+// out of sync with the production logic they're meant to be verifying.
+
+test("signerCompletedRequirement is false for an allowlisted commit author, even though they ARE the PR's only author and DID just sign", () => {
+  const authors = [{ id: 99, login: "dependabot[bot]" }];
+  const signer = { id: 99, login: "dependabot[bot]" };
+  assert.strictEqual(
+    signerCompletedRequirement(authors, signer),
+    false,
+    "an allowlisted account was never actually blocking this PR (it's excluded from `missing` regardless of signature status), so it must not be credited with completing it",
+  );
+});
+
+test("signerCompletedRequirement is true for a genuine, non-allowlisted commit author who just signed", () => {
+  const authors = [{ id: 100, login: "alice" }];
+  const signer = { id: 100, login: "alice" };
+  assert.strictEqual(signerCompletedRequirement(authors, signer), true);
+});
+
+test("signerCompletedRequirement is false for someone who isn't a commit author on this PR at all (an unrelated bystander)", () => {
+  const authors = [{ id: 100, login: "alice" }];
+  const signer = { id: 999, login: "mallory" };
+  assert.strictEqual(signerCompletedRequirement(authors, signer), false);
+});
+
+test("signerCompletedRequirement is false when there is no signer at all (an automatic check, not a comment-triggered one)", () => {
+  const authors = [{ id: 100, login: "alice" }];
+  assert.strictEqual(signerCompletedRequirement(authors, null), false);
 });
 
 console.log(`\n${passed} test(s) passed.`);
