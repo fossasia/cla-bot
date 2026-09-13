@@ -1797,6 +1797,305 @@ function makeFakeGitHub({
   });
 
   // =========================================================================
+  // "Already signed" PRs must stay quiet: checkPR's quietIfNeverFlagged
+  // behaviour (only used by the automatic pull_request_target trigger).
+  //
+  // Regression coverage for: a contributor who already signed the CLA (in
+  // an earlier PR/repo) opens a brand new PR, and the bot's very first
+  // comment on that PR is "All contributors have signed the CLA. ✅" - pure
+  // noise, since nothing was ever required of anyone on this PR. See
+  // https://github.com/rajnishtiwari7/cla-testing/pull/7 for a live example.
+  // =========================================================================
+
+  await test("opening a PR whose sole author already signed the CLA sets a success status but posts NO comment at all (nothing ever needed doing)", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 5001, login: "already-signed-author" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 5001, login: "already-signed-author" }],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha-abc" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(
+      gh.statuses.length,
+      1,
+      "the merge-gating status must still be set",
+    );
+    assert.strictEqual(gh.statuses[0].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      0,
+      "a PR that was compliant from the very first check must get no comment - there is nothing to tell anyone",
+    );
+  });
+
+  await test("a 'synchronize' push that only adds an author who ALSO already signed keeps a never-flagged PR silent", async () => {
+    // Mutated in place between the two handlePullRequestTarget calls below
+    // to simulate a new commit landing on the PR - makeFakeGitHub's mock
+    // reads this same array live on every request, so pushing to it after
+    // the first ("opened") check is what makes the second ("synchronize")
+    // check see the new commit.
+    const commits = [
+      {
+        sha: "c1",
+        author: { id: 5101, login: "author-one" },
+        parents: [{ sha: "p1" }],
+        commit: { author: { email: "a@example.com" } },
+      },
+    ];
+    const gh = makeFakeGitHub({
+      commits,
+      initialSignatures: {
+        version: 1,
+        signatures: [
+          { id: 5101, login: "author-one" },
+          { id: 5102, login: "author-two" },
+        ],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    // First check (PR opened with only author-one's commit) - still silent.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.comments.length, 0);
+
+    // A new commit lands from author-two, who happens to already be signed
+    // too - the requirement is to *ignore* them quietly, not announce
+    // anything.
+    commits.push({
+      sha: "c2",
+      author: { id: 5102, login: "author-two" },
+      parents: [{ sha: "p1" }],
+      commit: { author: { email: "b@example.com" } },
+    });
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-2" } },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      0,
+      "a newly-joined but already-signed committer must not trigger any comment",
+    );
+  });
+
+  await test("a 'synchronize' push that adds a NEW, unsigned committer to a previously-silent PR still asks that person to sign", async () => {
+    // Same mutate-in-place pattern as above - starts with only the
+    // already-signed author's commit, then a second, unsigned committer's
+    // commit is added before the 'synchronize' check.
+    const commits = [
+      {
+        sha: "c1",
+        author: { id: 5201, login: "already-signed" },
+        parents: [{ sha: "p1" }],
+        commit: { author: { email: "a@example.com" } },
+      },
+    ];
+    const gh = makeFakeGitHub({
+      commits,
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 5201, login: "already-signed" }],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    // Opened with just the already-signed author - silent, as above.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.comments.length, 0);
+
+    // A second, unsigned committer's commit is pushed.
+    commits.push({
+      sha: "c2",
+      author: { id: 5202, login: "brand-new-contributor" },
+      parents: [{ sha: "p1" }],
+      commit: { author: { email: "b@example.com" } },
+    });
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-2" } },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(
+      gh.comments.length,
+      1,
+      "the new, unsigned committer must still be asked to sign",
+    );
+    assert.ok(
+      gh.comments[0].body.includes("@brand-new-contributor"),
+      "the ask must name the newly-added unsigned committer",
+    );
+    assert.ok(
+      !gh.comments[0].body.includes("@already-signed"),
+      "the already-signed committer must not be listed as needing to sign",
+    );
+  });
+
+  await test("once a PR that WAS flagged (bot already asked someone to sign) becomes fully signed, the success comment IS posted - this is a real transition worth announcing", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 5301, login: "late-signer" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    // Opened while unsigned - the bot must ask.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 1);
+
+    // They sign via the issue_comment flow.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "late-signer" } },
+      comment: {
+        user: { id: 5301, login: "late-signer" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      2,
+      "the transition from blocked to fully-signed must be announced",
+    );
+    assert.ok(
+      gh.comments[gh.comments.length - 1].body.includes(
+        "All contributors have signed",
+      ),
+    );
+
+    // A later, redundant synchronize (no new commits, same head) that
+    // re-confirms the already-announced success must not spam a duplicate.
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(
+      gh.comments.length,
+      2,
+      "an unchanged already-announced success must be deduped, not reposted",
+    );
+  });
+
+  await test("an explicit 'recheck' request always answers, even when the PR was compliant from the start and the bot never said anything before", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 5401, login: "pr-author" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 5401, login: "pr-author" }],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    // PR opened silently, as expected.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.comments.length, 0);
+
+    // The PR author explicitly asks for a recheck - a direct question
+    // deserves a direct answer, unlike the automatic webhook trigger.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "pr-author" } },
+      comment: {
+        user: { id: 5401, login: "pr-author" },
+        body: "recheck",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    assert.strictEqual(
+      gh.comments.length,
+      1,
+      "an explicit human recheck must get a real answer even with no prior bot comment",
+    );
+    assert.ok(gh.comments[0].body.includes("All contributors have signed"));
+  });
+
+  await test("a PR that was already fully signed keeps producing NO comment across repeated 'synchronize' events (no accumulating noise)", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 5501, login: "clean-author" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 5501, login: "clean-author" }],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    for (const [action, sha] of [
+      ["opened", "s1"],
+      ["synchronize", "s2"],
+      ["synchronize", "s3"],
+    ]) {
+      await handlePullRequestTarget({
+        action,
+        pull_request: { number: 1, head: { sha } },
+      });
+    }
+
+    assert.strictEqual(gh.statuses.length, 3);
+    assert.ok(gh.statuses.every((s) => s.state === "success"));
+    assert.strictEqual(
+      gh.comments.length,
+      0,
+      "repeated pushes to an always-compliant PR must never produce a comment",
+    );
+  });
+
+  // =========================================================================
   // Input-validation hardening: PR/issue numbers and commit SHAs pulled out
   // of the webhook payload (itself read from a file, GITHUB_EVENT_PATH) must
   // never reach an outbound GitHub API URL unvalidated - see

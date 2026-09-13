@@ -853,8 +853,34 @@ async function lockPR(prNumber) {
 
 // ---------------------------------------------------------------------------
 // Core: evaluate one PR and bring its status/comment up to date.
-// ---------------------------------------------------------------------------
-async function checkPR(prNumber, headSha) {
+//
+// `quietIfNeverFlagged` (only ever passed `true` by the automatic
+// pull_request_target handler - see handlePullRequestTarget) controls
+// whether a clean result gets announced with a comment:
+//
+// - A brand new PR whose commit authors had ALL already signed the CLA
+//   before this PR ever existed needs no comment at all - nothing was
+//   ever required of anyone here, so saying "All contributors have signed
+//   the CLA ✅" on a PR the bot has never spoken on before is pure noise.
+//   The commit status is still set to "success" either way, since that's
+//   what merge protection actually reads.
+// - The moment this PR ever *did* need a signer (the bot posted a
+//   "please sign" comment for it, at any point in its history) and it
+//   later becomes fully signed, that transition is worth announcing -
+//   people watched this PR go from blocked to unblocked.
+// - An explicit human trigger (the sign-phrase comment, or the `recheck`
+//   command handled in handleIssueComment) always gets an answer, quiet
+//   or not: the caller took an action and asked a direct question, so
+//   `checkPR` is invoked there without this flag and always comments.
+//
+// This is what makes "new committers joining an already-compliant PR"
+// behave as silently as the very first check: as long as nothing has ever
+// needed asking on this PR, a still-fully-signed result just stays quiet.
+async function checkPR(
+  prNumber,
+  headSha,
+  { quietIfNeverFlagged = false } = {},
+) {
   assertValidPRNumber(prNumber, "checkPR(prNumber)");
   if (!headSha) {
     const pr = await gh(
@@ -889,6 +915,14 @@ async function checkPR(prNumber, headSha) {
       "success",
       "All contributors have signed the CLA.",
     );
+    if (quietIfNeverFlagged) {
+      // Only announce success if the bot has said *something* on this PR
+      // before (e.g. an earlier "please sign" comment this now resolves).
+      // No prior bot comment at all means every author was already signed
+      // up front - nothing changed, nothing to tell anyone.
+      const existing = await getExistingBotComments(prNumber);
+      if (existing.length === 0) return;
+    }
     await postComment(prNumber, "All contributors have signed the CLA. ✅");
     return;
   }
@@ -1055,7 +1089,11 @@ async function handlePullRequestTarget(payload) {
       payload.pull_request.head && payload.pull_request.head.sha,
       "pull_request_target payload pull_request.head.sha",
     );
-    await checkPR(prNumber, headSha);
+    // Automatic trigger (PR opened/pushed to/reopened), not a human asking
+    // a direct question - stay quiet on an already-compliant result unless
+    // this PR previously needed action. See checkPR's quietIfNeverFlagged
+    // doc comment above for the full reasoning.
+    await checkPR(prNumber, headSha, { quietIfNeverFlagged: true });
   }
 }
 
