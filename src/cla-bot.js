@@ -612,6 +612,37 @@ function isSameContributor(a, b) {
   );
 }
 
+// Combines a caller's already-known signature snapshot (e.g. the object
+// writeSignatures() just returned) with a freshly-read one, so that neither
+// side's staleness can hide a real signature from checkPR:
+//
+//  - `fresh` might still be serving the pre-write snapshot due to GitHub's
+//    Contents API read-after-write staleness window (see checkPR's doc
+//    comment) - `known`'s entries (the exact data the caller's own write
+//    just produced) cover that gap.
+//  - `known` was captured at some point BEFORE listPRCommitAuthors() ran,
+//    and can't reflect a signature written by a completely different
+//    workflow run (e.g. someone signing via a different PR/repo) that lands
+//    in the shared store while that call is in flight - `fresh`'s entries
+//    cover that gap instead.
+//
+// Where the same identity (per isSameContributor's id-first, login-fallback
+// rule) appears in both, the fresh entry wins, since it's the more recently
+// observed state of the shared store; entries only `known` has are kept
+// as-is. `known` may be null/undefined (every checkPR() caller except
+// handleIssueComment's has no such snapshot to hand over), in which case
+// `fresh` is returned unchanged.
+function mergeSignatures(known, fresh) {
+  if (!known) return fresh;
+  const keptFromKnown = known.signatures.filter(
+    (k) => !fresh.signatures.some((f) => isSameContributor(k, f)),
+  );
+  return {
+    version: fresh.version,
+    signatures: [...keptFromKnown, ...fresh.signatures],
+  };
+}
+
 // Was `signer` actually a required (non-allowlisted) commit author among
 // `authors` (a PR's own commit authors, as returned by
 // listPRCommitAuthors())? Extracted as its own top-level function - rather
@@ -939,8 +970,24 @@ async function postComment(prNumber, body, dedupe = true) {
   const full = `${BOT_MARKER}\n${body}`;
   if (dedupe) {
     const existing = await getExistingBotComments(prNumber);
-    const last = existing[existing.length - 1];
-    if (last && last.body === full) return; // nothing changed, don't spam the thread
+    // Compare against the most recent bot comment of the SAME category
+    // (per classifyBotComment: "pending", "success", or "other"), not
+    // merely the literal last bot comment overall. checkPR can post two
+    // comments back to back within a single call - a personal per-signer
+    // thank-you ("other") followed by the pending-list comment
+    // ("pending") - so a LATER call's own pending comment would otherwise
+    // be compared against an unrelated, DIFFERENT signer's thank-you that
+    // landed in between (e.g. two different unrelated contributors each
+    // signing while the same required contributor is still missing),
+    // rather than against the earlier, byte-identical pending comment it
+    // should actually be deduped against. Comparing within the same
+    // category finds the right prior comment to compare against
+    // regardless of what other comment category was posted in between.
+    const category = classifyBotComment(full);
+    const lastOfCategory = existing.findLast(
+      (c) => classifyBotComment(c.body) === category,
+    );
+    if (lastOfCategory && lastOfCategory.body === full) return; // nothing changed, don't spam the thread
   }
   await gh(
     `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments`,
@@ -1082,8 +1129,8 @@ async function lockPR(prNumber) {
 //   or not: the caller took an action and asked a direct question, so
 //   `checkPR` is invoked there without this flag and always comments,
 //   regardless of what's already been said on the thread (aside from the
-//   ordinary immediately-preceding-comment dedupe every postComment() call
-//   already does).
+//   ordinary same-category dedupe every postComment() call already does -
+//   see its own doc comment).
 //
 // This is what makes "new committers joining an already-compliant PR"
 // behave as silently as the very first check: as long as this PR has never
@@ -1122,10 +1169,62 @@ async function lockPR(prNumber) {
 //     would be actively misleading, especially since the PR may well have
 //     already been fully signed before they ever commented - see
 //     `signerCompletedRequirement` below.
+//
+// `statusOnly` (only ever passed by handleIssueComment's `alreadySigned`
+// branch below) recomputes and updates the merge-blocking status check as
+// usual, but returns immediately after - without posting ANY comment,
+// pending or success. This exists specifically for a redundant sign-phrase
+// comment from someone who'd already signed (typically via a different
+// PR): that person gets their own "you already signed, nothing more to do"
+// reply regardless (see handleIssueComment), but this PR's own status may
+// well have gone stale in the meantime - it was last set when THIS PR was
+// still missing them, and nothing had re-run checkPR for THIS PR since. A
+// normal (non-statusOnly) checkPR call would fix the status too, but would
+// ALSO post a fresh pending-list or success comment alongside the
+// "already signed" one - and would do so AGAIN every time the same person
+// harmlessly re-sends the same redundant comment, since none of those
+// extra comments would be byte-identical to the one immediately before
+// them (the "already signed" reply always comes first) for postComment's
+// own dedupe to catch. `statusOnly` avoids that: the status is corrected
+// silently, with no risk of ever piling up duplicate announcements no
+// matter how many times someone redundantly re-signs.
+// `knownSignatures` (only ever passed by handleIssueComment, right after a
+// writeSignatures() call in the SAME request) is the exact signatures
+// object writeSignatures() just returned - the freshest possible state for
+// the caller's own write, known for certain without another round trip.
+// When given, checkPR merges it (via mergeSignatures()) with its own fresh
+// GET instead of trusting either one alone:
+//
+//  - The fresh GET alone isn't enough: GitHub's Contents API does NOT
+//    guarantee that a GET immediately following a PUT reflects that write -
+//    a super-brief read-after-write staleness window is a documented
+//    characteristic of that API, not something application code can
+//    reliably wait out. Without `knownSignatures` filling that gap, a
+//    contributor could sign the CLA and, purely because the GET raced
+//    against that same brief window, see the very message thanking them
+//    for signing ALSO still list them as needing to sign.
+//  - `knownSignatures` alone isn't enough either: it's a snapshot from
+//    before listPRCommitAuthors() ran (which can be slow on a big PR), so
+//    it can't see a DIFFERENT required contributor's signature that lands
+//    in the shared store - written by a completely different workflow run,
+//    e.g. them signing via another PR/repo - while that call is in flight.
+//    Skipping the GET entirely in that window would let checkPR post a
+//    false pending-signer comment / failure status for someone who has, in
+//    fact, already signed.
+//
+// Every other caller of checkPR (the automatic pull_request_target
+// trigger, and the `recheck` command) has no such freshly-known snapshot to
+// hand over, so mergeSignatures() just returns the fresh GET unchanged for
+// them - same behavior as always.
 async function checkPR(
   prNumber,
   headSha,
-  { quietIfNeverFlagged = false, signer = null } = {},
+  {
+    quietIfNeverFlagged = false,
+    signer = null,
+    statusOnly = false,
+    knownSignatures = null,
+  } = {},
 ) {
   assertValidPRNumber(prNumber, "checkPR(prNumber)");
   if (!headSha) {
@@ -1141,16 +1240,20 @@ async function checkPR(
     assertValidSha(headSha, "checkPR(headSha)");
   }
 
-  // Read signatures last, right before deciding: listPRCommitAuthors() can
-  // be slow on a big PR, while the signature store is what's most likely to
-  // change under us (someone signing in another run). This narrows the race
-  // window but doesn't remove it - two overlapping runs can still each post
-  // a stale result if they're not serialized. That's what the consumer
-  // workflow's `concurrency:` group is for; it also covers the
+  // listPRCommitAuthors() can be slow on a big PR; reading the signature
+  // store right after it (rather than before) is what's most likely to
+  // change under us, e.g. someone signing in another run. This narrows the
+  // race window but doesn't remove it - two overlapping runs can still each
+  // post a stale result if they're not serialized. That's what the
+  // consumer workflow's `concurrency:` group is for; it also covers the
   // comment-duplication race handled in postComment().
+  //
+  // Always read here, even when `knownSignatures` was given - see
+  // mergeSignatures() and this function's doc comment above for why a
+  // caller's own known-fresh write still isn't a substitute for this GET.
   const { authors, unresolved } = await listPRCommitAuthors(prNumber);
-  const sigToken = await getSignaturesToken();
-  const { data } = await readSignatures(sigToken);
+  const freshData = (await readSignatures(await getSignaturesToken())).data;
+  const data = mergeSignatures(knownSignatures, freshData);
   const missing = authors.filter(
     (a) => !isAllowlisted(a.login) && !isSigned(data, a),
   );
@@ -1161,6 +1264,7 @@ async function checkPR(
       "success",
       "All contributors have signed the CLA.",
     );
+    if (statusOnly) return;
     if (quietIfNeverFlagged) {
       // GET comments come back in creation order (oldest first), so the
       // *last* match in the array for each category is the most recent
@@ -1195,19 +1299,7 @@ async function checkPR(
     return;
   }
 
-  const lines = [];
-  if (signer) {
-    // The PR isn't fully clear yet (someone else still needs to sign, or a
-    // commit needs manual review), but this specific person DID just sign
-    // successfully - acknowledge that up front, separately from the list of
-    // what's still outstanding below, so they're not left wondering whether
-    // their own comment did anything.
-    lines.push(
-      `@${signer.login} Thank you for signing the CLA! We look forward to your contributions.`,
-      "",
-    );
-  }
-  lines.push(PENDING_MARKER);
+  const lines = [PENDING_MARKER];
   if (missing.length) {
     lines.push(
       `The following contributor(s) ${NEEDS_SIGN_FRAGMENT} [CLA](${CLA_DOCUMENT_URL}) before this PR can be merged:`,
@@ -1243,6 +1335,20 @@ async function checkPR(
       ? `${missing.length} contributor(s) need to sign the CLA`
       : "Manual verification needed",
   );
+  if (statusOnly) return;
+  if (signer) {
+    // The PR isn't fully clear yet (someone else still needs to sign, or a
+    // commit needs manual review), but this specific person DID just sign
+    // successfully - acknowledge that as its OWN comment, separate from the
+    // list of what's still outstanding below (rather than one comment
+    // combining both), so each comment has one clear, single purpose: this
+    // one says "your action was recorded", the next one says "here's where
+    // the PR stands overall".
+    await postComment(
+      prNumber,
+      `@${signer.login} Thank you for signing the CLA! We look forward to your contributions.`,
+    );
+  }
   await postComment(prNumber, lines.join("\n"));
 }
 
@@ -1297,7 +1403,7 @@ async function handleIssueComment(payload) {
     // the 409 retry loop re-running this closure) - each attempt checks the
     // just-fetched state, not a stale snapshot.
     let alreadySigned = false;
-    await writeSignatures(
+    const writtenSignatures = await writeSignatures(
       sigToken,
       (data) => {
         if (isSigned(data, commenterIdentity)) {
@@ -1328,6 +1434,20 @@ async function handleIssueComment(payload) {
         prNumber,
         `@${commenter} you have already signed the CLA. Nothing more to do here.`,
       );
+      // This PR's own merge-blocking status may be stale: it was last set
+      // while THIS PR still considered them unsigned, and they may well
+      // have signed via a DIFFERENT PR since - nothing would have re-run
+      // checkPR for THIS PR in the meantime. Silently bring the status up
+      // to date (statusOnly: true posts no additional comment - see
+      // checkPR's doc comment for why that matters here specifically).
+      // knownSignatures ensures checkPR's own fresh GET can't shadow the
+      // write that just happened even if it races that write's
+      // read-after-write staleness window (see checkPR's and
+      // mergeSignatures()'s doc comments).
+      await checkPR(prNumber, undefined, {
+        statusOnly: true,
+        knownSignatures: writtenSignatures,
+      });
       return;
     }
 
@@ -1335,9 +1455,17 @@ async function handleIssueComment(payload) {
     // `signer` is what makes checkPR() address THIS specific person by name
     // (either in a personal thank-you leading the pending list, or - if
     // they're the one who just completed the requirement - in place of the
-    // generic "All contributors have signed" announcement). See checkPR's
-    // doc comment for the full reasoning.
-    await checkPR(prNumber, undefined, { signer: commenterIdentity });
+    // generic "All contributors have signed" announcement). knownSignatures
+    // is the exact data writeSignatures() just wrote, so checkPR's own
+    // fresh GET can't shadow it even if that GET races the write's own
+    // read-after-write staleness window (see checkPR's and
+    // mergeSignatures()'s doc comments) - the very bug that would let the
+    // person who just signed still show up in their own "still needs to
+    // sign" list.
+    await checkPR(prNumber, undefined, {
+      signer: commenterIdentity,
+      knownSignatures: writtenSignatures,
+    });
     return;
   }
 
@@ -1451,6 +1579,12 @@ module.exports = {
   // unrelated bystander), so it gets direct unit coverage of its id-first,
   // login-fallback matching rule in test/logic.test.js.
   isSameContributor,
+  // Exported for tests only, same reasoning as isSameContributor above:
+  // this is checkPR's single-source-of-truth definition of how a caller's
+  // known-fresh write and a subsequent GET are reconciled, so it gets
+  // direct unit coverage of its "fresh wins on a match, known-only entries
+  // are kept" merge rule in test/logic.test.js.
+  mergeSignatures,
   // Exported for tests only, same reasoning: this is checkPR's actual,
   // single-source-of-truth definition of "did this signer's own signature
   // complete the PR's requirement" - tests call this function directly

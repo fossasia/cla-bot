@@ -27,6 +27,7 @@ const {
   personalSuccessMessage,
   isSameContributor,
   signerCompletedRequirement,
+  mergeSignatures,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -720,6 +721,53 @@ test("isSameContributor returns false for genuinely different identities", () =>
 test("isSameContributor fails closed (false, never throws) on null/undefined input", () => {
   assert.strictEqual(isSameContributor(null, { login: "alice" }), false);
   assert.strictEqual(isSameContributor({ login: "alice" }, undefined), false);
+});
+
+// --- mergeSignatures (checkPR) -------------------------------------------
+// Reconciles a caller's already-known signature snapshot (knownSignatures)
+// with a freshly-read one, so that neither side's staleness can hide a real
+// signature from checkPR - see its doc comment in src/cla-bot.js.
+
+test("mergeSignatures returns the fresh read unchanged when there is no known snapshot to merge", () => {
+  const fresh = { version: 1, signatures: [{ id: 1, login: "alice" }] };
+  assert.deepStrictEqual(mergeSignatures(null, fresh), fresh);
+  assert.deepStrictEqual(mergeSignatures(undefined, fresh), fresh);
+});
+
+test("mergeSignatures keeps a known entry that the fresh read is missing (fresh is stale relative to the caller's own write)", () => {
+  const known = { version: 1, signatures: [{ id: 1, login: "alice" }] };
+  const fresh = { version: 1, signatures: [] };
+  assert.deepStrictEqual(mergeSignatures(known, fresh), {
+    version: 1,
+    signatures: [{ id: 1, login: "alice" }],
+  });
+});
+
+test("mergeSignatures adds a fresh entry that known doesn't have (a different contributor signed concurrently elsewhere)", () => {
+  const known = { version: 1, signatures: [{ id: 1, login: "alice" }] };
+  const fresh = {
+    version: 1,
+    signatures: [
+      { id: 1, login: "alice" },
+      { id: 2, login: "bob" },
+    ],
+  };
+  assert.deepStrictEqual(mergeSignatures(known, fresh), {
+    version: 1,
+    signatures: [
+      { id: 1, login: "alice" },
+      { id: 2, login: "bob" },
+    ],
+  });
+});
+
+test("mergeSignatures prefers the fresh entry over a matching known one (same identity, per isSameContributor's id-first rule)", () => {
+  const known = { version: 1, signatures: [{ id: 1, login: "old-name" }] };
+  const fresh = { version: 1, signatures: [{ id: 1, login: "new-name" }] };
+  assert.deepStrictEqual(mergeSignatures(known, fresh), {
+    version: 1,
+    signatures: [{ id: 1, login: "new-name" }],
+  });
 });
 
 // --- signerCompletedRequirement (checkPR) --------------------------------
