@@ -2180,6 +2180,124 @@ function makeFakeGitHub({
     );
   });
 
+  await test("a redundant 'already signed' comment on a PR whose OWN status had gone stale (they signed via a DIFFERENT PR since) silently refreshes THIS PR's status to success", async () => {
+    // Regression test for the exact real-world bug this fix addresses:
+    // handleIssueComment's `alreadySigned` branch used to return immediately
+    // after posting the personal reply, WITHOUT ever calling checkPR() - so
+    // this PR's own merge-blocking status stayed stuck at whatever it was
+    // last set to (here: "failure", from when carol genuinely hadn't signed
+    // yet), even after she became fully compliant via signing on a
+    // completely different PR in the meantime. See checkPR's `statusOnly`
+    // option.
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 6001, login: "carol" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "carol@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    // PR opens - carol hasn't signed yet, so it's genuinely blocked and the
+    // status is set to "failure".
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 1);
+
+    // Simulate her signing via a totally different PR in the meantime -
+    // directly seed the (global) signature store, exactly as
+    // writeSignatures() would have left it. Nothing re-runs checkPR for
+    // THIS PR as a result - signing is global, but status checks are
+    // per-PR and only get recomputed when something touches that PR.
+    gh.signatures.signatures.push({ id: 6001, login: "carol" });
+
+    // She now redundantly re-sends the sign phrase on THIS still-failing
+    // PR too - plausible if she has several open PRs and isn't sure
+    // whether "sign once, covers everywhere" really applies to this one.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "carol" } },
+      comment: {
+        user: { id: 6001, login: "carol" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    // Exactly one new comment - the personal "already signed" reply, no
+    // second comment piggybacking on it - but the status must now
+    // correctly reflect that she (this PR's sole author) is fully signed.
+    assert.strictEqual(gh.comments.length, 2);
+    assert.ok(gh.comments[1].body.includes("already signed the CLA"));
+    assert.strictEqual(
+      gh.statuses[gh.statuses.length - 1].state,
+      "success",
+      "the redundant 'already signed' comment must still silently refresh this PR's own status - it had gone stale since she signed via a different PR",
+    );
+  });
+
+  await test("a redundant 'already signed' comment on a PR that's STILL genuinely blocked by someone else refreshes the status (no-op here) without posting a second, spammy pending-list comment", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 6101, login: "dave" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "dave@example.com" } },
+        },
+        {
+          sha: "c2",
+          author: { id: 6102, login: "erin" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "erin@example.com" } },
+        },
+      ],
+      // dave already signed (elsewhere); erin has not.
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 6101, login: "dave" }],
+      },
+    });
+    global.fetch = gh.fetch;
+
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 1);
+
+    // dave redundantly re-signs even though he's already covered - erin is
+    // still the one actually blocking this PR, so nothing about the PR's
+    // own state changes.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "dave" } },
+      comment: {
+        user: { id: 6101, login: "dave" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    assert.strictEqual(
+      gh.comments.length,
+      2,
+      "only the personal 'already signed' reply - no second, redundant pending-list comment repeating that erin still needs to sign",
+    );
+    assert.ok(gh.comments[1].body.includes("already signed the CLA"));
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+  });
+
   await test("a genuine SECOND block-and-resolve cycle on the same PR is still correctly announced, even though an earlier resolution was already announced once", async () => {
     // Mutated in place to simulate a new, unsigned committer's commit
     // landing after the PR had already been fully resolved once.
@@ -2881,12 +2999,16 @@ function makeFakeGitHub({
     });
 
     // Alice signs first. Two others (bob, carol) still haven't - the PR
-    // stays blocked, but alice must still be personally thanked right away
-    // for the action she just took, alongside the usual "who's still
-    // missing" list.
+    // stays blocked. Alice still gets personally thanked right away for the
+    // action she just took - as its OWN comment now, separate from the
+    // "who's still missing" list comment that follows it.
     await handleIssueComment(signAs(7001, "alice"));
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
-    assert.strictEqual(gh.comments.length, 1);
+    assert.strictEqual(
+      gh.comments.length,
+      2,
+      "two comments: the personal thank-you, then the still-pending list, as separate comments",
+    );
     assert.ok(
       gh.comments[0].body.includes(
         "@alice Thank you for signing the CLA! We look forward to your contributions.",
@@ -2894,46 +3016,59 @@ function makeFakeGitHub({
       "alice must be thanked by name immediately for her own sign action",
     );
     assert.ok(
-      gh.comments[0].body.includes("@bob") &&
-        gh.comments[0].body.includes("@carol"),
-      "bob and carol must still be listed as needing to sign",
+      !gh.comments[0].body.includes("need to sign"),
+      "the personal thank-you must be its own comment, not merged with the pending list",
     );
     assert.ok(
-      !gh.comments[0].body.includes("All contributors have signed"),
+      gh.comments[1].body.includes("@bob") &&
+        gh.comments[1].body.includes("@carol"),
+      "bob and carol must still be listed as needing to sign, in the separate pending-list comment",
+    );
+    assert.ok(
+      !gh.comments[1].body.includes("Thank you for signing"),
+      "the pending-list comment must not also contain the personal thank-you",
+    );
+    assert.ok(
+      !gh.comments[1].body.includes("All contributors have signed"),
       "the PR isn't fully signed yet, so the completion announcement must not appear",
     );
 
     // Bob signs next. Still blocked (carol hasn't signed), so bob gets his
-    // own personal thank-you, and only carol remains in the pending list.
+    // own personal thank-you (comment 3) and a fresh pending-list comment
+    // (comment 4) naming only carol.
     await handleIssueComment(signAs(7002, "bob"));
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
-    assert.strictEqual(gh.comments.length, 2);
+    assert.strictEqual(gh.comments.length, 4);
     assert.ok(
-      gh.comments[1].body.includes(
+      gh.comments[2].body.includes(
         "@bob Thank you for signing the CLA! We look forward to your contributions.",
       ),
     );
-    assert.ok(gh.comments[1].body.includes("@carol"));
-    assert.ok(!gh.comments[1].body.includes("@bob you have already"));
+    assert.ok(gh.comments[3].body.includes("@carol"));
+    assert.ok(!gh.comments[2].body.includes("@bob you have already"));
     assert.ok(
-      !gh.comments[1].body.includes("@alice"),
-      "alice already signed and must not reappear in the still-missing list",
+      !gh.comments[3].body.includes("@alice") &&
+        !gh.comments[3].body.includes("@bob"),
+      "alice and bob already signed and must not reappear in the still-missing list",
     );
 
     // Carol signs last, completing the PR. She gets her OWN personalized
     // thank-you in place of the old generic "All contributors have signed"
-    // announcement - exactly the behaviour this fix is for.
+    // announcement - exactly the behaviour this fix is for. This is the
+    // SUCCESS case, so it's still just ONE comment (the personalized
+    // completion message already serves as her thank-you - no need for a
+    // separate one).
     await handleIssueComment(signAs(7003, "carol"));
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
-    assert.strictEqual(gh.comments.length, 3);
+    assert.strictEqual(gh.comments.length, 5);
     assert.ok(
-      gh.comments[2].body.includes(
+      gh.comments[4].body.includes(
         "@carol Thank you for signing the CLA! We look forward to your contributions.",
       ),
       "carol, who completed the PR's requirement, must be thanked by name",
     );
     assert.ok(
-      !gh.comments[2].body.includes("All contributors have signed"),
+      !gh.comments[4].body.includes("All contributors have signed"),
       "the generic, anonymous announcement must not be used when we know exactly who completed it",
     );
 
@@ -2996,6 +3131,267 @@ function makeFakeGitHub({
     );
   });
 
+  await test("checkPR merges its own just-written signature data (knownSignatures) into a stale post-write GET, instead of trusting that GET alone", async () => {
+    // Regression test for a real production bug: GitHub's Contents API does
+    // NOT guarantee that a GET immediately following a PUT reflects that
+    // write (a documented characteristic of that API, not a bug on
+    // GitHub's part) - so a naive "write, then immediately re-GET to
+    // recompute status" flow can occasionally read back the PRE-write
+    // content. This test simulates exactly that: the signatures GET
+    // endpoint is rigged to return STALE (pre-signing) content for every
+    // call that happens AFTER the PUT - if checkPR trusted that fresh GET
+    // alone instead of merging in the `knownSignatures` writeSignatures()
+    // already handed it (see mergeSignatures()), the contributor who just
+    // signed would still show up in their own "still needs to sign" list.
+    let putHappened = false;
+    let getCallsAfterPut = 0;
+    const preWriteSignatures = { version: 1, signatures: [] };
+    let sigSha = "sig-sha-0";
+
+    const commits = [
+      {
+        sha: "c1",
+        author: { id: 9001, login: "alice" },
+        parents: [{ sha: "p1" }],
+        commit: { author: { email: "alice@example.com" } },
+      },
+    ];
+    const comments = [];
+
+    function res(status, jsonBody) {
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
+        headers: { get: () => null },
+      };
+    }
+    function b64(obj) {
+      return Buffer.from(JSON.stringify(obj)).toString("base64");
+    }
+
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.includes("/pulls/1/commits")) return res(200, commits);
+      if (url.includes("/pulls/1") && !url.includes("/commits")) {
+        return res(200, { head: { sha: "head-sha-abc" } });
+      }
+      if (url.includes("/contents/signatures/cla.json")) {
+        if (method === "GET") {
+          if (putHappened) getCallsAfterPut += 1;
+          // The crux of the simulated race: even after the PUT below has
+          // completed, this GET keeps returning the PRE-write snapshot -
+          // exactly the documented Contents API staleness window. If
+          // checkPR's correctness depended on this GET, it would get the
+          // wrong answer every single time in this test.
+          return res(200, {
+            sha: sigSha,
+            content: b64(preWriteSignatures),
+            encoding: "base64",
+          });
+        }
+        if (method === "PUT") {
+          putHappened = true;
+          sigSha = "sig-sha-1";
+          return res(200, { content: { sha: sigSha } });
+        }
+      }
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") return res(200, comments);
+        if (method === "POST") {
+          const { body } = JSON.parse(opts.body);
+          const c = {
+            id: comments.length + 1,
+            body,
+            user: { login: "github-actions[bot]" },
+          };
+          comments.push(c);
+          return res(201, c);
+        }
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        return res(204, null);
+      }
+      if (url.includes("/statuses/")) {
+        return res(201, {});
+      }
+      throw new Error(`Unhandled mock request: ${method} ${url}`);
+    };
+
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 9001, login: "alice" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    assert.ok(
+      comments.length >= 1,
+      "expected checkPR to post at least one comment",
+    );
+    assert.ok(
+      comments[comments.length - 1].body.includes(
+        "@alice Thank you for signing the CLA! We look forward to your contributions.",
+      ),
+      `alice (this PR's sole author, who just signed) must be recognized as having completed the PR DESPITE the signatures GET being rigged to return stale (pre-signing) content - got: ${comments[comments.length - 1].body}`,
+    );
+    assert.ok(
+      !comments.some((c) => c.body.includes("need to sign")),
+      "alice must never appear in a 'still needs to sign' list here - mergeSignatures() must keep her knownSignatures entry even though the (in this test, deliberately poisoned) GET never reflects her write",
+    );
+    assert.strictEqual(
+      getCallsAfterPut,
+      1,
+      "checkPR must still perform exactly one signatures GET after the write - see the next test for why skipping it entirely would itself be a bug - but must not let that GET's staleness override alice's own known-fresh signature",
+    );
+  });
+
+  await test("checkPR's fresh GET still catches a DIFFERENT required contributor's signature written by a concurrent run, even when knownSignatures is also passed", async () => {
+    // Regression test for the race the previous test's fix (knownSignatures)
+    // introduced: knownSignatures is a snapshot from before
+    // listPRCommitAuthors() ran. If checkPR used it INSTEAD OF a fresh GET
+    // (rather than merging the two - see mergeSignatures()), it could never
+    // see a signature written by a completely different workflow run - e.g.
+    // bob signing via some other PR/repo - that lands in the shared store
+    // while listPRCommitAuthors() is still in flight for THIS PR. That would
+    // make checkPR post a false "bob still needs to sign" comment and a
+    // failure status for a PR that is, in fact, already fully compliant.
+    //
+    // Here alice and bob both authored commits on this PR. alice signs via
+    // a comment (the same knownSignatures path as the previous test); the
+    // mocked store starts empty and bob's signature is injected into it
+    // from inside the PUT handler below - AFTER alice's write has already
+    // read and left the store, so it lands in time for checkPR's own
+    // subsequent fresh GET but is deliberately never part of what
+    // writeSignatures() hands back as knownSignatures. The PR can only be
+    // recognized as fully signed if checkPR actually merges that fresh GET
+    // in, rather than relying on knownSignatures alone.
+    const commits = [
+      {
+        sha: "c1",
+        author: { id: 9001, login: "alice" },
+        parents: [{ sha: "p1" }],
+        commit: { author: { email: "alice@example.com" } },
+      },
+      {
+        sha: "c2",
+        author: { id: 9002, login: "bob" },
+        parents: [{ sha: "c1" }],
+        commit: { author: { email: "bob@example.com" } },
+      },
+    ];
+    const comments = [];
+    // The store starts EMPTY - bob has not signed yet at the moment
+    // alice's write reads it, so his entry is genuinely absent from
+    // whatever writeSignatures() hands back to checkPR as knownSignatures
+    // (alice's write only ever mutates her own entry, based on what it
+    // read at read-time). Bob's signature is injected into the shared
+    // store from inside the PUT handler below, simulating his concurrent
+    // sign (via some other PR/repo) landing moments AFTER alice's own
+    // write already completed - it only ever becomes visible through
+    // checkPR's own subsequent fresh GET, never through knownSignatures.
+    const storedSignatures = { version: 1, signatures: [] };
+    let sigSha = "sig-sha-0";
+
+    function res(status, jsonBody) {
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
+        headers: { get: () => null },
+      };
+    }
+    function b64(obj) {
+      return Buffer.from(JSON.stringify(obj)).toString("base64");
+    }
+
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.includes("/pulls/1/commits")) return res(200, commits);
+      if (url.includes("/pulls/1") && !url.includes("/commits")) {
+        return res(200, { head: { sha: "head-sha-abc" } });
+      }
+      if (url.includes("/contents/signatures/cla.json")) {
+        if (method === "GET") {
+          return res(200, {
+            sha: sigSha,
+            content: b64(storedSignatures),
+            encoding: "base64",
+          });
+        }
+        if (method === "PUT") {
+          const { content } = JSON.parse(opts.body);
+          const written = JSON.parse(
+            Buffer.from(content, "base64").toString("utf8"),
+          );
+          // Bob's concurrent signature lands in the shared store right
+          // after alice's own write - present for any GET from here on
+          // (including checkPR's own fresh read a moment later), but
+          // never part of `written` itself, since the store was still
+          // empty when alice's write read it.
+          storedSignatures.signatures = [
+            ...written.signatures,
+            { id: 9002, login: "bob" },
+          ];
+          sigSha = "sig-sha-1";
+          return res(200, { content: { sha: sigSha } });
+        }
+      }
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") return res(200, comments);
+        if (method === "POST") {
+          const { body } = JSON.parse(opts.body);
+          const c = {
+            id: comments.length + 1,
+            body,
+            user: { login: "github-actions[bot]" },
+          };
+          comments.push(c);
+          return res(201, c);
+        }
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        return res(204, null);
+      }
+      if (url.includes("/statuses/")) {
+        return res(201, {});
+      }
+      throw new Error(`Unhandled mock request: ${method} ${url}`);
+    };
+
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 9001, login: "alice" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    assert.ok(
+      comments.length >= 1,
+      "expected checkPR to post at least one comment",
+    );
+    assert.ok(
+      !comments.some((c) => c.body.includes("need to sign")),
+      `bob (signed concurrently, only visible via the fresh GET, never in knownSignatures) must not appear in a 'still needs to sign' list - got: ${JSON.stringify(comments.map((c) => c.body))}`,
+    );
+    assert.ok(
+      comments.some((c) =>
+        c.body.includes(
+          "@alice Thank you for signing the CLA! We look forward to your contributions.",
+        ),
+      ),
+      "alice, who just signed and completed the PR's requirement now that bob's concurrent signature is also visible, must still be personally thanked",
+    );
+  });
+
   await test("an unrelated commenter signing the CLA on an already-fully-signed PR is NOT credited with completing that PR", async () => {
     // Regression test: alice is the PR's only commit author and has
     // already signed (e.g. on some earlier PR - signatures are global).
@@ -3048,6 +3444,94 @@ function makeFakeGitHub({
       gh.signatures.signatures.some(
         (s) => s.id === 9001 && s.login === "mallory",
       ),
+    );
+  });
+
+  await test("two DIFFERENT unrelated signers signing an unchanged, still-blocked PR do not produce a duplicate pending-status comment", async () => {
+    // Regression test for postComment()'s dedupe being defeated by an
+    // intervening comment of a DIFFERENT category. alice is this PR's
+    // only commit author and hasn't signed; bob and carol are both
+    // unrelated bystanders (see the "unrelated commenter" test above) who
+    // each sign anyway. Neither signature affects alice's own requirement,
+    // so the PR stays blocked on alice across both events and the
+    // pending-list comment's content (just "@alice") never actually
+    // changes between them.
+    //
+    // Each blocked-case checkPR() call posts a personal thank-you FIRST
+    // (bob's, then carol's - each a distinct "other"-category comment,
+    // since it names a different person), immediately followed by the
+    // pending-list comment. Naively comparing only against the literal
+    // last bot comment would compare the second pending comment against
+    // carol's thank-you (different body -> "not a duplicate"), instead of
+    // against the first, byte-identical pending comment - reposting an
+    // unchanged status a second time. postComment() must instead compare
+    // each comment against the most recent one of the SAME category, so
+    // it correctly recognizes the second pending comment as an exact
+    // repeat of the first and skips posting it.
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 8101, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const signAs = (id, login) => ({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id, login },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    // bob signs first - unrelated, PR stays blocked on alice. Two
+    // comments: bob's personal thank-you, then the pending list.
+    await handleIssueComment(signAs(9201, "bob"));
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 2);
+    assert.ok(
+      gh.comments[0].body.includes(
+        "@bob Thank you for signing the CLA! We look forward to your contributions.",
+      ),
+    );
+    assert.ok(
+      gh.comments[1].body.includes("@alice") &&
+        !gh.comments[1].body.includes("@bob") &&
+        !gh.comments[1].body.includes("@carol"),
+    );
+
+    // carol signs next - also unrelated. She gets her OWN personal
+    // thank-you (a genuinely new, distinct comment - it names her, not
+    // bob), but the pending-list comment that would follow is byte-for-
+    // byte identical to the one already posted after bob (still just
+    // "@alice", nothing about the PR's state has changed) and must be
+    // deduped, not reposted.
+    await handleIssueComment(signAs(9202, "carol"));
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(
+      gh.comments.length,
+      3,
+      "only carol's own thank-you should be added - the unchanged pending-list comment must be deduped against the earlier one, not posted again just because carol's thank-you sits in between",
+    );
+    assert.ok(
+      gh.comments[2].body.includes(
+        "@carol Thank you for signing the CLA! We look forward to your contributions.",
+      ),
+    );
+    assert.ok(
+      !gh.comments.some(
+        (c, i) =>
+          i !== 1 && c.body.includes("<!-- fossasia-cla-bot:pending -->"),
+      ),
+      "no second pending-list comment should exist anywhere in the thread",
     );
   });
 
