@@ -19,6 +19,7 @@ process.env.SIG_APP_ID = "123456";
 process.env.SIG_APP_PRIVATE_KEY = require("crypto")
   .generateKeyPairSync("rsa", { modulusLength: 2048 })
   .privateKey.export({ type: "pkcs1", format: "pem" });
+const SIG_APP_ID_FOR_TESTS = process.env.SIG_APP_ID;
 
 const {
   readSignatures,
@@ -341,6 +342,142 @@ function fakeResponse(status, jsonBody, headers = {}) {
         u.includes("/repos/a-user-account/cla-signatures/installation"),
       ),
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // GitHub App auth: strengthening the happy path beyond "a token comes
+  // back eventually" - each of these uses its own fresh require() so
+  // getSignaturesToken's module-scope `_cachedSigToken` cache (same
+  // pattern noted in bot-identity.test.js for resolveBotLogin) starts
+  // clean, rather than silently reusing the token minted by the test
+  // above.
+  // ---------------------------------------------------------------------
+  await test("getSignaturesToken sends the App JWT (not GITHUB_TOKEN) as the Bearer auth on BOTH the installation lookup and the access_tokens mint", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    const authHeadersSeen = [];
+    global.fetch = async (url, opts) => {
+      authHeadersSeen.push({ url, auth: opts.headers.Authorization });
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 77 });
+      if (url.includes("/access_tokens"))
+        return fakeResponse(200, { token: "fresh-installation-token" });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    await freshGetToken();
+
+    assert.strictEqual(
+      authHeadersSeen.length,
+      2,
+      "expected exactly the installation lookup + the token mint",
+    );
+    for (const { url, auth } of authHeadersSeen) {
+      assert.ok(
+        auth.startsWith("Bearer "),
+        `expected a Bearer token on ${url}, got: ${auth}`,
+      );
+      assert.notStrictEqual(
+        auth,
+        "Bearer dummy",
+        `must use the App JWT, not the plain GITHUB_TOKEN ("dummy"), on ${url}`,
+      );
+      const jwt = auth.slice("Bearer ".length);
+      const parts = jwt.split(".");
+      assert.strictEqual(
+        parts.length,
+        3,
+        `expected a well-formed JWT (header.payload.signature) on ${url}, got: ${jwt}`,
+      );
+      const claims = JSON.parse(
+        Buffer.from(parts[1], "base64").toString("utf8"),
+      );
+      assert.strictEqual(
+        claims.iss,
+        SIG_APP_ID_FOR_TESTS,
+        `expected the JWT's iss claim to be the configured SIG_APP_ID, got: ${claims.iss}`,
+      );
+    }
+  });
+
+  await test("getSignaturesToken caches the minted token: a second call in the same run makes zero additional API calls", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    let callCount = 0;
+    global.fetch = async (url) => {
+      callCount += 1;
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 88 });
+      if (url.includes("/access_tokens"))
+        return fakeResponse(200, { token: "cached-installation-token" });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const first = await freshGetToken();
+    assert.strictEqual(
+      callCount,
+      2,
+      "expected exactly 2 calls for the first, uncached mint",
+    );
+    const second = await freshGetToken();
+    assert.strictEqual(
+      second,
+      first,
+      "the cached call must return the same token",
+    );
+    assert.strictEqual(
+      callCount,
+      2,
+      "a second call must be served entirely from the cache - zero additional network calls",
+    );
+  });
+
+  await test("getSignaturesToken fails clearly when the GitHub App isn't installed on the signatures repo (404 on the installation lookup)", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation"))
+        return fakeResponse(404, {
+          message: "Not Found",
+          documentation_url: "https://docs.github.com/rest",
+        });
+      throw new Error(
+        `unexpected call: ${url} - must not reach access_tokens after a 404`,
+      );
+    };
+    let caught = null;
+    try {
+      await freshGetToken();
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected getSignaturesToken to throw");
+    assert.strictEqual(caught.status, 404);
+  });
+
+  await test("getSignaturesToken's access_tokens mint is retried on a transient failure (it's marked idempotent) and still succeeds", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let mintAttempts = 0;
+    try {
+      global.fetch = async (url) => {
+        if (url.endsWith("/installation")) return fakeResponse(200, { id: 99 });
+        if (url.includes("/access_tokens")) {
+          mintAttempts += 1;
+          if (mintAttempts < 2)
+            return fakeResponse(503, { message: "Service Unavailable" });
+          return fakeResponse(200, { token: "retried-installation-token" });
+        }
+        throw new Error(`unexpected call: ${url}`);
+      };
+      const token = await freshGetToken();
+      assert.strictEqual(token, "retried-installation-token");
+      assert.strictEqual(
+        mintAttempts,
+        2,
+        "expected 1 failed attempt before the retry succeeds",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
   });
 
   await test("readSignatures falls back to a raw-media-type fetch when the file is too big for inline base64 content (over 1 MB)", async () => {

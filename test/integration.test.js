@@ -132,6 +132,16 @@ function makeFakeGitHub({
       }
       if (method === "PUT") {
         const body = JSON.parse(opts.body);
+        // Real compare-and-swap semantics, matching GitHub: a PUT against a
+        // stale sha is rejected with 409, not silently accepted. Without
+        // this, two genuinely concurrent writers racing through this mock
+        // would just last-write-wins overwrite each other instead of the
+        // second one hitting writeSignatures' real 409-retry path - making
+        // any race test built on this mock pass even if that retry logic
+        // were completely broken.
+        if (body.sha !== state.sha) {
+          return res(409, { message: "sha does not match" });
+        }
         state.signatures = JSON.parse(
           Buffer.from(body.content, "base64").toString(),
         );
@@ -3532,6 +3542,451 @@ function makeFakeGitHub({
           i !== 1 && c.body.includes("<!-- fossasia-cla-bot:pending -->"),
       ),
       "no second pending-list comment should exist anywhere in the thread",
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // Additional coverage merged in from PR #12 (add-tests-2): closed+merged
+  // head.sha exemption, lockPR transient-retry behavior, REQUIRE_VERIFIED_COMMITS
+  // edge cases, concurrent duplicate-webhook dedup, and combined comment rendering.
+  // ---------------------------------------------------------------------
+  await test("handlePullRequestTarget does NOT require pull_request.head.sha for a 'closed'+merged event - only opened/synchronize/reopened need it", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    // No `head` field at all - closed+merged must not care, since it never
+    // reads it.
+    await handlePullRequestTarget({
+      action: "closed",
+      pull_request: { number: 1, merged: true },
+    });
+    assert.strictEqual(gh.lockCalls.length, 1);
+  });
+
+  // ---------------------------------------------------------------------
+  // lockPR: transient-failure retry behavior (distinct from the existing
+  // immediate-403-no-retry test) - a PUT is safeToRetry inside gh(), so a
+  // transient 503 on the lock call should be retried automatically before
+  // lockPR's own best-effort catch/warn ever gets involved.
+  // ---------------------------------------------------------------------
+  await test("lockPR retries a transient failure (503) via gh()'s built-in PUT retry and succeeds silently, without ever logging the best-effort warning", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    const innerFetch = gh.fetch;
+    let lockAttempts = 0;
+    global.fetch = async (url, opts = {}) => {
+      if (
+        url.includes("/lock") &&
+        (opts.method || "GET").toUpperCase() === "PUT"
+      ) {
+        lockAttempts += 1;
+        if (lockAttempts < 3) {
+          return {
+            ok: false,
+            status: 503,
+            text: async () =>
+              JSON.stringify({ message: "Service Unavailable" }),
+            headers: { get: () => null },
+          };
+        }
+      }
+      return innerFetch(url, opts);
+    };
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0); // fast-forward gh()'s retry backoff
+    const originalWarn = console.warn;
+    let warned = false;
+    console.warn = () => {
+      warned = true;
+    };
+    try {
+      await lockPR(1);
+    } finally {
+      global.setTimeout = originalSetTimeout;
+      console.warn = originalWarn;
+    }
+    assert.strictEqual(
+      lockAttempts,
+      3,
+      "expected 2 failed attempts before the 3rd succeeds",
+    );
+    assert.strictEqual(
+      gh.lockCalls.length,
+      1,
+      "exactly one successful lock should have been recorded",
+    );
+    assert.ok(
+      !warned,
+      "a transient failure that eventually succeeds must not log the best-effort warning",
+    );
+  });
+
+  await test("lockPR exhausts gh()'s transient retries (persistent 503) and then falls back to its own best-effort warning, still without throwing", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    const innerFetch = gh.fetch;
+    let lockAttempts = 0;
+    global.fetch = async (url, opts = {}) => {
+      if (
+        url.includes("/lock") &&
+        (opts.method || "GET").toUpperCase() === "PUT"
+      ) {
+        lockAttempts += 1;
+        return {
+          ok: false,
+          status: 503,
+          text: async () => JSON.stringify({ message: "Service Unavailable" }),
+          headers: { get: () => null },
+        };
+      }
+      return innerFetch(url, opts);
+    };
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    const originalWarn = console.warn;
+    let warned = "";
+    console.warn = (msg) => {
+      warned = msg;
+    };
+    try {
+      await assert.doesNotReject(() => lockPR(1));
+    } finally {
+      global.setTimeout = originalSetTimeout;
+      console.warn = originalWarn;
+    }
+    assert.strictEqual(
+      lockAttempts,
+      3,
+      "expected exactly MAX_RETRIES (3) attempts before gh() gives up",
+    );
+    assert.ok(
+      warned.includes("Could not lock PR #1"),
+      `expected the best-effort warning after retries are exhausted, got: ${warned}`,
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // REQUIRE_VERIFIED_COMMITS: combinations beyond the 3 existing
+  // "flag=true" scenarios - the default/off state, env-var parsing
+  // edge cases, and a missing `committer` field under hardening.
+  // ---------------------------------------------------------------------
+  await test("REQUIRE_VERIFIED_COMMITS is false by default: an unverified commit with a mismatched committer is still auto-trusted via GitHub's email-based author match", async () => {
+    delete process.env.REQUIRE_VERIFIED_COMMITS; // explicit: default/unset
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { handleIssueComment: handleDefault } = require("../src/cla-bot.js");
+    try {
+      const gh = makeFakeGitHub({
+        commits: [
+          {
+            sha: "unverifiedandmismatched",
+            author: { id: 5201, login: "some-user" },
+            committer: { id: 8001, login: "someone-else" }, // deliberately mismatched
+            parents: [{ sha: "p1" }],
+            commit: {
+              author: { email: "5201+some-user@users.noreply.github.com" },
+              verification: { verified: false, reason: "unsigned" },
+            },
+          },
+        ],
+        initialSignatures: {
+          version: 1,
+          signatures: [{ id: 5201, login: "some-user" }],
+        },
+      });
+      global.fetch = gh.fetch;
+      const payload = {
+        action: "created",
+        issue: { number: 1, pull_request: {}, user: { login: "some-user" } },
+        comment: {
+          user: { id: 5201, login: "some-user" },
+          body: "recheck",
+          html_url: "x",
+          author_association: "NONE",
+        },
+      };
+      await handleDefault(payload);
+      assert.strictEqual(
+        gh.statuses[gh.statuses.length - 1].state,
+        "success",
+        "with the flag off (default), only the email-based author match should matter - verification status and committer mismatch must be ignored",
+      );
+    } finally {
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+    }
+  });
+
+  await test('REQUIRE_VERIFIED_COMMITS="TRUE" (mixed case) is treated the same as "true" - the comparison is case-insensitive', async () => {
+    process.env.REQUIRE_VERIFIED_COMMITS = "TRUE";
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { handleIssueComment: handleHardened } = require("../src/cla-bot.js");
+    try {
+      const gh = makeFakeGitHub({
+        commits: [
+          {
+            sha: "uppercaseflagtest",
+            author: { id: 5301, login: "some-user" },
+            committer: { id: 5301, login: "some-user" },
+            parents: [{ sha: "p1" }],
+            commit: {
+              author: { email: "5301+some-user@users.noreply.github.com" },
+              verification: { verified: false, reason: "unsigned" },
+            },
+          },
+        ],
+        initialSignatures: {
+          version: 1,
+          signatures: [{ id: 5301, login: "some-user" }],
+        },
+      });
+      global.fetch = gh.fetch;
+      const payload = {
+        action: "created",
+        issue: { number: 1, pull_request: {}, user: { login: "some-user" } },
+        comment: {
+          user: { id: 5301, login: "some-user" },
+          body: "recheck",
+          html_url: "x",
+          author_association: "NONE",
+        },
+      };
+      await handleHardened(payload);
+      assert.strictEqual(
+        gh.statuses[gh.statuses.length - 1].state,
+        "failure",
+        'REQUIRE_VERIFIED_COMMITS="TRUE" must harden just like "true"',
+      );
+    } finally {
+      delete process.env.REQUIRE_VERIFIED_COMMITS;
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+    }
+  });
+
+  await test('REQUIRE_VERIFIED_COMMITS="1" does NOT enable hardening - only the literal string "true" (any case) does, by design', async () => {
+    process.env.REQUIRE_VERIFIED_COMMITS = "1";
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { handleIssueComment: handleWithOne } = require("../src/cla-bot.js");
+    try {
+      const gh = makeFakeGitHub({
+        commits: [
+          {
+            sha: "onevaluetest",
+            author: { id: 5401, login: "some-user" },
+            committer: { id: 9999, login: "someone-else" },
+            parents: [{ sha: "p1" }],
+            commit: {
+              author: { email: "5401+some-user@users.noreply.github.com" },
+              verification: { verified: false },
+            },
+          },
+        ],
+        initialSignatures: {
+          version: 1,
+          signatures: [{ id: 5401, login: "some-user" }],
+        },
+      });
+      global.fetch = gh.fetch;
+      const payload = {
+        action: "created",
+        issue: { number: 1, pull_request: {}, user: { login: "some-user" } },
+        comment: {
+          user: { id: 5401, login: "some-user" },
+          body: "recheck",
+          html_url: "x",
+          author_association: "NONE",
+        },
+      };
+      await handleWithOne(payload);
+      assert.strictEqual(
+        gh.statuses[gh.statuses.length - 1].state,
+        "success",
+        '"1" is not the literal string "true", so hardening must stay OFF - this locks down a common misconfiguration where someone sets REQUIRE_VERIFIED_COMMITS=1 expecting it to work',
+      );
+    } finally {
+      delete process.env.REQUIRE_VERIFIED_COMMITS;
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+    }
+  });
+
+  await test("REQUIRE_VERIFIED_COMMITS=true treats a commit with no committer field at all as unresolved (fails closed), without crashing", async () => {
+    process.env.REQUIRE_VERIFIED_COMMITS = "true";
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { handleIssueComment: handleHardened } = require("../src/cla-bot.js");
+    try {
+      const gh = makeFakeGitHub({
+        commits: [
+          {
+            sha: "nocommitterfield",
+            author: { id: 5501, login: "some-user" },
+            // committer field entirely absent
+            parents: [{ sha: "p1" }],
+            commit: {
+              author: { email: "5501+some-user@users.noreply.github.com" },
+              verification: { verified: true, reason: "valid" },
+            },
+          },
+        ],
+        initialSignatures: {
+          version: 1,
+          signatures: [{ id: 5501, login: "some-user" }],
+        },
+      });
+      global.fetch = gh.fetch;
+      const payload = {
+        action: "created",
+        issue: { number: 1, pull_request: {}, user: { login: "some-user" } },
+        comment: {
+          user: { id: 5501, login: "some-user" },
+          body: "recheck",
+          html_url: "x",
+          author_association: "NONE",
+        },
+      };
+      await assert.doesNotReject(() => handleHardened(payload));
+      assert.strictEqual(
+        gh.statuses[gh.statuses.length - 1].state,
+        "failure",
+        "a missing committer field must fail closed under hardening, not crash and not be silently trusted",
+      );
+    } finally {
+      delete process.env.REQUIRE_VERIFIED_COMMITS;
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+    }
+  });
+
+  // ---------------------------------------------------------------------
+  // Concurrent write-success race: the SAME user (a duplicate webhook
+  // delivery of the identical sign-phrase comment, which GitHub can and
+  // does send) racing against itself, rather than two different users.
+  // ---------------------------------------------------------------------
+  await test("the same user signing via a genuinely concurrent duplicate webhook delivery is deduped to exactly one recorded signature, not two", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "duplicatewebhooktest",
+          author: { id: 6101, login: "double-signer" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "double-signer@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    // Force a real race: hold both concurrent calls' initial signature-file
+    // reads open with a barrier until both have arrived, so they're
+    // guaranteed to see the identical (empty) starting state before either
+    // one writes - exactly like two copies of the same webhook delivered
+    // close enough together to both start before either finishes.
+    let inFlightSigReads = 0;
+    let releaseReads;
+    const bothArrived = new Promise((resolve) => {
+      releaseReads = resolve;
+    });
+    const innerFetch = gh.fetch;
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.includes("/contents/signatures/cla.json") && method === "GET") {
+        inFlightSigReads += 1;
+        if (inFlightSigReads >= 2) releaseReads();
+        if (inFlightSigReads <= 2) await bothArrived; // only the two initial reads block on each other
+      }
+      return innerFetch(url, opts);
+    };
+
+    const payload = {
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "double-signer" } },
+      comment: {
+        user: { id: 6101, login: "double-signer" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    };
+
+    await Promise.all([
+      handleIssueComment(payload),
+      handleIssueComment(payload),
+    ]);
+
+    assert.strictEqual(
+      gh.signatures.signatures.filter((s) => s.id === 6101).length,
+      1,
+      "a genuine concurrent duplicate delivery must record the signer exactly once, never twice and never zero times",
+    );
+    assert.strictEqual(
+      gh.comments.filter((c) => c.body.includes("already signed")).length,
+      1,
+      "exactly one of the two racing calls should have discovered it was already signed and replied accordingly",
+    );
+    // Both racing calls independently re-check the PR and each calls
+    // setStatus() once - the one that actually recorded the signature (via
+    // its normal, non-statusOnly checkPR call) AND the one that discovered
+    // it was already signed (via its statusOnly:true checkPR call, which
+    // exists specifically to bring a possibly-stale status up to date - see
+    // handleIssueComment's `alreadySigned` branch). That's fine by design:
+    // setStatus()'s own doc comment notes that posting the same status
+    // twice is a harmless no-op on GitHub's side (only the latest status
+    // per context is ever shown), so this is not something worth
+    // serializing against. What must never happen is a STALE status (e.g.
+    // a leftover "failure" from before the signature landed) winning the
+    // race - so every status either call posts here must agree, and must
+    // be "success".
+    assert.ok(
+      gh.statuses.length >= 1,
+      "at least one status update must have been posted",
+    );
+    assert.ok(
+      gh.statuses.every((s) => s.state === "success"),
+      "every status posted by either racing call must be 'success' - a stale 'failure' status must never win this race",
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // Comment rendering: both "missing" and "unresolved" sections together.
+  // ---------------------------------------------------------------------
+  await test("a PR comment correctly lists BOTH missing signers AND unresolved commits at the same time, not just whichever was checked first", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "unsignedcommitsha1",
+          author: { id: 1, login: "unsigned-author" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+        {
+          sha: "unresolvedcommitsha2",
+          author: null,
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "b@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    const lastComment = gh.comments[gh.comments.length - 1].body;
+    assert.ok(
+      lastComment.includes("@unsigned-author"),
+      "the missing-signer section must list the unsigned author",
+    );
+    assert.ok(
+      lastComment.includes("unresolvedcommitsha2".slice(0, 7)),
+      "the unresolved-commit section must list the unresolvable commit by sha",
+    );
+    assert.ok(
+      lastComment.includes("could not be automatically attributed"),
+      "both sections must genuinely be present together in the one comment, not one overwriting the other",
     );
   });
 
