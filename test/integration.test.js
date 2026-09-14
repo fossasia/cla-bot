@@ -517,10 +517,12 @@ function makeFakeGitHub({
 
   await test("REQUIRE_VERIFIED_COMMITS=true flags an unverified commit for manual review instead of auto-trusting GitHub's email-based author match", async () => {
     const originalRVC = process.env.REQUIRE_VERIFIED_COMMITS;
-    process.env.REQUIRE_VERIFIED_COMMITS = "true";
-    delete require.cache[require.resolve("../src/cla-bot.js")];
-    const { handleIssueComment: handleHardened } = require("../src/cla-bot.js");
     try {
+      process.env.REQUIRE_VERIFIED_COMMITS = "true";
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+      const {
+        handleIssueComment: handleHardened,
+      } = require("../src/cla-bot.js");
       const gh = makeFakeGitHub({
         commits: [
           {
@@ -577,10 +579,12 @@ function makeFakeGitHub({
 
   await test("REQUIRE_VERIFIED_COMMITS=true does NOT trust a validly-VERIFIED commit whose author differs from its committer (the author-vs-committer forgery: GitHub only ever cryptographically verifies the committer)", async () => {
     const originalRVC = process.env.REQUIRE_VERIFIED_COMMITS;
-    process.env.REQUIRE_VERIFIED_COMMITS = "true";
-    delete require.cache[require.resolve("../src/cla-bot.js")];
-    const { handleIssueComment: handleHardened } = require("../src/cla-bot.js");
     try {
+      process.env.REQUIRE_VERIFIED_COMMITS = "true";
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+      const {
+        handleIssueComment: handleHardened,
+      } = require("../src/cla-bot.js");
       const gh = makeFakeGitHub({
         commits: [
           {
@@ -641,10 +645,12 @@ function makeFakeGitHub({
 
   await test("REQUIRE_VERIFIED_COMMITS=true DOES trust a verified commit when author and committer are genuinely the same account (the legitimate case)", async () => {
     const originalRVC = process.env.REQUIRE_VERIFIED_COMMITS;
-    process.env.REQUIRE_VERIFIED_COMMITS = "true";
-    delete require.cache[require.resolve("../src/cla-bot.js")];
-    const { handleIssueComment: handleHardened } = require("../src/cla-bot.js");
     try {
+      process.env.REQUIRE_VERIFIED_COMMITS = "true";
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+      const {
+        handleIssueComment: handleHardened,
+      } = require("../src/cla-bot.js");
       const gh = makeFakeGitHub({
         commits: [
           {
@@ -3687,10 +3693,12 @@ function makeFakeGitHub({
   // ---------------------------------------------------------------------
   await test("REQUIRE_VERIFIED_COMMITS is false by default: an unverified commit with a mismatched committer is still auto-trusted via GitHub's email-based author match", async () => {
     const originalRVC = process.env.REQUIRE_VERIFIED_COMMITS;
-    delete process.env.REQUIRE_VERIFIED_COMMITS; // explicit: default/unset
-    delete require.cache[require.resolve("../src/cla-bot.js")];
-    const { handleIssueComment: handleDefault } = require("../src/cla-bot.js");
     try {
+      delete process.env.REQUIRE_VERIFIED_COMMITS; // explicit: default/unset
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+      const {
+        handleIssueComment: handleDefault,
+      } = require("../src/cla-bot.js");
       const gh = makeFakeGitHub({
         commits: [
           {
@@ -3736,10 +3744,12 @@ function makeFakeGitHub({
 
   await test('REQUIRE_VERIFIED_COMMITS="TRUE" (mixed case) is treated the same as "true" - the comparison is case-insensitive', async () => {
     const originalRVC = process.env.REQUIRE_VERIFIED_COMMITS;
-    process.env.REQUIRE_VERIFIED_COMMITS = "TRUE";
-    delete require.cache[require.resolve("../src/cla-bot.js")];
-    const { handleIssueComment: handleHardened } = require("../src/cla-bot.js");
     try {
+      process.env.REQUIRE_VERIFIED_COMMITS = "TRUE";
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+      const {
+        handleIssueComment: handleHardened,
+      } = require("../src/cla-bot.js");
       const gh = makeFakeGitHub({
         commits: [
           {
@@ -3785,10 +3795,12 @@ function makeFakeGitHub({
 
   await test('REQUIRE_VERIFIED_COMMITS="1" does NOT enable hardening - only the literal string "true" (any case) does, by design', async () => {
     const originalRVC = process.env.REQUIRE_VERIFIED_COMMITS;
-    process.env.REQUIRE_VERIFIED_COMMITS = "1";
-    delete require.cache[require.resolve("../src/cla-bot.js")];
-    const { handleIssueComment: handleWithOne } = require("../src/cla-bot.js");
     try {
+      process.env.REQUIRE_VERIFIED_COMMITS = "1";
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+      const {
+        handleIssueComment: handleWithOne,
+      } = require("../src/cla-bot.js");
       const gh = makeFakeGitHub({
         commits: [
           {
@@ -3834,10 +3846,12 @@ function makeFakeGitHub({
 
   await test("REQUIRE_VERIFIED_COMMITS=true treats a commit with no committer field at all as unresolved (fails closed), without crashing", async () => {
     const originalRVC = process.env.REQUIRE_VERIFIED_COMMITS;
-    process.env.REQUIRE_VERIFIED_COMMITS = "true";
-    delete require.cache[require.resolve("../src/cla-bot.js")];
-    const { handleIssueComment: handleHardened } = require("../src/cla-bot.js");
     try {
+      process.env.REQUIRE_VERIFIED_COMMITS = "true";
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+      const {
+        handleIssueComment: handleHardened,
+      } = require("../src/cla-bot.js");
       const gh = makeFakeGitHub({
         commits: [
           {
