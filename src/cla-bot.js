@@ -79,6 +79,79 @@ const ALLOWLIST = (process.env.ALLOWLIST || "")
 const SIGN_PHRASE = "I have read the CLA Document and I hereby sign the CLA";
 const STATUS_CONTEXT = "cla/fossasia";
 const BOT_MARKER = "<!-- fossasia-cla-bot:v1 -->";
+// Embedded (in addition to BOT_MARKER) in the comment checkPR posts when a
+// PR genuinely needs action - someone still needs to sign, or a commit
+// needs manual review. Together with the two legacy text fragments below,
+// this is how a later, automatically triggered checkPR call recognizes
+// "this PR was actually blocked at some point" - see classifyBotComment()
+// and quietIfNeverFlagged.
+const PENDING_MARKER = "<!-- fossasia-cla-bot:pending -->";
+// The exact fragments that appear in the "please sign" and "needs manual
+// review" comment templates below (see the `lines` array in checkPR).
+// Defined once and referenced from both the template text and
+// classifyBotComment() so the two can never silently drift apart - and,
+// importantly, so a PR blocked by an OLDER deployment of this bot (from
+// before PENDING_MARKER existed, which only ever wrote this same wording)
+// is still correctly recognized as having been blocked. PENDING_MARKER
+// alone would miss those pre-existing comments entirely on the very first
+// run of the upgraded code.
+const NEEDS_SIGN_FRAGMENT = "need to sign our";
+const NEEDS_REVIEW_FRAGMENT = "could not be automatically attributed";
+// The exact legacy success wording, kept as its own constant so
+// classifyBotComment() can still recognize a plain-text success comment
+// posted by an OLDER deployment of this bot, from before SUCCESS_MARKER
+// existed (same reasoning as the two NEEDS_*_FRAGMENT constants above for
+// the "pending" case) - see the fallback check in classifyBotComment.
+const LEGACY_SUCCESS_TEXT = "All contributors have signed the CLA. ✅";
+// The full body of a "success" comment as posted by a version of this bot
+// from before SUCCESS_MARKER existed: back then, a success comment's
+// entire content beyond BOT_MARKER was always nothing more than this one
+// fixed string, with nothing else ever appended - unlike NEEDS_SIGN_FRAGMENT/
+// NEEDS_REVIEW_FRAGMENT above, which are genuinely partial fragments of a
+// longer, variable comment (one that also lists specific missing
+// contributors or unresolved commit SHAs, so no fixed whole-body string
+// exists to match against). Since the full legacy body IS fixed and known,
+// classifyBotComment checks it with an exact equality match rather than a
+// substring search - substring matching here would risk a false positive on
+// some unrelated future bot comment that merely happens to quote or mention
+// this exact phrase.
+const LEGACY_SUCCESS_COMMENT = `${BOT_MARKER}\n${LEGACY_SUCCESS_TEXT}`;
+// Embedded (in addition to BOT_MARKER) in EVERY comment this bot posts that
+// announces a PR as fully signed. classifyBotComment() looks for this
+// marker first, falling back to LEGACY_SUCCESS_COMMENT only for comments
+// predating it, so that checkPR's quietIfNeverFlagged history check keeps
+// recognizing "this PR's completion was already announced" even though the
+// visible wording now varies per signer instead of always being the one
+// fixed string it used to be. SUCCESS_MESSAGE below is built FROM this
+// marker (rather than the marker being appended separately at each call
+// site) specifically so that guarantee can never be broken by editing the
+// generic wording without also remembering to touch classifyBotComment.
+// Unlike LEGACY_SUCCESS_COMMENT above, this marker is matched with a
+// substring search rather than exact equality - it's a purpose-built,
+// distinctive HTML-comment sentinel (not a plain English phrase that could
+// plausibly appear elsewhere), and the personalized variant it also appears
+// in (personalSuccessMessage()) has a variable "@login" suffix that an
+// exact whole-body match couldn't account for anyway.
+const SUCCESS_MARKER = "<!-- fossasia-cla-bot:success -->";
+// Only ever used when checkPR() has no specific signer to credit (an
+// automatic pull_request_target check, or the human-triggered `recheck`
+// command) - see personalSuccessMessage() below for the normal, per-signer
+// case.
+const SUCCESS_MESSAGE = `${SUCCESS_MARKER}\n${LEGACY_SUCCESS_TEXT}`;
+// The per-signer announcement checkPR() posts when the person who *just*
+// signed (via the sign-phrase comment) is themselves one of the PR's
+// required (non-allowlisted) commit authors AND their signing is what
+// makes the PR fully signed. Replaces the one-size-fits-all SUCCESS_MESSAGE
+// for that specific case, so the contributor who unblocked the PR is
+// thanked by name instead of an anonymous "All contributors..."
+// announcement. See checkPR()'s `signer` option and the
+// `signerCompletedRequirement` check there for why this is NOT used
+// whenever `signer` is merely present - crediting a completely unrelated
+// commenter (someone who isn't even a commit author on this PR) with
+// "completing" a PR they had no bearing on would be actively misleading.
+function personalSuccessMessage(login) {
+  return `${SUCCESS_MARKER}\n@${login} Thank you for signing the CLA! We look forward to your contributions.`;
+}
 // Optional hardening, off by default so normal unsigned-commit workflows
 // keep working. GitHub attributes a commit's author to an account purely by
 // matching the commit's git email - for the noreply format that's
@@ -124,6 +197,63 @@ function fail(msg) {
 const GITHUB_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
 // Repo names are looser: letters, digits, '.', '-', '_', up to 100 chars.
 const GITHUB_REPO_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
+
+// ---------------------------------------------------------------------------
+// Webhook-payload sanitizers.
+//
+// EVENT_PATH (see main()) is a JSON file GitHub itself writes before the job
+// starts, but it's still external, file-provided data - a PR/issue number or
+// commit SHA read out of it flows straight into the path of every gh()/fetch
+// call below (postComment, checkPR, lockPR, setStatus, ...). These two
+// checks are called right where that data is first pulled out of the parsed
+// payload (handleIssueComment, handlePullRequestTarget), so nothing
+// unvalidated from the file ever reaches a request URL - a malformed or
+// unexpected event file fails loudly here instead of being interpolated
+// into an outbound API call.
+//
+// Number.isSafeInteger(), not Number.isInteger(): every double beyond
+// 2^53 is still "an integer" with no fractional part, so Number.isInteger
+// happily accepts values like 1e100 or Number.MAX_SAFE_INTEGER + 1 - which
+// then serialize into a URL as garbage (e.g. "1e+100") instead of a real
+// PR number. Worse, JSON.parse() itself silently rounds an out-of-range
+// integer literal in the source JSON to the nearest representable double
+// (JSON.parse("9007199254740993") === 9007199254740992) - by the time
+// this function sees the value, that corruption has already happened, so
+// isSafeInteger is the only check that reliably tells us we're not one of
+// those rounded, no-longer-faithful values. No real GitHub PR/issue number
+// is ever remotely close to this boundary, so this is strictly tighter
+// with zero risk to legitimate input.
+function assertValidPRNumber(value, context) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `${context}: expected a positive integer issue/PR number, got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
+
+// Real git commit SHAs are lowercase hex (40 chars for sha1, 64 for
+// sha256), but test/tooling code sometimes uses opaque placeholder strings
+// in their place, so this deliberately doesn't require hex - it only
+// rejects what would actually be dangerous as a URL path segment: slashes,
+// "..", "?"/"#" (which would truncate or redirect the request path/query),
+// whitespace/control characters, and "%" (blocks a percent-encoded
+// bypass of the checks above, e.g. "%2e%2e" or "%2f" - a real SHA never
+// contains one either way, so this costs nothing).
+const UNSAFE_URL_SEGMENT_RE = /[/\\?#%\s\x00-\x1f]|\.\./;
+function assertValidSha(value, context) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.length > 64 ||
+    UNSAFE_URL_SEGMENT_RE.test(value)
+  ) {
+    throw new Error(
+      `${context}: expected a valid commit SHA, got ${JSON.stringify(value)}`,
+    );
+  }
+  return value;
+}
 
 function validateConfig() {
   for (const [name, val] of [
@@ -460,6 +590,121 @@ function isAllowlisted(login) {
   return ALLOWLIST.some((a) => a.toLowerCase() === l);
 }
 
+// Same "prefer numeric id, fall back to a case-insensitive login compare"
+// matching rule as isSigned() above (kept as its own small function rather
+// than shared code, so a future change to either doesn't have to reason
+// about the other) - applied here to answer a different question: not
+// "has this identity signed anywhere", but "is this identity one of THIS
+// PR's own commit authors". Used by checkPR to tell a genuine required
+// signer apart from a bystander whose sign-phrase comment didn't actually
+// unblock this particular PR (see the `signerCompletedRequirement` check
+// there, and personalSuccessMessage()'s doc comment for why that
+// distinction matters).
+function isSameContributor(a, b) {
+  if (!a || !b) return false;
+  if (typeof a.id === "number" && typeof b.id === "number") {
+    return a.id === b.id;
+  }
+  return (
+    typeof a.login === "string" &&
+    typeof b.login === "string" &&
+    a.login.toLowerCase() === b.login.toLowerCase()
+  );
+}
+
+// Combines a caller's already-known signature snapshot (e.g. the object
+// writeSignatures() just returned) with a freshly-read one, so that neither
+// side's staleness can hide a real signature from checkPR:
+//
+//  - `fresh` might still be serving the pre-write snapshot due to GitHub's
+//    Contents API read-after-write staleness window (see checkPR's doc
+//    comment) - `known`'s entries (the exact data the caller's own write
+//    just produced) cover that gap.
+//  - `known` was captured at some point BEFORE listPRCommitAuthors() ran,
+//    and can't reflect a signature written by a completely different
+//    workflow run (e.g. someone signing via a different PR/repo) that lands
+//    in the shared store while that call is in flight - `fresh`'s entries
+//    cover that gap instead.
+//
+// Where the same identity (per isSameContributor's id-first, login-fallback
+// rule) appears in both, the fresh entry wins, since it's the more recently
+// observed state of the shared store; entries only `known` has are kept
+// as-is. `known` may be null/undefined (every checkPR() caller except
+// handleIssueComment's has no such snapshot to hand over), in which case
+// `fresh` is returned unchanged.
+function mergeSignatures(known, fresh) {
+  if (!known) return fresh;
+  const keptFromKnown = known.signatures.filter(
+    (k) => !fresh.signatures.some((f) => isSameContributor(k, f)),
+  );
+  return {
+    version: fresh.version,
+    signatures: [...keptFromKnown, ...fresh.signatures],
+  };
+}
+
+// Was `signer` actually a required (non-allowlisted) commit author among
+// `authors` (a PR's own commit authors, as returned by
+// listPRCommitAuthors())? Extracted as its own top-level function - rather
+// than an expression inlined into checkPR - specifically so it has ONE
+// definition that's directly unit-testable on its own (see
+// test/logic.test.js), instead of being duplicated between production code
+// and a re-typed copy of the same expression in its tests, which could
+// silently drift out of sync with each other over time.
+//
+// checkPR calls this only after confirming `missing.length === 0 &&
+// unresolved.length === 0` (the PR IS now fully signed), and only ever
+// passes a `signer` who just recorded a BRAND NEW signature (handleIssueComment
+// only passes `signer` after confirming they weren't already signed - see
+// there). So if `signer` really is a required author here, they were
+// necessarily among `missing` a moment ago and are not anymore: their
+// comment is genuinely what moved this PR's own requirement forward. If
+// not - an allowlisted account, or someone who never authored a commit on
+// this PR at all - their signing had zero effect on this PR's `missing`
+// list either way, so they get no credit for "completing" it (see
+// personalSuccessMessage()'s doc comment for why that distinction matters).
+function signerCompletedRequirement(authors, signer) {
+  return (
+    !!signer &&
+    !isAllowlisted(signer.login) &&
+    authors.some((a) => isSameContributor(a, signer))
+  );
+}
+
+// Classifies one of the bot's own comments (see getExistingBotComments -
+// only ever called on comments already confirmed to be from the bot) as
+// either "pending" (a real "you still need to sign" / "needs manual
+// review" comment - the PR was genuinely blocked when this was posted),
+// "success" (the "All contributors have signed" announcement), or neither
+// (e.g. the personal, non-blocking "you already signed the CLA, nothing
+// more to do here" reply someone gets for redundantly re-submitting the
+// sign phrase). Used by checkPR's quietIfNeverFlagged logic to tell a real
+// block apart from unrelated bot chatter on the same thread.
+function classifyBotComment(body) {
+  if (
+    body.includes(PENDING_MARKER) ||
+    body.includes(NEEDS_SIGN_FRAGMENT) ||
+    body.includes(NEEDS_REVIEW_FRAGMENT)
+  ) {
+    return "pending";
+  }
+  // SUCCESS_MARKER covers both the generic SUCCESS_MESSAGE and the
+  // personalized per-signer thank-you (personalSuccessMessage()), since
+  // SUCCESS_MESSAGE is built directly from this marker (see its doc
+  // comment) - so this ALSO catches any future change to the generic
+  // wording, as long as it keeps going through SUCCESS_MESSAGE. The
+  // LEGACY_SUCCESS_COMMENT check is a separate, deliberately EXACT
+  // (not substring) fallback: it's the only thing that still recognizes a
+  // genuinely pre-marker comment (one posted by an older deployment of
+  // this bot, whose entire body was always just that one fixed string with
+  // nothing else appended - see LEGACY_SUCCESS_COMMENT's doc comment for
+  // why exact equality is correct, and safer, here specifically).
+  if (body.includes(SUCCESS_MARKER) || body === LEGACY_SUCCESS_COMMENT) {
+    return "success";
+  }
+  return "other";
+}
+
 // ---------------------------------------------------------------------------
 // Repo-local helpers (comments / status / lock) - always use GITHUB_TOKEN,
 // never the signatures token.
@@ -497,7 +742,7 @@ async function resolveLoginById(id) {
   if (_loginByIdCache.has(id)) return _loginByIdCache.get(id);
   let login = null;
   try {
-    const user = await gh(`/user/${id}`, GITHUB_TOKEN);
+    const user = await gh(`/user/${encodeURIComponent(id)}`, GITHUB_TOKEN);
     if (user && typeof user.login === "string" && user.login.length > 0) {
       login = user.login;
     }
@@ -582,7 +827,7 @@ async function listPRCommitAuthors(prNumber) {
   let page = 1;
   for (;;) {
     const commits = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}/commits?per_page=100&page=${page}`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}/commits?per_page=100&page=${page}`,
       GITHUB_TOKEN,
     );
     if (!commits.length) break;
@@ -653,24 +898,62 @@ async function resolveBotLogin() {
   return _cachedBotLogin;
 }
 
-async function getExistingBotComments(prNumber) {
+async function getExistingBotComments(
+  prNumber,
+  { anyBotIdentity = false } = {},
+) {
   const botLogin = await resolveBotLogin();
   const all = [];
   let page = 1;
   for (;;) {
     const comments = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/comments?per_page=100&page=${page}`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?per_page=100&page=${page}`,
       GITHUB_TOKEN,
     );
     if (!comments.length) break;
     all.push(
-      ...comments.filter(
-        (c) =>
-          c.user &&
-          c.user.login === botLogin &&
-          c.body &&
-          c.body.includes(BOT_MARKER),
-      ),
+      ...comments.filter((c) => {
+        if (!c.user || !c.body || !c.body.includes(BOT_MARKER)) return false;
+        if (c.user.login === botLogin) return true;
+        // Broader match, opt-in via `anyBotIdentity` - used ONLY for the
+        // block/recovery history check in checkPR's quietIfNeverFlagged
+        // logic, never for postComment()'s own dedupe (which intentionally
+        // stays strict to the currently resolved identity - see
+        // bot-identity-success.test.js, which relies on a differently-
+        // identified past comment NOT counting as an already-said
+        // duplicate).
+        //
+        // Without this, a consumer that switches GITHUB_TOKEN from the
+        // default Actions token to a PAT or a separate GitHub App
+        // installation token (or back) mid-flight would have every comment
+        // posted under the OLD identity silently excluded here, since
+        // resolveBotLogin() only ever reports the CURRENT run's identity.
+        // A PR genuinely blocked before the switch would then look like it
+        // was never flagged, and its recovery announcement would be
+        // wrongly suppressed once it becomes fully signed.
+        //
+        // `type === "Bot"` is a field GitHub itself sets on the comment
+        // author and cannot be spoofed by an ordinary contributor's own
+        // account (see the spoofed-comment test below, whose fake commenter
+        // has no such type and so still fails this check) - it covers the
+        // default GITHUB_TOKEN identity and any GitHub-App-based custom
+        // token, regardless of which exact bot login was in use at the
+        // time. DEFAULT_BOT_LOGIN is checked too, as a defense-in-depth
+        // fallback for the single most common case (plain GITHUB_TOKEN) in
+        // case `type` is ever missing from a response - GitHub reserves
+        // the `[bot]`-suffixed login namespace for bot accounts, so an
+        // ordinary user can't take that exact login either. The one gap
+        // neither check can close is a PAT identity rotating to a
+        // DIFFERENT PAT-owned account: both report as an ordinary `type:
+        // "User"` account with an unreserved login, indistinguishable from
+        // any other GitHub user, so that specific switch still can't
+        // recover cross-identity history - a narrow, documented
+        // limitation (see CHANGELOG.md).
+        return (
+          anyBotIdentity &&
+          (c.user.type === "Bot" || c.user.login === DEFAULT_BOT_LOGIN)
+        );
+      }),
     );
     if (comments.length < 100) break;
     page += 1;
@@ -679,14 +962,35 @@ async function getExistingBotComments(prNumber) {
 }
 
 async function postComment(prNumber, body, dedupe = true) {
+  // Defense-in-depth: postComment is exported and callable directly (not
+  // only via the validated handleIssueComment/handlePullRequestTarget entry
+  // points), so it re-checks its own input rather than trusting every
+  // caller to have validated it first.
+  assertValidPRNumber(prNumber, "postComment(prNumber)");
   const full = `${BOT_MARKER}\n${body}`;
   if (dedupe) {
     const existing = await getExistingBotComments(prNumber);
-    const last = existing[existing.length - 1];
-    if (last && last.body === full) return; // nothing changed, don't spam the thread
+    // Compare against the most recent bot comment of the SAME category
+    // (per classifyBotComment: "pending", "success", or "other"), not
+    // merely the literal last bot comment overall. checkPR can post two
+    // comments back to back within a single call - a personal per-signer
+    // thank-you ("other") followed by the pending-list comment
+    // ("pending") - so a LATER call's own pending comment would otherwise
+    // be compared against an unrelated, DIFFERENT signer's thank-you that
+    // landed in between (e.g. two different unrelated contributors each
+    // signing while the same required contributor is still missing),
+    // rather than against the earlier, byte-identical pending comment it
+    // should actually be deduped against. Comparing within the same
+    // category finds the right prior comment to compare against
+    // regardless of what other comment category was posted in between.
+    const category = classifyBotComment(full);
+    const lastOfCategory = existing.findLast(
+      (c) => classifyBotComment(c.body) === category,
+    );
+    if (lastOfCategory && lastOfCategory.body === full) return; // nothing changed, don't spam the thread
   }
   await gh(
-    `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/comments`,
+    `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments`,
     GITHUB_TOKEN,
     {
       method: "POST",
@@ -733,7 +1037,7 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
   for (const dup of matching.slice(0, -1)) {
     try {
       await gh(
-        `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${dup.id}`,
+        `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${encodeURIComponent(dup.id)}`,
         GITHUB_TOKEN,
         { method: "DELETE" },
       );
@@ -749,24 +1053,34 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
 }
 
 async function setStatus(sha, state, description) {
-  await gh(`/repos/${REPO_OWNER}/${REPO_NAME}/statuses/${sha}`, GITHUB_TOKEN, {
-    method: "POST",
-    // Posting the same status twice has no visible effect - GitHub only
-    // shows the latest status per context - so it's fine to let gh() retry
-    // a transient failure here.
-    idempotent: true,
-    body: JSON.stringify({
-      state,
-      description: description.slice(0, 140),
-      context: STATUS_CONTEXT,
-    }),
-  });
+  await gh(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/statuses/${encodeURIComponent(sha)}`,
+    GITHUB_TOKEN,
+    {
+      method: "POST",
+      // Posting the same status twice has no visible effect - GitHub only
+      // shows the latest status per context - so it's fine to let gh() retry
+      // a transient failure here.
+      idempotent: true,
+      body: JSON.stringify({
+        state,
+        description: description.slice(0, 140),
+        context: STATUS_CONTEXT,
+      }),
+    },
+  );
 }
 
 async function lockPR(prNumber) {
   try {
+    // Defense-in-depth, same reasoning as postComment(): lockPR is exported
+    // and callable directly. Validating inside the try means a bad
+    // prNumber is handled exactly like any other lock failure - logged and
+    // swallowed, never thrown - keeping lockPR's "never fails the run"
+    // contract intact.
+    assertValidPRNumber(prNumber, "lockPR(prNumber)");
     await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${prNumber}/lock`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/lock`,
       GITHUB_TOKEN,
       {
         method: "PUT",
@@ -781,26 +1095,165 @@ async function lockPR(prNumber) {
 
 // ---------------------------------------------------------------------------
 // Core: evaluate one PR and bring its status/comment up to date.
-// ---------------------------------------------------------------------------
-async function checkPR(prNumber, headSha) {
+//
+// `quietIfNeverFlagged` (only ever passed `true` by the automatic
+// pull_request_target handler - see handlePullRequestTarget) controls
+// whether a clean result gets announced with a comment:
+//
+// - A brand new PR whose commit authors had ALL already signed the CLA
+//   before this PR ever existed needs no comment at all - nothing was
+//   ever required of anyone here, so saying "All contributors have signed
+//   the CLA ✅" on a PR the bot has never spoken on before is pure noise.
+//   The commit status is still set to "success" either way, since that's
+//   what merge protection actually reads.
+// - The moment this PR ever *did* need a signer or manual review (a
+//   comment classifyBotComment() recognizes as "pending" was posted for
+//   it, at any point in its history) and it later becomes fully signed,
+//   that transition is worth announcing - people watched this PR go from
+//   blocked to unblocked. A personal, non-blocking reply (e.g. "you
+//   already signed, nothing more to do here" from someone re-submitting
+//   the sign phrase) doesn't count as ever having been blocked - it says
+//   nothing about the PR's own state.
+// - Once that transition has already been announced, later fully-signed
+//   checks stay quiet again even if some unrelated comment (like that same
+//   personal reply) lands afterward - re-announcing "all signed" every
+//   time something unrelated gets posted would just reintroduce the same
+//   noise this whole feature exists to remove. Concretely: this compares
+//   the position of the *most recent* "pending" comment against the most
+//   recent "success" one - success is only (re-)announced when a pending
+//   comment is the more recent of the two, i.e. a real block happened
+//   since the last time success was announced (or it's never been
+//   announced at all).
+// - An explicit human trigger (the sign-phrase comment, or the `recheck`
+//   command handled in handleIssueComment) always gets an answer, quiet
+//   or not: the caller took an action and asked a direct question, so
+//   `checkPR` is invoked there without this flag and always comments,
+//   regardless of what's already been said on the thread (aside from the
+//   ordinary same-category dedupe every postComment() call already does -
+//   see its own doc comment).
+//
+// This is what makes "new committers joining an already-compliant PR"
+// behave as silently as the very first check: as long as this PR has never
+// actually needed asking (or that need was already fully announced as
+// resolved), a still-fully-signed result just stays quiet.
+//
+// `signer` (only ever passed by handleIssueComment, right after recording a
+// BRAND NEW signature - never by the automatic pull_request_target trigger
+// or the `recheck` command, neither of which has any one specific person to
+// address) is the `{ id, login }` of whoever just signed. When present, it
+// changes how checkPR names the person(s) it addresses, without changing
+// the underlying pass/fail logic at all:
+//   - Still missing other signers/reviews: the pending comment leads with a
+//     personal "@signer Thank you for signing..." line, in addition to
+//     (not instead of) the usual list of who else still needs to sign - so
+//     the contributor who just acted gets acknowledged even though the PR
+//     as a whole isn't clear yet. This is always accurate regardless of
+//     who `signer` turns out to be, since reaching checkPR with a `signer`
+//     at all already means that exact identity just recorded a brand new
+//     signature (see handleIssueComment) - it says nothing about whether
+//     they were required here, just that they did in fact sign.
+//   - Now fully signed AND `signer` is one of THIS PR's own required
+//     (non-allowlisted) commit authors: that person is thanked by name
+//     (personalSuccessMessage()) INSTEAD OF the generic, anonymous
+//     SUCCESS_MESSAGE - see personalSuccessMessage()'s doc comment. This is
+//     the fix for a PR with several contributors: each one signing via a
+//     comment gets their own "@username Thank you for signing the CLA! We
+//     look forward to your contributions." rather than everyone just seeing
+//     one generic "All contributors have signed the CLA. ✅" once the last
+//     person signs.
+//   - Now fully signed but `signer` is NOT one of this PR's required
+//     authors (an allowlisted account, or - just as easily - someone with
+//     no connection to this PR at all who happened to comment the sign
+//     phrase on it): falls back to the generic SUCCESS_MESSAGE. Crediting
+//     that person with "completing" a PR their signature had no bearing on
+//     would be actively misleading, especially since the PR may well have
+//     already been fully signed before they ever commented - see
+//     `signerCompletedRequirement` below.
+//
+// `statusOnly` (only ever passed by handleIssueComment's `alreadySigned`
+// branch below) recomputes and updates the merge-blocking status check as
+// usual, but returns immediately after - without posting ANY comment,
+// pending or success. This exists specifically for a redundant sign-phrase
+// comment from someone who'd already signed (typically via a different
+// PR): that person gets their own "you already signed, nothing more to do"
+// reply regardless (see handleIssueComment), but this PR's own status may
+// well have gone stale in the meantime - it was last set when THIS PR was
+// still missing them, and nothing had re-run checkPR for THIS PR since. A
+// normal (non-statusOnly) checkPR call would fix the status too, but would
+// ALSO post a fresh pending-list or success comment alongside the
+// "already signed" one - and would do so AGAIN every time the same person
+// harmlessly re-sends the same redundant comment, since none of those
+// extra comments would be byte-identical to the one immediately before
+// them (the "already signed" reply always comes first) for postComment's
+// own dedupe to catch. `statusOnly` avoids that: the status is corrected
+// silently, with no risk of ever piling up duplicate announcements no
+// matter how many times someone redundantly re-signs.
+// `knownSignatures` (only ever passed by handleIssueComment, right after a
+// writeSignatures() call in the SAME request) is the exact signatures
+// object writeSignatures() just returned - the freshest possible state for
+// the caller's own write, known for certain without another round trip.
+// When given, checkPR merges it (via mergeSignatures()) with its own fresh
+// GET instead of trusting either one alone:
+//
+//  - The fresh GET alone isn't enough: GitHub's Contents API does NOT
+//    guarantee that a GET immediately following a PUT reflects that write -
+//    a super-brief read-after-write staleness window is a documented
+//    characteristic of that API, not something application code can
+//    reliably wait out. Without `knownSignatures` filling that gap, a
+//    contributor could sign the CLA and, purely because the GET raced
+//    against that same brief window, see the very message thanking them
+//    for signing ALSO still list them as needing to sign.
+//  - `knownSignatures` alone isn't enough either: it's a snapshot from
+//    before listPRCommitAuthors() ran (which can be slow on a big PR), so
+//    it can't see a DIFFERENT required contributor's signature that lands
+//    in the shared store - written by a completely different workflow run,
+//    e.g. them signing via another PR/repo - while that call is in flight.
+//    Skipping the GET entirely in that window would let checkPR post a
+//    false pending-signer comment / failure status for someone who has, in
+//    fact, already signed.
+//
+// Every other caller of checkPR (the automatic pull_request_target
+// trigger, and the `recheck` command) has no such freshly-known snapshot to
+// hand over, so mergeSignatures() just returns the fresh GET unchanged for
+// them - same behavior as always.
+async function checkPR(
+  prNumber,
+  headSha,
+  {
+    quietIfNeverFlagged = false,
+    signer = null,
+    statusOnly = false,
+    knownSignatures = null,
+  } = {},
+) {
+  assertValidPRNumber(prNumber, "checkPR(prNumber)");
   if (!headSha) {
     const pr = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber}`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}`,
       GITHUB_TOKEN,
     );
-    headSha = pr.head.sha;
+    headSha = assertValidSha(
+      pr.head.sha,
+      `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.head.sha)`,
+    );
+  } else {
+    assertValidSha(headSha, "checkPR(headSha)");
   }
 
-  // Read signatures last, right before deciding: listPRCommitAuthors() can
-  // be slow on a big PR, while the signature store is what's most likely to
-  // change under us (someone signing in another run). This narrows the race
-  // window but doesn't remove it - two overlapping runs can still each post
-  // a stale result if they're not serialized. That's what the consumer
-  // workflow's `concurrency:` group is for; it also covers the
+  // listPRCommitAuthors() can be slow on a big PR; reading the signature
+  // store right after it (rather than before) is what's most likely to
+  // change under us, e.g. someone signing in another run. This narrows the
+  // race window but doesn't remove it - two overlapping runs can still each
+  // post a stale result if they're not serialized. That's what the
+  // consumer workflow's `concurrency:` group is for; it also covers the
   // comment-duplication race handled in postComment().
+  //
+  // Always read here, even when `knownSignatures` was given - see
+  // mergeSignatures() and this function's doc comment above for why a
+  // caller's own known-fresh write still isn't a substitute for this GET.
   const { authors, unresolved } = await listPRCommitAuthors(prNumber);
-  const sigToken = await getSignaturesToken();
-  const { data } = await readSignatures(sigToken);
+  const freshData = (await readSignatures(await getSignaturesToken())).data;
+  const data = mergeSignatures(knownSignatures, freshData);
   const missing = authors.filter(
     (a) => !isAllowlisted(a.login) && !isSigned(data, a),
   );
@@ -811,14 +1264,45 @@ async function checkPR(prNumber, headSha) {
       "success",
       "All contributors have signed the CLA.",
     );
-    await postComment(prNumber, "All contributors have signed the CLA. ✅");
+    if (statusOnly) return;
+    if (quietIfNeverFlagged) {
+      // GET comments come back in creation order (oldest first), so the
+      // *last* match in the array for each category is the most recent
+      // one of that kind - findLastIndex() (Node 22+, per the version
+      // guard at the top of this file) gets us that directly. Comparing
+      // those two positions (rather than just "does a pending comment
+      // exist anywhere") is what correctly re-announces success after a
+      // genuine second block-and-resolve cycle, while staying quiet when
+      // nothing has changed since the last announcement - see the
+      // function-level comment above.
+      const existing = await getExistingBotComments(prNumber, {
+        anyBotIdentity: true,
+      });
+      const lastPendingIdx = existing.findLastIndex(
+        (c) => classifyBotComment(c.body) === "pending",
+      );
+      const lastSuccessIdx = existing.findLastIndex(
+        (c) => classifyBotComment(c.body) === "success",
+      );
+      if (lastPendingIdx <= lastSuccessIdx) return;
+    }
+    // See checkPR's doc comment above and signerCompletedRequirement(): only
+    // address the signer by name when their own signature is what actually
+    // completed this PR's requirement, never merely because a `signer` was
+    // passed at all.
+    await postComment(
+      prNumber,
+      signerCompletedRequirement(authors, signer)
+        ? personalSuccessMessage(signer.login)
+        : SUCCESS_MESSAGE,
+    );
     return;
   }
 
-  const lines = [];
+  const lines = [PENDING_MARKER];
   if (missing.length) {
     lines.push(
-      `The following contributor(s) need to sign our [CLA](${CLA_DOCUMENT_URL}) before this PR can be merged:`,
+      `The following contributor(s) ${NEEDS_SIGN_FRAGMENT} [CLA](${CLA_DOCUMENT_URL}) before this PR can be merged:`,
       "",
     );
     missing.forEach((a) => lines.push(`- @${a.login}`));
@@ -840,7 +1324,7 @@ async function checkPR(prNumber, headSha) {
     const n = unresolved.length;
     lines.push(
       "",
-      `⚠️ ${n} commit${n === 1 ? "" : "s"} could not be automatically attributed to a GitHub account. A maintainer will need to verify ${n === 1 ? "it" : "them"} manually: ${shaList}`,
+      `⚠️ ${n} commit${n === 1 ? "" : "s"} ${NEEDS_REVIEW_FRAGMENT} to a GitHub account. A maintainer will need to verify ${n === 1 ? "it" : "them"} manually: ${shaList}`,
     );
   }
 
@@ -851,6 +1335,20 @@ async function checkPR(prNumber, headSha) {
       ? `${missing.length} contributor(s) need to sign the CLA`
       : "Manual verification needed",
   );
+  if (statusOnly) return;
+  if (signer) {
+    // The PR isn't fully clear yet (someone else still needs to sign, or a
+    // commit needs manual review), but this specific person DID just sign
+    // successfully - acknowledge that as its OWN comment, separate from the
+    // list of what's still outstanding below (rather than one comment
+    // combining both), so each comment has one clear, single purpose: this
+    // one says "your action was recorded", the next one says "here's where
+    // the PR stands overall".
+    await postComment(
+      prNumber,
+      `@${signer.login} Thank you for signing the CLA! We look forward to your contributions.`,
+    );
+  }
   await postComment(prNumber, lines.join("\n"));
 }
 
@@ -884,7 +1382,10 @@ async function handleIssueComment(payload) {
       "issue_comment payload is missing comment.user.login - malformed or unexpected webhook delivery.",
     );
   }
-  const prNumber = payload.issue.number;
+  const prNumber = assertValidPRNumber(
+    payload.issue.number,
+    "issue_comment payload issue.number",
+  );
   const body = (payload.comment.body || "").trim();
   const commenter = payload.comment.user.login;
 
@@ -902,7 +1403,7 @@ async function handleIssueComment(payload) {
     // the 409 retry loop re-running this closure) - each attempt checks the
     // just-fetched state, not a stale snapshot.
     let alreadySigned = false;
-    await writeSignatures(
+    const writtenSignatures = await writeSignatures(
       sigToken,
       (data) => {
         if (isSigned(data, commenterIdentity)) {
@@ -923,7 +1424,7 @@ async function handleIssueComment(payload) {
           ],
         };
       },
-      `${commenter} signed the CLA via ${REPO_OWNER}/${REPO_NAME}#${prNumber}`,
+      `${commenter} signed the CLA`,
     );
 
     if (alreadySigned) {
@@ -933,11 +1434,38 @@ async function handleIssueComment(payload) {
         prNumber,
         `@${commenter} you have already signed the CLA. Nothing more to do here.`,
       );
+      // This PR's own merge-blocking status may be stale: it was last set
+      // while THIS PR still considered them unsigned, and they may well
+      // have signed via a DIFFERENT PR since - nothing would have re-run
+      // checkPR for THIS PR in the meantime. Silently bring the status up
+      // to date (statusOnly: true posts no additional comment - see
+      // checkPR's doc comment for why that matters here specifically).
+      // knownSignatures ensures checkPR's own fresh GET can't shadow the
+      // write that just happened even if it races that write's
+      // read-after-write staleness window (see checkPR's and
+      // mergeSignatures()'s doc comments).
+      await checkPR(prNumber, undefined, {
+        statusOnly: true,
+        knownSignatures: writtenSignatures,
+      });
       return;
     }
 
-    // Re-evaluate the PR now that one more person has signed.
-    await checkPR(prNumber);
+    // Re-evaluate the PR now that one more person has signed. Passing
+    // `signer` is what makes checkPR() address THIS specific person by name
+    // (either in a personal thank-you leading the pending list, or - if
+    // they're the one who just completed the requirement - in place of the
+    // generic "All contributors have signed" announcement). knownSignatures
+    // is the exact data writeSignatures() just wrote, so checkPR's own
+    // fresh GET can't shadow it even if that GET races the write's own
+    // read-after-write staleness window (see checkPR's and
+    // mergeSignatures()'s doc comments) - the very bug that would let the
+    // person who just signed still show up in their own "still needs to
+    // sign" list.
+    await checkPR(prNumber, undefined, {
+      signer: commenterIdentity,
+      knownSignatures: writtenSignatures,
+    });
     return;
   }
 
@@ -961,12 +1489,24 @@ async function handlePullRequestTarget(payload) {
       "pull_request_target payload is missing pull_request - malformed or unexpected webhook delivery.",
     );
   }
+  const prNumber = assertValidPRNumber(
+    payload.pull_request.number,
+    "pull_request_target payload pull_request.number",
+  );
   if (payload.action === "closed" && payload.pull_request.merged) {
-    await lockPR(payload.pull_request.number);
+    await lockPR(prNumber);
     return;
   }
   if (["opened", "synchronize", "reopened"].includes(payload.action)) {
-    await checkPR(payload.pull_request.number, payload.pull_request.head.sha);
+    const headSha = assertValidSha(
+      payload.pull_request.head && payload.pull_request.head.sha,
+      "pull_request_target payload pull_request.head.sha",
+    );
+    // Automatic trigger (PR opened/pushed to/reopened), not a human asking
+    // a direct question - stay quiet on an already-compliant result unless
+    // this PR previously needed action. See checkPR's quietIfNeverFlagged
+    // doc comment above for the full reasoning.
+    await checkPR(prNumber, headSha, { quietIfNeverFlagged: true });
   }
 }
 
@@ -1016,4 +1556,39 @@ module.exports = {
   postComment,
   validateConfig,
   lockPR,
+  // Exported for tests only, same as everything above - not part of the
+  // action's public contract. Covered directly in test/logic.test.js so a
+  // future change to either validator's character rules (e.g. UNSAFE_URL_
+  // SEGMENT_RE) fails immediately and specifically, rather than only being
+  // caught indirectly through the webhook-handler integration tests.
+  assertValidPRNumber,
+  assertValidSha,
+  // Exported for tests only, same reasoning: classifyBotComment() is the
+  // exact piece that tells a genuine block apart from unrelated bot
+  // chatter for checkPR's quietIfNeverFlagged logic, so it gets direct
+  // unit coverage in test/logic.test.js in addition to the end-to-end
+  // integration tests exercising it indirectly.
+  classifyBotComment,
+  // Exported for tests only, same reasoning: the exact per-signer wording
+  // is a single source of truth used both when posting and when asserting
+  // in tests, so a future wording tweak can't silently drift between them.
+  personalSuccessMessage,
+  // Exported for tests only, same reasoning as isSigned/isAllowlisted
+  // above: this is the exact piece checkPR relies on to decide whether a
+  // signer was actually one of a PR's own commit authors (as opposed to an
+  // unrelated bystander), so it gets direct unit coverage of its id-first,
+  // login-fallback matching rule in test/logic.test.js.
+  isSameContributor,
+  // Exported for tests only, same reasoning as isSameContributor above:
+  // this is checkPR's single-source-of-truth definition of how a caller's
+  // known-fresh write and a subsequent GET are reconciled, so it gets
+  // direct unit coverage of its "fresh wins on a match, known-only entries
+  // are kept" merge rule in test/logic.test.js.
+  mergeSignatures,
+  // Exported for tests only, same reasoning: this is checkPR's actual,
+  // single-source-of-truth definition of "did this signer's own signature
+  // complete the PR's requirement" - tests call this function directly
+  // instead of re-typing the same expression themselves, so the two can
+  // never drift out of sync with each other.
+  signerCompletedRequirement,
 };

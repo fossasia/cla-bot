@@ -21,6 +21,13 @@ const {
   isAllowlisted,
   createAppJWT,
   isPrivileged,
+  assertValidPRNumber,
+  assertValidSha,
+  classifyBotComment,
+  personalSuccessMessage,
+  isSameContributor,
+  signerCompletedRequirement,
+  mergeSignatures,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -420,6 +427,381 @@ test("isPrivileged does not throw when payload.issue or payload.comment is missi
   );
   assert.strictEqual(isPrivileged({ issue: {} }, "someone"), false);
   assert.strictEqual(isPrivileged({}, "someone"), false);
+});
+
+// --- assertValidPRNumber / assertValidSha: direct unit-level regression ---
+// contract for UNSAFE_URL_SEGMENT_RE and the PR-number integer check.
+//
+// These call the validators straight (no webhook simulation, no fetch
+// mocking) precisely so that if either check is ever loosened - e.g. a
+// character accidentally dropped from UNSAFE_URL_SEGMENT_RE's class - the
+// failure is immediate, synchronous, and named after the exact character
+// that stopped being rejected, rather than surfacing only indirectly deep
+// inside an async webhook-handler integration test.
+
+test("assertValidPRNumber accepts an ordinary positive integer and returns it unchanged", () => {
+  assert.strictEqual(assertValidPRNumber(42, "ctx"), 42);
+});
+
+for (const { label, value } of [
+  { label: "zero", value: 0 },
+  { label: "a negative integer", value: -1 },
+  { label: "a non-integer float", value: 1.5 },
+  { label: "NaN", value: NaN },
+  { label: "Infinity", value: Infinity },
+  { label: "-Infinity", value: -Infinity },
+  { label: "a numeric string", value: "1" },
+  { label: "null", value: null },
+  { label: "undefined", value: undefined },
+  { label: "an array", value: [1] },
+  { label: "a plain object", value: {} },
+  { label: "a boolean", value: true },
+]) {
+  test(`assertValidPRNumber rejects ${label}`, () => {
+    assert.throws(
+      () => assertValidPRNumber(value, "ctx"),
+      /expected a positive integer/,
+    );
+  });
+}
+
+// Dedicated unsafe-integer boundary tests. Number.isInteger() alone is not
+// enough here: every double past 2^53 has no fractional part, so
+// Number.isInteger() calls it "an integer" even though it can't reliably
+// represent the real value - these three values would each have slipped
+// past a Number.isInteger()-only check. assertValidPRNumber uses
+// Number.isSafeInteger() specifically to reject them, and each test below
+// proves that with an explicit assert.ok(Number.isInteger(...)) sanity
+// check, so a regression back to Number.isInteger() fails immediately and
+// specifically here rather than only turning up as a garbled URL later.
+for (const { label, value } of [
+  {
+    label:
+      "Number.MAX_SAFE_INTEGER + 1 (still passes Number.isInteger, but not Number.isSafeInteger)",
+    value: Number.MAX_SAFE_INTEGER + 1,
+  },
+  {
+    label:
+      "1e100 (a huge float with no fractional part, but nowhere near a real PR number)",
+    value: 1e100,
+  },
+  {
+    label:
+      "9007199254740993, which JSON.parse() itself already silently rounds to a different integer (9007199254740992)",
+    value: 9007199254740993,
+  },
+]) {
+  test(`assertValidPRNumber rejects ${label}`, () => {
+    // Confirms this specific value really is the kind Number.isInteger()
+    // alone would wrongly accept - otherwise this test would prove nothing
+    // about the isSafeInteger() vs isInteger() distinction.
+    assert.ok(
+      Number.isInteger(value),
+      "expected this value to be a case Number.isInteger() alone would accept",
+    );
+    assert.throws(
+      () => assertValidPRNumber(value, "ctx"),
+      /expected a positive integer/,
+    );
+  });
+}
+
+test("assertValidPRNumber accepts Number.MAX_SAFE_INTEGER itself (the boundary, not the offender)", () => {
+  assert.strictEqual(
+    assertValidPRNumber(Number.MAX_SAFE_INTEGER, "ctx"),
+    Number.MAX_SAFE_INTEGER,
+  );
+});
+
+test("assertValidSha accepts a real 40-character lowercase-hex sha1 and returns it unchanged", () => {
+  const sha = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4";
+  assert.strictEqual(assertValidSha(sha, "ctx"), sha);
+});
+
+test("assertValidSha accepts a real 64-character lowercase-hex sha256", () => {
+  const sha = "a".repeat(64);
+  assert.strictEqual(assertValidSha(sha, "ctx"), sha);
+});
+
+test("assertValidSha accepts opaque non-hex placeholder strings (test/tooling convention, not just real hex shas)", () => {
+  assert.strictEqual(assertValidSha("head-sha-abc", "ctx"), "head-sha-abc");
+});
+
+// One test per individual member of UNSAFE_URL_SEGMENT_RE's character
+// class, plus the ".." alternation - so if a future edit ever drops just
+// one of them, exactly one narrowly-named test fails and points straight
+// at what changed.
+for (const { label, value } of [
+  { label: "a forward slash", value: "abc/def" },
+  { label: "a backslash", value: "abc\\def" },
+  { label: "a question mark", value: "abc?def" },
+  { label: "a hash/fragment marker", value: "abc#def" },
+  { label: "a percent sign", value: "abc%def" },
+  { label: "a space", value: "abc def" },
+  { label: "a tab", value: "abc\tdef" },
+  { label: "a newline", value: "abc\ndef" },
+  { label: "a NUL byte", value: "abc\x00def" },
+  { label: "a literal '..' traversal segment", value: "abc..def" },
+]) {
+  test(`assertValidSha rejects a sha containing ${label}`, () => {
+    assert.throws(
+      () => assertValidSha(value, "ctx"),
+      /expected a valid commit SHA/,
+    );
+  });
+}
+
+// Dedicated, explicitly-named percent-encoding bypass tests. Unencoded
+// "/", "..", "?", "#" are already covered above and by the integration
+// suite; a percent-encoded form of the same attack (e.g. "%2f" for "/",
+// "%2e%2e" for "..") contains none of those literal characters, so it can
+// ONLY be caught by the "%" member of the character class - these two
+// tests exist specifically to fail if that "%" is ever removed, even
+// though no other character in the value would trip any other check.
+test("assertValidSha rejects a percent-encoded '/' (\"%2f\") even though it contains no literal slash", () => {
+  assert.doesNotMatch("abc%2fdef", /[/\\?#\s\x00-\x1f]|\.\./);
+  assert.throws(
+    () => assertValidSha("abc%2fdef", "ctx"),
+    /expected a valid commit SHA/,
+  );
+});
+
+test("assertValidSha rejects a percent-encoded '../' traversal (\"%2e%2e%2f\") even though it contains no literal dot-dot or slash", () => {
+  assert.doesNotMatch("%2e%2e%2f", /[/\\?#\s\x00-\x1f]|\.\./);
+  assert.throws(
+    () => assertValidSha("%2e%2e%2f", "ctx"),
+    /expected a valid commit SHA/,
+  );
+});
+
+test("assertValidSha rejects an empty string", () => {
+  assert.throws(() => assertValidSha("", "ctx"), /expected a valid commit SHA/);
+});
+
+test("assertValidSha rejects a non-string value", () => {
+  assert.throws(
+    () => assertValidSha(12345, "ctx"),
+    /expected a valid commit SHA/,
+  );
+});
+
+test("assertValidSha accepts exactly 64 characters (the sha256 boundary) but rejects 65", () => {
+  assert.strictEqual(assertValidSha("a".repeat(64), "ctx"), "a".repeat(64));
+  assert.throws(
+    () => assertValidSha("a".repeat(65), "ctx"),
+    /expected a valid commit SHA/,
+  );
+});
+
+// --- classifyBotComment ----------------------------------------------------
+// Used by checkPR's quietIfNeverFlagged logic to tell a genuine "this PR
+// was blocked" comment apart from unrelated bot chatter on the same
+// thread. See src/cla-bot.js for the full reasoning.
+
+test("classifyBotComment recognizes a current-format 'needs to sign' comment (with PENDING_MARKER) as pending", () => {
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:pending -->\n" +
+    "The following contributor(s) need to sign our [CLA](https://example.com/CLA.md) before this PR can be merged:\n\n- @alice";
+  assert.strictEqual(classifyBotComment(body), "pending");
+});
+
+test("classifyBotComment recognizes a LEGACY 'needs to sign' comment with NO PENDING_MARKER at all as pending (backward compatibility with PRs blocked by an older deployment)", () => {
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\n" +
+    "The following contributor(s) need to sign our [CLA](https://example.com/CLA.md) before this PR can be merged:\n\n- @alice";
+  assert.strictEqual(classifyBotComment(body), "pending");
+});
+
+test("classifyBotComment recognizes a 'needs manual review' (unresolved commit) comment as pending, current and legacy wording alike", () => {
+  const current =
+    "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:pending -->\n" +
+    "⚠️ 1 commit could not be automatically attributed to a GitHub account. A maintainer will need to verify it manually: abc1234";
+  const legacy =
+    "<!-- fossasia-cla-bot:v1 -->\n" +
+    "⚠️ 1 commit could not be automatically attributed to a GitHub account. A maintainer will need to verify it manually: abc1234";
+  assert.strictEqual(classifyBotComment(current), "pending");
+  assert.strictEqual(classifyBotComment(legacy), "pending");
+});
+
+test("classifyBotComment recognizes the exact legacy success announcement as success", () => {
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\nAll contributors have signed the CLA. \u2705";
+  assert.strictEqual(classifyBotComment(body), "success");
+});
+
+test("classifyBotComment recognizes a current-format (SUCCESS_MARKER) success announcement as success, generic and personalized wording alike", () => {
+  const generic =
+    "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:success -->\nAll contributors have signed the CLA. \u2705";
+  const personalized =
+    "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:success -->\n@alice Thank you for signing the CLA! We look forward to your contributions.";
+  assert.strictEqual(classifyBotComment(generic), "success");
+  assert.strictEqual(classifyBotComment(personalized), "success");
+});
+
+test("classifyBotComment does NOT treat arbitrary bot text merely CONTAINING the legacy success phrase as a success announcement", () => {
+  // Regression test: the legacy fallback used to be a plain body.includes()
+  // substring search, which would have wrongly matched here just because
+  // this text happens to quote/mention the exact legacy phrase somewhere
+  // inside a longer, unrelated comment. It must now require the comment's
+  // ENTIRE body to be nothing more than that fixed legacy string (see
+  // LEGACY_SUCCESS_COMMENT's doc comment in src/cla-bot.js) - a substring
+  // match here is a false positive, since this comment doesn't actually
+  // represent this PR ever having reached a genuine success state.
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\n" +
+    "FYI, once everyone signs you'll see a comment saying " +
+    '"All contributors have signed the CLA. \u2705" - just a heads up, ' +
+    "nobody has signed yet.";
+  assert.strictEqual(classifyBotComment(body), "other");
+});
+
+test("classifyBotComment treats the personal 'already signed, nothing more to do' reply as neither pending nor success", () => {
+  const body =
+    "<!-- fossasia-cla-bot:v1 -->\n@alice you have already signed the CLA. Nothing more to do here.";
+  assert.strictEqual(classifyBotComment(body), "other");
+});
+
+// --- personalSuccessMessage / SUCCESS_MARKER --------------------------------
+// The per-signer completion announcement (checkPR's `signer` option) that
+// replaces the generic SUCCESS_MESSAGE whenever we know exactly who just
+// completed the PR's signing requirement.
+
+test("personalSuccessMessage addresses the given login by name and invites their contributions", () => {
+  const body = personalSuccessMessage("carol");
+  assert.ok(
+    body.includes(
+      "@carol Thank you for signing the CLA! We look forward to your contributions.",
+    ),
+    `expected a personalized thank-you for carol, got: ${body}`,
+  );
+});
+
+test("personalSuccessMessage embeds SUCCESS_MARKER so classifyBotComment recognizes it as a success announcement, even though its visible text differs per signer", () => {
+  const body = `<!-- fossasia-cla-bot:v1 -->\n${personalSuccessMessage("dave")}`;
+  assert.strictEqual(classifyBotComment(body), "success");
+});
+
+test("two personalSuccessMessage() calls for different logins produce different bodies (so they are never mistaken for duplicates of each other)", () => {
+  assert.notStrictEqual(
+    personalSuccessMessage("alice"),
+    personalSuccessMessage("bob"),
+  );
+});
+
+// --- isSameContributor -------------------------------------------------
+// Used by checkPR's `signerCompletedRequirement` check to tell whether the
+// person who just signed via a comment is actually one of a PR's own
+// commit authors (as opposed to an unrelated bystander) - see its doc
+// comment in src/cla-bot.js for why that distinction matters.
+
+test("isSameContributor matches by numeric id even when the logins differ (a renamed account)", () => {
+  assert.strictEqual(
+    isSameContributor(
+      { id: 42, login: "old-name" },
+      { id: 42, login: "new-name" },
+    ),
+    true,
+  );
+});
+
+test("isSameContributor falls back to a case-insensitive login match when either side has no id", () => {
+  assert.strictEqual(
+    isSameContributor({ login: "Alice" }, { login: "alice" }),
+    true,
+  );
+});
+
+test("isSameContributor returns false for genuinely different identities", () => {
+  assert.strictEqual(
+    isSameContributor({ id: 1, login: "alice" }, { id: 2, login: "bob" }),
+    false,
+  );
+});
+
+test("isSameContributor fails closed (false, never throws) on null/undefined input", () => {
+  assert.strictEqual(isSameContributor(null, { login: "alice" }), false);
+  assert.strictEqual(isSameContributor({ login: "alice" }, undefined), false);
+});
+
+// --- mergeSignatures (checkPR) -------------------------------------------
+// Reconciles a caller's already-known signature snapshot (knownSignatures)
+// with a freshly-read one, so that neither side's staleness can hide a real
+// signature from checkPR - see its doc comment in src/cla-bot.js.
+
+test("mergeSignatures returns the fresh read unchanged when there is no known snapshot to merge", () => {
+  const fresh = { version: 1, signatures: [{ id: 1, login: "alice" }] };
+  assert.deepStrictEqual(mergeSignatures(null, fresh), fresh);
+  assert.deepStrictEqual(mergeSignatures(undefined, fresh), fresh);
+});
+
+test("mergeSignatures keeps a known entry that the fresh read is missing (fresh is stale relative to the caller's own write)", () => {
+  const known = { version: 1, signatures: [{ id: 1, login: "alice" }] };
+  const fresh = { version: 1, signatures: [] };
+  assert.deepStrictEqual(mergeSignatures(known, fresh), {
+    version: 1,
+    signatures: [{ id: 1, login: "alice" }],
+  });
+});
+
+test("mergeSignatures adds a fresh entry that known doesn't have (a different contributor signed concurrently elsewhere)", () => {
+  const known = { version: 1, signatures: [{ id: 1, login: "alice" }] };
+  const fresh = {
+    version: 1,
+    signatures: [
+      { id: 1, login: "alice" },
+      { id: 2, login: "bob" },
+    ],
+  };
+  assert.deepStrictEqual(mergeSignatures(known, fresh), {
+    version: 1,
+    signatures: [
+      { id: 1, login: "alice" },
+      { id: 2, login: "bob" },
+    ],
+  });
+});
+
+test("mergeSignatures prefers the fresh entry over a matching known one (same identity, per isSameContributor's id-first rule)", () => {
+  const known = { version: 1, signatures: [{ id: 1, login: "old-name" }] };
+  const fresh = { version: 1, signatures: [{ id: 1, login: "new-name" }] };
+  assert.deepStrictEqual(mergeSignatures(known, fresh), {
+    version: 1,
+    signatures: [{ id: 1, login: "new-name" }],
+  });
+});
+
+// --- signerCompletedRequirement (checkPR) --------------------------------
+// checkPR's own, single-source-of-truth definition of "did this signer's
+// own signature complete the PR's requirement" - see its doc comment in
+// src/cla-bot.js. Tests call the REAL exported function directly (rather
+// than re-typing its expression here) so these can never silently drift
+// out of sync with the production logic they're meant to be verifying.
+
+test("signerCompletedRequirement is false for an allowlisted commit author, even though they ARE the PR's only author and DID just sign", () => {
+  const authors = [{ id: 99, login: "dependabot[bot]" }];
+  const signer = { id: 99, login: "dependabot[bot]" };
+  assert.strictEqual(
+    signerCompletedRequirement(authors, signer),
+    false,
+    "an allowlisted account was never actually blocking this PR (it's excluded from `missing` regardless of signature status), so it must not be credited with completing it",
+  );
+});
+
+test("signerCompletedRequirement is true for a genuine, non-allowlisted commit author who just signed", () => {
+  const authors = [{ id: 100, login: "alice" }];
+  const signer = { id: 100, login: "alice" };
+  assert.strictEqual(signerCompletedRequirement(authors, signer), true);
+});
+
+test("signerCompletedRequirement is false for someone who isn't a commit author on this PR at all (an unrelated bystander)", () => {
+  const authors = [{ id: 100, login: "alice" }];
+  const signer = { id: 999, login: "mallory" };
+  assert.strictEqual(signerCompletedRequirement(authors, signer), false);
+});
+
+test("signerCompletedRequirement is false when there is no signer at all (an automatic check, not a comment-triggered one)", () => {
+  const authors = [{ id: 100, login: "alice" }];
+  assert.strictEqual(signerCompletedRequirement(authors, null), false);
 });
 
 console.log(`\n${passed} test(s) passed.`);
