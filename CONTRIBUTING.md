@@ -22,11 +22,17 @@ FOSSASIA's projects.
    `test/bot-identity*.test.js` for anything about how the bot resolves its
    own identity. Run `npm test` before opening a PR - CI runs it too, on
    Node 22 and 24.
-3. **Don't weaken any of the security properties** listed at the top of
+3. **This repo requires 100% test coverage (lines, statements, functions
+   and branches) on every PR**, enforced by `.github/workflows/coverage.yml`.
+   Run `npm run coverage` locally before pushing - it fails the same way CI
+   does if anything is untested, and `npm run coverage:report` turns that
+   into the same human-readable breakdown (missing lines, never-called
+   functions, untested branches) that gets posted as a PR comment.
+4. **Don't weaken any of the security properties** listed at the top of
    `src/cla-bot.js` or in `SECURITY.md` (impersonation guard, exact-match
    allowlist, short-lived tokens, etc.) without discussing it in an issue
    first.
-4. Changes to `action.yml` inputs should stay backward compatible where
+5. Changes to `action.yml` inputs should stay backward compatible where
    possible; if a breaking change is unavoidable, bump the major version
    tag and note it in `CHANGELOG.md`.
 
@@ -63,6 +69,7 @@ that actually does exist.
 git clone https://github.com/fossasia/cla-bot.git
 cd cla-bot
 npm test              # runs the full offline unit-test suite
+npm run coverage       # same, plus a coverage report - fails if any line, branch or function isn't hit
 node --check src/cla-bot.js   # quick syntax check
 ```
 

@@ -1,0 +1,72 @@
+name: Post Coverage Comment
+
+# Split out from coverage.yml on purpose. coverage.yml runs on `pull_request`
+# and therefore only ever gets a read-only, secret-less GITHUB_TOKEN when
+# triggered by a fork PR (GitHub's own security default) - not enough to
+# post a comment. This workflow instead triggers on `workflow_run` after
+# coverage.yml finishes, which runs in the base repo's context with real
+# permissions, and its only job is to read the report *artifact* (plain
+# JSON/Markdown, not code) that coverage.yml already built and post it.
+# This is the standard safe pattern for commenting from untrusted PRs -
+# see https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+#
+# Note for future maintainers: `workflow_run` always executes the version
+# of *this* workflow file that's on the default branch, regardless of what
+# a PR changes - so edits here only take effect once merged to main.
+on:
+  # zizmor flags workflow_run as a dangerous trigger by default because it's
+  # frequently misused to run privileged code against untrusted PR input.
+  # This job never does that: it only ever checks out this repo's own
+  # default-branch content and reads a JSON/Markdown artifact as inert data
+  # (see post-coverage-comment.js) - it never checks out, evals, or executes
+  # anything from the triggering pull request. Verified safe per
+  # https://docs.zizmor.sh/audits/#dangerous-triggers.
+  workflow_run: # zizmor: ignore[dangerous-triggers]
+    workflows: ["Test Coverage"]
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: coverage-comment-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  comment:
+    # Only pull_request-triggered runs of coverage.yml produce a PR-shaped
+    # report; a push-to-main run of the same workflow has no PR to comment
+    # on. (coverage.yml is currently pull_request-only, so this is mostly
+    # future-proofing if a push trigger is ever added.)
+    if: github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      # Needed to download an artifact from a different workflow run via
+      # download-artifact's run-id input, even within the same repo.
+      actions: read
+    steps:
+      # Only used to fetch our own trusted comment-posting script - this
+      # checks out whatever is on the default branch (workflow_run never
+      # uses a PR's version of this workflow or its scripts), never
+      # anything from the pull request itself.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download coverage report artifact
+        id: download
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: coverage-pr-comment
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: coverage-artifact
+
+      - name: Post or update the sticky PR comment
+        if: steps.download.outcome == 'success'
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const script = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/post-coverage-comment.js`);
+            await script({ github, context, core });

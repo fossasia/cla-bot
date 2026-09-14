@@ -1,0 +1,77 @@
+name: Test Coverage
+
+# This workflow is the actual enforcement gate: it fails the job (and
+# therefore the PR's status check) whenever coverage is below 100%. It
+# deliberately runs with read-only, no-secret permissions so it's safe to
+# execute on pull requests from forks - see coverage-comment.yml for how the
+# human-readable PR comment gets posted from a separate, privileged workflow
+# instead of from here.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: coverage-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # Pinned to a commit SHA, not a tag - tags can be repointed later, a
+      # SHA can't. Check https://github.com/actions/checkout/releases before
+      # bumping this.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # `c8` reads thresholds from .c8rc.json (all four metrics set to
+      # 100%) and exits non-zero when any of them isn't met. We don't want
+      # that non-zero exit to stop the workflow before we've had a chance
+      # to build and upload the human-readable report, so it's captured
+      # here (continue-on-error) and turned back into a real failure in
+      # the "Enforce coverage threshold" step below, once everything else
+      # has run.
+      - name: Run tests with coverage
+        id: coverage
+        continue-on-error: true
+        run: npm run coverage
+
+      - name: Build PR comment from the coverage report
+        if: always()
+        continue-on-error: true
+        run: npm run coverage:report
+
+      # Uploaded as an artifact (not posted directly) because this job's
+      # GITHUB_TOKEN is intentionally read-only - see coverage-comment.yml,
+      # which runs with pull-requests:write and picks this up via
+      # workflow_run to actually post/update the comment.
+      - name: Upload coverage report for the comment workflow
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-pr-comment
+          path: |
+            coverage/pr-comment.md
+            coverage/pr-comment-meta.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Enforce coverage threshold
+        if: steps.coverage.outcome == 'failure'
+        run: |
+          echo "::error::Test coverage is below the required 100% - see the PR comment (posted shortly) for exactly which lines, functions and branches are missing, or run 'npm run coverage' locally."
+          exit 1
