@@ -108,6 +108,15 @@ function analyzeFile(fileCoverage) {
   return { uncoveredStatementLines, uncoveredFunctions, branchLineCounts };
 }
 
+// A hard length cut (e.g. for the comment-length cap below) can land inside
+// a ```js fence emitted by formatFileSection. An odd number of fence
+// markers means the string ends mid-block - close it so whatever gets
+// appended after renders as text, not code.
+function closeUnbalancedFence(text) {
+  const isUnbalanced = (text.match(/^```/gm) || []).length % 2 === 1;
+  return isUnbalanced ? `${text}\n\`\`\`` : text;
+}
+
 // Caps how many lines of source snippet we inline per file, so a file with
 // hundreds of uncovered lines still produces a readable (and GitHub
 // comment-length-safe) report instead of dumping the whole file.
@@ -115,7 +124,7 @@ const MAX_SNIPPET_LINES_PER_FILE = 25;
 
 function formatFileSection(relPath, summary, detail, sourceLines) {
   const lines = [
-    `### \`${relPath}\` — ${summary.lines.pct}% lines, ${summary.branches.pct}% branches, ${summary.functions.pct}% functions`,
+    `### \`${relPath}\` — ${summary.lines.pct}% lines, ${summary.statements.pct}% statements, ${summary.branches.pct}% branches, ${summary.functions.pct}% functions`,
   ];
 
   if (detail.uncoveredFunctions.length > 0) {
@@ -227,6 +236,7 @@ function main() {
       if (absPath === "total") continue;
       if (
         fileSummary.lines.pct === 100 &&
+        fileSummary.statements.pct === 100 &&
         fileSummary.branches.pct === 100 &&
         fileSummary.functions.pct === 100
       ) {
@@ -266,12 +276,21 @@ function main() {
   const MAX_COMMENT_LENGTH = 60000;
   if (markdown.length > MAX_COMMENT_LENGTH) {
     markdown =
-      markdown.slice(0, MAX_COMMENT_LENGTH) +
+      closeUnbalancedFence(markdown.slice(0, MAX_COMMENT_LENGTH)) +
       "\n\n---\n**⚠️ Report truncated** - too many files/lines to list here. Run `npm run coverage` locally for the full breakdown.";
   }
 
   fs.writeFileSync(OUT_MD, markdown, "utf8");
 
+  // NOTE ON TRUST: this whole script runs inside coverage.yml, in the same
+  // job that just executed the PR's own test files (untrusted PR content).
+  // A malicious test could have tampered with GITHUB_EVENT_PATH - or with
+  // anything else in this process - before this line runs. So prNumber
+  // below (and this entire metadata file) MUST be treated as an untrusted
+  // hint only. The privileged workflow (coverage-comment.yml /
+  // post-coverage-comment.js) re-derives and verifies the real target PR
+  // itself from trusted workflow_run data before ever posting anything -
+  // it does not take this value as authoritative.
   const eventPath = process.env.GITHUB_EVENT_PATH;
   let prNumber = null;
   if (eventPath && fs.existsSync(eventPath)) {
@@ -306,4 +325,16 @@ function main() {
   }
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+module.exports = {
+  main,
+  analyzeFile,
+  toRanges,
+  formatFileSection,
+  relativize,
+  sourceSnippet,
+  closeUnbalancedFence,
+};

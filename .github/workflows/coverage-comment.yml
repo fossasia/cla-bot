@@ -27,9 +27,23 @@ on:
 
 permissions: {}
 
+# Grouped by the *source* of the run (fork/repo + branch), not by
+# workflow_run.id - every id is unique, so keying on it would put every run
+# in its own group and never serialize anything, letting an older run's
+# comment job finish after a newer one and overwrite the sticky comment
+# with stale results. Keying on the source branch instead means a new push
+# cancels any older, now-superseded run for that same branch, same as
+# coverage.yml's own concurrency group does for the coverage job itself.
+# `head_repository.full_name` is included so two different forks pushing
+# to a same-named branch don't collide.
+#
+# This is a best-effort optimization, not the actual correctness guard:
+# post-coverage-comment.js independently verifies the report's commit SHA
+# before posting, which is what actually prevents a stale comment even if
+# some overlap slips through here.
 concurrency:
-  group: coverage-comment-${{ github.event.workflow_run.id }}
-  cancel-in-progress: false
+  group: coverage-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
 
 jobs:
   comment:

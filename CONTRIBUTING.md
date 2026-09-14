@@ -69,7 +69,7 @@ that actually does exist.
 git clone https://github.com/fossasia/cla-bot.git
 cd cla-bot
 npm test              # runs the full offline unit-test suite
-npm run coverage       # same, plus a coverage report - fails if any line, branch or function isn't hit
+npm run coverage       # same, plus a coverage report - fails if any line, statement, branch or function isn't hit
 node --check src/cla-bot.js   # quick syntax check
 ```
 
