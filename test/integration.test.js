@@ -1011,15 +1011,72 @@ function makeFakeGitHub({
     };
 
     const { postComment } = require("../src/cla-bot.js");
-    await Promise.all([
-      postComment(1, "All contributors have signed the CLA. \u2705"),
-      postComment(1, "All contributors have signed the CLA. \u2705"),
-    ]);
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => {
+      warnings.push(msg);
+    };
+    try {
+      await Promise.all([
+        postComment(1, "All contributors have signed the CLA. \u2705"),
+        postComment(1, "All contributors have signed the CLA. \u2705"),
+      ]);
+    } finally {
+      console.warn = originalWarn;
+    }
 
     assert.strictEqual(
       state.comments.length,
       1,
       "self-healing must converge to exactly one surviving comment under a genuine concurrent race",
+    );
+    // Observability check: this race should be logged, not just silently
+    // cleaned up - see dedupeIdenticalTrailingComments()'s doc comment for
+    // why (it's the signal a maintainer needs to notice the consuming
+    // workflow may be missing its `concurrency:` group).
+    assert.ok(
+      warnings.some((w) => w.includes("Deleted 1 duplicate bot comment")),
+      `expected a warning logging the duplicate cleanup, got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  await test("postComment's self-heal cleanup logs NO warning on the ordinary, non-racing path (nothing to delete)", async () => {
+    const state = { comments: [] };
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") return res(200, state.comments);
+        if (method === "POST") {
+          const { body } = JSON.parse(opts.body);
+          const comment = {
+            id: state.comments.length + 1,
+            body,
+            user: { login: "github-actions[bot]" },
+          };
+          state.comments.push(comment);
+          return res(201, comment);
+        }
+      }
+      throw new Error(`Unhandled mock request: ${method} ${url}`);
+    };
+
+    const { postComment } = require("../src/cla-bot.js");
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => {
+      warnings.push(msg);
+    };
+    try {
+      await postComment(1, "a perfectly ordinary, non-racing comment");
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.strictEqual(state.comments.length, 1);
+    assert.deepStrictEqual(
+      warnings,
+      [],
+      "no warning should be logged when the self-heal cleanup finds nothing to delete",
     );
   });
 
