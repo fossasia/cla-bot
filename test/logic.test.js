@@ -404,6 +404,33 @@ test("validateConfig rejects an absolute SIG_PATH", () => {
   );
 });
 
+// The SIG_PATH check is a single `||` chain of four conditions
+// (startsWith("/"), includes("\\"), split("/").includes(".."),
+// trim().length === 0) - the two tests above only ever drive the FIRST
+// and THIRD conditions true. Without a dedicated test for each of the
+// remaining two, a future refactor could silently break either one (e.g.
+// drop the backslash check entirely) and nothing would catch it, even
+// though overall statement/line coverage of this file would stay at
+// 100% throughout (the buggy line would still be *executed*, just no
+// longer *asserted on*).
+test("validateConfig rejects a SIG_PATH containing a backslash", () => {
+  assertConfigFails(
+    { ...VALID_BASE_CONFIG, SIG_PATH: "signatures\\cla.json" },
+    "SIG_PATH",
+  );
+});
+
+test("validateConfig rejects a whitespace-only SIG_PATH", () => {
+  assertConfigFails({ ...VALID_BASE_CONFIG, SIG_PATH: "   " }, "SIG_PATH");
+});
+
+test("validateConfig accepts a SIG_PATH nested in subdirectories (sanity check: legitimate relative paths are not caught by the traversal/absolute/backslash checks above)", () => {
+  assertConfigOK({
+    ...VALID_BASE_CONFIG,
+    SIG_PATH: "nested/dir/signatures.json",
+  });
+});
+
 test("validateConfig rejects a SIG_APP_PRIVATE_KEY that does not look like PEM", () => {
   assertConfigFails(
     {
@@ -708,6 +735,32 @@ test("isSameContributor falls back to a case-insensitive login match when either
   assert.strictEqual(
     isSameContributor({ login: "Alice" }, { login: "alice" }),
     true,
+  );
+});
+
+// The two tests above only ever exercise BOTH sides having a numeric id,
+// or NEITHER side having one. The asymmetric case - one side has a
+// numeric id (e.g. a commit author resolved via the API) and the other
+// doesn't (e.g. a legacy signature entry, or a bare { login } passed by
+// an older caller) - takes a different code path (falls through to the
+// login-only comparison) and needs its own coverage, since a future
+// change to the id-check condition could silently break just this one
+// asymmetric shape without either existing test noticing.
+test("isSameContributor falls back to a login match when only ONE side has a numeric id (asymmetric shape)", () => {
+  assert.strictEqual(
+    isSameContributor({ id: 1, login: "alice" }, { login: "alice" }),
+    true,
+    "same login should still match even though only one side carries an id",
+  );
+  assert.strictEqual(
+    isSameContributor({ login: "alice" }, { id: 2, login: "alice" }),
+    true,
+    "order of which side has the id must not matter",
+  );
+  assert.strictEqual(
+    isSameContributor({ id: 1, login: "alice" }, { login: "bob" }),
+    false,
+    "an id on only one side must not cause a false match against a different login",
   );
 });
 
