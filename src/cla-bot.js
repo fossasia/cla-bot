@@ -415,35 +415,61 @@ function createAppJWT(appId, privateKeyPem) {
   return `${unsigned}.${base64url(signer.sign(privateKeyPem))}`;
 }
 
-let _cachedSigToken = null; // one per run, no need to mint more than once
+// Cache the in-flight PROMISE, not just the eventually-resolved value. A
+// bare `let _cachedSigToken = null; if (_cachedSigToken) return it; ...
+// mint ... _cachedSigToken = result` has a TOCTOU gap: two calls to
+// getSignaturesToken() that both arrive before the first mint has resolved
+// will both see the cache empty and both mint their own token (two
+// `/app/installations/.../access_tokens` calls plus the /installation
+// lookup before it). Nothing in this file currently calls this function
+// twice concurrently, but it's exported and cheap to make race-safe
+// unconditionally rather than relying on every present and future caller
+// never doing so - see test/cache-race.test.js. Caching the promise itself
+// means every concurrent caller awaits the exact same mint instead of each
+// starting their own.
+//
+// A failed mint must NOT be cached, though - unlike the success case, a
+// rejected promise cached here would permanently poison every later call
+// in this run with the same error, even after whatever transient condition
+// caused it (a 5xx, a bad installation lookup) might have cleared. So a
+// failure resets the cache to null before rethrowing, letting the next
+// call try again from scratch.
+let _sigTokenPromise = null;
 async function getSignaturesToken() {
-  if (_cachedSigToken) return _cachedSigToken;
+  if (_sigTokenPromise) return _sigTokenPromise;
 
-  if (!SIG_APP_ID || !SIG_APP_PRIVATE_KEY) {
-    console.warn(
-      "::warning::SIG_APP_ID/SIG_APP_PRIVATE_KEY not set - falling back to GITHUB_TOKEN. Cross-repo writes will only work if the signatures repo equals the current repo.",
+  _sigTokenPromise = (async () => {
+    if (!SIG_APP_ID || !SIG_APP_PRIVATE_KEY) {
+      console.warn(
+        "::warning::SIG_APP_ID/SIG_APP_PRIVATE_KEY not set - falling back to GITHUB_TOKEN. Cross-repo writes will only work if the signatures repo equals the current repo.",
+      );
+      return GITHUB_TOKEN;
+    }
+
+    const jwt = createAppJWT(SIG_APP_ID, SIG_APP_PRIVATE_KEY);
+    // Repo-scoped lookup, not /orgs/{org}/installation - the org endpoint
+    // 404s when signatures-owner is a user account rather than an org, and
+    // this one works for both without needing to branch on account type.
+    const installation = await gh(
+      `/repos/${SIG_OWNER}/${SIG_REPO}/installation`,
+      jwt,
     );
-    _cachedSigToken = GITHUB_TOKEN;
-    return _cachedSigToken;
-  }
+    const tokenResp = await gh(
+      `/app/installations/${installation.id}/access_tokens`,
+      jwt,
+      // A retried mint just produces an extra unused, short-lived token -
+      // no user-visible side effect, so it's fine to let gh() retry here.
+      { method: "POST", idempotent: true },
+    );
+    return tokenResp.token; // valid ~1 hour
+  })();
 
-  const jwt = createAppJWT(SIG_APP_ID, SIG_APP_PRIVATE_KEY);
-  // Repo-scoped lookup, not /orgs/{org}/installation - the org endpoint
-  // 404s when signatures-owner is a user account rather than an org, and
-  // this one works for both without needing to branch on account type.
-  const installation = await gh(
-    `/repos/${SIG_OWNER}/${SIG_REPO}/installation`,
-    jwt,
-  );
-  const tokenResp = await gh(
-    `/app/installations/${installation.id}/access_tokens`,
-    jwt,
-    // A retried mint just produces an extra unused, short-lived token -
-    // no user-visible side effect, so it's fine to let gh() retry here.
-    { method: "POST", idempotent: true },
-  );
-  _cachedSigToken = tokenResp.token; // valid ~1 hour
-  return _cachedSigToken;
+  try {
+    return await _sigTokenPromise;
+  } catch (e) {
+    _sigTokenPromise = null;
+    throw e;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -717,41 +743,62 @@ function classifyBotComment(body) {
 const NEW_NOREPLY = /^(\d+)\+([^@]+)@users\.noreply\.github\.com$/i;
 const OLD_NOREPLY = /^([^@+]+)@users\.noreply\.github\.com$/i;
 
-const _userIdCache = new Map(); // login (lowercased) -> id | null (not found)
+// Both caches below store the in-flight PROMISE for each key, not the
+// eventually-resolved id/login - same TOCTOU reasoning as getSignaturesToken()
+// and resolveBotLogin() above: a plain "check Map, await, then Map.set()"
+// lets two concurrent lookups for the SAME key (e.g. the same co-author
+// email appearing in two different commits on one PR) each fire their own
+// API call instead of sharing one. listPRCommitAuthors() currently walks
+// commits in a sequential `for` loop with no concurrent calls, so this
+// never actually happens with today's call graph - this is deliberate
+// hardening against a future change (e.g. parallelizing that loop for
+// speed) reintroducing the race silently. Neither helper below can reject
+// (both catch internally and resolve to `null` on any failure, same as
+// before), so - unlike getSignaturesToken() - there's no failure-caching
+// pitfall here: the cached promise is always safe to reuse for the rest of
+// the run once set.
+const _userIdCache = new Map(); // login (lowercased) -> Promise<id | null>
 async function resolveUserIdByLogin(login) {
   const key = login.toLowerCase();
   if (_userIdCache.has(key)) return _userIdCache.get(key);
-  let id = null;
-  try {
-    const user = await gh(`/users/${encodeURIComponent(login)}`, GITHUB_TOKEN);
-    if (user && typeof user.id === "number") id = user.id;
-  } catch (e) {
-    // 404 or a transient failure - either way this falls through to
-    // "unresolved" at the call site rather than being silently dropped.
-  }
-  _userIdCache.set(key, id);
-  return id;
+  const promise = (async () => {
+    try {
+      const user = await gh(
+        `/users/${encodeURIComponent(login)}`,
+        GITHUB_TOKEN,
+      );
+      if (user && typeof user.id === "number") return user.id;
+    } catch (e) {
+      // 404 or a transient failure - either way this falls through to
+      // "unresolved" at the call site rather than being silently dropped.
+    }
+    return null;
+  })();
+  _userIdCache.set(key, promise);
+  return promise;
 }
 
-const _loginByIdCache = new Map(); // id -> login | null (not found)
+const _loginByIdCache = new Map(); // id -> Promise<login | null>
 // GET /user/{account_id} gives us the current, GitHub-verified login for an
 // id, instead of trusting whatever login string sits next to that id in a
 // commit trailer (see extractCoAuthors - the trailer is free text, so an
 // "id+login" pair in it doesn't prove they belong to the same account).
 async function resolveLoginById(id) {
   if (_loginByIdCache.has(id)) return _loginByIdCache.get(id);
-  let login = null;
-  try {
-    const user = await gh(`/user/${encodeURIComponent(id)}`, GITHUB_TOKEN);
-    if (user && typeof user.login === "string" && user.login.length > 0) {
-      login = user.login;
+  const promise = (async () => {
+    try {
+      const user = await gh(`/user/${encodeURIComponent(id)}`, GITHUB_TOKEN);
+      if (user && typeof user.login === "string" && user.login.length > 0) {
+        return user.login;
+      }
+    } catch (e) {
+      // 404 (deleted account, or no such id) or transient failure - falls
+      // through to unresolved.
     }
-  } catch (e) {
-    // 404 (deleted account, or no such id) or transient failure - falls
-    // through to unresolved.
-  }
-  _loginByIdCache.set(id, login);
-  return login;
+    return null;
+  })();
+  _loginByIdCache.set(id, promise);
+  return promise;
 }
 
 // A Co-authored-by: trailer in a commit message is free text - GitHub never
@@ -877,25 +924,33 @@ async function listPRCommitAuthors(prNumber) {
   return { authors: [...authors.values()], unresolved: [...unresolvedShas] };
 }
 
-let _cachedBotLogin = null; // one per run, same idea as _cachedSigToken
+// Same promise-caching reasoning as getSignaturesToken() above: cache the
+// in-flight promise, not just the eventually-resolved login, so that two
+// concurrent callers (e.g. two postComment() calls racing via Promise.all -
+// see the "genuinely concurrent postComment()" test) share one `/user`
+// lookup instead of each firing their own. Unlike getSignaturesToken(),
+// this never rejects (the try/catch below always resolves to a login, real
+// or the default), so there's no failure-caching pitfall to guard against
+// here - the cached promise is always safe to reuse for the rest of the
+// run.
+let _botLoginPromise = null;
 async function resolveBotLogin() {
-  if (_cachedBotLogin) return _cachedBotLogin;
-  try {
-    // Works for a PAT or user-scoped token. The standard GITHUB_TOKEN isn't
-    // one of those, so this is expected to fail in the normal setup - we
-    // just fall back to the default below. This only matters for a
-    // consumer using a different kind of token, so dedupe still compares
-    // against the right identity instead of a hardcoded guess.
-    const me = await gh("/user", GITHUB_TOKEN);
-    if (me && me.login) {
-      _cachedBotLogin = me.login;
-      return _cachedBotLogin;
+  if (_botLoginPromise) return _botLoginPromise;
+  _botLoginPromise = (async () => {
+    try {
+      // Works for a PAT or user-scoped token. The standard GITHUB_TOKEN
+      // isn't one of those, so this is expected to fail in the normal
+      // setup - we just fall back to the default below. This only matters
+      // for a consumer using a different kind of token, so dedupe still
+      // compares against the right identity instead of a hardcoded guess.
+      const me = await gh("/user", GITHUB_TOKEN);
+      if (me && me.login) return me.login;
+    } catch (e) {
+      // Expected for the standard GITHUB_TOKEN - fall through to the default.
     }
-  } catch (e) {
-    // Expected for the standard GITHUB_TOKEN - fall through to the default.
-  }
-  _cachedBotLogin = DEFAULT_BOT_LOGIN;
-  return _cachedBotLogin;
+    return DEFAULT_BOT_LOGIN;
+  })();
+  return _botLoginPromise;
 }
 
 async function getExistingBotComments(
@@ -1034,7 +1089,20 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
     .filter((c) => c.body === body)
     .sort((a, b) => a.id - b.id);
   // Keep the newest (highest id), delete the rest.
-  for (const dup of matching.slice(0, -1)) {
+  const toDelete = matching.slice(0, -1);
+  if (toDelete.length > 0) {
+    // Observability, not correctness: this only fires when the race
+    // described above actually happened (two concurrent runs both posted
+    // the identical comment). It's a signal worth surfacing in the Actions
+    // log - if a maintainer sees this repeatedly, it usually means the
+    // consuming workflow is missing (or has misconfigured) the
+    // `concurrency:` group from the example workflow, which is what
+    // actually prevents the race rather than just cleaning up after it.
+    console.warn(
+      `::warning::Deleted ${toDelete.length} duplicate bot comment(s) on PR #${prNumber} - this means two runs raced past the dedupe check at the same time. If this keeps happening, check that the consuming workflow has the \`concurrency:\` group from the example workflow (see SECURITY.md).`,
+    );
+  }
+  for (const dup of toDelete) {
     try {
       await gh(
         `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${encodeURIComponent(dup.id)}`,
@@ -1591,4 +1659,12 @@ module.exports = {
   // instead of re-typing the same expression themselves, so the two can
   // never drift out of sync with each other.
   signerCompletedRequirement,
+  // Exported for tests only, same reasoning as getSignaturesToken above:
+  // these are the two per-key lookup caches hardened against the same
+  // "concurrent callers for the same key both fire their own request"
+  // race, and are covered directly in test/cache-race.test.js rather than
+  // only indirectly through the (currently always-sequential)
+  // listPRCommitAuthors() call path that normally reaches them.
+  resolveUserIdByLogin,
+  resolveLoginById,
 };
