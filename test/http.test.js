@@ -26,6 +26,7 @@ const {
   writeSignatures,
   getSignaturesToken,
   postComment,
+  ghRaw,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -480,6 +481,123 @@ function fakeResponse(status, jsonBody, headers = {}) {
     }
   });
 
+  // Item E: the mint request can come back 200 OK but with a body that
+  // doesn't actually carry a usable token. getSignaturesToken() now
+  // validates tokenResp.token before caching/returning it (see the
+  // "missing a usable token field" check right after the mint request) -
+  // a malformed successful response must fail loudly right here, not
+  // silently flow through as an unusable `Authorization: Bearer undefined`
+  // that only surfaces later as a confusing 401 on some unrelated request.
+  await test("getSignaturesToken throws a clear error (not a silently-cached undefined) when the access_tokens response body is an empty object", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 111 });
+      if (url.includes("/access_tokens")) return fakeResponse(200, {}); // no "token" field at all
+      throw new Error(`unexpected call: ${url}`);
+    };
+    let caught = null;
+    try {
+      await freshGetToken();
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(
+      caught,
+      "expected getSignaturesToken to throw instead of returning an unusable undefined token",
+    );
+    assert.ok(
+      /missing a usable "token" field/.test(caught.message),
+      `expected a specific, actionable error message, got: ${caught.message}`,
+    );
+  });
+
+  await test("getSignaturesToken throws a clear error (not a silently-cached null) when the access_tokens response explicitly carries a null token", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 112 });
+      if (url.includes("/access_tokens"))
+        return fakeResponse(200, { token: null });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    let caught = null;
+    try {
+      await freshGetToken();
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected getSignaturesToken to throw on a null token");
+    assert.ok(/missing a usable "token" field/.test(caught.message));
+  });
+
+  await test("getSignaturesToken throws a clear error (not a raw TypeError) when the access_tokens response is a 200 OK with a completely empty body", async () => {
+    // ghRaw()'s success path does `text ? JSON.parse(text) : null` - an
+    // empty 200 body becomes a bare `null`, not `{}`. Dereferencing
+    // `.token` directly on that would throw an unrelated "Cannot read
+    // properties of null" TypeError instead of the intended, actionable
+    // validation error - this is exactly the case the `!tokenResp` guard
+    // (checked before `tokenResp.token`) exists for.
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 114 });
+      if (url.includes("/access_tokens")) return fakeResponse(200, null); // 200 OK, empty body -> ghRaw() returns bare null
+      throw new Error(`unexpected call: ${url}`);
+    };
+    let caught = null;
+    try {
+      await freshGetToken();
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(
+      caught,
+      "expected getSignaturesToken to throw instead of crashing or silently caching an unusable token",
+    );
+    assert.ok(
+      !(caught instanceof TypeError),
+      `expected the intended, actionable Error - not a raw TypeError from dereferencing .token on null - got: ${caught.constructor.name}: ${caught.message}`,
+    );
+    assert.ok(
+      /missing a usable "token" field/.test(caught.message),
+      `expected the same specific, actionable error message as the other malformed-response cases, got: ${caught.message}`,
+    );
+  });
+
+  await test("getSignaturesToken's failed-validation mint does not poison the cache: a later call still successfully re-mints a real token", async () => {
+    // A thrown error happens BEFORE `_cachedSigToken` is ever assigned, so
+    // the module-scope cache is never left holding a bad value - this
+    // confirms a transient malformed response (e.g. a flaky proxy) doesn't
+    // permanently break every subsequent call in the same run.
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    let mintCalls = 0;
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 113 });
+      if (url.includes("/access_tokens")) {
+        mintCalls += 1;
+        if (mintCalls === 1) return fakeResponse(200, {}); // first mint: malformed, must throw
+        return fakeResponse(200, { token: "real-token-on-second-try" });
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+    let firstCaught = null;
+    try {
+      await freshGetToken();
+    } catch (e) {
+      firstCaught = e;
+    }
+    assert.ok(firstCaught, "expected the first, malformed mint to throw");
+    const second = await freshGetToken();
+    assert.strictEqual(second, "real-token-on-second-try");
+    assert.strictEqual(
+      mintCalls,
+      2,
+      "a failed mint must not be cached as if it succeeded - the second call had to actually re-mint",
+    );
+  });
+
   await test("readSignatures falls back to a raw-media-type fetch when the file is too big for inline base64 content (over 1 MB)", async () => {
     const stored = {
       version: 1,
@@ -576,6 +694,44 @@ function fakeResponse(status, jsonBody, headers = {}) {
     assert.ok(
       caught.message.includes("403"),
       "the original status must still be visible in the error message",
+    );
+  });
+
+  // Item D: the mirror image of the test above - here the response IS
+  // ok (200), so ghRaw()'s success branch (`return text ? JSON.parse(text)
+  // : null`) is what runs, and that JSON.parse is NOT wrapped in its own
+  // try/catch the way the error-body path just above is. A malformed
+  // success body (e.g. a misconfigured proxy that returns 200 with a
+  // truncated/non-JSON payload) must still surface as a clear, immediate
+  // SyntaxError - not silently produce garbage data, and not be masked by
+  // gh()'s retry loop (a SyntaxError has no `.status` and isn't named
+  // "AbortError", so it isn't "transient" and must NOT be retried).
+  await test("ghRaw's success path (200 OK) throws a clear SyntaxError, without retrying, when the response body is not valid JSON", async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        text: async () => "this is not { valid json",
+        headers: { get: () => null },
+      };
+    };
+    let caught = null;
+    try {
+      await readSignatures("tok");
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected JSON.parse to throw on the malformed body");
+    assert.ok(
+      caught instanceof SyntaxError,
+      `expected a SyntaxError, got: ${caught && caught.constructor.name}`,
+    );
+    assert.strictEqual(
+      calls,
+      1,
+      "a SyntaxError has no .status and isn't an AbortError, so gh()'s transient-retry loop must not retry it",
     );
   });
 
@@ -707,6 +863,51 @@ function fakeResponse(status, jsonBody, headers = {}) {
         fetchCalls,
         3,
         "AbortError must be retried up to MAX_RETRIES (3 total attempts), not thrown immediately and not retried forever",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  // Item C: the test above only exercises "hangs on every attempt, until
+  // retries run out" - the equally important, distinct case is a transient
+  // hang that clears up partway through: the first attempt(s) time out, but
+  // a later attempt within MAX_RETRIES gets a real, immediate response and
+  // the whole call succeeds cleanly, exactly like the 503/429 recovery
+  // tests below do for HTTP-level transient errors.
+  await test("a request that times out on its first attempt but succeeds on a later retry recovers cleanly (does not throw, does not needlessly exhaust all retries)", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let fetchCalls = 0;
+    try {
+      global.fetch = (url, opts) => {
+        fetchCalls += 1;
+        if (fetchCalls === 1) {
+          // Only the FIRST attempt hangs and gets aborted - every
+          // subsequent attempt gets a real, immediate response below.
+          return new Promise((resolve, reject) => {
+            opts.signal.addEventListener("abort", () => {
+              const err = new Error("This operation was aborted");
+              err.name = "AbortError";
+              reject(err);
+            });
+          });
+        }
+        return Promise.resolve(
+          fakeResponse(200, {
+            sha: "recovered-after-timeout-sha",
+            content: b64({ version: 1, signatures: [] }),
+            encoding: "base64",
+          }),
+        );
+      };
+
+      const { sha } = await readSignatures("tok");
+      assert.strictEqual(sha, "recovered-after-timeout-sha");
+      assert.strictEqual(
+        fetchCalls,
+        2,
+        "expected exactly 1 timed-out attempt followed by 1 successful retry - not 3 (all retries exhausted) and not 1 (no retry happened at all)",
       );
     } finally {
       global.setTimeout = originalSetTimeout;
@@ -1032,6 +1233,904 @@ function fakeResponse(status, jsonBody, headers = {}) {
       1,
       "a 422 with an unparseable body must not be mistaken for the first-write sha race and retried",
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // Item Q: rounding out the HTTP method x transient-status retry matrix.
+  // The tests above already prove GET recovers from 503/429/Retry-After/
+  // AbortError, and that a plain POST is never auto-retried. These fill in
+  // the remaining safe-to-retry methods (PUT, DELETE) against the same
+  // transient conditions, plus the one POST case that IS retried
+  // (idempotent: true, on getSignaturesToken's token mint) all the way to
+  // exhaustion instead of just its one already-tested recovery case.
+  // ---------------------------------------------------------------------
+  await test("a transient 503 on a DELETE (duplicate-comment cleanup) is retried by gh() and the cleanup succeeds silently, without ever reaching the outer per-comment warning", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => warnings.push(msg);
+    let getCount = 0;
+    let deleteAttempts = 0;
+    try {
+      global.fetch = async (url, opts) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (method === "GET" && url.includes("/comments")) {
+          getCount += 1;
+          if (getCount === 1) return fakeResponse(200, []); // pre-check: nothing yet, so postComment proceeds to POST
+          // cleanup re-fetch: an older identical duplicate plus our own new comment
+          return fakeResponse(200, [
+            {
+              id: 10,
+              body: "<!-- fossasia-cla-bot:v1 -->\nhello",
+              user: { login: "github-actions[bot]" },
+            },
+            {
+              id: 11,
+              body: "<!-- fossasia-cla-bot:v1 -->\nhello",
+              user: { login: "github-actions[bot]" },
+            },
+          ]);
+        }
+        if (method === "POST") {
+          return fakeResponse(201, {
+            id: 11,
+            body: "<!-- fossasia-cla-bot:v1 -->\nhello",
+            user: { login: "github-actions[bot]" },
+          });
+        }
+        if (method === "DELETE") {
+          deleteAttempts += 1;
+          if (deleteAttempts === 1)
+            return fakeResponse(503, { message: "Service Unavailable" });
+          return fakeResponse(204, null);
+        }
+        throw new Error(`unexpected call: ${method} ${url}`);
+      };
+      await postComment(1, "hello");
+      assert.strictEqual(
+        deleteAttempts,
+        2,
+        "expected the 503 to be retried once and succeed on the 2nd DELETE attempt",
+      );
+      assert.strictEqual(
+        warnings.length,
+        0,
+        "a DELETE that eventually succeeds via gh()'s own retry loop must never reach the outer 'could not delete' warning",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+      console.warn = originalWarn;
+    }
+  });
+
+  await test("a DELETE (duplicate-comment cleanup) that times out on its first attempt recovers cleanly on retry, without ever surfacing the 'could not delete' warning", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => warnings.push(msg);
+    let getCount = 0;
+    let deleteAttempts = 0;
+    try {
+      global.fetch = (url, opts) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (method === "GET" && url.includes("/comments")) {
+          getCount += 1;
+          if (getCount === 1) return Promise.resolve(fakeResponse(200, []));
+          return Promise.resolve(
+            fakeResponse(200, [
+              {
+                id: 20,
+                body: "<!-- fossasia-cla-bot:v1 -->\nworld",
+                user: { login: "github-actions[bot]" },
+              },
+              {
+                id: 21,
+                body: "<!-- fossasia-cla-bot:v1 -->\nworld",
+                user: { login: "github-actions[bot]" },
+              },
+            ]),
+          );
+        }
+        if (method === "POST") {
+          return Promise.resolve(
+            fakeResponse(201, {
+              id: 21,
+              body: "<!-- fossasia-cla-bot:v1 -->\nworld",
+              user: { login: "github-actions[bot]" },
+            }),
+          );
+        }
+        if (method === "DELETE") {
+          deleteAttempts += 1;
+          if (deleteAttempts === 1) {
+            // First attempt hangs and gets aborted, exactly like the GET
+            // timeout tests above - the only way it ever settles is via
+            // the abort signal ghRaw() attaches.
+            return new Promise((resolve, reject) => {
+              opts.signal.addEventListener("abort", () => {
+                const err = new Error("This operation was aborted");
+                err.name = "AbortError";
+                reject(err);
+              });
+            });
+          }
+          return Promise.resolve(fakeResponse(204, null));
+        }
+        return Promise.reject(new Error(`unexpected call: ${method} ${url}`));
+      };
+      await postComment(1, "world");
+      assert.strictEqual(
+        deleteAttempts,
+        2,
+        "expected 1 timed-out DELETE attempt followed by 1 successful retry",
+      );
+      assert.strictEqual(
+        warnings.length,
+        0,
+        "a DELETE that recovers via retry must never reach the outer per-comment warning",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+      console.warn = originalWarn;
+    }
+  });
+
+  await test("a 429 rate-limit response on a PUT (writeSignatures) is retried the same way as a GET, and the write still succeeds", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let putAttempts = 0;
+    try {
+      global.fetch = async (url, opts) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (method === "GET") {
+          return fakeResponse(200, {
+            sha: "s1",
+            content: b64({ version: 1, signatures: [] }),
+            encoding: "base64",
+          });
+        }
+        if (method === "PUT") {
+          putAttempts += 1;
+          if (putAttempts === 1)
+            return fakeResponse(429, { message: "rate limited" });
+          return fakeResponse(200, { content: { sha: "s2" } });
+        }
+        throw new Error(`unexpected call: ${method} ${url}`);
+      };
+      const result = await writeSignatures(
+        "tok",
+        (data) => ({
+          ...data,
+          signatures: [...data.signatures, { login: "dave" }],
+        }),
+        "dave signs",
+      );
+      assert.deepStrictEqual(
+        result.signatures.map((s) => s.login),
+        ["dave"],
+      );
+      assert.strictEqual(
+        putAttempts,
+        2,
+        "expected 1 failed PUT attempt (429) before the retry succeeds",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("gh() honors the Retry-After header for the backoff delay on a PUT (writeSignatures), not just a GET", async () => {
+    const originalSetTimeout = global.setTimeout;
+    const delaysSeen = [];
+    global.setTimeout = (fn, ms) => {
+      delaysSeen.push(ms);
+      return originalSetTimeout(fn, 0);
+    };
+    let putAttempts = 0;
+    try {
+      global.fetch = async (url, opts) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (method === "GET") {
+          return fakeResponse(200, {
+            sha: "s1",
+            content: b64({ version: 1, signatures: [] }),
+            encoding: "base64",
+          });
+        }
+        if (method === "PUT") {
+          putAttempts += 1;
+          if (putAttempts === 1)
+            return fakeResponse(
+              403,
+              { message: "secondary rate limit" },
+              { "retry-after": "3" },
+            );
+          return fakeResponse(200, { content: { sha: "s2" } });
+        }
+        throw new Error(`unexpected call: ${method} ${url}`);
+      };
+      await writeSignatures(
+        "tok",
+        (data) => ({
+          ...data,
+          signatures: [...data.signatures, { login: "eve" }],
+        }),
+        "eve signs",
+      );
+      assert.ok(
+        delaysSeen.includes(3000),
+        `expected a 3000ms backoff delay honoring Retry-After: 3 on the PUT, saw: ${delaysSeen}`,
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("getSignaturesToken's idempotent access_tokens mint (a POST) is retried up to MAX_RETRIES on a persistent transient failure, then propagates - not retried forever", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let mintAttempts = 0;
+    try {
+      global.fetch = async (url) => {
+        if (url.endsWith("/installation"))
+          return fakeResponse(200, { id: 200 });
+        if (url.includes("/access_tokens")) {
+          mintAttempts += 1;
+          return fakeResponse(503, { message: "Service Unavailable" });
+        }
+        throw new Error(`unexpected call: ${url}`);
+      };
+      let caught = null;
+      try {
+        await freshGetToken();
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught, "expected getSignaturesToken to eventually throw");
+      assert.strictEqual(caught.status, 503);
+      assert.strictEqual(
+        mintAttempts,
+        3,
+        "expected exactly MAX_RETRIES (3) attempts on the idempotent POST, not unlimited retries and not fewer",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  // ===========================================================================
+  // Rounding out the gh() retry matrix: a few specific combinations flagged
+  // as still open - idempotent-but-non-transient, plain 403 without
+  // Retry-After on the safe-to-retry methods, and ghRaw()'s empty-body ->
+  // null path tested directly (the exact path behind the getSignaturesToken
+  // null-tokenResp bug fixed above).
+  // ===========================================================================
+  await test("ghRaw's success path returns null (not an error, not {}) when the response body is a completely empty string", async () => {
+    // readSignatures would choke on a null `data` (it expects a signatures
+    // object), so this reaches into ghRaw()'s own success branch a
+    // different way: through the getSignaturesToken mint call, where a
+    // bare `null` is exactly the shape the validation fix above defends
+    // against. This proves ghRaw() itself is what produces that null.
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    let sawEmptyBodyOnMint = false;
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 999 });
+      if (url.includes("/access_tokens")) {
+        sawEmptyBodyOnMint = true;
+        return {
+          ok: true,
+          status: 200,
+          text: async () => "", // the exact case: `text ? JSON.parse(text) : null` -> null
+          headers: { get: () => null },
+        };
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+    let caught = null;
+    try {
+      await freshGetToken();
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(sawEmptyBodyOnMint, "test setup sanity check");
+    assert.ok(
+      caught && !(caught instanceof TypeError),
+      `ghRaw() must have returned a bare null here (not thrown, not {}) - and the caller's own validation, not a raw TypeError, must be what catches it. Got: ${caught && caught.constructor.name}`,
+    );
+  });
+
+  await test("an idempotent-marked POST is still NOT retried on a non-transient error (e.g. 404) - idempotent only widens what's safe to retry, it doesn't force a retry", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    let mintAttempts = 0;
+    try {
+      global.fetch = async (url) => {
+        if (url.endsWith("/installation"))
+          return fakeResponse(200, { id: 501 });
+        if (url.includes("/access_tokens")) {
+          mintAttempts += 1;
+          // getSignaturesToken's mint is the one real idempotent: true POST
+          // in the codebase - a 404 here (e.g. the installation was
+          // uninstalled between the two calls) is not transient and must
+          // not be retried, despite idempotent: true.
+          return fakeResponse(404, { message: "Not Found" });
+        }
+        throw new Error(`unexpected call: ${url}`);
+      };
+      let caught = null;
+      try {
+        await freshGetToken();
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught);
+      assert.strictEqual(caught.status, 404);
+      assert.strictEqual(
+        mintAttempts,
+        1,
+        "a non-transient 404 must not be retried even on an idempotent-marked request",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("a POST (idempotent: false, the default) is also NOT retried on a 429, the same as the already-tested 5xx case", async () => {
+    let postAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "GET" && url.includes("/comments")) {
+        return fakeResponse(200, []); // dedupe pre-check: no existing comments
+      }
+      if (method === "POST") {
+        postAttempts += 1;
+        return fakeResponse(429, { message: "rate limited" });
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    let caught = null;
+    try {
+      await postComment(1, "hello");
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught);
+    assert.strictEqual(caught.status, 429);
+    assert.strictEqual(
+      postAttempts,
+      1,
+      "a plain (non-idempotent) POST must not be retried on a 429 either - only 5xx was tested before, 429 is a distinct branch of the same status check",
+    );
+  });
+
+  await test("a plain 403 WITHOUT a Retry-After header on a PUT is not retried (it's not the secondary-rate-limit case, just a permissions error)", async () => {
+    let putAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "GET") {
+        return fakeResponse(200, {
+          sha: "s1",
+          content: b64({ version: 1, signatures: [] }),
+          encoding: "base64",
+        });
+      }
+      if (method === "PUT") {
+        putAttempts += 1;
+        return fakeResponse(403, { message: "Resource not accessible" }); // no retry-after header
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    let caught = null;
+    try {
+      await writeSignatures(
+        "tok",
+        (data) => ({
+          ...data,
+          signatures: [...data.signatures, { login: "someone" }],
+        }),
+        "someone signs",
+      );
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught);
+    assert.strictEqual(caught.status, 403);
+    assert.strictEqual(
+      putAttempts,
+      1,
+      "a plain 403 (no retry-after) must NOT be treated as transient, on PUT just like on GET - only 403+retry-after (secondary rate limit) qualifies",
+    );
+  });
+
+  await test("a plain 403 WITHOUT a Retry-After header on a DELETE (duplicate-comment cleanup) is not retried and is swallowed by the per-comment warning, same as any other permanent DELETE failure", async () => {
+    let getCount = 0;
+    let deleteAttempts = 0;
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => warnings.push(msg);
+    try {
+      global.fetch = async (url, opts) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (method === "GET" && url.includes("/comments")) {
+          getCount += 1;
+          if (getCount === 1) return fakeResponse(200, []);
+          return fakeResponse(200, [
+            {
+              id: 30,
+              body: "<!-- fossasia-cla-bot:v1 -->\nplain403",
+              user: { login: "github-actions[bot]" },
+            },
+            {
+              id: 31,
+              body: "<!-- fossasia-cla-bot:v1 -->\nplain403",
+              user: { login: "github-actions[bot]" },
+            },
+          ]);
+        }
+        if (method === "POST") {
+          return fakeResponse(201, {
+            id: 31,
+            body: "<!-- fossasia-cla-bot:v1 -->\nplain403",
+            user: { login: "github-actions[bot]" },
+          });
+        }
+        if (method === "DELETE") {
+          deleteAttempts += 1;
+          return fakeResponse(403, { message: "Resource not accessible" }); // no retry-after
+        }
+        throw new Error(`unexpected call: ${method} ${url}`);
+      };
+      await postComment(1, "plain403");
+      assert.strictEqual(
+        deleteAttempts,
+        1,
+        "a plain 403 (no retry-after) on a DELETE must NOT be retried - it's not transient",
+      );
+      assert.ok(
+        warnings.some((w) => w.includes("duplicate comment 30")),
+        "the permanent DELETE failure must still be swallowed as a warning by the outer per-comment catch, not thrown out of postComment",
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  // ===========================================================================
+  // Signature store: the remaining readSignatures/writeSignatures branches -
+  // the non-base64 encoding fallback, a non-404/non-transient error on the
+  // initial read, and the isFirstWriteRace FALSE branch (a 422 that isn't
+  // actually about a missing sha).
+  // ===========================================================================
+  await test("readSignatures falls back to a second, raw-media-type fetch when the metadata response has content but a non-base64 encoding", async () => {
+    let getCount = 0;
+    global.fetch = async () => {
+      getCount += 1;
+      if (getCount === 1) {
+        // Some encoding other than "base64" (or content present but the
+        // field simply isn't populated the expected way) - the base64
+        // fast path must not be taken here.
+        return fakeResponse(200, {
+          sha: "s1",
+          content: "irrelevant-because-encoding-is-wrong",
+          encoding: "none",
+        });
+      }
+      return fakeResponse(200, {
+        version: 1,
+        signatures: [{ login: "via-raw-fallback" }],
+      });
+    };
+    const { sha, data } = await readSignatures("tok");
+    assert.strictEqual(sha, "s1");
+    assert.deepStrictEqual(data.signatures, [{ login: "via-raw-fallback" }]);
+    assert.strictEqual(
+      getCount,
+      2,
+      "a non-base64 encoding must trigger the second, raw-media-type request, just like a too-large file does",
+    );
+  });
+
+  await test("readSignatures propagates a non-404, non-transient error (e.g. a permissions 403) on the initial read immediately, without retrying and without treating it as 'file doesn't exist yet'", async () => {
+    let getCalls = 0;
+    global.fetch = async () => {
+      getCalls += 1;
+      return fakeResponse(403, {
+        message: "Resource not accessible by integration",
+      });
+    };
+    let caught = null;
+    try {
+      await readSignatures("tok");
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(
+      caught,
+      "expected readSignatures to throw, not silently return an empty store",
+    );
+    assert.strictEqual(caught.status, 403);
+    assert.strictEqual(
+      getCalls,
+      1,
+      "a plain 403 is neither a 404 (empty store) nor transient (retryable) - it must surface immediately, on the first attempt",
+    );
+  });
+
+  await test("writeSignatures does NOT treat a 422 as the first-write race when the error body's message doesn't actually mention a sha (isFirstWriteRace's message-pattern check must be specific, not just 'sha === null and status 422')", async () => {
+    let putAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "GET") {
+        // sha === null: exactly the condition isFirstWriteRace requires
+        // alongside status 422 - but the message below deliberately does
+        // NOT mention "sha", so it must still be rejected as a race.
+        return fakeResponse(404, { message: "Not Found" });
+      }
+      if (method === "PUT") {
+        putAttempts += 1;
+        return fakeResponse(422, {
+          message: "Validation Failed: path is invalid",
+        });
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    let caught = null;
+    try {
+      await writeSignatures(
+        "tok",
+        (data) => ({
+          ...data,
+          signatures: [...data.signatures, { login: "first-writer" }],
+        }),
+        "first-writer signs",
+      );
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected writeSignatures to throw immediately");
+    assert.strictEqual(caught.status, 422);
+    assert.strictEqual(
+      putAttempts,
+      1,
+      "a 422 whose message doesn't mention 'sha' must not be mistaken for the first-write race and retried",
+    );
+  });
+
+  // ===========================================================================
+  // ghRaw() tested directly (not just indirectly through some caller) -
+  // its success-path body-parsing branch.
+  // ===========================================================================
+  await test("ghRaw itself (called directly) returns a bare null, not {} or an error, for a 200 OK response with a completely empty body", async () => {
+    global.fetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => "",
+      headers: { get: () => null },
+    });
+    const result = await ghRaw("/some/path", "tok");
+    assert.strictEqual(result, null);
+  });
+
+  await test("ghRaw itself (called directly) parses and returns the JSON body for an ordinary 200 OK response", async () => {
+    global.fetch = async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ hello: "world" }),
+      headers: { get: () => null },
+    });
+    const result = await ghRaw("/some/path", "tok");
+    assert.deepStrictEqual(result, { hello: "world" });
+  });
+
+  // ===========================================================================
+  // e.retryAfter present but safeToRetry === false: the delay-calculation
+  // dead path. A plain (non-idempotent) POST getting a 403 WITH a
+  // Retry-After header still must not be retried - `transient` is
+  // `safeToRetry && (...)`, so a false safeToRetry short-circuits before
+  // e.retryAfter is ever consulted, regardless of its value.
+  // ===========================================================================
+  await test("a plain POST (not idempotent) is not retried on a 403+Retry-After either - safeToRetry gates the whole transient check before retryAfter is ever looked at", async () => {
+    let postAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "GET" && url.includes("/comments")) {
+        return fakeResponse(200, []); // dedupe pre-check: no existing comments
+      }
+      if (method === "POST") {
+        postAttempts += 1;
+        return fakeResponse(
+          403,
+          { message: "secondary rate limit" },
+          { "retry-after": "5" },
+        );
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    let caught = null;
+    try {
+      await postComment(1, "hello");
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught);
+    assert.strictEqual(caught.status, 403);
+    assert.strictEqual(
+      postAttempts,
+      1,
+      "a non-idempotent POST must not be retried even with a Retry-After header present - method safety is checked first",
+    );
+  });
+
+  // ===========================================================================
+  // Exact attempt === MAX_RETRIES boundary, forced independently on PUT and
+  // DELETE (GET and the idempotent POST mint are already covered
+  // elsewhere).
+  // ===========================================================================
+  await test("a persistently-failing transient error (429) on a PUT (writeSignatures) is retried up to MAX_RETRIES (3) attempts, then propagates - not retried forever", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let putAttempts = 0;
+    try {
+      global.fetch = async (url, opts) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (method === "GET") {
+          return fakeResponse(200, {
+            sha: "s1",
+            content: b64({ version: 1, signatures: [] }),
+            encoding: "base64",
+          });
+        }
+        if (method === "PUT") {
+          putAttempts += 1;
+          return fakeResponse(429, { message: "rate limited" });
+        }
+        throw new Error(`unexpected call: ${method} ${url}`);
+      };
+      let caught = null;
+      try {
+        await writeSignatures(
+          "tok",
+          (data) => ({
+            ...data,
+            signatures: [...data.signatures, { login: "persistent-429" }],
+          }),
+          "persistent-429 signs",
+        );
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught, "expected writeSignatures to eventually throw");
+      assert.strictEqual(caught.status, 429);
+      assert.strictEqual(
+        putAttempts,
+        3,
+        "expected exactly MAX_RETRIES (3) attempts on the PUT, not unlimited retries and not fewer",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
+  });
+
+  await test("a persistently-failing transient error (503) on a DELETE (duplicate-comment cleanup) is retried up to MAX_RETRIES (3) attempts, then swallowed by the outer per-comment warning - not thrown out of postComment", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => warnings.push(msg);
+    let getCount = 0;
+    let deleteAttempts = 0;
+    try {
+      global.fetch = async (url, opts) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (method === "GET" && url.includes("/comments")) {
+          getCount += 1;
+          if (getCount === 1) return fakeResponse(200, []);
+          return fakeResponse(200, [
+            {
+              id: 50,
+              body: "<!-- fossasia-cla-bot:v1 -->\npersistent503",
+              user: { login: "github-actions[bot]" },
+            },
+            {
+              id: 51,
+              body: "<!-- fossasia-cla-bot:v1 -->\npersistent503",
+              user: { login: "github-actions[bot]" },
+            },
+          ]);
+        }
+        if (method === "POST") {
+          return fakeResponse(201, {
+            id: 51,
+            body: "<!-- fossasia-cla-bot:v1 -->\npersistent503",
+            user: { login: "github-actions[bot]" },
+          });
+        }
+        if (method === "DELETE") {
+          deleteAttempts += 1;
+          return fakeResponse(503, { message: "Service Unavailable" });
+        }
+        throw new Error(`unexpected call: ${method} ${url}`);
+      };
+      await postComment(1, "persistent503"); // must NOT throw
+      assert.strictEqual(
+        deleteAttempts,
+        3,
+        "expected exactly MAX_RETRIES (3) DELETE attempts before giving up on this one duplicate",
+      );
+      assert.ok(
+        warnings.some((w) => w.includes("duplicate comment 50")),
+        "after exhausting retries, the permanent failure must still be swallowed as a warning, not thrown out of postComment",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+      console.warn = originalWarn;
+    }
+  });
+
+  // ===========================================================================
+  // getSignaturesToken(): installation lookup succeeds but the response has
+  // no usable .id. This is now rejected BEFORE the mint request is ever
+  // made - previously it flowed through unvalidated as the literal string
+  // "undefined" in the access_tokens URL, and only surfaced as a
+  // misleading 404 that named the wrong problem (a bad access_tokens
+  // response, when the real issue was the installation lookup).
+  // ===========================================================================
+  await test("getSignaturesToken rejects a malformed installation-lookup response (no usable .id) BEFORE making any mint request at all", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    let mintRequestMade = false;
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation")) return fakeResponse(200, {}); // no `id` field at all
+      if (url.includes("/access_tokens")) {
+        mintRequestMade = true;
+        return fakeResponse(200, { token: "should-never-be-reached" });
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+    let caught = null;
+    try {
+      await freshGetToken();
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(
+      caught,
+      "expected getSignaturesToken to throw its own clear validation error",
+    );
+    assert.ok(
+      /missing a usable "id" field/.test(caught.message),
+      `expected a specific, actionable error naming the installation lookup as the problem, got: ${caught.message}`,
+    );
+    assert.strictEqual(
+      mintRequestMade,
+      false,
+      "the mint request must never be attempted once the installation id is already known to be unusable - failing fast means not making a request that was always going to be pointless",
+    );
+  });
+
+  // installation.id sits at the exact same trust boundary as a PR/issue
+  // number (an externally-sourced value interpolated directly into a
+  // request path), so it's held to the same Number.isSafeInteger() + > 0
+  // bar assertValidPRNumber() already applies there via
+  // assertValidInstallationId() - not just "is it typeof number". Each of
+  // these is a value that a plain `typeof === "number"` check would have
+  // wrongly accepted.
+  //
+  // NaN/Infinity/-Infinity are deliberately NOT in this list: they can
+  // never actually reach getSignaturesToken() through a real HTTP
+  // response, because JSON's grammar has no token for any of the three -
+  // ghRaw()'s JSON.parse() can never produce them from response text.
+  // (fakeResponse() JSON.stringify()s its body, and JSON.stringify()
+  // itself silently turns all three into `null` - so mocking them here
+  // would only retest the `null` case a second time under a misleading
+  // name.) They're covered directly, against assertValidInstallationId()
+  // itself, in test/logic.test.js instead - see the comment there.
+  for (const { label, id } of [
+    { label: "a non-numeric string", id: "not-a-number" },
+    { label: "zero", id: 0 },
+    { label: "a negative integer", id: -1 },
+    { label: "a non-integer float", id: 1.5 },
+    { label: "null", id: null },
+    {
+      label:
+        "Number.MAX_SAFE_INTEGER + 1 (passes Number.isInteger, but not Number.isSafeInteger)",
+      id: Number.MAX_SAFE_INTEGER + 1,
+    },
+  ]) {
+    await test(`getSignaturesToken rejects an installation .id that is ${label}, before making any mint request at all`, async () => {
+      delete require.cache[require.resolve("../src/cla-bot.js")];
+      const {
+        getSignaturesToken: freshGetToken,
+      } = require("../src/cla-bot.js");
+      let mintRequestMade = false;
+      global.fetch = async (url) => {
+        if (url.endsWith("/installation")) return fakeResponse(200, { id });
+        if (url.includes("/access_tokens")) {
+          mintRequestMade = true;
+          return fakeResponse(200, { token: "should-never-be-reached" });
+        }
+        throw new Error(`unexpected call: ${url}`);
+      };
+      let caught = null;
+      try {
+        await freshGetToken();
+      } catch (e) {
+        caught = e;
+      }
+      assert.ok(caught, `expected getSignaturesToken to reject id=${label}`);
+      assert.ok(/missing a usable "id" field/.test(caught.message));
+      assert.strictEqual(
+        mintRequestMade,
+        false,
+        `a mint request must never be attempted for an unusable id (${label})`,
+      );
+    });
+  }
+
+  await test("getSignaturesToken accepts a genuinely valid installation id (a real positive integer) and proceeds to mint normally", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation"))
+        return fakeResponse(200, { id: 987654 });
+      if (url.includes("/access_tokens"))
+        return fakeResponse(200, { token: "genuinely-valid-token" });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const token = await freshGetToken();
+    assert.strictEqual(token, "genuinely-valid-token");
+  });
+
+  // ===========================================================================
+  // A whitespace-only token (e.g. "   ") is a non-empty string, so it would
+  // pass a plain `.length === 0` check while still being just as unusable
+  // as an empty one - the validation now checks the TRIMMED length.
+  // ===========================================================================
+  await test("getSignaturesToken rejects a whitespace-only token, not just an empty one", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 115 });
+      if (url.includes("/access_tokens"))
+        return fakeResponse(200, { token: "   " }); // non-empty, but whitespace-only
+      throw new Error(`unexpected call: ${url}`);
+    };
+    let caught = null;
+    try {
+      await freshGetToken();
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(
+      caught,
+      "expected a whitespace-only token to be rejected just like an empty one",
+    );
+    assert.ok(/missing a usable "token" field/.test(caught.message));
+  });
+
+  await test("getSignaturesToken trims incidental whitespace from an otherwise-valid token before caching it", async () => {
+    // Defensive normalization, not something a real GitHub response should
+    // ever need - if a token DOES arrive with stray whitespace around
+    // otherwise-real content, the cached/returned value must be the clean
+    // token, not a string with leading/trailing whitespace baked into every
+    // future Authorization header built from it.
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
+    global.fetch = async (url) => {
+      if (url.endsWith("/installation")) return fakeResponse(200, { id: 116 });
+      if (url.includes("/access_tokens"))
+        return fakeResponse(200, { token: "  real-token-with-padding  " });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const token = await freshGetToken();
+    assert.strictEqual(token, "real-token-with-padding");
   });
 
   console.log(`\n${passed} test(s) passed.`);
