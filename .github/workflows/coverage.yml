@@ -38,22 +38,43 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      # `c8` reads thresholds from .c8rc.json (all four metrics set to
-      # 100%) and exits non-zero when any of them isn't met. We don't want
-      # that non-zero exit to stop the workflow before we've had a chance
-      # to build and upload the human-readable report, so it's captured
-      # here (continue-on-error) and turned back into a real failure in
-      # the "Enforce coverage threshold" step below, once everything else
-      # has run.
-      - name: Run tests with coverage
+      # Deliberately split into two steps. Running `c8 npm test` in one go
+      # would collapse two very different failures - "a test failed" and
+      # "the tests all passed but coverage is below 100%" - into the same
+      # non-zero exit, so a broken test would get reported to the
+      # contributor as a coverage problem. Here the test run explicitly
+      # opts out of the threshold check (`--check-coverage=false`) and
+      # fails the job immediately on a genuine test failure, while the
+      # threshold is asserted separately further down.
+      - name: Run tests
+        run: npm run test:coverage-nocheck
+
+      # Captured rather than failing straight away so the human-readable
+      # report still gets built, summarised and uploaded first; it's turned
+      # back into a real job failure by the last step.
+      - name: Check coverage threshold
         id: coverage
         continue-on-error: true
-        run: npm run coverage
+        run: npm run coverage:check
 
       - name: Build PR comment from the coverage report
         if: always()
         continue-on-error: true
         run: npm run coverage:report
+
+      # Written directly into this job's own summary (not just stdout) so
+      # the exact missing lines/functions/branches are easy to find even
+      # when the separate comment workflow can't post them - notably on the
+      # very PR that first introduces coverage.yml, before it exists on the
+      # default branch, workflow_run (see coverage-comment.yml) has nothing
+      # to trigger off yet.
+      - name: Add coverage report to the job summary
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ -f coverage/pr-comment.md ]; then
+            cat coverage/pr-comment.md >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       # Uploaded as an artifact (not posted directly) because this job's
       # GITHUB_TOKEN is intentionally read-only - see coverage-comment.yml,
@@ -70,8 +91,11 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+      # Reaching this step at all means every test passed (the "Run tests"
+      # step above would have failed the job otherwise), so this really is
+      # a coverage shortfall and the message can say so unambiguously.
       - name: Enforce coverage threshold
         if: steps.coverage.outcome == 'failure'
         run: |
-          echo "::error::Test coverage is below the required 100% - see the PR comment (posted shortly) for exactly which lines, functions and branches are missing, or run 'npm run coverage' locally."
+          echo "::error::All tests passed, but coverage is below the required 100% - see the job summary above (or the PR comment, once this workflow exists on the default branch) for exactly which lines, statements, functions and branches are missing, or run 'npm run coverage' locally."
           exit 1

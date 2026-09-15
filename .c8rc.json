@@ -7,7 +7,6 @@
   "report-dir": "./coverage",
   "clean": true,
   "check-coverage": true,
-  "100": true,
   "lines": 100,
   "statements": 100,
   "functions": 100,
