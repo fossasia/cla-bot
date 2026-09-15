@@ -27,6 +27,10 @@ const {
   postComment,
   checkPR,
   assertValidSha,
+  getExistingBotComments,
+  resolveUserIdByLogin,
+  resolveLoginById,
+  setStatus,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -1046,6 +1050,88 @@ function makeFakeGitHub({
       1,
       "self-healing must converge to exactly one surviving comment under a genuine concurrent race",
     );
+  });
+
+  // ---------------------------------------------------------------------
+  // dedupeIdenticalTrailingComments() catches each DELETE failure
+  // individually (inside its per-comment loop) and keeps going, as
+  // opposed to the cleanup step's own re-fetch GET failing outright, which
+  // is caught one level up in postComment() (covered above). This test
+  // pins down the former: one duplicate refuses to delete (403), but that
+  // must not stop the newer duplicate from still being cleaned up, and
+  // must not surface as a failure of the run at all.
+  // ---------------------------------------------------------------------
+  await test("dedupeIdenticalTrailingComments swallows an individual comment's DELETE failure and still deletes the other duplicate(s)", async () => {
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => warnings.push(msg);
+
+    const raceComments = [
+      { id: 1, body: null, user: { login: "github-actions[bot]" } }, // body filled in below
+      { id: 2, body: null, user: { login: "github-actions[bot]" } },
+    ];
+    let getCount = 0;
+    const deleteAttempts = [];
+
+    try {
+      global.fetch = async (url, opts = {}) => {
+        const method = (opts.method || "GET").toUpperCase();
+        if (url.includes("/issues/2/comments")) {
+          if (method === "GET") {
+            getCount += 1;
+            // Pre-check (1st GET): nothing exists yet, so postComment
+            // proceeds to actually POST a new comment below.
+            if (getCount === 1) return res(200, []);
+            // Cleanup re-fetch (2nd+ GET): as if two OTHER duplicate
+            // comments landed concurrently between the pre-check and now,
+            // in addition to the one we just posted ourselves.
+            return res(200, raceComments.concat([global.__newComment]));
+          }
+          if (method === "POST") {
+            const { body } = JSON.parse(opts.body);
+            global.__newComment = {
+              id: 3,
+              body,
+              user: { login: "github-actions[bot]" },
+            };
+            raceComments.forEach((c) => (c.body = body)); // the "raced-in" duplicates are byte-identical
+            return res(201, global.__newComment);
+          }
+        }
+        if (url.includes("/issues/comments/")) {
+          if (method === "DELETE") {
+            const id = Number(url.split("/issues/comments/")[1]);
+            deleteAttempts.push(id);
+            if (id === 1) return res(403, { message: "Forbidden" }); // this one refuses to delete
+            return res(204, null); // id 2 deletes cleanly
+          }
+        }
+        throw new Error(`Unhandled mock request: ${method} ${url}`);
+      };
+
+      const { postComment } = require("../src/cla-bot.js");
+      // Must not throw despite the 403 buried inside the cleanup loop.
+      await postComment(2, "All contributors have signed the CLA. \u2705");
+
+      assert.deepStrictEqual(
+        deleteAttempts.sort(),
+        [1, 2],
+        "both older duplicates must have been attempted, regardless of the first one's outcome",
+      );
+      assert.ok(
+        warnings.some(
+          (w) => w.includes("::warning::") && w.includes("duplicate comment 1"),
+        ),
+        `expected a specific per-comment warning about comment 1, got: ${JSON.stringify(warnings)}`,
+      );
+      assert.ok(
+        !warnings.some((w) => w.includes("duplicate comment 2")),
+        "comment 2 deleted cleanly and must not also be warned about",
+      );
+    } finally {
+      console.warn = originalWarn;
+      delete global.__newComment;
+    }
   });
 
   await test("handleIssueComment throws a clear, specific error on a malformed payload (missing comment.user) instead of a raw TypeError", async () => {
@@ -2125,6 +2211,77 @@ function makeFakeGitHub({
       gh.comments.length,
       1,
       "a non-blocking bot comment (the redundant 'already signed' reply) must not be mistaken for proof the PR was ever blocked - no new comment should appear",
+    );
+  });
+
+  await test("an 'other'-classified comment (redundant already-signed reply) posted AFTER a genuine block-and-resolve cycle does not confuse the lastPendingIdx/lastSuccessIdx comparison into wrongly re-announcing success", async () => {
+    // Regression-shaped variant of the two tests above: here classifyBot-
+    // Comment's "other" category isn't the ONLY bot comment (as in the
+    // always-compliant case just above) - it's the MOST RECENT one,
+    // interleaved after a real pending-then-success pair. If the quiet
+    // check were buggy in a way that treated "is the very last bot
+    // comment overall a success" as its signal (instead of correctly
+    // using findLastIndex per category), this trailing, unrelated "other"
+    // comment could look like neither category is "most recent" and
+    // wrongly conclude the PR needs re-announcing.
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 5701, login: "erin" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "erin@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    // Block, then resolve - a genuine pending -> success pair.
+    await handlePullRequestTarget({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "sha-1" } },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "erin" } },
+      comment: {
+        user: { id: 5701, login: "erin" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(gh.comments.length, 2); // [pending, success]
+
+    // Erin redundantly re-sends the sign phrase - produces a THIRD, "other"
+    // -classified comment, chronologically AFTER the success announcement.
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "erin" } },
+      comment: {
+        user: { id: 5701, login: "erin" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.comments.length, 3); // [pending, success, other]
+    assert.ok(gh.comments[2].body.includes("already signed the CLA"));
+
+    // A later, redundant automatic synchronize (unchanged compliance) must
+    // stay quiet - the trailing "other" comment must not make it think a
+    // re-announcement is due.
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "sha-2" } },
+    });
+    assert.strictEqual(
+      gh.comments.length,
+      3,
+      "the trailing 'other' comment (positioned after the last real success) must not trigger a spurious re-announcement",
     );
   });
 
@@ -4024,6 +4181,861 @@ function makeFakeGitHub({
       lastComment.includes("could not be automatically attributed"),
       "both sections must genuinely be present together in the one comment, not one overwriting the other",
     );
+  });
+
+  // ===========================================================================
+  // Item G: getExistingBotComments() full filter truth table, tested directly
+  // rather than only inferred through postComment/checkPR's own use of it.
+  // ===========================================================================
+  await test("getExistingBotComments filters out comments missing a user, missing a body, or lacking BOT_MARKER, and (by default) only matches the CURRENT bot identity", async () => {
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.includes("/issues/777/comments") && method === "GET") {
+        return res(200, [
+          { id: 1, body: "<!-- fossasia-cla-bot:v1 -->\nhi" }, // no `user` at all
+          { id: 2, user: { login: "github-actions[bot]" } }, // no `body` at all
+          {
+            id: 3,
+            user: { login: "github-actions[bot]" },
+            body: "just a normal comment, no marker",
+          },
+          {
+            id: 4,
+            user: { login: "github-actions[bot]" },
+            body: "<!-- fossasia-cla-bot:v1 -->\nthe real one",
+          },
+          {
+            id: 5,
+            user: { login: "some-other-bot[bot]", type: "Bot" },
+            body: "<!-- fossasia-cla-bot:v1 -->\nan older identity's comment",
+          },
+        ]);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    const strict = await getExistingBotComments(777);
+    assert.deepStrictEqual(
+      strict.map((c) => c.id),
+      [4],
+      "default (anyBotIdentity: false) must match ONLY the current identity, excluding the missing-user/missing-body/no-marker/different-identity comments alike",
+    );
+
+    const broad = await getExistingBotComments(777, { anyBotIdentity: true });
+    assert.deepStrictEqual(
+      broad.map((c) => c.id).sort(),
+      [4, 5],
+      "anyBotIdentity: true must additionally include a DIFFERENT bot identity (type: 'Bot'), while still excluding the missing-user/missing-body/no-marker comments",
+    );
+  });
+
+  await test("getExistingBotComments' anyBotIdentity fallback also matches DEFAULT_BOT_LOGIN specifically (not just type==='Bot'), even when the CURRENT run's identity is a different, custom one", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { getExistingBotComments: freshGet } = require("../src/cla-bot.js");
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user"))
+        return res(200, { login: "a-custom-pat-identity" });
+      if (url.includes("/issues/778/comments") && method === "GET") {
+        return res(200, [
+          // An old comment from the standard GITHUB_TOKEN identity, from
+          // before this run switched to a custom PAT - `type` is absent
+          // here, so ONLY the DEFAULT_BOT_LOGIN-specific fallback check
+          // can recognize it, not the type==="Bot" check.
+          {
+            id: 9,
+            user: { login: "github-actions[bot]" },
+            body: "<!-- fossasia-cla-bot:v1 -->\nfrom the old default identity",
+          },
+        ]);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    const broad = await freshGet(778, { anyBotIdentity: true });
+    assert.deepStrictEqual(
+      broad.map((c) => c.id),
+      [9],
+    );
+    const strict = await freshGet(778);
+    assert.deepStrictEqual(
+      strict.map((c) => c.id),
+      [],
+      "the CURRENT identity here is 'a-custom-pat-identity', so the strict filter must NOT match the old default-identity comment",
+    );
+  });
+
+  // ===========================================================================
+  // Item J: resolveUserIdByLogin/resolveLoginById negative-cache call counts.
+  // ===========================================================================
+  await test("resolveUserIdByLogin caches an UNRESOLVED (404) lookup too: a second call for the same login makes zero additional API requests", async () => {
+    let calls = 0;
+    global.fetch = async (url) => {
+      calls += 1;
+      if (url.includes("/users/a-genuinely-unique-unresolvable-login-j1"))
+        return res(404, { message: "Not Found" });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const first = await resolveUserIdByLogin(
+      "a-genuinely-unique-unresolvable-login-j1",
+    );
+    assert.strictEqual(first, null);
+    assert.strictEqual(calls, 1);
+    const second = await resolveUserIdByLogin(
+      "a-genuinely-unique-unresolvable-login-j1",
+    );
+    assert.strictEqual(second, null);
+    assert.strictEqual(
+      calls,
+      1,
+      "the unresolved result must be cached too - a repeat lookup must cost zero additional API calls",
+    );
+  });
+
+  await test("resolveLoginById caches an UNRESOLVED (404) lookup too: a second call for the same id makes zero additional API requests", async () => {
+    let calls = 0;
+    const uniqueId = 918273645;
+    global.fetch = async (url) => {
+      calls += 1;
+      if (url.includes(`/user/${uniqueId}`))
+        return res(404, { message: "Not Found" });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const first = await resolveLoginById(uniqueId);
+    assert.strictEqual(first, null);
+    assert.strictEqual(calls, 1);
+    const second = await resolveLoginById(uniqueId);
+    assert.strictEqual(second, null);
+    assert.strictEqual(
+      calls,
+      1,
+      "the unresolved result must be cached too - a repeat lookup must cost zero additional API calls",
+    );
+  });
+
+  // ===========================================================================
+  // Item F: resolveBotLogin() succeeding (GET /user returns 200) but with a
+  // body that carries no usable login - the third branch beyond "succeeds
+  // with a real login" (bot-identity-success.test.js) and "the request
+  // itself fails" (bot-identity.test.js). Needs its own fresh module
+  // instance, same reasoning as those two files: _cachedBotLogin is a
+  // module-scope cache.
+  // ===========================================================================
+  await test("resolveBotLogin falls back to DEFAULT_BOT_LOGIN when GET /user succeeds but the body has no usable login (empty object)", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { postComment: freshPostComment } = require("../src/cla-bot.js");
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(200, {}); // 200 OK, but no `login` field at all
+      if (url.includes("/issues/779/comments") && method === "GET") {
+        // A comment already posted under the DEFAULT_BOT_LOGIN identity -
+        // if the fallback correctly kicked in, this is recognized as a
+        // duplicate and no POST happens below.
+        return res(200, [
+          {
+            id: 1,
+            user: { login: "github-actions[bot]" },
+            body: "<!-- fossasia-cla-bot:v1 -->\nfallback-check",
+          },
+        ]);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    let postHappened = false;
+    const originalFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      if ((opts.method || "GET") === "POST" && url.includes("/comments"))
+        postHappened = true;
+      return originalFetch(url, opts);
+    };
+    await freshPostComment(779, "fallback-check");
+    assert.strictEqual(
+      postHappened,
+      false,
+      "an empty /user body has no usable login, so resolveBotLogin must fall back to DEFAULT_BOT_LOGIN ('github-actions[bot]') and recognize the existing comment as a duplicate",
+    );
+  });
+
+  await test("resolveBotLogin falls back to DEFAULT_BOT_LOGIN when GET /user succeeds with an explicitly null login", async () => {
+    delete require.cache[require.resolve("../src/cla-bot.js")];
+    const { postComment: freshPostComment } = require("../src/cla-bot.js");
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(200, { login: null });
+      if (url.includes("/issues/780/comments") && method === "GET") {
+        return res(200, [
+          {
+            id: 1,
+            user: { login: "github-actions[bot]" },
+            body: "<!-- fossasia-cla-bot:v1 -->\nfallback-check-2",
+          },
+        ]);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    let postHappened = false;
+    const originalFetch = global.fetch;
+    global.fetch = async (url, opts) => {
+      if ((opts.method || "GET") === "POST" && url.includes("/comments"))
+        postHappened = true;
+      return originalFetch(url, opts);
+    };
+    await freshPostComment(780, "fallback-check-2");
+    assert.strictEqual(
+      postHappened,
+      false,
+      "a null login must be treated the same as a missing one - resolveBotLogin must still fall back to DEFAULT_BOT_LOGIN",
+    );
+  });
+
+  // ===========================================================================
+  // Item L: checkPR() combinations not yet covered elsewhere - statusOnly on
+  // both outcomes, and the signer-present cases beyond "signer completes a
+  // straightforward missing-signers-only PR" (already covered above).
+  // ===========================================================================
+  await test("checkPR({statusOnly: true}) on a still-failing PR updates the status but posts no comment at all", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9001, login: "frank" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "frank@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await checkPR(1, "sha-x", { statusOnly: true });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(
+      gh.comments.length,
+      0,
+      "statusOnly must never post a comment, even on a genuinely failing PR",
+    );
+  });
+
+  await test("checkPR({statusOnly: true}) on an already-fully-signed PR updates the status to success but posts no comment", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9002, login: "grace" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "grace@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 9002, login: "grace" }],
+      },
+    });
+    global.fetch = gh.fetch;
+    await checkPR(1, "sha-y", { statusOnly: true });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      0,
+      "statusOnly must never post a comment, even on a fully compliant PR",
+    );
+  });
+
+  await test("checkPR with a signer, where the only remaining problem is an unresolved commit (zero missing signers), still posts the personal thank-you AND the manual-review warning", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9003, login: "henry" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "henry@example.com" } },
+        },
+        {
+          sha: "unresolvedsha1",
+          author: null,
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "ghost@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 9003, login: "henry" }], // henry already signed - not "missing"
+      },
+    });
+    global.fetch = gh.fetch;
+    await checkPR(1, "sha-z", { signer: { id: 9003, login: "henry" } });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(
+      gh.statuses[gh.statuses.length - 1].description,
+      "Manual verification needed",
+      "with zero missing signers but an unresolved commit, the status description must be the manual-review wording, not the '... need to sign' one",
+    );
+    assert.strictEqual(
+      gh.comments.length,
+      2,
+      "expected the personal thank-you comment AND the separate pending/unresolved comment",
+    );
+    assert.ok(gh.comments[0].body.includes("@henry Thank you for signing"));
+    assert.ok(
+      gh.comments[1].body.includes("could not be automatically attributed"),
+    );
+    assert.ok(
+      !gh.comments[1].body.includes("need to sign"),
+      "there are no missing signers here, so the missing-signer section must not appear",
+    );
+  });
+
+  await test("checkPR with a signer who is NOT the only one still missing posts the personal thank-you AND still lists the OTHER genuinely-missing signer(s)", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9004, login: "iris" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "iris@example.com" } },
+        },
+        {
+          sha: "c2",
+          author: { id: 9005, login: "jack" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "jack@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 9004, login: "iris" }], // iris signed, jack still hasn't
+      },
+    });
+    global.fetch = gh.fetch;
+    await checkPR(1, "sha-w", { signer: { id: 9004, login: "iris" } });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.strictEqual(gh.comments.length, 2);
+    assert.ok(gh.comments[0].body.includes("@iris Thank you for signing"));
+    assert.ok(
+      gh.comments[1].body.includes("@jack"),
+      "the pending list must still name the other, genuinely still-missing signer",
+    );
+    assert.ok(
+      !gh.comments[1].body.includes("@iris"),
+      "iris already signed and must not appear in the still-missing list",
+    );
+  });
+
+  await test("checkPR given a `signer` who ISN'T actually one of the PR's own commit authors, on a PR that happens to be fully signed by everyone else, uses the generic success message - not a personal thank-you", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9006, login: "karen" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "karen@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 9006, login: "karen" }], // already fully signed
+      },
+    });
+    global.fetch = gh.fetch;
+    // "leo" is a total bystander here - not a commit author on this PR at all.
+    await checkPR(1, "sha-v", { signer: { id: 9099, login: "leo" } });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(gh.comments.length, 1);
+    assert.ok(
+      gh.comments[0].body.includes("All contributors have signed the CLA"),
+      "must use the generic success message",
+    );
+    assert.ok(
+      !gh.comments[0].body.includes("@leo"),
+      "an unrelated bystander must not be personally credited with completing the PR",
+    );
+  });
+
+  // ===========================================================================
+  // Item M: handleIssueComment() malformed comment-field shapes not yet
+  // covered (missing comment.user.login and missing comment.user entirely
+  // are already tested elsewhere - these fill in the remaining fields).
+  // ===========================================================================
+  await test("handleIssueComment signs successfully when comment.user.id is entirely missing - the stored entry falls back to a login-only match, no crash", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9101, login: "mona" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "mona@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "mona" } },
+      comment: {
+        user: { login: "mona" }, // no id at all
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    const lastEntry =
+      gh.signatures.signatures[gh.signatures.signatures.length - 1];
+    assert.ok(
+      !("id" in lastEntry),
+      "with no id in the webhook payload, the stored entry must simply omit the key (JSON.stringify drops `id: undefined`), not store a literal 'undefined'",
+    );
+    assert.strictEqual(lastEntry.login, "mona");
+  });
+
+  await test("handleIssueComment signs successfully when comment.user.id is a non-numeric value (malformed webhook) - stored as-is, falls back to login matching, no crash", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9102, login: "nate" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "nate@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "nate" } },
+      comment: {
+        user: { id: "not-a-number", login: "nate" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    const lastEntry =
+      gh.signatures.signatures[gh.signatures.signatures.length - 1];
+    assert.strictEqual(
+      lastEntry.id,
+      "not-a-number",
+      "the malformed id is stored as-is (not validated/coerced) - isSigned()'s typeof-number guard is what keeps matching safe despite this",
+    );
+  });
+
+  await test("handleIssueComment signs successfully when comment.html_url is absent - the stored entry's commentUrl is simply omitted, no crash", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9103, login: "olivia" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "olivia@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "olivia" } },
+      comment: {
+        user: { id: 9103, login: "olivia" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        // html_url intentionally omitted
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    const lastEntry =
+      gh.signatures.signatures[gh.signatures.signatures.length - 1];
+    assert.ok(
+      !("commentUrl" in lastEntry),
+      "commentUrl must simply be omitted, not crash or store the literal string 'undefined'",
+    );
+  });
+
+  await test("handleIssueComment does nothing at all (no throw, no API calls) when comment.body is null", async () => {
+    global.fetch = async (url) => {
+      throw new Error(
+        `unexpected call: ${url} - a null body matches neither the sign phrase nor 'recheck', so nothing should be called at all`,
+      );
+    };
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "someone" } },
+      comment: {
+        user: { id: 1, login: "someone" },
+        body: null,
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+  });
+
+  await test("handleIssueComment does nothing at all (no throw, no API calls) when comment.body is whitespace-only", async () => {
+    global.fetch = async (url) => {
+      throw new Error(`unexpected call: ${url}`);
+    };
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "someone" } },
+      comment: {
+        user: { id: 1, login: "someone" },
+        body: "   \n\t  ",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+  });
+
+  // ===========================================================================
+  // Positive-cache-hit tests for resolveUserIdByLogin/resolveLoginById -
+  // the earlier PR added negative (unresolved) caching; these confirm the
+  // ordinary successful-lookup case is ALSO cached (a second call for the
+  // same key costs zero additional API requests), not just the 404 case.
+  // ===========================================================================
+  await test("resolveUserIdByLogin caches a SUCCESSFUL lookup too: a second call for the same login makes zero additional API requests", async () => {
+    let calls = 0;
+    global.fetch = async (url) => {
+      calls += 1;
+      if (url.includes("/users/positive-cache-test-login-k1"))
+        return res(200, { id: 424242, login: "positive-cache-test-login-k1" });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const first = await resolveUserIdByLogin("positive-cache-test-login-k1");
+    assert.strictEqual(first, 424242);
+    assert.strictEqual(calls, 1);
+    const second = await resolveUserIdByLogin("positive-cache-test-login-k1");
+    assert.strictEqual(second, 424242);
+    assert.strictEqual(
+      calls,
+      1,
+      "a successful resolution must be cached too - a repeat lookup for the same login must cost zero additional API calls",
+    );
+  });
+
+  await test("resolveLoginById caches a SUCCESSFUL lookup too: a second call for the same id makes zero additional API requests", async () => {
+    let calls = 0;
+    const uniqueId = 555444333;
+    global.fetch = async (url) => {
+      calls += 1;
+      if (url.includes(`/user/${uniqueId}`))
+        return res(200, { login: "positive-cache-test-login-k2" });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const first = await resolveLoginById(uniqueId);
+    assert.strictEqual(first, "positive-cache-test-login-k2");
+    assert.strictEqual(calls, 1);
+    const second = await resolveLoginById(uniqueId);
+    assert.strictEqual(second, "positive-cache-test-login-k2");
+    assert.strictEqual(
+      calls,
+      1,
+      "a successful resolution must be cached too - a repeat lookup for the same id must cost zero additional API calls",
+    );
+  });
+
+  // ===========================================================================
+  // listPRCommitAuthors' merge-commit skip: `Array.isArray(c.parents) &&
+  // c.parents.length > 1`. The "> 1" side (an actual merge commit) is
+  // already covered elsewhere - this covers the defensive side: a commit
+  // object where `parents` is missing/not an array at all (a malformed or
+  // unusually-shaped API response) must NOT be mistaken for a merge commit
+  // and skipped - it must still be treated as a normal, single commit
+  // whose author is required to sign.
+  // ===========================================================================
+  await test("a commit with no `parents` field at all is treated as a normal (non-merge) commit - its author is still required to sign, not silently skipped", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9201, login: "parentless" },
+          commit: { author: { email: "parentless@example.com" } },
+          // `parents` intentionally omitted entirely.
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await checkPR(1, "sha-parentless", {});
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.ok(
+      gh.comments[gh.comments.length - 1].body.includes("@parentless"),
+      "an author whose commit lacks a `parents` field must still be listed as needing to sign - Array.isArray(undefined) is false, so this must NOT be mistaken for a (parents.length > 1) merge commit and skipped",
+    );
+  });
+
+  // ===========================================================================
+  // postComment(..., dedupe = false): the explicit opt-out path. Every
+  // other postComment test in this suite relies on the default (true), so
+  // this proves passing `false` genuinely skips BOTH the pre-check GET and
+  // the post-POST cleanup - not just one of them - by making any GET call
+  // to the comments endpoint throw.
+  // ===========================================================================
+  await test("postComment(prNumber, body, false) skips both the pre-check AND the cleanup entirely - it always posts, even if that means a literal duplicate", async () => {
+    let postCount = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "GET" && url.includes("/comments")) {
+        throw new Error(
+          "dedupe: false must never call getExistingBotComments at all - neither the pre-check nor the cleanup re-fetch",
+        );
+      }
+      if (method === "POST" && url.includes("/comments")) {
+        postCount += 1;
+        return res(201, { id: postCount, body: "posted" });
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    await postComment(1, "no dedupe here", false);
+    await postComment(1, "no dedupe here", false); // identical body, again
+    assert.strictEqual(
+      postCount,
+      2,
+      "with dedupe: false, an identical body posted twice must genuinely result in two POSTs - no pre-check ever runs to catch it",
+    );
+  });
+
+  // ===========================================================================
+  // dedupeIdenticalTrailingComments' own no-op path: `matching.slice(0,
+  // -1)` is empty (nothing to delete) when 0 or 1 comments match the body
+  // on the cleanup re-fetch. The "many duplicates" case is covered
+  // elsewhere - these are the two smallest, most easily-overlooked cases.
+  // ===========================================================================
+  await test("dedupeIdenticalTrailingComments is a genuine no-op (zero DELETE calls) when the cleanup re-fetch finds only the ONE comment just posted (no true duplicates)", async () => {
+    let getCount = 0;
+    let deleteAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "GET" && url.includes("/issues/1/comments")) {
+        getCount += 1;
+        if (getCount === 1) return res(200, []); // pre-check: nothing yet
+        // cleanup re-fetch: only our own just-posted comment, no other duplicate
+        return res(200, [
+          {
+            id: 40,
+            body: "<!-- fossasia-cla-bot:v1 -->\nsolo",
+            user: { login: "github-actions[bot]" },
+          },
+        ]);
+      }
+      if (method === "POST") {
+        return res(201, {
+          id: 40,
+          body: "<!-- fossasia-cla-bot:v1 -->\nsolo",
+          user: { login: "github-actions[bot]" },
+        });
+      }
+      if (method === "DELETE") {
+        deleteAttempts += 1;
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    await postComment(1, "solo");
+    assert.strictEqual(
+      deleteAttempts,
+      0,
+      "with only 1 matching comment (itself), slice(0, -1) is empty - nothing should ever be deleted",
+    );
+  });
+
+  await test("dedupeIdenticalTrailingComments is a genuine no-op (zero DELETE calls, no crash) when the cleanup re-fetch finds ZERO matching comments at all (e.g. read-after-write lag)", async () => {
+    let getCount = 0;
+    let deleteAttempts = 0;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "GET" && url.includes("/issues/1/comments")) {
+        getCount += 1;
+        if (getCount === 1) return res(200, []); // pre-check: nothing yet
+        // cleanup re-fetch: doesn't even show our own just-created comment
+        // yet (eventual consistency) - matching.length must be 0, not throw.
+        return res(200, []);
+      }
+      if (method === "POST") {
+        return res(201, {
+          id: 41,
+          body: "<!-- fossasia-cla-bot:v1 -->\nghost-read",
+          user: { login: "github-actions[bot]" },
+        });
+      }
+      if (method === "DELETE") {
+        deleteAttempts += 1;
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    await postComment(1, "ghost-read");
+    assert.strictEqual(deleteAttempts, 0);
+  });
+
+  // ===========================================================================
+  // setStatus()'s own defensive truncation - no real production call site
+  // currently produces a description over 140 chars, so this is tested
+  // directly against the exported function.
+  // ===========================================================================
+  await test("setStatus truncates a description longer than 140 characters before sending it to the GitHub Status API", async () => {
+    let capturedBody = null;
+    global.fetch = async (url, opts) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (method === "POST" && url.includes("/statuses/")) {
+        capturedBody = JSON.parse(opts.body);
+        return res(201, {});
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    const longDescription = "x".repeat(200);
+    await setStatus("somesha", "success", longDescription);
+    assert.ok(capturedBody, "expected the status POST to have happened");
+    assert.strictEqual(capturedBody.description.length, 140);
+    assert.strictEqual(capturedBody.description, "x".repeat(140));
+  });
+
+  // ===========================================================================
+  // quietIfNeverFlagged's findLastIndex comparison ignores "other"-
+  // classified comments entirely (e.g. the personal, non-blocking "you
+  // already signed the CLA" reply) - they match neither the "pending" nor
+  // "success" predicate, so their presence anywhere in the list, including
+  // as the most RECENT comment of all, must not perturb the
+  // lastPendingIdx <= lastSuccessIdx comparison or cause a spurious
+  // re-announcement.
+  // ===========================================================================
+  await test("quietIfNeverFlagged stays silent even when the single most recent bot comment is an unrelated 'other'-classified one, trailing after an already-resolved pending/success pair", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9301, login: "quietuser" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "quietuser@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 9301, login: "quietuser" }],
+      },
+    });
+    // Oldest first (creation order), exactly as GET /issues/{n}/comments
+    // returns them - a pending flag, then its resolution, then an
+    // unrelated "other" reply posted afterwards (e.g. someone re-typed the
+    // sign phrase after already being covered, triggering the harmless
+    // "you already signed" personal reply).
+    gh.comments.push(
+      {
+        id: 1,
+        body: "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:pending -->\n1 contributor(s) need to sign the CLA.",
+        user: { login: "github-actions[bot]" },
+      },
+      {
+        id: 2,
+        body: "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:success -->\nAll contributors have signed the CLA. ✅",
+        user: { login: "github-actions[bot]" },
+      },
+      {
+        id: 3,
+        body: "<!-- fossasia-cla-bot:v1 -->\n@quietuser you have already signed the CLA - nothing more to do here.",
+        user: { login: "github-actions[bot]" },
+      },
+    );
+    global.fetch = gh.fetch;
+    await checkPR(1, "sha-quiet-trailing-other", { quietIfNeverFlagged: true });
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh.comments.length,
+      3,
+      "the trailing 'other' comment must not be mistaken for a fresh pending flag (or anything else) that would warrant re-announcing success - the count must stay exactly as seeded",
+    );
+  });
+
+  // ===========================================================================
+  // checkPR(prNumber, undefined) - headSha genuinely omitted, forcing the
+  // internal `GET /pulls/{n}` fallback to fetch it, tested in pure
+  // isolation (the many other checkPR tests always pass headSha directly).
+  // ===========================================================================
+  await test("checkPR fetches the head sha itself via GET /pulls/{n} when headSha is omitted entirely", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9302, login: "noshapassed" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "noshapassed@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await checkPR(1); // headSha intentionally omitted
+    assert.strictEqual(
+      gh.statuses[gh.statuses.length - 1].sha,
+      "head-sha-abc",
+      "expected the status to be set against the sha makeFakeGitHub's GET /pulls/1 reports, proving checkPR fetched it itself rather than using an undefined sha",
+    );
+  });
+
+  // ===========================================================================
+  // Sign-phrase matching: `body.toLowerCase() === SIGN_PHRASE.toLowerCase()`
+  // after `.trim()`. The many tests elsewhere all use the exact literal
+  // phrase - these specifically probe the two things .trim()+toLowerCase()
+  // actually promise: any mixed case plus ordinary AND unicode leading/
+  // trailing whitespace is tolerated, but the match is still exact
+  // character-for-character in between - a real copy-paste artifact like an
+  // internal non-breaking space is deliberately NOT treated as a match.
+  // ===========================================================================
+  await test("handleIssueComment recognizes the sign phrase with mixed CASE and extra ordinary/unicode whitespace around it (leading/trailing, not internal)", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 9401, login: "casewhitespace" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "casewhitespace@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "casewhitespace" } },
+      comment: {
+        user: { id: 9401, login: "casewhitespace" },
+        // A non-breaking space (U+00A0) and a few ordinary newlines/tabs
+        // around an otherwise-correct but randomly-cased phrase - `.trim()`
+        // strips unicode whitespace too, and the comparison is
+        // case-insensitive, so this must still count as signing.
+        body: "\u00A0\n\t  I HAVE READ the cla document AND i Hereby Sign The CLA  \n\u00A0",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(
+      gh.statuses[gh.statuses.length - 1].state,
+      "success",
+      "mixed case plus leading/trailing ordinary and unicode whitespace must still be recognized as a valid signature",
+    );
+  });
+
+  await test("handleIssueComment does NOT recognize the sign phrase when a non-breaking space replaces an ordinary space IN THE MIDDLE of it (an internal difference, not leading/trailing)", async () => {
+    global.fetch = async (url) => {
+      throw new Error(
+        `unexpected call: ${url} - an internally-altered phrase must not match at all, so nothing should be called`,
+      );
+    };
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "nbspinside" } },
+      comment: {
+        user: { id: 9402, login: "nbspinside" },
+        // Ordinary spaces everywhere except one non-breaking space in the
+        // middle (a realistic artifact of copying text from a rendered
+        // web page) - .trim() only strips the ENDS, so this must NOT match.
+        body: "I have read the CLA Document and I hereby\u00A0sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    // No assertion needed beyond "didn't throw and made no API calls at
+    // all" - the throwing fetch stub above proves the comment was
+    // correctly treated as a no-op, exactly like any other non-matching
+    // comment.
   });
 
   console.log(`\n${passed} test(s) passed.`);

@@ -20,14 +20,18 @@ const {
   isSigned,
   isAllowlisted,
   createAppJWT,
+  base64url,
   isPrivileged,
   assertValidPRNumber,
+  assertValidInstallationId,
   assertValidSha,
   classifyBotComment,
   personalSuccessMessage,
   isSameContributor,
   signerCompletedRequirement,
   mergeSignatures,
+  extractCoAuthors,
+  fail,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -120,6 +124,48 @@ test("multiple commit authors on one PR all must sign independently", () => {
   assert.deepStrictEqual(missing, ["bob"]);
 });
 
+// --- base64url ---------------------------------------------------------
+// createAppJWT() exercises base64url() indirectly on every call, but a
+// direct test pins down each individual character-substitution rule so a
+// future refactor of the function can't silently break one of them while
+// still passing the higher-level JWT round-trip test below.
+test("base64url strips '=' padding", () => {
+  // Buffer.from("a").toString("base64") === "YQ==" - two padding chars.
+  assert.strictEqual(base64url(Buffer.from("a")), "YQ");
+});
+
+test("base64url replaces '+' with '-'", () => {
+  // 0xfb 0xff -> base64 "+/8=" - contains both '+' and '/' to substitute.
+  assert.strictEqual(base64url(Buffer.from([0xfb, 0xff])), "-_8");
+});
+
+test("base64url replaces '/' with '_'", () => {
+  // 0xff 0xff 0xff -> base64 "////" - a deterministic run of raw '/'s.
+  const buf = Buffer.from([0xff, 0xff, 0xff]);
+  assert.strictEqual(buf.toString("base64"), "////");
+  assert.strictEqual(base64url(buf), "____");
+});
+
+test("base64url of an empty buffer is an empty string", () => {
+  assert.strictEqual(base64url(Buffer.alloc(0)), "");
+});
+
+test("base64url round-trips arbitrary binary bytes (all 256 byte values)", () => {
+  const buf = Buffer.from(Array.from({ length: 256 }, (_, i) => i));
+  const encoded = base64url(buf);
+  assert.ok(!encoded.includes("="), "must not contain '=' padding");
+  assert.ok(!encoded.includes("+"), "must not contain '+'");
+  assert.ok(!encoded.includes("/"), "must not contain '/'");
+  const restored = Buffer.from(
+    encoded.replace(/-/g, "+").replace(/_/g, "/"),
+    "base64",
+  );
+  assert.ok(
+    buf.equals(restored),
+    "decoding the url-safe form must recover the exact original bytes",
+  );
+});
+
 // --- GitHub App JWT ---------------------------------------------------------
 test("JWT is well-formed RS256 with a valid exp window and verifies correctly", () => {
   const { publicKey, privateKey } = crypto.generateKeyPairSync("rsa", {
@@ -165,6 +211,23 @@ test("JWT signed with the wrong key fails verification (sanity check on the test
   verifier.end();
   const sigBuf = Buffer.from(s.replace(/-/g, "+").replace(/_/g, "/"), "base64");
   assert.strictEqual(verifier.verify(otherPublicKey, sigBuf), false);
+});
+
+// Item: validateConfig's PEM-shape check is deliberately shallow (it only
+// checks for a "-----BEGIN" header, see its own comment) - a string that
+// passes that check can still be garbage between the markers (e.g. a
+// truncated or corrupted secret). createAppJWT() itself must fail there,
+// at actual signing time, with a real (if less friendly) crypto error -
+// this is the "later, inside crypto.sign()" case validateConfig's own
+// comment explicitly says it does NOT protect against.
+test("createAppJWT throws when given a PEM-shaped but cryptographically invalid private key (passes the shape check, fails at actual signing)", () => {
+  const fakePem =
+    "-----BEGIN RSA PRIVATE KEY-----\nnot-real-key-bytes-but-has-the-right-shape\n-----END RSA PRIVATE KEY-----";
+  assert.throws(
+    () => createAppJWT("123456", fakePem),
+    undefined,
+    "expected signer.sign() to throw on a key that isn't actually valid PEM content, not silently produce a garbage signature",
+  );
 });
 
 // --- recheck authorization guard (resource-abuse mitigation) ---------------
@@ -218,6 +281,7 @@ test("a random passer-by with no association cannot trigger recheck on someone e
     "FIRST_TIME_CONTRIBUTOR",
     "FIRST_TIMER",
     "CONTRIBUTOR",
+    "MANNEQUIN", // real GitHub association for an unclaimed/migrated ("ghost") account
   ]) {
     const payload = fakeCommentPayload({
       prAuthor: "alice",
@@ -442,8 +506,44 @@ test("validateConfig rejects a SIG_APP_PRIVATE_KEY that does not look like PEM",
   );
 });
 
+// The test above only exercises the FAILURE side of the PEM shape check -
+// the TRUE branch (a key that genuinely looks like PEM) was never
+// separately forced. validateConfig only checks for the "-----BEGIN"
+// header (deliberately - it's a cheap, fail-fast sanity check, not full
+// PEM parsing; genuinely invalid key *contents* are caught later, at
+// actual JWT-signing time), so a syntactically-plausible-looking string is
+// enough here without needing a real, cryptographically valid key.
+test("validateConfig accepts a SIG_APP_PRIVATE_KEY that does look like PEM (happy path for the PEM-shape check)", () => {
+  assertConfigOK({
+    ...VALID_BASE_CONFIG,
+    SIG_APP_ID: "12345",
+    SIG_APP_PRIVATE_KEY:
+      "-----BEGIN RSA PRIVATE KEY-----\nnot-real-key-bytes-but-has-the-right-shape\n-----END RSA PRIVATE KEY-----",
+  });
+});
+
 test("validateConfig still requires the base presence checks (unchanged behavior)", () => {
   assertConfigFails({ ...VALID_BASE_CONFIG, GITHUB_TOKEN: "" }, "GITHUB_TOKEN");
+});
+
+// Item B: the base presence loop checks 4 required values, but only
+// GITHUB_TOKEN's absence was covered above - each of the other 3 needs its
+// own dedicated test so a future refactor that drops one of them from the
+// loop (or typos its name) fails immediately and specifically, the same
+// reasoning already applied to every SIG_PATH sub-condition above.
+test("validateConfig rejects a missing/empty SIG_OWNER", () => {
+  assertConfigFails({ ...VALID_BASE_CONFIG, SIG_OWNER: "" }, "SIG_OWNER");
+});
+
+test("validateConfig rejects a missing/empty SIG_REPO", () => {
+  assertConfigFails({ ...VALID_BASE_CONFIG, SIG_REPO: "" }, "SIG_REPO");
+});
+
+test("validateConfig rejects a missing/empty CLA_DOCUMENT_URL", () => {
+  assertConfigFails(
+    { ...VALID_BASE_CONFIG, CLA_DOCUMENT_URL: "" },
+    "CLA_DOCUMENT_URL",
+  );
 });
 
 // --- isPrivileged: malformed payload shapes fail safe, don't throw --------
@@ -537,6 +637,86 @@ test("assertValidPRNumber accepts Number.MAX_SAFE_INTEGER itself (the boundary, 
   assert.strictEqual(
     assertValidPRNumber(Number.MAX_SAFE_INTEGER, "ctx"),
     Number.MAX_SAFE_INTEGER,
+  );
+});
+
+// assertValidInstallationId() sits at the identical trust boundary as
+// assertValidPRNumber() above (an externally-sourced number interpolated
+// directly into a request path) and shares its exact Number.isSafeInteger
+// + > 0 bar - these tests mirror that suite directly. Critically, this is
+// also the ONLY honest way to verify the NaN/Infinity/-Infinity cases at
+// all: getSignaturesToken() only ever receives this value after a real
+// `JSON.parse()` of an HTTP response body, and JSON's grammar has no token
+// for any of the three - JSON.parse() can never produce them, and
+// JSON.stringify() silently turns all three into `null` before they'd ever
+// be sent. A fetch-mock-based test using JSON.stringify({id: NaN}) would
+// therefore silently test `null` a second time, not NaN - calling this
+// function directly is what makes the coverage real.
+test("assertValidInstallationId accepts an ordinary positive integer and returns it unchanged", () => {
+  assert.strictEqual(assertValidInstallationId(12345, "ctx"), 12345);
+});
+
+for (const { label, value } of [
+  { label: "zero", value: 0 },
+  { label: "a negative integer", value: -1 },
+  { label: "a non-integer float", value: 1.5 },
+  { label: "NaN", value: NaN },
+  { label: "Infinity", value: Infinity },
+  { label: "-Infinity", value: -Infinity },
+  { label: "a numeric string", value: "1" },
+  { label: "null", value: null },
+  { label: "undefined", value: undefined },
+  { label: "an array", value: [1] },
+  { label: "a plain object", value: {} },
+  { label: "a boolean", value: true },
+]) {
+  test(`assertValidInstallationId rejects ${label}`, () => {
+    assert.throws(
+      () => assertValidInstallationId(value, "ctx"),
+      /missing a usable "id" field/,
+    );
+  });
+}
+
+for (const { label, value } of [
+  {
+    label:
+      "Number.MAX_SAFE_INTEGER + 1 (still passes Number.isInteger, but not Number.isSafeInteger)",
+    value: Number.MAX_SAFE_INTEGER + 1,
+  },
+  {
+    label:
+      "1e100 (a huge float with no fractional part, but nowhere near a real installation id)",
+    value: 1e100,
+  },
+]) {
+  test(`assertValidInstallationId rejects ${label}`, () => {
+    assert.ok(
+      Number.isInteger(value),
+      "expected this value to be a case Number.isInteger() alone would accept",
+    );
+    assert.throws(
+      () => assertValidInstallationId(value, "ctx"),
+      /missing a usable "id" field/,
+    );
+  });
+}
+
+test("assertValidInstallationId accepts Number.MAX_SAFE_INTEGER itself (the boundary, not the offender)", () => {
+  assert.strictEqual(
+    assertValidInstallationId(Number.MAX_SAFE_INTEGER, "ctx"),
+    Number.MAX_SAFE_INTEGER,
+  );
+});
+
+test("assertValidInstallationId's error message includes the given context string and the rejected value", () => {
+  assert.throws(
+    () =>
+      assertValidInstallationId(
+        -1,
+        "GitHub App installation lookup for /repos/x/y/installation",
+      ),
+    /GitHub App installation lookup for \/repos\/x\/y\/installation is missing a usable "id" field \(got -1\)/,
   );
 });
 
@@ -857,9 +1037,273 @@ test("signerCompletedRequirement is false when there is no signer at all (an aut
   assert.strictEqual(signerCompletedRequirement(authors, null), false);
 });
 
+// --- fail(): direct assertion on its error-formatting/exit contract -------
+// fail() is only ever exercised indirectly today (via validateConfig, the
+// missing-event-file path in main(), etc.) - a dedicated test pins down its
+// own two responsibilities directly: the exact "::error::"-prefixed
+// console.error output GitHub Actions annotations rely on, and exiting with
+// code 1 specifically (not just "some nonzero code" or a thrown exception).
+test("fail() logs a '::error::'-prefixed message to console.error and calls process.exit(1)", () => {
+  const originalError = console.error;
+  const originalExit = process.exit;
+  let loggedMessage = null;
+  let exitCode = null;
+  console.error = (msg) => {
+    loggedMessage = msg;
+  };
+  process.exit = (code) => {
+    exitCode = code;
+  };
+  try {
+    fail("something went wrong");
+  } finally {
+    console.error = originalError;
+    process.exit = originalExit;
+  }
+  assert.strictEqual(
+    loggedMessage,
+    "::error::something went wrong",
+    "fail() must prefix the message with the exact GitHub Actions error-annotation syntax",
+  );
+  assert.strictEqual(
+    exitCode,
+    1,
+    "fail() must exit with code 1 specifically, not merely a truthy/nonzero value",
+  );
+});
+
 console.log(`\n${passed} test(s) passed.`);
 if (process.exitCode) {
   console.error("\nSOME TESTS FAILED.");
 } else {
   console.log("ALL TESTS PASSED.");
 }
+
+// ---------------------------------------------------------------------------
+// extractCoAuthors is async (it may resolve co-author noreply emails via the
+// API), so its tests run in an async IIFE after the synchronous ones above -
+// the summary printed above only covers those. This second, independent
+// summary covers this block specifically; `npm test`'s overall pass/fail for
+// this file is the logical AND of both (either block setting
+// process.exitCode fails the whole `node test/logic.test.js` run).
+// ---------------------------------------------------------------------------
+(async () => {
+  let asyncPassed = 0;
+  async function testAsync(name, fn) {
+    try {
+      await fn();
+      console.log(`PASS: ${name}`);
+      asyncPassed += 1;
+    } catch (e) {
+      console.error(`FAIL: ${name}\n - ${e.stack}`);
+      process.exitCode = 1;
+    }
+  }
+
+  // --- extractCoAuthors: defensive against non-string/empty input --------
+  // Production only ever calls this with `c.commit?.message`, which can
+  // legitimately be undefined (missing `commit` object in a malformed API
+  // response) - and the function itself does `commitMessage || ""` before
+  // matching, suggesting it was written to tolerate more than just the one
+  // real-world undefined case. Each of these documents (and locks in) that
+  // it resolves to "no co-authors found" without throwing and, just as
+  // importantly, without making any network call it doesn't need to - a
+  // stubbed fetch that throws on any call proves that.
+  const throwIfFetched = async (url) => {
+    throw new Error(
+      `extractCoAuthors must not make any network call for input with no trailer match, but called: ${url}`,
+    );
+  };
+
+  await testAsync(
+    "extractCoAuthors(undefined) returns no co-authors, no crash, no network call",
+    async () => {
+      global.fetch = throwIfFetched;
+      const result = await extractCoAuthors(undefined);
+      assert.deepStrictEqual(result, { authors: [], hasUnresolved: false });
+    },
+  );
+
+  await testAsync(
+    "extractCoAuthors(null) returns no co-authors, no crash, no network call",
+    async () => {
+      global.fetch = throwIfFetched;
+      const result = await extractCoAuthors(null);
+      assert.deepStrictEqual(result, { authors: [], hasUnresolved: false });
+    },
+  );
+
+  await testAsync(
+    'extractCoAuthors("") returns no co-authors, no crash, no network call',
+    async () => {
+      global.fetch = throwIfFetched;
+      const result = await extractCoAuthors("");
+      assert.deepStrictEqual(result, { authors: [], hasUnresolved: false });
+    },
+  );
+
+  await testAsync(
+    "extractCoAuthors rejects a non-string value (e.g. a number) safely instead of throwing",
+    async () => {
+      global.fetch = throwIfFetched;
+      const result = await extractCoAuthors(12345);
+      assert.deepStrictEqual(result, { authors: [], hasUnresolved: false });
+    },
+  );
+
+  await testAsync(
+    "extractCoAuthors rejects a non-string, non-primitive value (a plain object) safely instead of throwing",
+    async () => {
+      global.fetch = throwIfFetched;
+      const result = await extractCoAuthors({ not: "a string" });
+      assert.deepStrictEqual(result, { authors: [], hasUnresolved: false });
+    },
+  );
+
+  await testAsync(
+    'extractCoAuthors still correctly finds a real trailer once given an actual string message (sanity check: the defensive `|| ""` above isn\'t swallowing real input too)',
+    async () => {
+      global.fetch = async (url) => {
+        if (url.includes("/user/123")) {
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ login: "alice" }),
+            headers: { get: () => null },
+          };
+        }
+        throw new Error(`unexpected call: ${url}`);
+      };
+      const result = await extractCoAuthors(
+        "Fix bug\n\nCo-authored-by: Alice <123+alice@users.noreply.github.com>",
+      );
+      assert.strictEqual(result.hasUnresolved, false);
+      assert.deepStrictEqual(result.authors, [{ id: 123, login: "alice" }]);
+    },
+  );
+
+  await testAsync(
+    "extractCoAuthors flags a NEW_NOREPLY-format trailer as unresolved when resolveLoginById can't resolve the claimed id (e.g. a deleted account)",
+    async () => {
+      global.fetch = async (url) => {
+        if (url.includes("/user/999888777"))
+          return {
+            ok: false,
+            status: 404,
+            text: async () => "{}",
+            headers: { get: () => null },
+          };
+        throw new Error(`unexpected call: ${url}`);
+      };
+      const result = await extractCoAuthors(
+        "Fix bug\n\nCo-authored-by: Ghost <999888777+ghost@users.noreply.github.com>",
+      );
+      assert.strictEqual(
+        result.hasUnresolved,
+        true,
+        "an id that doesn't resolve to any current account must be flagged for manual review, not silently dropped or trusted from the trailer text",
+      );
+      assert.deepStrictEqual(result.authors, []);
+    },
+  );
+
+  await testAsync(
+    "extractCoAuthors flags an OLD_NOREPLY-format trailer as unresolved when resolveUserIdByLogin can't resolve the login (e.g. a deleted/renamed account)",
+    async () => {
+      global.fetch = async (url) => {
+        if (url.includes("/users/long-gone-user"))
+          return {
+            ok: false,
+            status: 404,
+            text: async () => "{}",
+            headers: { get: () => null },
+          };
+        throw new Error(`unexpected call: ${url}`);
+      };
+      const result = await extractCoAuthors(
+        "Fix bug\n\nCo-authored-by: Old Timer <long-gone-user@users.noreply.github.com>",
+      );
+      assert.strictEqual(
+        result.hasUnresolved,
+        true,
+        "a login that doesn't resolve to any current account must be flagged for manual review",
+      );
+      assert.deepStrictEqual(result.authors, []);
+    },
+  );
+
+  // --- MAX_COAUTHOR_TRAILERS_PER_COMMIT (20) exact boundary --------------
+  await testAsync(
+    "extractCoAuthors resolves ALL 20 co-authors, with hasUnresolved: false, when a commit has EXACTLY the cap's worth of unique trailers",
+    async () => {
+      const trailers = Array.from(
+        { length: 20 },
+        (_, i) =>
+          `Co-authored-by: Person${i} <${5000 + i}+person${i}@users.noreply.github.com>`,
+      ).join("\n");
+      global.fetch = async (url) => {
+        const m = url.match(/\/user\/(\d+)$/);
+        if (m) {
+          const id = Number(m[1]);
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ login: `person${id - 5000}` }),
+            headers: { get: () => null },
+          };
+        }
+        throw new Error(`unexpected call: ${url}`);
+      };
+      const result = await extractCoAuthors(`Fix bug\n\n${trailers}`);
+      assert.strictEqual(
+        result.hasUnresolved,
+        false,
+        "exactly 20 unique trailers must all be processed - the cap check (seen.size >= 20) must not fire before the 20th one is added",
+      );
+      assert.strictEqual(result.authors.length, 20);
+    },
+  );
+
+  await testAsync(
+    "extractCoAuthors stops at 20 and flags hasUnresolved: true once a commit has 21 unique trailers - the 21st (and only the 21st) tips over the cap",
+    async () => {
+      const trailers = Array.from(
+        { length: 21 },
+        (_, i) =>
+          `Co-authored-by: Person${i} <${6000 + i}+person${i}@users.noreply.github.com>`,
+      ).join("\n");
+      global.fetch = async (url) => {
+        const m = url.match(/\/user\/(\d+)$/);
+        if (m) {
+          const id = Number(m[1]);
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify({ login: `person${id - 6000}` }),
+            headers: { get: () => null },
+          };
+        }
+        throw new Error(`unexpected call: ${url}`);
+      };
+      const result = await extractCoAuthors(`Fix bug\n\n${trailers}`);
+      assert.strictEqual(
+        result.hasUnresolved,
+        true,
+        "the 21st unique trailer must tip the cap and flag the commit for manual review",
+      );
+      assert.strictEqual(
+        result.authors.length,
+        20,
+        "exactly the first 20 must still be processed - the cap stops further lookups, it doesn't discard what was already resolved",
+      );
+    },
+  );
+
+  console.log(`\n${asyncPassed} test(s) passed.`);
+  if (process.exitCode) {
+    console.error("\nSOME TESTS FAILED.");
+    process.exit(1);
+  } else {
+    console.log("ALL TESTS PASSED.");
+  }
+})();
