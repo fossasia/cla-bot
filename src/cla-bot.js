@@ -232,6 +232,25 @@ function assertValidPRNumber(value, context) {
   return value;
 }
 
+// Same trust boundary and same bar as assertValidPRNumber() above (an
+// externally-sourced number interpolated directly into a request path) -
+// a real GitHub App installation id is always a positive integer. Pulled
+// out as its own named function specifically so NaN/Infinity/-Infinity can
+// be unit-tested directly: those three values can never actually survive
+// a real HTTP round-trip (JSON has no token for any of them - JSON.parse
+// can't produce them from response text, and JSON.stringify silently
+// turns all three into `null` before they'd ever be sent), so the only
+// honest way to verify this function rejects them is to call it directly,
+// not through a JSON-serialized fetch mock.
+function assertValidInstallationId(value, context) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `${context} is missing a usable "id" field (got ${JSON.stringify(value)}) - cannot mint a signatures-repo token.`,
+    );
+  }
+  return value;
+}
+
 // Real git commit SHAs are lowercase hex (40 chars for sha1, 64 for
 // sha256), but test/tooling code sometimes uses opaque placeholder strings
 // in their place, so this deliberately doesn't require hex - it only
@@ -435,6 +454,17 @@ async function getSignaturesToken() {
     `/repos/${SIG_OWNER}/${SIG_REPO}/installation`,
     jwt,
   );
+  // Same reasoning as the tokenResp check below: a 200 OK here doesn't
+  // guarantee a usable installation id. Without this check, a malformed
+  // response could flow straight into the URL below as "undefined" (or
+  // any other non-safe value), and the failure would only surface as a
+  // misleading 404 from the *next* request - naming the wrong problem
+  // (a bad access_tokens response) instead of the actual one (a bad
+  // installation lookup response).
+  assertValidInstallationId(
+    installation?.id,
+    `GitHub App installation lookup for /repos/${SIG_OWNER}/${SIG_REPO}/installation`,
+  );
   const tokenResp = await gh(
     `/app/installations/${installation.id}/access_tokens`,
     jwt,
@@ -442,7 +472,30 @@ async function getSignaturesToken() {
     // no user-visible side effect, so it's fine to let gh() retry here.
     { method: "POST", idempotent: true },
   );
-  _cachedSigToken = tokenResp.token; // valid ~1 hour
+  // A 200 OK response here doesn't guarantee a usable token - a malformed
+  // or unexpected body (e.g. a proxy/gateway that mangles the response, an
+  // empty 200 body which ghRaw() turns into `null`, or a future GitHub API
+  // change) must fail loudly right here, not silently flow through as
+  // `_cachedSigToken = undefined/null` and only surface later as a
+  // confusing "Bad credentials" 401 on some unrelated request that happens
+  // to use it. `tokenResp?.token` (rather than `tokenResp.token`) matters:
+  // ghRaw() returns a bare `null` (not `{}`) for a 200 response with an
+  // empty body, and dereferencing `.token` directly on that would throw an
+  // unrelated, confusing TypeError instead of this clear, actionable one.
+  // `.trim().length === 0` (rather than just `.length === 0`) also catches
+  // a whitespace-only token (e.g. `"   "`) - a non-empty string that would
+  // otherwise pass the plain length check but is just as unusable as an
+  // empty one.
+  if (
+    !tokenResp ||
+    typeof tokenResp.token !== "string" ||
+    tokenResp.token.trim().length === 0
+  ) {
+    throw new Error(
+      `GitHub App access_tokens response for /app/installations/${installation.id}/access_tokens is missing a usable "token" field (got ${typeof tokenResp?.token}) - cannot mint a signatures-repo token.`,
+    );
+  }
+  _cachedSigToken = tokenResp.token.trim(); // valid ~1 hour
   return _cachedSigToken;
 }
 
@@ -1545,6 +1598,13 @@ module.exports = {
   isSigned,
   isAllowlisted,
   createAppJWT,
+  // Exported for tests only, same reasoning as the others below: ghRaw()'s
+  // own success-path body parsing (`text ? JSON.parse(text) : null`) is
+  // otherwise only exercised indirectly, through whichever higher-level
+  // caller happens to trigger it - a direct test pins down its null-body
+  // behavior against ghRaw() itself, not just one specific caller's
+  // reaction to it.
+  ghRaw,
   base64url,
   readSignatures,
   writeSignatures,
@@ -1562,6 +1622,7 @@ module.exports = {
   // SEGMENT_RE) fails immediately and specifically, rather than only being
   // caught indirectly through the webhook-handler integration tests.
   assertValidPRNumber,
+  assertValidInstallationId,
   assertValidSha,
   // Exported for tests only, same reasoning: classifyBotComment() is the
   // exact piece that tells a genuine block apart from unrelated bot
@@ -1591,4 +1652,38 @@ module.exports = {
   // instead of re-typing the same expression themselves, so the two can
   // never drift out of sync with each other.
   signerCompletedRequirement,
+  // Exported for tests only, same reasoning as above: extractCoAuthors()
+  // is the exact piece that has to stay safe against a missing/null/non-
+  // string commit message (e.g. a malformed API response) without ever
+  // throwing or making a network call it doesn't need to - direct unit
+  // coverage in test/logic.test.js pins that down independently of the
+  // full listPRCommitAuthors() integration path.
+  extractCoAuthors,
+  // Exported for tests only, same reasoning: fail() is the single place
+  // that formats an error for the Actions log and terminates the run, so
+  // its exact "::error::"-prefixed output and process.exit(1) behavior get
+  // one direct, isolated test instead of being inferred only through the
+  // handful of call sites that happen to trigger it.
+  fail,
+  // Exported for tests only, same reasoning: this is the exact filter
+  // checkPR's quietIfNeverFlagged history check and postComment's dedupe
+  // both rely on, so its full truth table (missing user/body/marker,
+  // current-identity match, and each anyBotIdentity fallback) gets direct
+  // unit coverage instead of being inferred only through those two
+  // higher-level call sites.
+  getExistingBotComments,
+  // Exported for tests only, same reasoning: these are the two identity-
+  // resolution caches extractCoAuthors() relies on - direct coverage here
+  // pins down the negative-caching contract (an unresolved lookup is
+  // cached too, so a repeat lookup costs zero additional API calls)
+  // independently of the higher-level commit/co-author integration tests.
+  resolveUserIdByLogin,
+  resolveLoginById,
+  // Exported for tests only, same reasoning: setStatus()'s own 140-char
+  // description truncation has no reachable production call site that
+  // actually produces a description that long (every real caller passes a
+  // short, fixed-shape string) - direct coverage here is the only honest
+  // way to test defensive code that exists for a case the codebase itself
+  // never currently triggers.
+  setStatus,
 };

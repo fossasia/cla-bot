@@ -329,6 +329,54 @@ function baseEnv(apiUrl) {
     }
   });
 
+  // The test above only checks the event-name half of the "nothing to do"
+  // log line - these pin down the exact `action "${payload.action}"`
+  // interpolation too, for the two ways a real webhook payload can lack
+  // a usable action: the field missing entirely (undefined) vs. present
+  // but explicitly null.
+  await test("main()'s 'nothing to do' log line renders action as the literal string \"undefined\" when payload.action is missing entirely", async () => {
+    const server = await startFakeGitHub({ authorAlreadySigned: true });
+    const eventFile = writeTempEventFile({ ref: "refs/heads/main" }); // no `action` key at all
+    try {
+      const { code, stdout } = await runScript({
+        ...baseEnv(server.url),
+        GITHUB_EVENT_NAME: "push",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(code, 0);
+      assert.ok(
+        stdout.includes('Nothing to do for event "push" / action "undefined".'),
+        `expected the exact interpolated log line, got stdout:\n${stdout}`,
+      );
+    } finally {
+      await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("main()'s 'nothing to do' log line renders action as the literal string \"null\" when payload.action is explicitly null", async () => {
+    const server = await startFakeGitHub({ authorAlreadySigned: true });
+    const eventFile = writeTempEventFile({
+      ref: "refs/heads/main",
+      action: null,
+    });
+    try {
+      const { code, stdout } = await runScript({
+        ...baseEnv(server.url),
+        GITHUB_EVENT_NAME: "push",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(code, 0);
+      assert.ok(
+        stdout.includes('Nothing to do for event "push" / action "null".'),
+        `expected the exact interpolated log line, got stdout:\n${stdout}`,
+      );
+    } finally {
+      await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
   await test("the CLI entrypoint fails loudly and exits non-zero when GITHUB_EVENT_PATH doesn't point to a real file", async () => {
     const { code, stderr } = await runScript({
       ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
@@ -340,6 +388,160 @@ function baseEnv(apiUrl) {
       /GITHUB_EVENT_PATH not found/.test(stderr),
       `expected a specific error about the missing event file, got stderr:\n${stderr}`,
     );
+  });
+
+  // The check is `if (!EVENT_PATH || !fs.existsSync(EVENT_PATH))` - the
+  // test above exercises the RIGHT side (a real, non-empty path that just
+  // doesn't exist). This one exercises the LEFT side specifically: no
+  // GITHUB_EVENT_PATH at all (empty string, via buildChildEnv's default),
+  // so `!EVENT_PATH` alone is true and short-circuits before
+  // fs.existsSync() is ever called on it.
+  await test("the CLI entrypoint fails loudly and exits non-zero when GITHUB_EVENT_PATH is entirely unset (as opposed to set-but-nonexistent)", async () => {
+    const { code, stderr } = await runScript({
+      ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+      GITHUB_EVENT_NAME: "pull_request_target",
+      // GITHUB_EVENT_PATH deliberately omitted - buildChildEnv() defaults
+      // it to "", so `!EVENT_PATH` is the true operand here, not
+      // `!fs.existsSync(EVENT_PATH)`.
+    });
+    assert.notStrictEqual(code, 0, "expected a non-zero exit code");
+    assert.ok(
+      /GITHUB_EVENT_PATH not found/.test(stderr),
+      `expected the same specific error as the set-but-missing case, got stderr:\n${stderr}`,
+    );
+  });
+
+  // ---------------------------------------------------------------------
+  // This is the one path every other test in this file (and the rest of
+  // the suite) misses: `main().catch((e) => fail(e.stack || e.message))`
+  // at the very bottom of the file. Every OTHER fail() call in the source
+  // (missing config, missing event file, ...) runs INSIDE main() itself
+  // and calls process.exit(1) directly - main()'s promise never gets a
+  // chance to reject, so that top-level .catch() handler never actually
+  // runs for those cases. The only way to genuinely exercise it is an
+  // exception main() throws itself and does NOT already catch - e.g. the
+  // event file existing (so the fs.existsSync guard passes) but not being
+  // valid JSON, so JSON.parse() inside main() throws a raw, unhandled
+  // SyntaxError that only the top-level .catch() ever sees.
+  // ---------------------------------------------------------------------
+  await test("the CLI entrypoint's top-level main().catch() handler fires (and fails loudly) on a genuinely malformed - not just missing - GITHUB_EVENT_PATH file", async () => {
+    const eventFile = path.join(
+      TMP_DIR,
+      `bad-event-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+    );
+    // Deliberately invalid JSON, written to a file that DOES exist - this
+    // must get past the fs.existsSync() check inside main() and fail only
+    // once JSON.parse() itself throws.
+    fs.writeFileSync(eventFile, "{ this is not valid json");
+    try {
+      const { code, stderr } = await runScript({
+        ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.notStrictEqual(
+        code,
+        0,
+        `expected a non-zero exit code from the uncaught JSON.parse() rejection, got 0. stderr:\n${stderr}`,
+      );
+      assert.ok(
+        /::error::/.test(stderr),
+        `expected fail()'s "::error::"-prefixed output from the top-level catch handler, got stderr:\n${stderr}`,
+      );
+      assert.ok(
+        /SyntaxError/.test(stderr),
+        `expected the raw JSON.parse() SyntaxError (via e.stack) to surface through the catch handler, got stderr:\n${stderr}`,
+      );
+      // e.stack (not just e.message) is what fail() is given here - assert
+      // the stack trace specifically, so this test can't quietly pass if a
+      // future refactor swapped in e.message and lost the trace.
+      assert.ok(
+        /at main /.test(stderr) || /at main\(/.test(stderr),
+        `expected a stack trace naming main() (proving e.stack, not just e.message, was used), got stderr:\n${stderr}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  // The test above exercises the LEFT side of `e.stack || e.message` - a
+  // real thrown Error always has a `.stack`, so the RIGHT side is
+  // genuinely unreachable through any real call path in this codebase:
+  // every single `throw` here constructs a real `new Error(...)` (or
+  // rethrows one), and every real Error has a truthy `.stack`. The only
+  // honest way to exercise the fallback is to force something main()
+  // calls to reject with a non-Error value - same wrapper-script technique
+  // as the Node-version/fetch guard tests above, this time monkey-patching
+  // fs.readFileSync (which main() calls unguarded, right after the
+  // existsSync check) to throw a plain object that has a `.message` but
+  // deliberately no `.stack` at all, proving the fallback itself is wired
+  // correctly for the day something upstream ever does throw a
+  // non-Error - not proving any current code path can trigger it.
+  await test("the top-level main().catch() handler falls back to e.message when the rejection has no .stack at all (a non-Error throw)", async () => {
+    const eventFile = path.join(
+      TMP_DIR,
+      `nonerror-event-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+    );
+    // The file must genuinely exist so main()'s existsSync guard passes
+    // and execution reaches the patched readFileSync call below.
+    fs.writeFileSync(eventFile, JSON.stringify({ action: "opened" }));
+    // A `-r`-preloaded module, NOT a wrapper that `require()`s the real
+    // script - requiring cla-bot.js from another script would make THAT
+    // script `require.main`, so `if (require.main === module)` inside
+    // cla-bot.js would be false and main() would never even run. `-r`
+    // preloads this file first but still runs cla-bot.js itself as the
+    // actual entry point, keeping require.main correct.
+    const preload = path.join(TMP_DIR, `nonerror-preload-${Date.now()}.js`);
+    fs.writeFileSync(
+      preload,
+      [
+        "const fs = require('fs');",
+        "const originalReadFileSync = fs.readFileSync;",
+        "fs.readFileSync = function (...args) {",
+        `  if (args[0] === ${JSON.stringify(eventFile)}) {`,
+        "    // A plain object, not an Error - no .stack property at all,",
+        "    // only .message - exactly the shape that forces the RHS of",
+        "    // `e.stack || e.message` to be the one actually used.",
+        "    throw { message: 'synthetic non-Error rejection for e.message fallback test' };",
+        "  }",
+        "  return originalReadFileSync.apply(fs, args);",
+        "};",
+      ].join("\n"),
+    );
+    try {
+      const { code, stderr } = await new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ["-r", preload, SCRIPT], {
+          cwd: REPO_ROOT,
+          env: buildChildEnv({
+            ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+            GITHUB_EVENT_NAME: "pull_request_target",
+            GITHUB_EVENT_PATH: eventFile,
+          }),
+        });
+        let stderrOut = "";
+        child.stderr.on("data", (d) => (stderrOut += d));
+        child.on("error", reject);
+        child.on("close", (c) => resolve({ code: c, stderr: stderrOut }));
+      });
+      assert.notStrictEqual(
+        code,
+        0,
+        `expected a non-zero exit code, got 0. stderr:\n${stderr}`,
+      );
+      assert.ok(
+        stderr.includes(
+          "::error::synthetic non-Error rejection for e.message fallback test",
+        ),
+        `expected fail() to have used e.message verbatim (via the RHS of the ||, since .stack was absent), got stderr:\n${stderr}`,
+      );
+      assert.ok(
+        !/at main/.test(stderr),
+        "with no .stack on the thrown value, no stack trace naming main() should appear anywhere in the output - confirming the LHS (e.stack) was genuinely NOT what was used here",
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+      fs.unlinkSync(preload);
+    }
   });
 
   await test("main() runs a full issue_comment 'created' (sign phrase) event end-to-end via the real CLI entrypoint: the write is actually persisted and read back, ending in a 'success' status", async () => {
@@ -444,6 +646,44 @@ function baseEnv(apiUrl) {
       assert.ok(
         /requires Node\.js >= 22/.test(stderr),
         `expected a specific version-requirement error, got stderr:\n${stderr}`,
+      );
+    } finally {
+      fs.unlinkSync(wrapper);
+    }
+  });
+
+  await test("the startup guard also fails loudly when global fetch is missing, independent of the Node-version check (the guard is `||`, not just a proxy for old Node)", async () => {
+    // Same technique as the Node-version test above, but this time
+    // process.versions.node is left alone (a real, supported version) and
+    // only `fetch` itself is removed before the real file is required -
+    // proving this is a genuinely separate condition in the `||`, not
+    // something that only ever fires together with the version check.
+    const wrapper = path.join(TMP_DIR, `nofetch-wrapper-${Date.now()}.js`);
+    fs.writeFileSync(
+      wrapper,
+      ["delete globalThis.fetch;", `require(${JSON.stringify(SCRIPT)});`].join(
+        "\n",
+      ),
+    );
+    try {
+      const { code, stderr } = await new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [wrapper], {
+          cwd: REPO_ROOT,
+          env: buildChildEnv(baseEnv("http://127.0.0.1:1")),
+        });
+        let stderrOut = "";
+        child.stderr.on("data", (d) => (stderrOut += d));
+        child.on("error", reject);
+        child.on("close", (c) => resolve({ code: c, stderr: stderrOut }));
+      });
+      assert.notStrictEqual(
+        code,
+        0,
+        "expected a non-zero exit code when global fetch is missing",
+      );
+      assert.ok(
+        /requires Node\.js >= 22 with global fetch/.test(stderr),
+        `expected the same specific version/fetch-requirement error, got stderr:\n${stderr}`,
       );
     } finally {
       fs.unlinkSync(wrapper);
