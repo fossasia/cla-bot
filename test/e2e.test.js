@@ -56,6 +56,68 @@ function writeTempEventFile(payload) {
   return file;
 }
 
+// Runs the real CLI entrypoint as an actual subprocess (so module-level
+// consts like GITHUB_API/REPO_OWNER/REPO_NAME - computed once, at require
+// time, from that process's own env - get exercised for real), while
+// intercepting the very first fetch() call via a `-r`-preloaded module and
+// immediately failing it with a synthetic, clearly-labeled error instead
+// of ever performing real network I/O. This is what lets a test observe
+// exactly which URL a module-level `X || <default>` fallback produced
+// without needing to actually reach the real https://api.github.com (or
+// any other live endpoint) to prove it.
+function runScriptCapturingFirstFetchUrl(env, { timeoutMs = 10000 } = {}) {
+  const preload = path.join(
+    TMP_DIR,
+    `capture-fetch-preload-${Date.now()}-${Math.random().toString(36).slice(2)}.js`,
+  );
+  fs.writeFileSync(
+    preload,
+    [
+      "const originalFetch = global.fetch;",
+      "let capturedUrl = null;",
+      "global.fetch = async (url, opts) => {",
+      "  if (capturedUrl === null) capturedUrl = String(url);",
+      "  const err = new Error('synthetic-network-failure: intercepted before any real request was made');",
+      "  throw err;",
+      "};",
+      "process.on('exit', () => {",
+      "  process.stderr.write('\\n__CAPTURED_FETCH_URL__:' + capturedUrl + '\\n');",
+      "});",
+    ].join("\n"),
+  );
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-r", preload, SCRIPT], {
+      cwd: REPO_ROOT,
+      env: buildChildEnv(env),
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      fs.unlinkSync(preload);
+      reject(new Error(`script did not exit within ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      fs.unlinkSync(preload);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      fs.unlinkSync(preload);
+      const match = stderr.match(/__CAPTURED_FETCH_URL__:(\S*)/);
+      resolve({
+        code,
+        stdout,
+        stderr,
+        capturedUrl: match ? match[1] : null,
+      });
+    });
+  });
+}
+
 function runScript(env, { timeoutMs = 10000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
@@ -541,6 +603,132 @@ function baseEnv(apiUrl) {
     } finally {
       fs.unlinkSync(eventFile);
       fs.unlinkSync(preload);
+    }
+  });
+
+  // ===========================================================================
+  // Two module-level `X || <default>` fallbacks, computed once at require
+  // time from that process's own env - GITHUB_API (line ~67) and
+  // REPO_OWNER/REPO_NAME (line ~184). Every other e2e test in this file
+  // always sets both GITHUB_API_URL and GITHUB_REPOSITORY explicitly (via
+  // baseEnv()), which only ever exercises the TRUTHY side of both. These
+  // four force each side of each fallback independently, using
+  // runScriptCapturingFirstFetchUrl() so the DEFAULT side (a real,
+  // unset-env misconfiguration) can be observed without ever making a real
+  // network call to the actual https://api.github.com.
+  // ===========================================================================
+  await test("GITHUB_API defaults to https://api.github.com when GITHUB_API_URL is unset", async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "test-sha" } },
+    });
+    try {
+      const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
+        // GITHUB_API_URL deliberately omitted - buildChildEnv() defaults it
+        // to "", so `"" || "https://api.github.com"` takes the RHS.
+        GITHUB_TOKEN: "e2e-fake-token",
+        GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
+        SIG_OWNER: "fossasia",
+        SIG_REPO: "cla-signatures",
+        SIG_PATH: "signatures/cla.json",
+        CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+        ALLOWLIST: "",
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.ok(
+        capturedUrl && capturedUrl.startsWith("https://api.github.com/"),
+        `expected the default GitHub API host to be used, got: ${capturedUrl}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("GITHUB_API uses GITHUB_API_URL verbatim when it's set, instead of the default host", async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "test-sha" } },
+    });
+    try {
+      const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
+        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3",
+        GITHUB_TOKEN: "e2e-fake-token",
+        GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
+        SIG_OWNER: "fossasia",
+        SIG_REPO: "cla-signatures",
+        SIG_PATH: "signatures/cla.json",
+        CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+        ALLOWLIST: "",
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.ok(
+        capturedUrl &&
+          capturedUrl.startsWith(
+            "https://custom-ghe-instance.example.test/api/v3/",
+          ),
+        `expected the custom GITHUB_API_URL to be used verbatim (e.g. a GitHub Enterprise host), not the default, got: ${capturedUrl}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test('REPO_OWNER/REPO_NAME fall back to empty strings (via the "/" default) when GITHUB_REPOSITORY is unset - a real, if unlikely, misconfiguration', async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "test-sha" } },
+    });
+    try {
+      const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
+        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3", // isolate this test to only the GITHUB_REPOSITORY fallback
+        // GITHUB_REPOSITORY deliberately omitted - buildChildEnv() defaults
+        // it to "", so `"" || "/"` takes the RHS, and "/".split("/")
+        // yields ["", ""] for [REPO_OWNER, REPO_NAME].
+        GITHUB_TOKEN: "e2e-fake-token",
+        SIG_OWNER: "fossasia",
+        SIG_REPO: "cla-signatures",
+        SIG_PATH: "signatures/cla.json",
+        CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+        ALLOWLIST: "",
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.ok(
+        capturedUrl && capturedUrl.includes("/repos///pulls/"),
+        `expected empty owner and repo segments (three consecutive slashes) from the "/" fallback, got: ${capturedUrl}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test('REPO_OWNER/REPO_NAME parse normally from a genuine "owner/repo" GITHUB_REPOSITORY', async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "test-sha" } },
+    });
+    try {
+      const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
+        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3",
+        GITHUB_REPOSITORY: "some-owner/some-repo",
+        GITHUB_TOKEN: "e2e-fake-token",
+        SIG_OWNER: "fossasia",
+        SIG_REPO: "cla-signatures",
+        SIG_PATH: "signatures/cla.json",
+        CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+        ALLOWLIST: "",
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.ok(
+        capturedUrl &&
+          capturedUrl.includes("/repos/some-owner/some-repo/pulls/"),
+        `expected REPO_OWNER="some-owner" and REPO_NAME="some-repo" to be parsed out correctly, got: ${capturedUrl}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
     }
   });
 
