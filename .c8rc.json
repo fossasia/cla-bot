@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/istanbuljs/schemas/master/spec/c8.json",
+  "all": true,
+  "include": ["src/**/*.js"],
+  "exclude": ["test/**", "coverage/**", "examples/**", ".github/**"],
+  "reporter": ["text", "json-summary", "json"],
+  "report-dir": "./coverage",
+  "clean": true,
+  "check-coverage": true,
+  "lines": 100,
+  "statements": 100,
+  "functions": 100,
+  "branches": 100
+}
