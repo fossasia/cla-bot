@@ -65,6 +65,26 @@ function writeTempEventFile(payload) {
 // exactly which URL a module-level `X || <default>` fallback produced
 // without needing to actually reach the real https://api.github.com (or
 // any other live endpoint) to prove it.
+// Deletes a file, tolerating it already being gone. Node guarantees a
+// spawned child's "close" event fires exactly once no matter how the
+// process ends, but a timeout path that kills the child AND rejects can
+// still race that same "close" event landing moments later - both paths
+// then try to clean up the same temp file. A plain fs.unlinkSync() would
+// throw ENOENT on whichever one runs second, and since that throw happens
+// synchronously inside an event-handler callback (not inside the promise
+// chain), nothing catches it - it becomes an uncaught exception that
+// crashes the whole test runner, not just one test. Swallowing ENOENT
+// specifically (and only ENOENT - any other error, e.g. a permissions
+// problem, still surfaces) makes repeated cleanup of the same path safe
+// regardless of which caller gets there first.
+function safeUnlink(filePath) {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+}
+
 function runScriptCapturingFirstFetchUrl(env, { timeoutMs = 10000 } = {}) {
   const preload = path.join(
     TMP_DIR,
@@ -94,19 +114,19 @@ function runScriptCapturingFirstFetchUrl(env, { timeoutMs = 10000 } = {}) {
     let stderr = "";
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      fs.unlinkSync(preload);
+      safeUnlink(preload);
       reject(new Error(`script did not exit within ${timeoutMs}ms`));
     }, timeoutMs);
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
     child.on("error", (e) => {
       clearTimeout(timer);
-      fs.unlinkSync(preload);
+      safeUnlink(preload);
       reject(e);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      fs.unlinkSync(preload);
+      safeUnlink(preload);
       const match = stderr.match(/__CAPTURED_FETCH_URL__:(\S*)/);
       resolve({
         code,
@@ -391,7 +411,51 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // The test above only checks the event-name half of the "nothing to do"
+  // The test above proves an unrelated EVENT_NAME (e.g. "push") is ignored.
+  // This is the other half of that same `&&`: EVENT_NAME IS
+  // "issue_comment" (the first clause is true), but the action is NOT
+  // "created" (e.g. "edited" - someone editing an existing comment rather
+  // than posting a new one) - the second clause failing alone must still
+  // fall through to "nothing to do", not call handleIssueComment(). This
+  // matters for real: without it, editing an OLD, unrelated comment into
+  // the sign phrase (or an already-processed sign-phrase comment being
+  // edited afterwards) could be mistaken for a brand new signature event.
+  await test("main() does nothing for an 'issue_comment' event whose action is NOT 'created' (e.g. 'edited'), even though the event NAME matches", async () => {
+    const server = await startFakeGitHub({ authorAlreadySigned: true });
+    const eventFile = writeTempEventFile({
+      action: "edited",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 1, login: "alice" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    try {
+      const { code, stdout } = await runScript({
+        ...baseEnv(server.url),
+        GITHUB_EVENT_NAME: "issue_comment",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(code, 0);
+      assert.ok(
+        /Nothing to do for event "issue_comment" \/ action "edited"/.test(
+          stdout,
+        ),
+        `expected the "nothing to do" log line naming the edited action, got stdout:\n${stdout}`,
+      );
+      assert.strictEqual(
+        server.requestsSeen.length,
+        0,
+        "an 'issue_comment' event with action !== 'created' must not call handleIssueComment() at all, even though the comment body is a perfectly valid sign phrase",
+      );
+    } finally {
+      await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
   // log line - these pin down the exact `action "${payload.action}"`
   // interpolation too, for the two ways a real webhook payload can lack
   // a usable action: the field missing entirely (undefined) vs. present
@@ -617,6 +681,46 @@ function baseEnv(apiUrl) {
   // unset-env misconfiguration) can be observed without ever making a real
   // network call to the actual https://api.github.com.
   // ===========================================================================
+
+  // Regression test for runScriptCapturingFirstFetchUrl()'s own timeout
+  // handling: killing the child on timeout AND rejecting, while the
+  // child's "close" event still fires independently moments later, races
+  // two cleanup attempts against the same preload file. Before
+  // safeUnlink() existed, the second fs.unlinkSync() threw an uncaught
+  // ENOENT from inside the "close" handler - a synchronous throw with
+  // nothing to catch it, killing the entire test runner instead of
+  // failing one test. An impossibly short timeoutMs (1ms - no real Node
+  // process can even finish spawning that fast) forces this exact race on
+  // every run, not just occasionally.
+  await test("runScriptCapturingFirstFetchUrl's timeout path rejects cleanly and does not crash on a delayed 'close' event racing the same cleanup", async () => {
+    await assert.rejects(
+      () =>
+        runScriptCapturingFirstFetchUrl(
+          {
+            GITHUB_TOKEN: "e2e-fake-token",
+            GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
+            SIG_OWNER: "fossasia",
+            SIG_REPO: "cla-signatures",
+            SIG_PATH: "signatures/cla.json",
+            CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+            ALLOWLIST: "",
+            GITHUB_EVENT_NAME: "pull_request_target",
+            GITHUB_EVENT_PATH: "/nonexistent",
+          },
+          { timeoutMs: 1 },
+        ),
+      /did not exit within 1ms/,
+    );
+    // Give the killed child's "close" event - and therefore the second,
+    // previously-crashing cleanup attempt - time to actually fire and
+    // resolve before this test (and the process) moves on. Reaching this
+    // assertion at all is the real proof: the old code's uncaught ENOENT
+    // would have crashed the whole node process before any subsequent
+    // test could even run, not just failed this one.
+    await new Promise((r) => setTimeout(r, 200));
+    assert.ok(true, "survived the delayed close-event cleanup race");
+  });
+
   await test("GITHUB_API defaults to https://api.github.com when GITHUB_API_URL is unset", async () => {
     const eventFile = writeTempEventFile({
       action: "opened",
