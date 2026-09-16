@@ -102,6 +102,39 @@ test("allowlist does NOT let a human bypass by naming themselves like a bot", ()
   assert.strictEqual(isAllowlisted("super-bot"), false);
 });
 
+// The module-level ALLOWLIST const is `(process.env.ALLOWLIST || "")
+// .split(",").map(trim).filter(Boolean)` - every other test in this file
+// uses a clean, pre-trimmed value ("dependabot[bot],renovate[bot]"), which
+// never actually exercises .trim() or .filter(Boolean) (there's nothing
+// for them to do). This forces a genuinely messy real-world value -
+// surrounding whitespace on some entries, a doubled comma, and a
+// trailing comma - through a fresh module instance, and confirms both
+// that the real names still match despite the mess and that a stray
+// empty segment doesn't itself become a phantom allowlist entry.
+test("ALLOWLIST parsing trims whitespace around entries and drops empty segments (extra/doubled commas, trailing comma)", () => {
+  withFreshBot(
+    { ALLOWLIST: "  dependabot[bot] , ,renovate[bot],,  " },
+    ({ isAllowlisted: freshIsAllowlisted }) => {
+      assert.strictEqual(
+        freshIsAllowlisted("dependabot[bot]"),
+        true,
+        "surrounding whitespace around this entry must be trimmed away",
+      );
+      assert.strictEqual(
+        freshIsAllowlisted("renovate[bot]"),
+        true,
+        "this entry must still match despite the doubled/trailing commas around it",
+      );
+      assert.strictEqual(
+        freshIsAllowlisted(""),
+        false,
+        "an empty login must never match, even though the messy input contained empty comma-separated segments - filter(Boolean) must have dropped them, not turned them into a literal '' allowlist entry",
+      );
+      assert.strictEqual(freshIsAllowlisted("some-other-bot[bot]"), false);
+    },
+  );
+});
+
 // --- impersonation guard ---------------------------------------------------
 test("a third party signing does not clear the actual PR commit author", () => {
   const prCommitAuthors = ["real-author"];

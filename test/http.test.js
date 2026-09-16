@@ -313,6 +313,79 @@ function fakeResponse(status, jsonBody, headers = {}) {
     assert.ok(written.signatures.some((s) => s.login === "bob"));
   });
 
+  // ===========================================================================
+  // readSignatures' own malformed-entry warning - the test above proves a
+  // malformed entry survives a write untouched, but never actually checks
+  // the warning ITSELF: its exact message, which of the three sub-
+  // conditions (`!entry`, non-string login, empty-string login) triggers
+  // it, or that a genuinely valid entry stays silent. This drives
+  // readSignatures() directly (no write involved) with one of each shape
+  // in a single array, checked in one pass.
+  // ===========================================================================
+  await test("readSignatures warns with the exact, specific message for each malformed signature entry shape (null, missing login, empty-string login, non-string login) and stays silent for a valid one", async () => {
+    const stored = {
+      version: 1,
+      signatures: [
+        null, // index 0: `!entry`
+        { id: 1 }, // index 1: missing login entirely (typeof undefined !== "string")
+        { id: 2, login: "" }, // index 2: present but empty string
+        { id: 3, login: 123 }, // index 3: present, but genuinely the wrong TYPE (not just missing/empty)
+        { id: 4, login: "valid-user" }, // index 4: genuinely valid - must NOT warn
+      ],
+    };
+    global.fetch = async () =>
+      fakeResponse(200, {
+        sha: "abc",
+        content: b64(stored),
+        encoding: "base64",
+      });
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => warnings.push(msg);
+    try {
+      const { data } = await readSignatures("tok");
+      assert.strictEqual(
+        data.signatures.length,
+        5,
+        "all five entries, malformed or not, must be preserved in the returned data",
+      );
+      assert.strictEqual(
+        warnings.length,
+        4,
+        `expected exactly 4 warnings (indices 0-3) and silence for index 4, got: ${JSON.stringify(warnings)}`,
+      );
+      assert.strictEqual(
+        warnings[0],
+        '::warning::Signature entry at index 0 is missing/has an invalid "login" field (kept as-is, not treated as a match) - check a-user-account/cla-signatures/signatures/cla.json',
+        "expected the exact message for the null-entry case, verbatim",
+      );
+      assert.ok(
+        warnings[1].startsWith(
+          '::warning::Signature entry at index 1 is missing/has an invalid "login" field',
+        ),
+        `expected index 1 (missing login) to be named specifically, got: ${warnings[1]}`,
+      );
+      assert.ok(
+        warnings[2].startsWith(
+          '::warning::Signature entry at index 2 is missing/has an invalid "login" field',
+        ),
+        `expected index 2 (empty-string login) to be named specifically, got: ${warnings[2]}`,
+      );
+      assert.ok(
+        warnings[3].startsWith(
+          '::warning::Signature entry at index 3 is missing/has an invalid "login" field',
+        ),
+        `expected index 3 (a number, not a string - a genuinely wrong-typed login, not just missing/empty) to be named specifically, got: ${warnings[3]}`,
+      );
+      assert.ok(
+        !warnings.some((w) => w.includes("index 4")),
+        "the valid entry at index 4 must never be warned about",
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
   await test("getSignaturesToken uses the repo-scoped installation lookup, which works for both user- and org-owned signatures repos", async () => {
     const calledUrls = [];
     global.fetch = async (url, opts) => {
@@ -2131,6 +2204,83 @@ function fakeResponse(status, jsonBody, headers = {}) {
     };
     const token = await freshGetToken();
     assert.strictEqual(token, "real-token-with-padding");
+  });
+
+  // ===========================================================================
+  // e.status >= 500 && e.status <= 599: every existing "5xx" test uses 500
+  // or 503 generically, which proves large status codes get retried but
+  // never actually forces the boundary itself - a status just below (499)
+  // or just above (600) the range must NOT be treated as transient, and
+  // 599 (the top of the range, inclusive) must still BE treated as
+  // transient. Driven through readSignatures' GET, the simplest vehicle.
+  // ===========================================================================
+  await test("a 499 response (just below the 5xx transient range) is NOT retried", async () => {
+    let getAttempts = 0;
+    global.fetch = async () => {
+      getAttempts += 1;
+      return fakeResponse(499, { message: "Client Closed Request" });
+    };
+    let caught = null;
+    try {
+      await readSignatures("tok");
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected readSignatures to throw immediately");
+    assert.strictEqual(caught.status, 499);
+    assert.strictEqual(
+      getAttempts,
+      1,
+      "499 is just outside the >= 500 transient range and must not be retried",
+    );
+  });
+
+  await test("a 600 response (just above the 5xx transient range) is NOT retried", async () => {
+    let getAttempts = 0;
+    global.fetch = async () => {
+      getAttempts += 1;
+      return fakeResponse(600, { message: "non-standard status" });
+    };
+    let caught = null;
+    try {
+      await readSignatures("tok");
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected readSignatures to throw immediately");
+    assert.strictEqual(caught.status, 600);
+    assert.strictEqual(
+      getAttempts,
+      1,
+      "600 is just outside the <= 599 transient range and must not be retried",
+    );
+  });
+
+  await test("a 599 response (the top of the 5xx transient range, inclusive) IS retried and can still succeed", async () => {
+    const originalSetTimeout = global.setTimeout;
+    global.setTimeout = (fn) => originalSetTimeout(fn, 0);
+    let getAttempts = 0;
+    try {
+      global.fetch = async () => {
+        getAttempts += 1;
+        if (getAttempts === 1)
+          return fakeResponse(599, { message: "edge of range" });
+        return fakeResponse(200, {
+          sha: "recovered-at-599-boundary",
+          content: b64({ version: 1, signatures: [] }),
+          encoding: "base64",
+        });
+      };
+      const { sha } = await readSignatures("tok");
+      assert.strictEqual(sha, "recovered-at-599-boundary");
+      assert.strictEqual(
+        getAttempts,
+        2,
+        "599 must still be treated as transient (the range is inclusive) and retried",
+      );
+    } finally {
+      global.setTimeout = originalSetTimeout;
+    }
   });
 
   console.log(`\n${passed} test(s) passed.`);

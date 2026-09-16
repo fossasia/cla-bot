@@ -56,6 +56,127 @@ function writeTempEventFile(payload) {
   return file;
 }
 
+// Runs the real CLI entrypoint as an actual subprocess (so module-level
+// consts like GITHUB_API/REPO_OWNER/REPO_NAME - computed once, at require
+// time, from that process's own env - get exercised for real), while
+// intercepting the very first fetch() call via a `-r`-preloaded module and
+// immediately failing it with a synthetic, clearly-labeled error instead
+// of ever performing real network I/O. This is what lets a test observe
+// exactly which URL a module-level `X || <default>` fallback produced
+// without needing to actually reach the real https://api.github.com (or
+// any other live endpoint) to prove it.
+// Deletes a file, tolerating it already being gone. Node guarantees a
+// spawned child's "close" event fires exactly once no matter how the
+// process ends, but a timeout path that kills the child AND rejects can
+// still race that same "close" event landing moments later - both paths
+// then try to clean up the same temp file. A plain fs.unlinkSync() would
+// throw ENOENT on whichever one runs second, and since that throw happens
+// synchronously inside an event-handler callback (not inside the promise
+// chain), nothing catches it - it becomes an uncaught exception that
+// crashes the whole test runner, not just one test. Swallowing ENOENT
+// specifically (and only ENOENT - any other error, e.g. a permissions
+// problem, still surfaces) makes repeated cleanup of the same path safe
+// regardless of which caller gets there first.
+function safeUnlink(filePath) {
+  try {
+    fs.unlinkSync(filePath);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw e;
+  }
+}
+
+function runScriptCapturingFirstFetchUrl(
+  env,
+  { timeoutMs = 10000, forceHangUntilKilled = false } = {},
+) {
+  const preload = path.join(
+    TMP_DIR,
+    `capture-fetch-preload-${Date.now()}-${Math.random().toString(36).slice(2)}.js`,
+  );
+  fs.writeFileSync(
+    preload,
+    [
+      "const originalFetch = global.fetch;",
+      "let capturedUrl = null;",
+      "global.fetch = async (url, opts) => {",
+      "  if (capturedUrl === null) capturedUrl = String(url);",
+      "  const err = new Error('synthetic-network-failure: intercepted before any real request was made');",
+      "  throw err;",
+      "};",
+      "process.on('exit', () => {",
+      "  process.stderr.write('\\n__CAPTURED_FETCH_URL__:' + capturedUrl + '\\n');",
+      "});",
+      // Test-only: makes the child deterministically un-killable by
+      // anything except an actual signal (SIGKILL from the timeout
+      // handler below) - see the "timeout path" regression test for why
+      // this matters. `process.exit` is overridden to a no-op so none of
+      // cla-bot.js's own error paths (fail(), an uncaught rejection
+      // reaching the top-level .catch()) can end the process, and the
+      // never-cleared interval keeps the event loop alive forever, so the
+      // process has no way to exit "naturally" at all - only a signal
+      // from outside can end it, at a time entirely of the test's
+      // choosing rather than a guess about how fast this machine runs.
+      ...(forceHangUntilKilled
+        ? ["process.exit = () => {};", "setInterval(() => {}, 1 << 30);"]
+        : []),
+    ].join("\n"),
+  );
+  let notifyClosed;
+  const closed = new Promise((r) => {
+    notifyClosed = r;
+  });
+  // Cleanup is idempotent by construction (safeUnlink tolerates the file
+  // already being gone), so it's safe to call from more than one of the
+  // timeout/error/close paths with no ordering guarantee between them -
+  // whichever gets there first does the real unlink, the other(s) are
+  // harmless no-ops. This one function is the single place that invariant
+  // lives, rather than three separate call sites each hoping it holds.
+  function cleanup() {
+    safeUnlink(preload);
+  }
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-r", preload, SCRIPT], {
+      cwd: REPO_ROOT,
+      env: buildChildEnv(env),
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      cleanup();
+      const err = new Error(`script did not exit within ${timeoutMs}ms`);
+      // A caller that needs to deterministically observe the child's own,
+      // independent "close" event (and the second, idempotent cleanup
+      // pass it triggers) - rather than guessing with an arbitrary sleep -
+      // can `await err.closed`. See the dedicated regression test for
+      // exactly this.
+      err.closed = closed;
+      err.preloadPath = preload;
+      reject(err);
+    }, timeoutMs);
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      cleanup();
+      notifyClosed();
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      cleanup();
+      notifyClosed();
+      const match = stderr.match(/__CAPTURED_FETCH_URL__:(\S*)/);
+      resolve({
+        code,
+        stdout,
+        stderr,
+        capturedUrl: match ? match[1] : null,
+      });
+    });
+  });
+}
+
 function runScript(env, { timeoutMs = 10000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [SCRIPT], {
@@ -329,7 +450,51 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // The test above only checks the event-name half of the "nothing to do"
+  // The test above proves an unrelated EVENT_NAME (e.g. "push") is ignored.
+  // This is the other half of that same `&&`: EVENT_NAME IS
+  // "issue_comment" (the first clause is true), but the action is NOT
+  // "created" (e.g. "edited" - someone editing an existing comment rather
+  // than posting a new one) - the second clause failing alone must still
+  // fall through to "nothing to do", not call handleIssueComment(). This
+  // matters for real: without it, editing an OLD, unrelated comment into
+  // the sign phrase (or an already-processed sign-phrase comment being
+  // edited afterwards) could be mistaken for a brand new signature event.
+  await test("main() does nothing for an 'issue_comment' event whose action is NOT 'created' (e.g. 'edited'), even though the event NAME matches", async () => {
+    const server = await startFakeGitHub({ authorAlreadySigned: true });
+    const eventFile = writeTempEventFile({
+      action: "edited",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 1, login: "alice" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+    try {
+      const { code, stdout } = await runScript({
+        ...baseEnv(server.url),
+        GITHUB_EVENT_NAME: "issue_comment",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(code, 0);
+      assert.ok(
+        /Nothing to do for event "issue_comment" \/ action "edited"/.test(
+          stdout,
+        ),
+        `expected the "nothing to do" log line naming the edited action, got stdout:\n${stdout}`,
+      );
+      assert.strictEqual(
+        server.requestsSeen.length,
+        0,
+        "an 'issue_comment' event with action !== 'created' must not call handleIssueComment() at all, even though the comment body is a perfectly valid sign phrase",
+      );
+    } finally {
+      await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
   // log line - these pin down the exact `action "${payload.action}"`
   // interpolation too, for the two ways a real webhook payload can lack
   // a usable action: the field missing entirely (undefined) vs. present
@@ -541,6 +706,218 @@ function baseEnv(apiUrl) {
     } finally {
       fs.unlinkSync(eventFile);
       fs.unlinkSync(preload);
+    }
+  });
+
+  // ===========================================================================
+  // Two module-level `X || <default>` fallbacks, computed once at require
+  // time from that process's own env - GITHUB_API (line ~67) and
+  // REPO_OWNER/REPO_NAME (line ~184). Every other e2e test in this file
+  // always sets both GITHUB_API_URL and GITHUB_REPOSITORY explicitly (via
+  // baseEnv()), which only ever exercises the TRUTHY side of both. These
+  // four force each side of each fallback independently, using
+  // runScriptCapturingFirstFetchUrl() so the DEFAULT side (a real,
+  // unset-env misconfiguration) can be observed without ever making a real
+  // network call to the actual https://api.github.com.
+  // ===========================================================================
+
+  // Regression test for runScriptCapturingFirstFetchUrl()'s own timeout
+  // handling: killing the child on timeout AND rejecting, while the
+  // child's "close" event still fires independently moments later, races
+  // two cleanup attempts against the same preload file. Before
+  // safeUnlink() existed, the second fs.unlinkSync() threw an uncaught
+  // ENOENT from inside the "close" handler - a synchronous throw with
+  // nothing to catch it, killing the entire test runner instead of
+  // failing one test.
+  //
+  // forceHangUntilKilled: true makes the child deterministically
+  // un-killable by anything except the SIGKILL below - process.exit is
+  // neutered and the event loop is kept alive forever, so there is no
+  // "natural" exit for a fast/loaded CI box to win a race against. This
+  // guarantees the timeout (not the child finishing on its own) is what
+  // ends the process, on every run, everywhere - a short but generous
+  // timeoutMs is just "wait a bit", not "hope 1ms is impossibly fast".
+  //
+  // Rather than a second arbitrary sleep to "probably" let the delayed
+  // "close" event and its cleanup pass finish, this awaits the actual
+  // `closed` signal the helper exposes on the rejection - a real
+  // synchronization primitive, not a wall-clock guess - and then checks
+  // the concrete, physical invariant that guards against: the preload
+  // temp file must be genuinely gone afterwards, not merely "didn't
+  // throw".
+  await test("runScriptCapturingFirstFetchUrl's timeout path rejects cleanly, and its cleanup completes deterministically - with no temp preload file left behind - once the delayed 'close' event fires", async () => {
+    let caught = null;
+    try {
+      await runScriptCapturingFirstFetchUrl(
+        {
+          GITHUB_TOKEN: "e2e-fake-token",
+          GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
+          SIG_OWNER: "fossasia",
+          SIG_REPO: "cla-signatures",
+          SIG_PATH: "signatures/cla.json",
+          CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+          ALLOWLIST: "",
+          GITHUB_EVENT_NAME: "pull_request_target",
+          GITHUB_EVENT_PATH: "/nonexistent",
+        },
+        { timeoutMs: 200, forceHangUntilKilled: true },
+      );
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected the timeout path to reject");
+    assert.ok(
+      /did not exit within 200ms/.test(caught.message),
+      `expected the timeout-specific message, got: ${caught.message}`,
+    );
+
+    // Deterministically wait for the child's own, independent "close"
+    // event - and the second, idempotent cleanup pass it triggers - to
+    // actually fire. If the old, unguarded fs.unlinkSync() bug were
+    // reintroduced, that second cleanup pass would throw synchronously
+    // inside the "close" handler and `closed` would never resolve; the
+    // 5-second safety margin turns that scenario into a clean, readable
+    // test failure instead of hanging this test (or the whole suite)
+    // forever.
+    await Promise.race([
+      caught.closed,
+      new Promise((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                "the killed child's 'close' event never fired within 5s - either the kill didn't take effect, or its cleanup handler hung/threw",
+              ),
+            ),
+          5000,
+        ),
+      ),
+    ]);
+
+    // Now that the close-triggered cleanup has genuinely, verifiably
+    // completed (not just "some time probably passed"), confirm it did
+    // what it's actually supposed to: an exactly-once (or safely-repeated)
+    // cleanup that leaves no temp file behind - not just "no exception
+    // was thrown".
+    assert.strictEqual(
+      fs.existsSync(caught.preloadPath),
+      false,
+      "the preload temp file must not survive the timeout+close cleanup race",
+    );
+  });
+
+  await test("GITHUB_API defaults to https://api.github.com when GITHUB_API_URL is unset", async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "test-sha" } },
+    });
+    try {
+      const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
+        // GITHUB_API_URL deliberately omitted - buildChildEnv() defaults it
+        // to "", so `"" || "https://api.github.com"` takes the RHS.
+        GITHUB_TOKEN: "e2e-fake-token",
+        GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
+        SIG_OWNER: "fossasia",
+        SIG_REPO: "cla-signatures",
+        SIG_PATH: "signatures/cla.json",
+        CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+        ALLOWLIST: "",
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.ok(
+        capturedUrl && capturedUrl.startsWith("https://api.github.com/"),
+        `expected the default GitHub API host to be used, got: ${capturedUrl}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("GITHUB_API uses GITHUB_API_URL verbatim when it's set, instead of the default host", async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "test-sha" } },
+    });
+    try {
+      const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
+        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3",
+        GITHUB_TOKEN: "e2e-fake-token",
+        GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
+        SIG_OWNER: "fossasia",
+        SIG_REPO: "cla-signatures",
+        SIG_PATH: "signatures/cla.json",
+        CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+        ALLOWLIST: "",
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.ok(
+        capturedUrl &&
+          capturedUrl.startsWith(
+            "https://custom-ghe-instance.example.test/api/v3/",
+          ),
+        `expected the custom GITHUB_API_URL to be used verbatim (e.g. a GitHub Enterprise host), not the default, got: ${capturedUrl}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test('REPO_OWNER/REPO_NAME fall back to empty strings (via the "/" default) when GITHUB_REPOSITORY is unset - a real, if unlikely, misconfiguration', async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "test-sha" } },
+    });
+    try {
+      const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
+        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3", // isolate this test to only the GITHUB_REPOSITORY fallback
+        // GITHUB_REPOSITORY deliberately omitted - buildChildEnv() defaults
+        // it to "", so `"" || "/"` takes the RHS, and "/".split("/")
+        // yields ["", ""] for [REPO_OWNER, REPO_NAME].
+        GITHUB_TOKEN: "e2e-fake-token",
+        SIG_OWNER: "fossasia",
+        SIG_REPO: "cla-signatures",
+        SIG_PATH: "signatures/cla.json",
+        CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+        ALLOWLIST: "",
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.ok(
+        capturedUrl && capturedUrl.includes("/repos///pulls/"),
+        `expected empty owner and repo segments (three consecutive slashes) from the "/" fallback, got: ${capturedUrl}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test('REPO_OWNER/REPO_NAME parse normally from a genuine "owner/repo" GITHUB_REPOSITORY', async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "test-sha" } },
+    });
+    try {
+      const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
+        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3",
+        GITHUB_REPOSITORY: "some-owner/some-repo",
+        GITHUB_TOKEN: "e2e-fake-token",
+        SIG_OWNER: "fossasia",
+        SIG_REPO: "cla-signatures",
+        SIG_PATH: "signatures/cla.json",
+        CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+        ALLOWLIST: "",
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.ok(
+        capturedUrl &&
+          capturedUrl.includes("/repos/some-owner/some-repo/pulls/"),
+        `expected REPO_OWNER="some-owner" and REPO_NAME="some-repo" to be parsed out correctly, got: ${capturedUrl}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
     }
   });
 

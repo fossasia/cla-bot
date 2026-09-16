@@ -1691,6 +1691,37 @@ function makeFakeGitHub({
     );
   });
 
+  await test("exactly one unresolvable commit produces correctly SINGULAR wording in the PR comment ('commit' / 'it', not 'commits' / 'them')", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "aaaaaaa1111",
+          author: null,
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "opened",
+      pull_request: { number: 1, head: { sha: "head-sha" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    const lastComment = gh.comments[gh.comments.length - 1].body;
+    assert.ok(
+      lastComment.includes("1 commit could not be automatically attributed"),
+      `expected singular "commit" (not "commits"), got: ${lastComment}`,
+    );
+    assert.ok(
+      lastComment.includes("verify it manually"),
+      `expected singular "it" (not "them"), got: ${lastComment}`,
+    );
+  });
+
   await test("a sign-phrase comment event with no body field at all does not crash - it is simply treated as neither a sign nor a recheck", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -1721,6 +1752,35 @@ function makeFakeGitHub({
       0,
       "a missing comment body must not be treated as a sign or a recheck",
     );
+  });
+
+  // ===========================================================================
+  // handleIssueComment's "recheck" command gates on isPrivileged() - but
+  // EVERY other "recheck" test in this suite happens to have the commenter
+  // be the PR's own author (privileged via that path alone), so the
+  // isPrivileged() === false early return has never actually fired inside
+  // a real handleIssueComment() call, only in isPrivileged()'s own
+  // standalone unit tests. This is the one that actually wires a random,
+  // unprivileged third party's "recheck" comment through the real
+  // handler and proves it does genuinely nothing at all.
+  // ===========================================================================
+  await test("a random, unprivileged commenter's 'recheck' on someone ELSE's PR is silently ignored end-to-end - no status update, no comment, no API calls at all", async () => {
+    global.fetch = async (url) => {
+      throw new Error(
+        `an unprivileged recheck must return before making any API call at all, got: ${url}`,
+      );
+    };
+    const payload = {
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "pr-author" } },
+      comment: {
+        user: { id: 9501, login: "random-passerby" },
+        body: "recheck",
+        html_url: "x",
+        author_association: "NONE", // not OWNER/MEMBER/COLLABORATOR, and not the PR author
+      },
+    };
+    await assert.doesNotReject(() => handleIssueComment(payload));
   });
 
   await test("a co-author in OLD-STYLE noreply-email format whose login cannot be resolved (e.g. a deleted/renamed account) is flagged for manual review, not silently dropped", async () => {
@@ -4733,6 +4793,58 @@ function makeFakeGitHub({
   });
 
   // ===========================================================================
+  // resolveUserIdByLogin/resolveLoginById with a genuinely malformed but
+  // SUCCESSFUL (200) response - the exact category of bug found (and
+  // fixed) in getSignaturesToken() twice over: a 200 OK doesn't guarantee
+  // a *usable* body. Only the outright-404 "not found" case was tested
+  // for these two functions before; a 200 with a non-numeric id or an
+  // empty-string login must be treated as equally unresolved, not
+  // silently accepted as a real id/login.
+  // ===========================================================================
+  await test("resolveUserIdByLogin treats a 200 response with a non-numeric id as unresolved (returns null), not as a literal non-numeric id", async () => {
+    global.fetch = async (url) => {
+      if (url.includes("/users/malformed-200-id-response-login"))
+        return res(200, {
+          id: "not-a-number",
+          login: "malformed-200-id-response-login",
+        });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const result = await resolveUserIdByLogin(
+      "malformed-200-id-response-login",
+    );
+    assert.strictEqual(
+      result,
+      null,
+      'typeof user.id !== "number" must be treated as unresolved, even on a 200 OK',
+    );
+  });
+
+  await test("resolveLoginById treats a 200 response with an empty-string login as unresolved (returns null), not as a literal empty login", async () => {
+    const uniqueId = 741852963;
+    global.fetch = async (url) => {
+      if (url.includes(`/user/${uniqueId}`)) return res(200, { login: "" });
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const result = await resolveLoginById(uniqueId);
+    assert.strictEqual(
+      result,
+      null,
+      "an empty-string login must be treated as unresolved, even on a 200 OK - the length > 0 check exists specifically for this",
+    );
+  });
+
+  await test("resolveLoginById treats a 200 response with a missing login field as unresolved (returns null)", async () => {
+    const uniqueId = 852963741;
+    global.fetch = async (url) => {
+      if (url.includes(`/user/${uniqueId}`)) return res(200, {}); // no `login` field at all
+      throw new Error(`unexpected call: ${url}`);
+    };
+    const result = await resolveLoginById(uniqueId);
+    assert.strictEqual(result, null);
+  });
+
+  // ===========================================================================
   // listPRCommitAuthors' merge-commit skip: `Array.isArray(c.parents) &&
   // c.parents.length > 1`. The "> 1" side (an actual merge commit) is
   // already covered elsewhere - this covers the defensive side: a commit
@@ -4759,6 +4871,84 @@ function makeFakeGitHub({
     assert.ok(
       gh.comments[gh.comments.length - 1].body.includes("@parentless"),
       "an author whose commit lacks a `parents` field must still be listed as needing to sign - Array.isArray(undefined) is false, so this must NOT be mistaken for a (parents.length > 1) merge commit and skipped",
+    );
+  });
+
+  // ===========================================================================
+  // listPRCommitAuthors' primary-author condition is a 3-way AND:
+  // `c.author && c.author.login && typeof c.author.id === "number"`.
+  // `c.author` being null entirely is covered elsewhere - these force the
+  // other two sub-clauses to fail independently, with `c.author` itself
+  // still present, proving each one is actually load-bearing rather than
+  // redundant with the null-author check.
+  // ===========================================================================
+  await test("a commit whose author object is present but has no login at all is treated as unresolved (needs manual review), not silently skipped or crashed on", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "no-login-sha",
+          author: { id: 9203 }, // present, but no `login` field
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "no-login@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await checkPR(1, "sha-no-login", {});
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.ok(
+      gh.comments[gh.comments.length - 1].body.includes(
+        "no-login-sha".slice(0, 7),
+      ),
+      "a commit author missing `login` must surface as an unresolved commit needing manual review, by sha",
+    );
+  });
+
+  await test("a commit whose author has a login but a non-numeric id is treated as unresolved (needs manual review), not silently skipped or crashed on", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "bad-id-sha",
+          author: { id: "not-a-number", login: "someone" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "someone@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+    await checkPR(1, "sha-bad-id", {});
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    assert.ok(
+      gh.comments[gh.comments.length - 1].body.includes(
+        "bad-id-sha".slice(0, 7),
+      ),
+      "a commit author with a non-numeric id must surface as an unresolved commit needing manual review, by sha - not trusted as a real numeric identity",
+    );
+    assert.ok(
+      !gh.comments[gh.comments.length - 1].body.includes("@someone"),
+      "a non-numeric id must not let this author be treated as a normal, resolved, sign-required contributor",
+    );
+  });
+
+  // ===========================================================================
+  // postComment() re-validates prNumber itself via its own direct
+  // assertValidPRNumber() call, rather than trusting every caller to have
+  // already done so - it's exported and callable directly (as every dedupe
+  // test in this section already does), so this proves that check fires
+  // for real when called that way, not just indirectly through
+  // handleIssueComment/handlePullRequestTarget's own separate calls.
+  // ===========================================================================
+  await test("postComment rejects an invalid prNumber via its own direct validation, before making any API calls", async () => {
+    global.fetch = async (url) => {
+      throw new Error(
+        `postComment must reject an invalid prNumber before ever calling fetch, got: ${url}`,
+      );
+    };
+    await assert.rejects(
+      () => postComment(-1, "hello"),
+      /expected a positive integer issue\/PR number/,
     );
   });
 
