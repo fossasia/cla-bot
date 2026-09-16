@@ -121,6 +121,19 @@ function runScriptCapturingFirstFetchUrl(
         : []),
     ].join("\n"),
   );
+  let notifyClosed;
+  const closed = new Promise((r) => {
+    notifyClosed = r;
+  });
+  // Cleanup is idempotent by construction (safeUnlink tolerates the file
+  // already being gone), so it's safe to call from more than one of the
+  // timeout/error/close paths with no ordering guarantee between them -
+  // whichever gets there first does the real unlink, the other(s) are
+  // harmless no-ops. This one function is the single place that invariant
+  // lives, rather than three separate call sites each hoping it holds.
+  function cleanup() {
+    safeUnlink(preload);
+  }
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["-r", preload, SCRIPT], {
       cwd: REPO_ROOT,
@@ -130,19 +143,29 @@ function runScriptCapturingFirstFetchUrl(
     let stderr = "";
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
-      safeUnlink(preload);
-      reject(new Error(`script did not exit within ${timeoutMs}ms`));
+      cleanup();
+      const err = new Error(`script did not exit within ${timeoutMs}ms`);
+      // A caller that needs to deterministically observe the child's own,
+      // independent "close" event (and the second, idempotent cleanup
+      // pass it triggers) - rather than guessing with an arbitrary sleep -
+      // can `await err.closed`. See the dedicated regression test for
+      // exactly this.
+      err.closed = closed;
+      err.preloadPath = preload;
+      reject(err);
     }, timeoutMs);
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
     child.on("error", (e) => {
       clearTimeout(timer);
-      safeUnlink(preload);
+      cleanup();
+      notifyClosed();
       reject(e);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      safeUnlink(preload);
+      cleanup();
+      notifyClosed();
       const match = stderr.match(/__CAPTURED_FETCH_URL__:(\S*)/);
       resolve({
         code,
@@ -714,37 +737,73 @@ function baseEnv(apiUrl) {
   // guarantees the timeout (not the child finishing on its own) is what
   // ends the process, on every run, everywhere - a short but generous
   // timeoutMs is just "wait a bit", not "hope 1ms is impossibly fast".
-  await test("runScriptCapturingFirstFetchUrl's timeout path rejects cleanly and does not crash on a delayed 'close' event racing the same cleanup", async () => {
-    await assert.rejects(
-      () =>
-        runScriptCapturingFirstFetchUrl(
-          {
-            GITHUB_TOKEN: "e2e-fake-token",
-            GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
-            SIG_OWNER: "fossasia",
-            SIG_REPO: "cla-signatures",
-            SIG_PATH: "signatures/cla.json",
-            CLA_DOCUMENT_URL: "https://example.com/CLA.md",
-            ALLOWLIST: "",
-            GITHUB_EVENT_NAME: "pull_request_target",
-            GITHUB_EVENT_PATH: "/nonexistent",
-          },
-          { timeoutMs: 200, forceHangUntilKilled: true },
-        ),
-      /did not exit within 200ms/,
+  //
+  // Rather than a second arbitrary sleep to "probably" let the delayed
+  // "close" event and its cleanup pass finish, this awaits the actual
+  // `closed` signal the helper exposes on the rejection - a real
+  // synchronization primitive, not a wall-clock guess - and then checks
+  // the concrete, physical invariant that guards against: the preload
+  // temp file must be genuinely gone afterwards, not merely "didn't
+  // throw".
+  await test("runScriptCapturingFirstFetchUrl's timeout path rejects cleanly, and its cleanup completes deterministically - with no temp preload file left behind - once the delayed 'close' event fires", async () => {
+    let caught = null;
+    try {
+      await runScriptCapturingFirstFetchUrl(
+        {
+          GITHUB_TOKEN: "e2e-fake-token",
+          GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
+          SIG_OWNER: "fossasia",
+          SIG_REPO: "cla-signatures",
+          SIG_PATH: "signatures/cla.json",
+          CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+          ALLOWLIST: "",
+          GITHUB_EVENT_NAME: "pull_request_target",
+          GITHUB_EVENT_PATH: "/nonexistent",
+        },
+        { timeoutMs: 200, forceHangUntilKilled: true },
+      );
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, "expected the timeout path to reject");
+    assert.ok(
+      /did not exit within 200ms/.test(caught.message),
+      `expected the timeout-specific message, got: ${caught.message}`,
     );
-    // Give the killed child's "close" event - and therefore the second,
-    // previously-crashing cleanup attempt - time to actually fire and
-    // resolve before this test (and the process) moves on. This wait
-    // isn't load-bearing for whether the race happens (forceHangUntilKilled
-    // already guarantees the timeout fired the kill), only for letting
-    // the OS finish delivering that already-guaranteed "close" event
-    // before the test function returns. Reaching the assertion below at
-    // all is the real proof: the old code's uncaught ENOENT would have
-    // crashed the whole node process before any subsequent test could
-    // even run, not just failed this one.
-    await new Promise((r) => setTimeout(r, 200));
-    assert.ok(true, "survived the delayed close-event cleanup race");
+
+    // Deterministically wait for the child's own, independent "close"
+    // event - and the second, idempotent cleanup pass it triggers - to
+    // actually fire. If the old, unguarded fs.unlinkSync() bug were
+    // reintroduced, that second cleanup pass would throw synchronously
+    // inside the "close" handler and `closed` would never resolve; the
+    // 5-second safety margin turns that scenario into a clean, readable
+    // test failure instead of hanging this test (or the whole suite)
+    // forever.
+    await Promise.race([
+      caught.closed,
+      new Promise((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                "the killed child's 'close' event never fired within 5s - either the kill didn't take effect, or its cleanup handler hung/threw",
+              ),
+            ),
+          5000,
+        ),
+      ),
+    ]);
+
+    // Now that the close-triggered cleanup has genuinely, verifiably
+    // completed (not just "some time probably passed"), confirm it did
+    // what it's actually supposed to: an exactly-once (or safely-repeated)
+    // cleanup that leaves no temp file behind - not just "no exception
+    // was thrown".
+    assert.strictEqual(
+      fs.existsSync(caught.preloadPath),
+      false,
+      "the preload temp file must not survive the timeout+close cleanup race",
+    );
   });
 
   await test("GITHUB_API defaults to https://api.github.com when GITHUB_API_URL is unset", async () => {
