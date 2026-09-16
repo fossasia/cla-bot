@@ -85,7 +85,10 @@ function safeUnlink(filePath) {
   }
 }
 
-function runScriptCapturingFirstFetchUrl(env, { timeoutMs = 10000 } = {}) {
+function runScriptCapturingFirstFetchUrl(
+  env,
+  { timeoutMs = 10000, forceHangUntilKilled = false } = {},
+) {
   const preload = path.join(
     TMP_DIR,
     `capture-fetch-preload-${Date.now()}-${Math.random().toString(36).slice(2)}.js`,
@@ -103,6 +106,19 @@ function runScriptCapturingFirstFetchUrl(env, { timeoutMs = 10000 } = {}) {
       "process.on('exit', () => {",
       "  process.stderr.write('\\n__CAPTURED_FETCH_URL__:' + capturedUrl + '\\n');",
       "});",
+      // Test-only: makes the child deterministically un-killable by
+      // anything except an actual signal (SIGKILL from the timeout
+      // handler below) - see the "timeout path" regression test for why
+      // this matters. `process.exit` is overridden to a no-op so none of
+      // cla-bot.js's own error paths (fail(), an uncaught rejection
+      // reaching the top-level .catch()) can end the process, and the
+      // never-cleared interval keeps the event loop alive forever, so the
+      // process has no way to exit "naturally" at all - only a signal
+      // from outside can end it, at a time entirely of the test's
+      // choosing rather than a guess about how fast this machine runs.
+      ...(forceHangUntilKilled
+        ? ["process.exit = () => {};", "setInterval(() => {}, 1 << 30);"]
+        : []),
     ].join("\n"),
   );
   return new Promise((resolve, reject) => {
@@ -689,9 +705,15 @@ function baseEnv(apiUrl) {
   // safeUnlink() existed, the second fs.unlinkSync() threw an uncaught
   // ENOENT from inside the "close" handler - a synchronous throw with
   // nothing to catch it, killing the entire test runner instead of
-  // failing one test. An impossibly short timeoutMs (1ms - no real Node
-  // process can even finish spawning that fast) forces this exact race on
-  // every run, not just occasionally.
+  // failing one test.
+  //
+  // forceHangUntilKilled: true makes the child deterministically
+  // un-killable by anything except the SIGKILL below - process.exit is
+  // neutered and the event loop is kept alive forever, so there is no
+  // "natural" exit for a fast/loaded CI box to win a race against. This
+  // guarantees the timeout (not the child finishing on its own) is what
+  // ends the process, on every run, everywhere - a short but generous
+  // timeoutMs is just "wait a bit", not "hope 1ms is impossibly fast".
   await test("runScriptCapturingFirstFetchUrl's timeout path rejects cleanly and does not crash on a delayed 'close' event racing the same cleanup", async () => {
     await assert.rejects(
       () =>
@@ -707,16 +729,20 @@ function baseEnv(apiUrl) {
             GITHUB_EVENT_NAME: "pull_request_target",
             GITHUB_EVENT_PATH: "/nonexistent",
           },
-          { timeoutMs: 1 },
+          { timeoutMs: 200, forceHangUntilKilled: true },
         ),
-      /did not exit within 1ms/,
+      /did not exit within 200ms/,
     );
     // Give the killed child's "close" event - and therefore the second,
     // previously-crashing cleanup attempt - time to actually fire and
-    // resolve before this test (and the process) moves on. Reaching this
-    // assertion at all is the real proof: the old code's uncaught ENOENT
-    // would have crashed the whole node process before any subsequent
-    // test could even run, not just failed this one.
+    // resolve before this test (and the process) moves on. This wait
+    // isn't load-bearing for whether the race happens (forceHangUntilKilled
+    // already guarantees the timeout fired the kill), only for letting
+    // the OS finish delivering that already-guaranteed "close" event
+    // before the test function returns. Reaching the assertion below at
+    // all is the real proof: the old code's uncaught ENOENT would have
+    // crashed the whole node process before any subsequent test could
+    // even run, not just failed this one.
     await new Promise((r) => setTimeout(r, 200));
     assert.ok(true, "survived the delayed close-event cleanup race");
   });

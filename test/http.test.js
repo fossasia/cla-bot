@@ -322,14 +322,15 @@ function fakeResponse(status, jsonBody, headers = {}) {
   // readSignatures() directly (no write involved) with one of each shape
   // in a single array, checked in one pass.
   // ===========================================================================
-  await test("readSignatures warns with the exact, specific message for each malformed signature entry shape (null, missing login, empty-string login) and stays silent for a valid one", async () => {
+  await test("readSignatures warns with the exact, specific message for each malformed signature entry shape (null, missing login, empty-string login, non-string login) and stays silent for a valid one", async () => {
     const stored = {
       version: 1,
       signatures: [
         null, // index 0: `!entry`
         { id: 1 }, // index 1: missing login entirely (typeof undefined !== "string")
         { id: 2, login: "" }, // index 2: present but empty string
-        { id: 3, login: "valid-user" }, // index 3: genuinely valid - must NOT warn
+        { id: 3, login: 123 }, // index 3: present, but genuinely the wrong TYPE (not just missing/empty)
+        { id: 4, login: "valid-user" }, // index 4: genuinely valid - must NOT warn
       ],
     };
     global.fetch = async () =>
@@ -345,13 +346,13 @@ function fakeResponse(status, jsonBody, headers = {}) {
       const { data } = await readSignatures("tok");
       assert.strictEqual(
         data.signatures.length,
-        4,
-        "all four entries, malformed or not, must be preserved in the returned data",
+        5,
+        "all five entries, malformed or not, must be preserved in the returned data",
       );
       assert.strictEqual(
         warnings.length,
-        3,
-        `expected exactly 3 warnings (indices 0, 1, 2) and silence for index 3, got: ${JSON.stringify(warnings)}`,
+        4,
+        `expected exactly 4 warnings (indices 0-3) and silence for index 4, got: ${JSON.stringify(warnings)}`,
       );
       assert.strictEqual(
         warnings[0],
@@ -371,8 +372,14 @@ function fakeResponse(status, jsonBody, headers = {}) {
         `expected index 2 (empty-string login) to be named specifically, got: ${warnings[2]}`,
       );
       assert.ok(
-        !warnings.some((w) => w.includes("index 3")),
-        "the valid entry at index 3 must never be warned about",
+        warnings[3].startsWith(
+          '::warning::Signature entry at index 3 is missing/has an invalid "login" field',
+        ),
+        `expected index 3 (a number, not a string - a genuinely wrong-typed login, not just missing/empty) to be named specifically, got: ${warnings[3]}`,
+      );
+      assert.ok(
+        !warnings.some((w) => w.includes("index 4")),
+        "the valid entry at index 4 must never be warned about",
       );
     } finally {
       console.warn = originalWarn;
