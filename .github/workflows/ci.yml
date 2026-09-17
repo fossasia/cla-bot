@@ -5,9 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch: {}
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
@@ -19,9 +26,6 @@ jobs:
         # anything that only breaks on the newer runtime early.
         node-version: ["22", "24"]
     steps:
-      # Pinned to a commit SHA, not a tag - tags can be repointed later, a
-      # SHA can't. Check https://github.com/actions/checkout/releases before
-      # bumping this.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # We only read our own code to run our own tests; no later step
@@ -90,3 +94,117 @@ jobs:
             }
             console.log('action.yml is valid YAML with the required structure');
           "
+
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # only needed to check out the repo
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Enable actionlint inline annotations
+        run: echo "::add-matcher::.github/actionlint-matcher.json"
+
+      # Official Docker image, pinned by digest for reproducibility.
+      # Digest corresponds to v1.7.12 (latest as of 2026-09-11).
+      - name: Check workflow files with actionlint
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # v1.7.12
+        with:
+          args: -color
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write # required for upload-sarif to publish results to the Security tab
+      contents: read # only strictly needed if this repo is ever made private
+      actions: read # only strictly needed if this repo is ever made private
+    env:
+      # Pin the exact release to avoid silent changes; bump manually when needed.
+      # Last checked: 2026-09-11.
+      ZIZMOR_VERSION: "1.30.1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the latest version of uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+
+      - name: Run zizmor
+        run: uvx "zizmor@${ZIZMOR_VERSION}" --format=sarif . > results.sarif
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload SARIF file
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          sarif_file: results.sarif
+          category: zizmor
+
+  codeql:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # for actions/checkout to fetch code
+      security-events: write # for github/codeql-action/analyze to upload SARIF results
+      actions: read # for github/codeql-action/init to get workflow run details
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: javascript-typescript
+            build-mode: none
+          - language: actions
+            build-mode: none
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  # This is the ONLY job that should be added as a required status check in
+  # branch protection / repository rulesets. It fans in every job above via
+  # `needs:`, so adding, removing, renaming a job, or changing a matrix here
+  # automatically updates what's required - no repo-settings edit needed.
+  #
+  # `if: always()` is essential: without it, this job would be *skipped*
+  # (not failed) whenever a dependency fails, and GitHub treats a skipped
+  # required check as passing - silently defeating the whole point.
+  required-checks-pass:
+    name: Required checks pass
+    if: always()
+    needs: [test, actionlint, zizmor, codeql]
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      # A step-level `if:` (pure GitHub Actions expression) is used here
+      # instead of interpolating `${{ needs.*.result }}` into a shell `run:`
+      # string, so there is no template-into-shell injection surface for
+      # zizmor (or anything else) to flag - this job never runs a shell
+      # command that embeds an expression.
+      - name: Fail if any required job did not succeed
+        if: >-
+          contains(needs.*.result, 'failure') ||
+          contains(needs.*.result, 'cancelled') ||
+          contains(needs.*.result, 'skipped')
+        run: |
+          echo "::error::One or more required jobs failed, were cancelled, or were skipped. See the job summaries above."
+          exit 1
