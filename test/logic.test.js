@@ -542,7 +542,12 @@ function captureConfigFailure(envOverrides) {
       throw new Error("__TEST_PROCESS_EXIT__");
     };
     console.error = (msg) => {
-      message = msg;
+      // FIRST message wins: in production the first fail() call terminates
+      // the process, but here process.exit is mocked to throw, and one
+      // branch of validateConfig calls fail() inside a try/catch whose
+      // catch then calls fail() AGAIN - a test-only artifact that would
+      // otherwise overwrite the message under test with the second one.
+      if (message === null) message = msg;
     };
     try {
       mod.validateConfig();
@@ -572,14 +577,11 @@ for (const [label, value] of [
   ],
   ['an upper-case percent-encoded ".." ("%2E%2E")', "a/%2E%2E/b.json"],
   ['a percent-encoded slash ("%2f")', "a%2fb.json"],
-  ["an embedded space", "signatures/my file.json"],
-  ["a leading/trailing space", " cla.json "],
-  ["a tab (silently stripped by the URL parser)", "a\tb.json"],
-  ["a newline", "a\nb.json"],
+  ["an interior tab (silently stripped by the URL parser)", "a\tb.json"],
+  ["an interior newline", "a\nb.json"],
   // (NUL byte / lone surrogate: not representable in process.env at all -
   // covered directly via findSigPathProblem in test/sig-path.test.js.)
-  ["a non-breaking space", "a\u00a0b.json"],
-  ['a "." segment', "./cla.json"],
+  ['a "." segment in the middle of the path', "a/./b.json"],
   ['a ".." segment in the middle of the path', "a/../b.json"],
   ['an empty segment ("//")', "a//b.json"],
   ["a trailing slash (a directory, not a file)", "signatures/"],
@@ -600,12 +602,59 @@ test("validateConfig's SIG_PATH failure is ONE log line with the value JSON-quot
   assert.ok(msg.includes('"a\\n::warning::pwned"'), msg);
 });
 
+test("validateConfig's SIG_OWNER failure is ONE log line with the value JSON-quoted (same hardening as SIG_PATH/SIG_REPO)", () => {
+  const msg = captureConfigFailure({
+    ...VALID_BASE_CONFIG,
+    SIG_OWNER: "bad\n::warning::pwned",
+  });
+  assert.ok(msg && msg.startsWith("::error::SIG_OWNER "), msg);
+  assert.ok(!msg.includes("\n"), "the message must not contain a raw newline");
+  assert.ok(msg.includes('"bad\\n::warning::pwned"'), msg);
+});
+
+test("validateConfig's SIG_REPO failure is ONE log line with the value JSON-quoted", () => {
+  const msg = captureConfigFailure({
+    ...VALID_BASE_CONFIG,
+    SIG_REPO: "bad\n::warning::pwned",
+  });
+  assert.ok(msg && msg.startsWith("::error::SIG_REPO "), msg);
+  assert.ok(!msg.includes("\n"), msg);
+});
+
+test("validateConfig's CLA_DOCUMENT_URL failures (not-a-URL, and non-http(s)) are ONE log line with the value JSON-quoted", () => {
+  for (const value of [
+    "not a url\n::warning::pwned",
+    "ftp://example.com/\n::warning::pwned",
+  ]) {
+    const msg = captureConfigFailure({
+      ...VALID_BASE_CONFIG,
+      CLA_DOCUMENT_URL: value,
+    });
+    assert.ok(msg && msg.startsWith("::error::CLA_DOCUMENT_URL "), msg);
+    assert.ok(!msg.includes("\n"), `raw newline leaked into: ${msg}`);
+    assert.ok(msg.includes(JSON.stringify(value)), msg);
+  }
+});
+
 test("validateConfig's SIG_PATH failure message says WHY the path was rejected", () => {
   const msg = captureConfigFailure({
     ...VALID_BASE_CONFIG,
     SIG_PATH: "sig#path.json",
   });
   assert.ok(msg.includes('"#"'), msg);
+});
+
+test("validateConfig accepts SIG_PATH values that always worked and must keep working (spaces, a YAML '|' block's trailing newline, surrounding whitespace, a leading './') - backward compatibility", () => {
+  for (const p of [
+    "signatures/my file.json",
+    "dir with space/cla.json",
+    "a\u00a0b.json",
+    "signatures/cla.json\n",
+    "  signatures/cla.json  ",
+    "./signatures/cla.json",
+  ]) {
+    assertConfigOK({ ...VALID_BASE_CONFIG, SIG_PATH: p });
+  }
 });
 
 test("validateConfig accepts legitimate-but-unusual SIG_PATH values (hidden dirs, non-ASCII, '+', '@', '~', names merely containing dots)", () => {

@@ -12,6 +12,12 @@
  * path looks exactly like an empty store and the bot would read/write the
  * WRONG file without any error. These tests pin down that this can't happen.
  *
+ * Backward compatibility is part of the contract too (see CONTRIBUTING.md,
+ * rule 4): interior spaces / non-ASCII whitespace, surrounding whitespace and
+ * a leading "./" all kept working before this change, and must keep doing so
+ * with a byte-identical (or, for sub-delimiters, semantically identical)
+ * request URL. Only silently-mangled inputs and "%" are rejected.
+ *
  * No network, no mocking library. Run: node test/sig-path.test.js
  * (also part of `npm test`).
  */
@@ -128,15 +134,7 @@ function installFakeContentsApi({ owner, repo }) {
   return { files, requests };
 }
 
-function withFetch(stub, fn) {
-  const original = global.fetch;
-  global.fetch = stub;
-  return Promise.resolve(fn()).finally(() => {
-    global.fetch = original;
-  });
-}
-
-const { findSigPathProblem, encodeRepoPath, sigRepoApiPath } = loadBot();
+const { findSigPathProblem, encodeRepoPath } = loadBot();
 
 // Paths that must be accepted: ordinary ones plus the awkward-but-legal ones
 // (hidden dirs, non-ASCII, URL sub-delims, "..."-like names that are NOT
@@ -156,6 +154,13 @@ const VALID_PATHS = [
   "签名/协议.json",
   "ünï/cöde.json",
   "😀/sig.json",
+  // Whitespace inside a path always worked (fetch sent it as %20 / UTF-8
+  // escapes) and must keep working.
+  "signatures/my file.json",
+  "dir with space/cla.json",
+  "lead space/ x.json",
+  "a\u00a0b/x.json",
+  "a\u2028b.json",
 ];
 
 // Paths that must be rejected, each with the reason it matters.
@@ -168,13 +173,8 @@ const INVALID_PATHS = [
   ["a bare %2e segment", "a/%2e/b.json"],
   ["%2f (encoded slash)", "a%2fb.json"],
   ["%5c (encoded backslash)", "a%5cb.json"],
-  ["an embedded space", "signatures/my file.json"],
-  ["a leading space", " cla.json"],
-  ["a trailing space", "cla.json "],
-  ["a non-breaking space", "a\u00a0b.json"],
-  ["a Unicode line separator", "a\u2028b.json"],
-  ["a tab (URL parser silently strips it)", "a\tb.json"],
-  ["a newline (URL parser silently strips it)", "a\nb.json"],
+  ["an interior tab (URL parser silently strips it)", "a\tb.json"],
+  ["an interior newline (URL parser silently strips it)", "a\nb.json"],
   ["a carriage return", "a\rb.json"],
   ["a NUL byte", "a\x00b.json"],
   ["a DEL character", "a\x7fb.json"],
@@ -183,7 +183,6 @@ const INVALID_PATHS = [
   ["a leading slash", "/signatures/cla.json"],
   ["a trailing slash (directory, not a file)", "signatures/"],
   ["an empty segment", "signatures//cla.json"],
-  ["a '.' segment", "./cla.json"],
   ["a '.' segment in the middle", "a/./b.json"],
   ["a '..' segment at the start", "../cla.json"],
   ["a '..' segment in the middle", "a/../b.json"],
@@ -193,6 +192,8 @@ const INVALID_PATHS = [
   ["a lone UTF-16 surrogate", "a\ud800b.json"],
   ["an empty string", ""],
   ["whitespace only", "   "],
+  ["a '.' segment after a real directory", "a/./b.json"],
+  ["a lone '.'", "."],
 ];
 
 (async () => {
@@ -301,36 +302,144 @@ const INVALID_PATHS = [
     }
   });
 
-  await test("sigRepoApiPath encodes owner/repo too (a '/' can't smuggle in an extra path segment when the builder is reached without validateConfig)", () => {
+  await test("sigInstallationApiPath encodes REPO too (a '/' can't smuggle in an extra path segment when the builder is reached without validateConfig)", () => {
     const bot = loadBot({ SIG_REPO: "we ird/repo" });
     assert.strictEqual(
-      bot.sigRepoApiPath("/installation"),
+      bot.sigInstallationApiPath(),
       "/repos/fossasia/we%20ird%2Frepo/installation",
     );
   });
 
-  await test("sigRepoApiPath leaves valid owner/repo names untouched (including '.', '-', '_' and a leading-dot repo like .github)", () => {
+  await test("sigInstallationApiPath encodes OWNER too, symmetrically with REPO", () => {
+    const bot = loadBot({ SIG_OWNER: "we ird/owner" });
     assert.strictEqual(
-      loadBot({ SIG_REPO: ".github" }).sigRepoApiPath("/x"),
-      "/repos/fossasia/.github/x",
-    );
-    assert.strictEqual(
-      loadBot({ SIG_OWNER: "a-b", SIG_REPO: "r_1.x-y" }).sigRepoApiPath(),
-      "/repos/a-b/r_1.x-y",
+      bot.sigInstallationApiPath(),
+      "/repos/we%20ird%2Fowner/cla-signatures/installation",
     );
   });
 
-  await test("sigRepoApiPath refuses a '.' or '..' owner/repo (dot-segments the URL parser would collapse)", () => {
+  await test("sigContentsApiPath encodes both owner AND repo as well as the path", () => {
+    const bot = loadBot({
+      SIG_OWNER: "o/x",
+      SIG_REPO: "r#y",
+      SIG_PATH: "d e/f.json",
+    });
+    assert.strictEqual(
+      bot.sigContentsApiPath(),
+      "/repos/o%2Fx/r%23y/contents/d%20e/f.json",
+    );
+  });
+
+  await test("the sig URL builders leave valid owner/repo names untouched (including '.', '-', '_' and a leading-dot repo like .github)", () => {
+    assert.strictEqual(
+      loadBot({ SIG_REPO: ".github" }).sigInstallationApiPath(),
+      "/repos/fossasia/.github/installation",
+    );
+    assert.strictEqual(
+      loadBot({
+        SIG_OWNER: "a-b",
+        SIG_REPO: "r_1.x-y",
+      }).sigInstallationApiPath(),
+      "/repos/a-b/r_1.x-y/installation",
+    );
+  });
+
+  await test("both URL builders refuse a '.' or '..' owner/repo (dot-segments the URL parser would collapse)", () => {
     for (const [k, v] of [
       ["SIG_REPO", ".."],
       ["SIG_REPO", "."],
       ["SIG_OWNER", ".."],
       ["SIG_OWNER", "."],
     ]) {
+      const bot = loadBot({ [k]: v });
       assert.throws(
-        () => loadBot({ [k]: v }).sigRepoApiPath("/installation"),
+        () => bot.sigInstallationApiPath(),
         /dot-segment/,
         `${k}=${v}`,
+      );
+      assert.throws(() => bot.sigContentsApiPath(), /dot-segment/, `${k}=${v}`);
+    }
+  });
+
+  await test("the removed generic helper stays removed: the module exposes no 'base + arbitrary suffix' URL builder that could be misused with a dynamic value", () => {
+    const bot = loadBot();
+    assert.strictEqual(bot.sigRepoApiPath, undefined);
+    assert.strictEqual(bot.sigRepoBasePath, undefined);
+  });
+
+  // ---- backward compatibility (CONTRIBUTING.md rule 4) --------------------
+  // `oldUrl` is exactly what the pre-fix code built: raw interpolation,
+  // normalized by fetch()'s own URL parsing.
+  const oldPathname = (raw) =>
+    new URL(`${API}/repos/fossasia/cla-signatures/contents/${raw}`).pathname;
+
+  await test("compat: for paths containing spaces / Unicode whitespace / non-ASCII, the request pathname is BYTE-IDENTICAL to what the old, un-encoded code sent", () => {
+    for (const raw of [
+      "signatures/my file.json",
+      "dir with space/cla.json",
+      "lead space/ x.json",
+      "a\u00a0b/x.json",
+      "a\u2028b.json",
+      "ünï/cöde.json",
+      "签名/协议.json",
+    ]) {
+      const bot = loadBot({ SIG_PATH: raw });
+      assert.strictEqual(
+        new URL(`${API}${bot.sigContentsApiPath()}`).pathname,
+        oldPathname(raw),
+        raw,
+      );
+    }
+  });
+
+  await test("compat: for paths containing URL sub-delimiters ('+', '@', '=', ','), the request is semantically identical to the old one (same decoded path; only the redundant escaping differs)", () => {
+    for (const raw of ["a+b/c@d.json", "x=y,z.json", "it's/(ok)!.json"]) {
+      const bot = loadBot({ SIG_PATH: raw });
+      const decode = (pn) =>
+        pn
+          .slice("/repos/fossasia/cla-signatures/contents/".length)
+          .split("/")
+          .map(decodeURIComponent)
+          .join("/");
+      assert.strictEqual(
+        decode(new URL(`${API}${bot.sigContentsApiPath()}`).pathname),
+        decode(oldPathname(raw)),
+        raw,
+      );
+    }
+  });
+
+  await test("compat: surrounding whitespace (e.g. the trailing newline a YAML '|' block adds) and a leading './' keep working - normalized to the same file, same URL as the plain path", () => {
+    const plain = loadBot({
+      SIG_PATH: "signatures/cla.json",
+    }).sigContentsApiPath();
+    for (const raw of [
+      "signatures/cla.json\n",
+      "  signatures/cla.json  ",
+      "\tsignatures/cla.json\r\n",
+      "./signatures/cla.json",
+      "././signatures/cla.json",
+      "  ./signatures/cla.json\n",
+    ]) {
+      assert.strictEqual(
+        loadBot({ SIG_PATH: raw }).sigContentsApiPath(),
+        plain,
+        JSON.stringify(raw),
+      );
+      // ...and the old code agreed on the file (it just got there by accident):
+      assert.strictEqual(
+        oldPathname(raw.trim()),
+        new URL(`${API}${plain}`).pathname,
+      );
+    }
+  });
+
+  await test("normalization does not over-reach: '.' / './' / whitespace-only / an interior './' segment are still refused by the builder", () => {
+    for (const raw of [".", "./", "   ", "a/./b.json", ".//x.json"]) {
+      assert.throws(
+        () => loadBot({ SIG_PATH: raw }).sigContentsApiPath(),
+        /Refusing to build a request URL/,
+        JSON.stringify(raw),
       );
     }
   });
@@ -572,7 +681,7 @@ const INVALID_PATHS = [
     "sig#path.json",
     "sig?q=1.json",
     "a/%2e%2e/b.json",
-    "signatures/my file.json",
+    "my%20file.json",
   ]) {
     await test(`CLI exits 1 with a clear ::error:: naming SIG_PATH for ${JSON.stringify(p)}`, () => {
       const r = runCli({ SIG_PATH: p });
@@ -604,6 +713,34 @@ const INVALID_PATHS = [
       assert.match(r.stderr, /^::error::SIG_REPO /m);
     }
   });
+
+  await test("CLI: the '%' rejection tells the user to write the literal character instead (the migration path for 'my%20file.json')", () => {
+    const r = runCli({ SIG_PATH: "my%20file.json" });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /spaces are fine, and are encoded automatically/);
+  });
+
+  for (const p of [
+    "signatures/my file.json",
+    "signatures/cla.json\n",
+    "./signatures/cla.json",
+    "  signatures/cla.json  ",
+  ]) {
+    await test(`CLI: previously-working SIG_PATH ${JSON.stringify(p)} still passes validateConfig (backward compatible)`, () => {
+      const r = runCli({ SIG_PATH: p });
+      assert.strictEqual(r.status, 1); // no GITHUB_EVENT_PATH - the NEXT check
+      assert.match(r.stderr, /GITHUB_EVENT_PATH not found/);
+      assert.ok(!/SIG_PATH/.test(r.stderr), r.stderr);
+    });
+  }
+
+  for (const p of [".", "./", "   "]) {
+    await test(`CLI: ${JSON.stringify(p)} is still rejected after normalization`, () => {
+      const r = runCli({ SIG_PATH: p });
+      assert.strictEqual(r.status, 1);
+      assert.match(r.stderr, /^::error::SIG_PATH /m);
+    });
+  }
 
   await test("CLI: a valid awkward-but-legal SIG_PATH passes validateConfig (proceeds to the event-file check instead)", () => {
     const r = runCli({ SIG_PATH: "签名/a+b@c.json" }); // no GITHUB_EVENT_PATH

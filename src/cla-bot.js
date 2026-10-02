@@ -70,7 +70,10 @@ const SIG_APP_ID = process.env.SIG_APP_ID || "";
 const SIG_APP_PRIVATE_KEY = process.env.SIG_APP_PRIVATE_KEY || "";
 const SIG_OWNER = process.env.SIG_OWNER;
 const SIG_REPO = process.env.SIG_REPO;
-const SIG_PATH = process.env.SIG_PATH || "signatures/cla.json";
+// Normalized once, here, so every consumer (validation, URL building, log
+// messages) sees the same value. See normalizeSigPath() for exactly what is
+// (and deliberately is not) tolerated.
+const SIG_PATH = normalizeSigPath(process.env.SIG_PATH);
 const CLA_DOCUMENT_URL = process.env.CLA_DOCUMENT_URL;
 const ALLOWLIST = (process.env.ALLOWLIST || "")
   .split(",")
@@ -292,7 +295,8 @@ function assertValidSha(value, context) {
 //     real ".." traversal AFTER the literal-".." check in validateConfig
 //     already passed - and it can climb right out of /contents/ into other
 //     API endpoints (".../%2e%2e/%2e%2e/orgs/x" -> "/repos/o/orgs/x").
-//   - tab/CR/LF are stripped from the URL without any error.
+//   - tab/CR/LF anywhere in the URL, and a trailing space, are stripped
+//     without any error.
 //   - A bare "." or ".." SIG_REPO passes GITHUB_REPO_NAME_RE's character
 //     class but is itself a dot-segment ("/repos/o/../contents/..").
 //
@@ -300,26 +304,50 @@ function assertValidSha(value, context) {
 // "no signatures yet", so a silently-truncated path looks exactly like an
 // empty store, and the bot then reads/writes the WRONG file.
 //
-// Two layers, deliberately both kept (neither is enough alone):
-//   1. findSigPathProblem() rejects ambiguous/unsafe input up front, with a
+// Three layers, deliberately all kept (none is enough alone):
+//   1. normalizeSigPath() forgives the harmless, previously-working
+//      formatting slips (surrounding whitespace such as the trailing
+//      newline a YAML `|` block adds, and a leading "./").
+//   2. findSigPathProblem() rejects what is ambiguous or unsafe, with a
 //      message that names the actual problem (called by validateConfig).
-//   2. encodeRepoPath() percent-encodes every "/"-separated segment, so
-//      whatever DOES pass validation (spaces aside, e.g. non-ASCII names)
+//   3. encodeRepoPath() percent-encodes every "/"-separated segment, so
+//      whatever DOES pass validation (interior spaces, non-ASCII names, ...)
 //      reaches the wire unambiguously - the same treatment PR numbers and
 //      SHAs already get via encodeURIComponent at their call sites.
 //
+// Backward compatibility is deliberate: interior spaces and other non-ASCII
+// whitespace are ALLOWED, because fetch() already sent them as %20 / UTF-8
+// percent-escapes, so the request URL for any such path is byte-for-byte
+// what it was before. Only inputs that were silently mangled, or that are
+// themselves the traversal vector ("%"), are rejected.
+//
 // Encoding alone is NOT sufficient: encodeURIComponent("..") is still "..",
-// which the URL parser collapses. That is why sigRepoApiPath() re-runs the
-// validator itself: readSignatures()/writeSignatures() are exported, so they
-// can be reached without validateConfig() ever having run.
+// which the URL parser collapses. That is why the URL builders re-run the
+// validator themselves: readSignatures()/writeSignatures() are exported, so
+// they can be reached without validateConfig() ever having run.
 // ---------------------------------------------------------------------------
-// Characters that are never acceptable anywhere in SIG_PATH: backslash,
-// "?" and "#" (URL delimiters), "%" (blocks percent-encoded bypasses such
-// as "%2e%2e" or "%2f" - and a literal "%" in a repo path is vanishingly
-// rare), any whitespace (including Unicode spaces), and C0/DEL/C1 control
-// characters (these can also forge GitHub Actions log commands, since this
-// value is echoed into "::warning::"/"::error::" lines).
-const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\s\x00-\x1f\x7f-\x9f]/;
+// Characters never acceptable anywhere in SIG_PATH: backslash, "?" and "#"
+// (URL delimiters), "%" (blocks percent-encoded bypasses such as "%2e%2e" or
+// "%2f"; write the literal character instead, e.g. a space rather than
+// "%20" - encoding is done for you), and C0/DEL/C1 control characters (the
+// URL parser silently strips some of them, and they can forge GitHub
+// Actions log commands since this value is echoed into "::error::" lines).
+// Ordinary whitespace is NOT in this set - see the compatibility note above.
+const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
+
+// Tolerates, without changing which file is meant:
+//   - leading/trailing whitespace. Before this fix a trailing newline or
+//     space was silently stripped by the URL parser, so configs carrying one
+//     (e.g. from a YAML `|` block scalar) already worked; trimming keeps them
+//     working explicitly instead of by accident.
+//   - leading "./" prefixes, which the URL parser used to collapse.
+// An unset/empty value falls back to the default; a whitespace-only value
+// normalizes to "" and is then rejected by findSigPathProblem().
+function normalizeSigPath(raw) {
+  let p = (raw || "signatures/cla.json").trim();
+  while (p.startsWith("./")) p = p.slice(2);
+  return p;
+}
 
 // Returns a short human-readable reason SIG_PATH-style input is unusable,
 // or null when it's fine. Pure function: no I/O, never throws.
@@ -335,7 +363,7 @@ function findSigPathProblem(path) {
   }
   const bad = path.match(SIG_PATH_UNSAFE_CHAR_RE);
   if (bad) {
-    return `it contains the disallowed character ${JSON.stringify(bad[0])} (none of backslash, "?", "#", "%", whitespace or control characters are allowed)`;
+    return `it contains the disallowed character ${JSON.stringify(bad[0])} (backslash, "?", "#", "%" and control characters are not allowed; spaces are fine, and are encoded automatically)`;
   }
   for (const segment of path.split("/")) {
     if (segment.length === 0) {
@@ -374,12 +402,18 @@ function encodeRepoPath(path) {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-// "/repos/{owner}/{repo}" + suffix for the SIGNATURES repo, with owner and
-// repo encoded like every other interpolated path value. For values that
-// passed validateConfig() (letters, digits, ".", "-", "_") encoding is a
-// no-op; it matters only for direct, unvalidated callers. A "." / ".." repo
-// name is refused outright - encoding can't save it, see above.
-function sigRepoApiPath(suffix = "") {
+// "/repos/{owner}/{repo}" for the SIGNATURES repo, with owner and repo
+// encoded like every other interpolated path value. For values that passed
+// validateConfig() (letters, digits, ".", "-", "_") encoding is a no-op; it
+// matters only for direct, unvalidated callers. A "." / ".." name is refused
+// outright - encoding can't save it, see above.
+//
+// Deliberately NOT exported and deliberately takes no suffix: callers must go
+// through one of the two purpose-built functions below, each of which fixes
+// its own (static or separately-encoded) tail. A general
+// "base + arbitrary suffix" helper would look like a safe URL builder while
+// encoding only half of what it returns.
+function sigRepoBasePath() {
   for (const [name, value] of [
     ["SIG_OWNER", SIG_OWNER],
     ["SIG_REPO", SIG_REPO],
@@ -390,12 +424,17 @@ function sigRepoApiPath(suffix = "") {
       );
     }
   }
-  return `/repos/${encodeURIComponent(SIG_OWNER)}/${encodeURIComponent(SIG_REPO)}${suffix}`;
+  return `/repos/${encodeURIComponent(SIG_OWNER)}/${encodeURIComponent(SIG_REPO)}`;
+}
+
+// GitHub App installation lookup for the signatures repo.
+function sigInstallationApiPath() {
+  return `${sigRepoBasePath()}/installation`;
 }
 
 // The Contents API path of the signature file itself.
 function sigContentsApiPath() {
-  return sigRepoApiPath(`/contents/${encodeRepoPath(SIG_PATH)}`);
+  return `${sigRepoBasePath()}/contents/${encodeRepoPath(SIG_PATH)}`;
 }
 
 function validateConfig() {
@@ -415,7 +454,7 @@ function validateConfig() {
   // what's wrong.
   if (!GITHUB_LOGIN_RE.test(SIG_OWNER)) {
     fail(
-      `SIG_OWNER "${SIG_OWNER}" doesn't look like a valid GitHub user/org name.`,
+      `SIG_OWNER ${JSON.stringify(SIG_OWNER)} doesn't look like a valid GitHub user/org name.`,
     );
   }
   // "." and ".." satisfy GITHUB_REPO_NAME_RE's character class but are
@@ -441,10 +480,14 @@ function validateConfig() {
   try {
     const parsed = new URL(CLA_DOCUMENT_URL);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      fail(`CLA_DOCUMENT_URL "${CLA_DOCUMENT_URL}" must be an http(s) URL.`);
+      fail(
+        `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} must be an http(s) URL.`,
+      );
     }
   } catch (e) {
-    fail(`CLA_DOCUMENT_URL "${CLA_DOCUMENT_URL}" is not a valid URL.`);
+    fail(
+      `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} is not a valid URL.`,
+    );
   }
   // App auth is optional (getSignaturesToken falls back to GITHUB_TOKEN when
   // either half is missing), but if a key WAS supplied, check its shape here
@@ -579,7 +622,7 @@ async function getSignaturesToken() {
   // Repo-scoped lookup, not /orgs/{org}/installation - the org endpoint
   // 404s when signatures-owner is a user account rather than an org, and
   // this one works for both without needing to branch on account type.
-  const installation = await gh(sigRepoApiPath("/installation"), jwt);
+  const installation = await gh(sigInstallationApiPath(), jwt);
   // Same reasoning as the tokenResp check below: a 200 OK here doesn't
   // guarantee a usable installation id. Without this check, a malformed
   // response could flow straight into the URL below as "undefined" (or
@@ -1744,7 +1787,7 @@ module.exports = {
   // being inferred through readSignatures()/writeSignatures().
   findSigPathProblem,
   encodeRepoPath,
-  sigRepoApiPath,
+  sigInstallationApiPath,
   sigContentsApiPath,
   // Exported for tests only, same as everything above - not part of the
   // action's public contract. Covered directly in test/logic.test.js so a
