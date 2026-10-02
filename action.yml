@@ -27,7 +27,13 @@ inputs:
     description: "Name of the private central signatures repo, e.g. cla-signatures"
     required: true
   signatures-path:
-    description: "Path to the JSON file inside the signatures repo"
+    description: >-
+      Path to the JSON file inside the signatures repo. Must be a relative
+      path to a file (no leading or trailing "/", no empty, "." or ".."
+      segments, no ".git" segment). The characters "#", "?", "%", backslash,
+      whitespace and control characters are rejected up front, because they
+      would otherwise corrupt the API request URL. Non-ASCII characters are
+      fine and are percent-encoded automatically.
     required: false
     default: "signatures/cla.json"
   cla-document-url:

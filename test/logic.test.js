@@ -501,15 +501,17 @@ test("validateConfig rejects an absolute SIG_PATH", () => {
   );
 });
 
-// The SIG_PATH check is a single `||` chain of four conditions
-// (startsWith("/"), includes("\\"), split("/").includes(".."),
-// trim().length === 0) - the two tests above only ever drive the FIRST
-// and THIRD conditions true. Without a dedicated test for each of the
-// remaining two, a future refactor could silently break either one (e.g.
+// The SIG_PATH check (findSigPathProblem) has many independent rejection
+// rules (leading "/", backslash, ".." segment, whitespace-only, and - added
+// later - "#", "?", "%", whitespace, control characters, "."/empty/".git"
+// segments, trailing "/", invalid Unicode). The two tests above only drive
+// the leading-"/" and ".." rules. Without a dedicated test for each of the
+// remaining rules, a future refactor could silently break any one (e.g.
 // drop the backslash check entirely) and nothing would catch it, even
 // though overall statement/line coverage of this file would stay at
 // 100% throughout (the buggy line would still be *executed*, just no
-// longer *asserted on*).
+// longer *asserted on*). The exhaustive per-character matrix lives in
+// test/sig-path.test.js; the cases below pin the validateConfig() wiring.
 test("validateConfig rejects a SIG_PATH containing a backslash", () => {
   assertConfigFails(
     { ...VALID_BASE_CONFIG, SIG_PATH: "signatures\\cla.json" },
@@ -526,6 +528,108 @@ test("validateConfig accepts a SIG_PATH nested in subdirectories (sanity check: 
     ...VALID_BASE_CONFIG,
     SIG_PATH: "nested/dir/signatures.json",
   });
+});
+
+// Same as assertConfigFails, but returns the exact message instead of
+// asserting on a substring - used to check the message's FORMAT (single
+// line, JSON-quoted value), not just its content.
+function captureConfigFailure(envOverrides) {
+  let message = null;
+  withFreshBot(envOverrides, (mod) => {
+    const originalExit = process.exit;
+    const originalError = console.error;
+    process.exit = () => {
+      throw new Error("__TEST_PROCESS_EXIT__");
+    };
+    console.error = (msg) => {
+      message = msg;
+    };
+    try {
+      mod.validateConfig();
+    } catch (e) {
+      if (e.message !== "__TEST_PROCESS_EXIT__") throw e;
+    } finally {
+      process.exit = originalExit;
+      console.error = originalError;
+    }
+  });
+  return message;
+}
+
+for (const [label, value] of [
+  [
+    'a "#" (would silently truncate the request path to everything before it)',
+    "sig#path.json",
+  ],
+  [
+    'a "?" (would turn the rest of the path into a query string)',
+    "sig?q=1.json",
+  ],
+  ['a literal "%"', "100%.json"],
+  [
+    'a percent-encoded ".." ("%2e%2e" is collapsed into real traversal by the URL parser)',
+    "a/%2e%2e/b.json",
+  ],
+  ['an upper-case percent-encoded ".." ("%2E%2E")', "a/%2E%2E/b.json"],
+  ['a percent-encoded slash ("%2f")', "a%2fb.json"],
+  ["an embedded space", "signatures/my file.json"],
+  ["a leading/trailing space", " cla.json "],
+  ["a tab (silently stripped by the URL parser)", "a\tb.json"],
+  ["a newline", "a\nb.json"],
+  // (NUL byte / lone surrogate: not representable in process.env at all -
+  // covered directly via findSigPathProblem in test/sig-path.test.js.)
+  ["a non-breaking space", "a\u00a0b.json"],
+  ['a "." segment', "./cla.json"],
+  ['a ".." segment in the middle of the path', "a/../b.json"],
+  ['an empty segment ("//")', "a//b.json"],
+  ["a trailing slash (a directory, not a file)", "signatures/"],
+  ['a ".git" segment', "a/.git/b.json"],
+]) {
+  test(`validateConfig rejects a SIG_PATH containing ${label}`, () => {
+    assertConfigFails({ ...VALID_BASE_CONFIG, SIG_PATH: value }, "SIG_PATH");
+  });
+}
+
+test("validateConfig's SIG_PATH failure is ONE log line with the value JSON-quoted - a newline in the value can't forge extra workflow commands", () => {
+  const msg = captureConfigFailure({
+    ...VALID_BASE_CONFIG,
+    SIG_PATH: "a\n::warning::pwned",
+  });
+  assert.ok(msg && msg.startsWith("::error::SIG_PATH "), msg);
+  assert.ok(!msg.includes("\n"), "the message must not contain a raw newline");
+  assert.ok(msg.includes('"a\\n::warning::pwned"'), msg);
+});
+
+test("validateConfig's SIG_PATH failure message says WHY the path was rejected", () => {
+  const msg = captureConfigFailure({
+    ...VALID_BASE_CONFIG,
+    SIG_PATH: "sig#path.json",
+  });
+  assert.ok(msg.includes('"#"'), msg);
+});
+
+test("validateConfig accepts legitimate-but-unusual SIG_PATH values (hidden dirs, non-ASCII, '+', '@', '~', names merely containing dots)", () => {
+  for (const p of [
+    "cla.json",
+    ".github/cla.json",
+    "a+b@c~d.json",
+    "file..name.json",
+    "..hidden/x.json",
+    "签名/协议.json",
+  ]) {
+    assertConfigOK({ ...VALID_BASE_CONFIG, SIG_PATH: p });
+  }
+});
+
+test('validateConfig rejects SIG_REPO "." and ".." (they match the repo-name character class but are URL dot-segments: "/repos/o/../contents" collapses to "/repos/contents")', () => {
+  assertConfigFails({ ...VALID_BASE_CONFIG, SIG_REPO: ".." }, "SIG_REPO");
+  assertConfigFails({ ...VALID_BASE_CONFIG, SIG_REPO: "." }, "SIG_REPO");
+});
+
+test('validateConfig still accepts legitimate dotted repo names (".github", "a..b", "repo.js")', () => {
+  for (const r of [".github", "a..b", "repo.js", "...x"]) {
+    assertConfigOK({ ...VALID_BASE_CONFIG, SIG_REPO: r });
+  }
 });
 
 test("validateConfig rejects a SIG_APP_PRIVATE_KEY that does not look like PEM", () => {

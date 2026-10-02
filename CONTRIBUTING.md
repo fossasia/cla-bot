@@ -17,7 +17,8 @@ FOSSASIA's projects.
 2. **Every change to `src/cla-bot.js` needs a matching test.** Pick the
    right layer: `test/logic.test.js` for pure functions (no network),
    `test/http.test.js` for anything touching `readSignatures`/`writeSignatures`
-   (mocked `fetch`), `test/integration.test.js` for changes to event
+   (mocked `fetch`), `test/sig-path.test.js` for how `SIG_PATH`/`SIG_OWNER`/
+   `SIG_REPO` become request URLs (validation + encoding), `test/integration.test.js` for changes to event
    orchestration (`handleIssueComment`, `checkPR`), and
    `test/bot-identity*.test.js` for anything about how the bot resolves its
    own identity. Run `npm test` before opening a PR - CI runs it too, on
