@@ -629,6 +629,63 @@ function baseEnv(apiUrl) {
     }
   });
 
+  // ---------------------------------------------------------------------
+  // Real CLI entrypoint, real event file: a sign-phrase issue_comment whose
+  // comment.user.id is missing must fail the run (non-zero exit, "::error::"
+  // annotation naming the field) WITHOUT a single request reaching the API.
+  // 127.0.0.1:1 is unroutable, so if the bot ignored the guard and tried to
+  // read/write the store it would die with a connection error instead - the
+  // assertion on the message below tells those two outcomes apart.
+  // ---------------------------------------------------------------------
+  await test("the CLI entrypoint fails the run with a clear ::error:: (and makes no API request) when a sign-phrase issue_comment payload has no comment.user.id", async () => {
+    const eventFile = path.join(
+      TMP_DIR,
+      `no-id-event-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+    );
+    fs.writeFileSync(
+      eventFile,
+      JSON.stringify({
+        action: "created",
+        issue: { number: 1, pull_request: {}, user: { login: "mona" } },
+        comment: {
+          user: { login: "mona" }, // id deliberately absent
+          body: "I have read the CLA Document and I hereby sign the CLA",
+          html_url:
+            "https://github.com/fossasia/testrepo/pull/1#issuecomment-1",
+          author_association: "NONE",
+        },
+      }),
+    );
+    try {
+      const { code, stderr } = await runScript({
+        ...baseEnv("http://127.0.0.1:1"),
+        GITHUB_EVENT_NAME: "issue_comment",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.notStrictEqual(
+        code,
+        0,
+        `expected a non-zero exit, got 0. stderr:\n${stderr}`,
+      );
+      assert.ok(
+        /::error::/.test(stderr),
+        `expected an ::error:: annotation, got:\n${stderr}`,
+      );
+      assert.ok(
+        /comment\.user\.id: expected a positive integer GitHub user id, got undefined/.test(
+          stderr,
+        ),
+        `expected the specific id-validation error (not a connection error), got:\n${stderr}`,
+      );
+      assert.ok(
+        !/ECONNREFUSED|fetch failed/i.test(stderr),
+        `no API request may be attempted before validation, got:\n${stderr}`,
+      );
+    } finally {
+      fs.unlinkSync(eventFile);
+    }
+  });
+
   // The test above exercises the LEFT side of `e.stack || e.message` - a
   // real thrown Error always has a `.stack`, so the RIGHT side is
   // genuinely unreachable through any real call path in this codebase:
