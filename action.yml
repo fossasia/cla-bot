@@ -44,7 +44,14 @@ inputs:
     description: "Full URL to the CLA text contributors must read before signing"
     required: true
   allowlist:
-    description: "Comma-separated EXACT usernames/bot names exempt from signing. No wildcard support by design."
+    description: >-
+      Accounts exempt from signing, as numeric GitHub account ids separated
+      by commas and/or whitespace/newlines, e.g. "12345678,87654321". Ids are
+      immutable and never reassigned, unlike usernames (which can be renamed
+      and then claimed by a different account, who would inherit the
+      exemption) - so usernames are NOT accepted, and any non-numeric entry
+      fails the run. Look an id up with `gh api users/NAME --jq .id` (bots:
+      `gh api 'users/dependabot[bot]' --jq .id`). No wildcard support by design.
     required: false
     default: ""
   app-id:
