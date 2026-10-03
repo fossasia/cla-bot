@@ -24,6 +24,15 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const SRC = path.resolve(__dirname, "../src/cla-bot.js");
+// fs.mkdtempSync (unlike a hand-built "pid + Date.now()" path in the shared,
+// world-writable os.tmpdir()) creates a directory with an unguessable name
+// and owner-only permissions (0o700 on POSIX), so no other local user can
+// pre-create, read, or symlink-swap the event file. Same pattern as
+// test/e2e.test.js.
+const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-token-expiry-"));
+process.on("exit", () => {
+  fs.rmSync(TMP_DIR, { recursive: true, force: true });
+});
 const PRIVATE_KEY = crypto
   .generateKeyPairSync("rsa", { modulusLength: 2048 })
   .privateKey.export({ type: "pkcs1", format: "pem" });
@@ -908,15 +917,17 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
         });
       });
       await new Promise((r) => server.listen(0, "127.0.0.1", r));
-      const eventFile = path.join(
-        os.tmpdir(),
-        `cla-token-expiry-${process.pid}-${Date.now()}.json`,
-      );
-      fs.writeFileSync(eventFile, JSON.stringify(signPayload()));
+      const eventFile = path.join(TMP_DIR, "event.json");
+      // flag "wx": fail instead of following/overwriting anything that
+      // already exists at this path. mode 0o600: owner read/write only.
+      fs.writeFileSync(eventFile, JSON.stringify(signPayload()), {
+        flag: "wx",
+        mode: 0o600,
+      });
       try {
         const env = {
           PATH: process.env.PATH,
-          HOME: process.env.HOME || os.tmpdir(),
+          HOME: process.env.HOME || TMP_DIR,
           ...BASE_ENV,
           GITHUB_API_URL: `http://127.0.0.1:${server.address().port}`,
           GITHUB_EVENT_NAME: "issue_comment",
