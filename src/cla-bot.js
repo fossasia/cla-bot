@@ -7,15 +7,19 @@
  *
  * ── Security properties (read before changing anything below) ───────────
  * 1. Writes to the signatures repo use a short-lived GitHub App token,
- *    minted fresh each run. No long-lived PAT is ever stored.
+ *    minted on demand and never persisted. It is re-minted before it
+ *    expires (and once more on a 401), so a long run can't outlive it. No
+ *    long-lived PAT is ever stored. See getSignaturesToken().
  * 2. Everything else (comments, statuses) uses the job's own `GITHUB_TOKEN`,
  *    which has no access to the signatures repo - a leaked token can't
  *    reach it.
  * 3. A PR only counts as "signed" once every one of its real commit authors
  *    (looked up via the API, not whoever left the sign comment) is in the
  *    signature store. Someone else can't sign on a contributor's behalf.
- * 4. The allowlist is an exact, case-insensitive string match only - no
- *    wildcards, so nobody can dodge signing by naming themselves like a bot.
+ * 4. The allowlist is a set of immutable numeric GitHub account ids - no
+ *    logins, no wildcards - so nobody can dodge signing by naming themselves
+ *    like a bot, and a released/renamed login can never inherit an
+ *    exemption. See parseAllowlist()/isAllowlisted().
  * 5. Writes retry with a fresh read on HTTP 409, for when two repos' PRs
  *    write to the same file at once.
  * 6. Every request has a timeout, so a hung call can't stall the whole job.
@@ -42,6 +46,11 @@
  *     login-based allowlist check. It can't verify the named person
  *     actually agreed to be credited; nothing can, since GitHub doesn't
  *     ask.
+ * 11. Same reasoning as 7, applied to the allowlist: it holds numeric
+ *     account ids only, matched against the id GitHub itself reported for
+ *     the author (never against anything a commit/trailer merely claims).
+ *     A non-numeric entry (e.g. a username) fails validateConfig() loudly
+ *     instead of being silently ignored.
  */
 
 "use strict";
@@ -70,12 +79,40 @@ const SIG_APP_ID = process.env.SIG_APP_ID || "";
 const SIG_APP_PRIVATE_KEY = process.env.SIG_APP_PRIVATE_KEY || "";
 const SIG_OWNER = process.env.SIG_OWNER;
 const SIG_REPO = process.env.SIG_REPO;
-const SIG_PATH = process.env.SIG_PATH || "signatures/cla.json";
+// Normalized once, here, so every consumer (validation, URL building, log
+// messages) sees the same value. See normalizeSigPath() for exactly what is
+// (and deliberately is not) tolerated.
+const SIG_PATH_RAW = process.env.SIG_PATH;
+const SIG_PATH = normalizeSigPath(SIG_PATH_RAW);
 const CLA_DOCUMENT_URL = process.env.CLA_DOCUMENT_URL;
-const ALLOWLIST = (process.env.ALLOWLIST || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// The allowlist is a list of immutable numeric GitHub account ids (the same
+// identity the signature store is keyed on), separated by commas and/or any
+// whitespace (so a multi-line YAML value works). Logins are deliberately NOT
+// supported: a login can be renamed and later claimed by a different account,
+// which would then inherit the exemption.
+//
+// Anything that isn't a plain positive integer (a username, "id:5", "0",
+// "1e3", "012", a value beyond Number.MAX_SAFE_INTEGER) is collected in
+// `invalid` rather than dropped or coerced - validateConfig() fails the run on
+// it, because a silently ignored entry would demand a signature from the very
+// account the maintainer meant to exempt.
+const ALLOWLIST_ID_RE = /^[1-9][0-9]*$/;
+function parseAllowlist(raw) {
+  const ids = new Set();
+  const invalid = [];
+  for (const entry of String(raw || "")
+    .split(/[,\s]+/)
+    .filter(Boolean)) {
+    const id = Number(entry);
+    if (ALLOWLIST_ID_RE.test(entry) && Number.isSafeInteger(id)) {
+      ids.add(id);
+    } else {
+      invalid.push(entry);
+    }
+  }
+  return { ids, invalid };
+}
+const ALLOWLIST = parseAllowlist(process.env.ALLOWLIST);
 const SIGN_PHRASE = "I have read the CLA Document and I hereby sign the CLA";
 const STATUS_CONTEXT = "cla/fossasia";
 const BOT_MARKER = "<!-- fossasia-cla-bot:v1 -->";
@@ -251,6 +288,33 @@ function assertValidInstallationId(value, context) {
   return value;
 }
 
+// A GitHub account id (user.id in every webhook/REST user object) is always a
+// positive integer. Same trust boundary and same bar as the two validators
+// above, but with a different consequence for getting it wrong: this value
+// is PERSISTED into the signature store, and isSigned() only matches on id
+// when both sides are numbers (typeof === "number"). An entry written with
+// a missing/null/string/zero/negative/fractional id is therefore not
+// rejected anywhere later - it just silently degrades, forever, to the
+// login-only comparison that the id-keying exists to avoid (a released
+// login claimed by a different person would inherit the old signature; see
+// security property 7 at the top of this file). JSON.stringify makes the
+// missing case invisible, too: `{ id: undefined }` simply drops the key, so
+// the stored entry looks like a perfectly ordinary legacy record.
+//
+// Fail loudly BEFORE anything is written instead - exactly what the
+// existing comment.user.login guard does for the login. Real GitHub
+// payloads never trip this (user.id is a required integer in GitHub's own
+// schema, for bots and the "ghost" placeholder user alike), so it only ever
+// fires on a corrupted event file or a non-GitHub caller.
+function assertValidUserId(value, context) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `${context}: expected a positive integer GitHub user id, got ${JSON.stringify(value)} (${typeof value}) - refusing to record a signature that could only be matched by login.`,
+    );
+  }
+  return value;
+}
+
 // Real git commit SHAs are lowercase hex (40 chars for sha1, 64 for
 // sha256), but test/tooling code sometimes uses opaque placeholder strings
 // in their place, so this deliberately doesn't require hex - it only
@@ -274,6 +338,208 @@ function assertValidSha(value, context) {
   return value;
 }
 
+// ---------------------------------------------------------------------------
+// SIG_PATH / SIG_OWNER / SIG_REPO -> request-URL safety.
+//
+// These three values are interpolated straight into the path of every
+// signature-store request (readSignatures, writeSignatures, the App
+// installation lookup). They're maintainer-supplied config rather than
+// attacker-controlled PR content, but a mistake here is NOT harmless - and
+// it's not loud either. Node's fetch() parses the request URL with the
+// WHATWG URL algorithm, which means (verified empirically, see
+// test/sig-path.test.js):
+//
+//   - "#" starts a fragment and everything after it is silently dropped
+//     from the request ("sig#path.json" is fetched as ".../contents/sig").
+//   - "?" starts a query string, truncating the path the same way.
+//   - "%2e"/"%2E" are treated as ".", so "a/%2e%2e/b" is normalized to a
+//     real ".." traversal AFTER the literal-".." check in validateConfig
+//     already passed - and it can climb right out of /contents/ into other
+//     API endpoints (".../%2e%2e/%2e%2e/orgs/x" -> "/repos/o/orgs/x").
+//   - tab/CR/LF anywhere in the URL, and a trailing space, are stripped
+//     without any error.
+//   - A bare "." or ".." SIG_REPO passes GITHUB_REPO_NAME_RE's character
+//     class but is itself a dot-segment ("/repos/o/../contents/..").
+//
+// The worst part is what happens next: readSignatures() treats a 404 as
+// "no signatures yet", so a silently-truncated path looks exactly like an
+// empty store, and the bot then reads/writes the WRONG file.
+//
+// Three layers, deliberately all kept (none is enough alone):
+//   1. normalizeSigPath() reproduces - explicitly, instead of by accident -
+//      the two formatting slips the old, un-normalized code happened to
+//      tolerate: trailing whitespace/control characters (e.g. the newline a
+//      YAML `|` block adds) and a leading "./". Nothing else is touched.
+//   2. findSigPathProblem() rejects what is ambiguous or unsafe, with a
+//      message that names the actual problem (called by validateConfig).
+//   3. encodeRepoPath() percent-encodes every "/"-separated segment, so
+//      whatever DOES pass validation (interior spaces, non-ASCII names, ...)
+//      reaches the wire unambiguously - the same treatment PR numbers and
+//      SHAs already get via encodeURIComponent at their call sites.
+//
+// Backward compatibility is deliberate: whitespace (including leading
+// whitespace and non-ASCII whitespace) is ALLOWED as part of the file name,
+// because fetch() already sent it as %20 / UTF-8 percent-escapes, so the
+// request URL for any such path is byte-for-byte what it was before. Only
+// inputs that were silently mangled, or whose meaning would silently change
+// once encoding is applied ("%", see below), are rejected.
+//
+// Encoding alone is NOT sufficient: encodeURIComponent("..") is still "..",
+// which the URL parser collapses. That is why the URL builders re-run the
+// validator themselves: readSignatures()/writeSignatures() are exported, so
+// they can be reached without validateConfig() ever having run.
+// ---------------------------------------------------------------------------
+// Characters never acceptable anywhere in SIG_PATH: backslash, "?" and "#"
+// (URL delimiters), "%", and C0/DEL/C1 control characters (the URL parser
+// silently strips some of them, and they can forge GitHub Actions log
+// commands since this value is echoed into "::error::" lines). Ordinary
+// whitespace is NOT in this set - see the compatibility note above.
+//
+// Why "%" is rejected rather than simply encoded as "%25": once every
+// segment is encoded, a "%" is no longer a traversal vector. The problem is
+// that its MEANING would change. The old code passed "%XX" through verbatim,
+// so "my%20file.json" addressed "my file.json"; encoding it again would
+// silently address a file literally named "my%20file.json" instead - a
+// 404, which readSignatures() reads as "no signatures yet". Decoding
+// instead would reopen the double-decode class of bugs ("%252e%252e").
+// Failing fast, with a message that says what to write instead, is the only
+// choice that is neither silent nor risky.
+const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
+
+// Normalizes SIG_PATH to EXACTLY the file the pre-validation code addressed,
+// no more and no less. That code interpolated the raw value at the very end
+// of the request URL and handed it to fetch(), whose WHATWG URL parser:
+//   - strips trailing C0-control-or-space characters (U+0000..U+0020) from
+//     the whole URL - which is the end of SIG_PATH. So a trailing space, or
+//     the newline a YAML `|` block scalar adds, never reached the server and
+//     configs carrying one worked.
+//   - collapsed a leading "./" segment.
+// and did NOT touch anything else: leading whitespace stayed part of the file
+// name (as %20), and Unicode whitespace such as NBSP at either end was
+// percent-encoded as part of it. This function reproduces precisely that, so
+// an upgrade can never silently redirect an existing config to a different
+// file - which would be dangerous here, since a read that lands on a missing
+// file looks like "no signatures yet". A blanket String#trim() is NOT
+// equivalent (it also removes leading and Unicode whitespace), and neither is
+// removing normalization altogether (a trailing space would then address
+// "cla.json%20" instead of "cla.json"). validateConfig() reports when
+// normalization changed the value, so it is never invisible.
+//
+// An unset/empty value falls back to the default; a value that is nothing but
+// whitespace normalizes to "" and is then rejected by findSigPathProblem().
+// (A char-code loop, not a /[\x00-\x20]+$/ regex, to stay linear-time on
+// pathological input.)
+function normalizeSigPath(raw) {
+  let p = raw || "signatures/cla.json";
+  let end = p.length;
+  while (end > 0 && p.charCodeAt(end - 1) <= 0x20) end -= 1;
+  p = p.slice(0, end);
+  while (p.startsWith("./")) p = p.slice(2);
+  return p;
+}
+
+// Returns a short human-readable reason SIG_PATH-style input is unusable,
+// or null when it's fine. Pure function: no I/O, never throws.
+function findSigPathProblem(path) {
+  if (typeof path !== "string" || path.trim().length === 0) {
+    return "it must not be empty";
+  }
+  if (path.startsWith("/")) {
+    return 'it must be relative (no leading "/")';
+  }
+  if (path.endsWith("/")) {
+    return 'it must name a file, not a directory (no trailing "/")';
+  }
+  const bad = path.match(SIG_PATH_UNSAFE_CHAR_RE);
+  if (bad && bad[0] === "%") {
+    return 'it contains "%" - percent-encoded input is not supported, because encoding it again would silently address a different file; write the literal character instead (a space, not "%20"), encoding is done for you';
+  }
+  if (bad) {
+    return `it contains the disallowed character ${JSON.stringify(bad[0])} (backslash, "?", "#", "%" and control characters are not allowed; spaces are fine, and are encoded automatically)`;
+  }
+  for (const segment of path.split("/")) {
+    if (segment.length === 0) {
+      return 'it contains an empty segment ("//")';
+    }
+    if (segment === "." || segment === "..") {
+      return `it contains the "${segment}" path segment`;
+    }
+    // Git itself refuses a ".git" path component, so GitHub's Contents API
+    // can never address one.
+    if (segment.toLowerCase() === ".git") {
+      return 'it contains a ".git" path segment, which git does not allow';
+    }
+  }
+  try {
+    encodeURIComponent(path);
+  } catch {
+    // Lone UTF-16 surrogate: encodeURIComponent throws URIError on it.
+    // Catching it here turns a mid-run crash into a clear config error.
+    return "it is not valid Unicode text";
+  }
+  return null;
+}
+
+// Percent-encodes each "/"-separated segment, keeping the "/" separators
+// literal - the shape GitHub's /contents/{path} endpoint expects. Throws on
+// input findSigPathProblem() rejects, so a bad value can never be turned
+// into a request URL by accident (see the layering note above).
+function encodeRepoPath(path) {
+  const problem = findSigPathProblem(path);
+  if (problem) {
+    throw new Error(
+      `Refusing to build a request URL from path ${JSON.stringify(path)}: ${problem}.`,
+    );
+  }
+  return path.split("/").map(encodeURIComponent).join("/");
+}
+
+// "/repos/{owner}/{repo}" for the SIGNATURES repo, with owner and repo
+// encoded like every other interpolated path value. For values that passed
+// validateConfig() (letters, digits, ".", "-", "_") encoding is a no-op; it
+// matters only for direct, unvalidated callers. A "." / ".." name is refused
+// outright - encoding can't save it, see above.
+//
+// Deliberately NOT exported and deliberately takes no suffix: callers must go
+// through one of the two purpose-built functions below, each of which fixes
+// its own (static or separately-encoded) tail. A general
+// "base + arbitrary suffix" helper would look like a safe URL builder while
+// encoding only half of what it returns.
+function sigRepoBasePath() {
+  for (const [name, value] of [
+    ["SIG_OWNER", SIG_OWNER],
+    ["SIG_REPO", SIG_REPO],
+  ]) {
+    // Not stricter than the URL-safety contract on purpose: once encoded,
+    // the only things that can still misdirect a request are an absent value
+    // (encodeURIComponent(undefined) would silently yield "undefined") and a
+    // dot-segment. Whether a name is a REAL GitHub name is validateConfig()'s
+    // job (GITHUB_LOGIN_RE / GITHUB_REPO_NAME_RE); re-applying those regexes
+    // here would make the encoding below unreachable dead code.
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error(
+        `Refusing to build a request URL: ${name} is missing or empty.`,
+      );
+    }
+    if (value === "." || value === "..") {
+      throw new Error(
+        `Refusing to build a request URL: ${name} ${JSON.stringify(value)} is a dot-segment.`,
+      );
+    }
+  }
+  return `/repos/${encodeURIComponent(SIG_OWNER)}/${encodeURIComponent(SIG_REPO)}`;
+}
+
+// GitHub App installation lookup for the signatures repo.
+function sigInstallationApiPath() {
+  return `${sigRepoBasePath()}/installation`;
+}
+
+// The Contents API path of the signature file itself.
+function sigContentsApiPath() {
+  return `${sigRepoBasePath()}/contents/${encodeRepoPath(SIG_PATH)}`;
+}
+
 function validateConfig() {
   for (const [name, val] of [
     ["GITHUB_TOKEN", GITHUB_TOKEN],
@@ -291,31 +557,57 @@ function validateConfig() {
   // what's wrong.
   if (!GITHUB_LOGIN_RE.test(SIG_OWNER)) {
     fail(
-      `SIG_OWNER "${SIG_OWNER}" doesn't look like a valid GitHub user/org name.`,
+      `SIG_OWNER ${JSON.stringify(SIG_OWNER)} doesn't look like a valid GitHub user/org name.`,
     );
   }
-  if (!GITHUB_REPO_NAME_RE.test(SIG_REPO)) {
-    fail(
-      `SIG_REPO "${SIG_REPO}" doesn't look like a valid GitHub repository name.`,
-    );
-  }
+  // "." and ".." satisfy GITHUB_REPO_NAME_RE's character class but are
+  // URL dot-segments (".../repos/o/../contents" collapses to
+  // "/repos/contents") - GitHub itself never allows either as a repo name.
   if (
-    SIG_PATH.startsWith("/") ||
-    SIG_PATH.includes("\\") ||
-    SIG_PATH.split("/").includes("..") ||
-    SIG_PATH.trim().length === 0
+    !GITHUB_REPO_NAME_RE.test(SIG_REPO) ||
+    SIG_REPO === "." ||
+    SIG_REPO === ".."
   ) {
     fail(
-      `SIG_PATH "${SIG_PATH}" must be a non-empty, relative path within the signatures repo (no leading "/", no ".." segments, no backslashes).`,
+      `SIG_REPO ${JSON.stringify(SIG_REPO)} doesn't look like a valid GitHub repository name.`,
+    );
+  }
+  // JSON.stringify (not a bare "${SIG_PATH}") so a value containing control
+  // characters can't inject extra lines/commands into the Actions log.
+  const sigPathProblem = findSigPathProblem(SIG_PATH);
+  if (sigPathProblem) {
+    fail(
+      `SIG_PATH ${JSON.stringify(SIG_PATH)} is not a valid path within the signatures repo: ${sigPathProblem}.`,
     );
   }
   try {
     const parsed = new URL(CLA_DOCUMENT_URL);
     if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      fail(`CLA_DOCUMENT_URL "${CLA_DOCUMENT_URL}" must be an http(s) URL.`);
+      fail(
+        `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} must be an http(s) URL.`,
+      );
     }
   } catch (e) {
-    fail(`CLA_DOCUMENT_URL "${CLA_DOCUMENT_URL}" is not a valid URL.`);
+    fail(
+      `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} is not a valid URL.`,
+    );
+  }
+  // Normalization (see normalizeSigPath) reproduces what the old code did
+  // implicitly; say so, rather than leaving a config that differs from what
+  // is actually used invisible.
+  if (SIG_PATH_RAW && SIG_PATH_RAW !== SIG_PATH) {
+    console.warn(
+      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing whitespace/control characters and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
+    );
+  }
+  // A bad entry would otherwise silently exempt nobody (and demand a
+  // signature from the very account the maintainer meant to allowlist), so
+  // fail loudly like every other bad input. JSON.stringify keeps control
+  // characters from injecting extra lines into the Actions log.
+  if (ALLOWLIST.invalid.length) {
+    fail(
+      `ALLOWLIST entries must be numeric GitHub account ids (usernames are not supported - they can be renamed and reclaimed by someone else); invalid: ${ALLOWLIST.invalid.map((e) => JSON.stringify(e)).join(", ")}. Look an id up with: gh api users/NAME --jq .id`,
+    );
   }
   // App auth is optional (getSignaturesToken falls back to GITHUB_TOKEN when
   // either half is missing), but if a key WAS supplied, check its shape here
@@ -434,26 +726,81 @@ function createAppJWT(appId, privateKeyPem) {
   return `${unsigned}.${base64url(signer.sign(privateKeyPem))}`;
 }
 
-let _cachedSigToken = null; // one per run, no need to mint more than once
-async function getSignaturesToken() {
-  if (_cachedSigToken) return _cachedSigToken;
+// ---------------------------------------------------------------------------
+// Signatures-repo token lifecycle.
+//
+// A GitHub App installation token lives ~1 hour; the access_tokens response
+// carries the authoritative `expires_at`. In the normal case a run takes
+// seconds, so one mint per run is plenty - but the sign-phrase flow mints
+// FIRST (to write the signature) and only reads the store again at the very
+// end of checkPR(), after listPRCommitAuthors() has paged through every
+// commit and resolved every co-author trailer. On a huge PR, a slow or
+// rate-limited API, or a long-lived self-hosted runner, that gap can outlast
+// the token, and the final read would fail with a 401 AFTER the signature
+// was already persisted - leaving the PR's status/comment stale. So:
+//
+//  1. The cache remembers when the token expires and re-mints once it is
+//     within SIG_TOKEN_REFRESH_SKEW_MS of that (proactive refresh).
+//  2. withSignaturesToken() additionally recovers from a 401 on a
+//     signatures-repo request - a token revoked early, or a runner clock
+//     that disagrees with GitHub's - by minting a fresh token and retrying
+//     exactly once (reactive refresh).
+//  3. Concurrent callers share one in-flight mint instead of each minting.
+// ---------------------------------------------------------------------------
+// GitHub documents installation tokens as valid for one hour. Also the
+// ceiling for any `expires_at` we are told about: we never trust a token to
+// outlive the documented lifetime, whatever the response claims.
+const SIG_TOKEN_LIFETIME_MS = 60 * 60 * 1000;
+// Refresh this long BEFORE the real expiry, so a token is never handed out
+// that dies mid-request, and so modest clock drift between this runner and
+// GitHub is absorbed.
+const SIG_TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
-  if (!SIG_APP_ID || !SIG_APP_PRIVATE_KEY) {
+let _sigTokenCache = null; // { token, expiresAtMs, viaApp } | null
+let _sigTokenMint = null; // in-flight mint promise, shared by concurrent callers
+
+function usesAppAuth() {
+  return Boolean(SIG_APP_ID && SIG_APP_PRIVATE_KEY);
+}
+
+// When should a freshly minted token be considered dead? Uses the response's
+// `expires_at` when it is a parseable date, never later than the documented
+// 1-hour lifetime counted from when the mint REQUEST started (the
+// conservative end - the token was necessarily created after that). A
+// missing/unparseable `expires_at` falls back to that same ceiling: caching
+// NaN here would make every later freshness check false and silently
+// re-mint on every single call.
+function resolveSigTokenExpiry(expiresAt, mintStartedAtMs) {
+  const ceiling = mintStartedAtMs + SIG_TOKEN_LIFETIME_MS;
+  if (typeof expiresAt !== "string") return ceiling;
+  const parsed = Date.parse(expiresAt);
+  if (!Number.isFinite(parsed)) return ceiling;
+  return Math.min(parsed, ceiling);
+}
+
+function isSigTokenFresh(entry) {
+  return (
+    entry !== null && Date.now() < entry.expiresAtMs - SIG_TOKEN_REFRESH_SKEW_MS
+  );
+}
+
+async function mintSignaturesToken() {
+  if (!usesAppAuth()) {
     console.warn(
       "::warning::SIG_APP_ID/SIG_APP_PRIVATE_KEY not set - falling back to GITHUB_TOKEN. Cross-repo writes will only work if the signatures repo equals the current repo.",
     );
-    _cachedSigToken = GITHUB_TOKEN;
-    return _cachedSigToken;
+    // The job's own GITHUB_TOKEN is not ours to refresh - it lives for the
+    // whole job, so this entry never goes stale.
+    return { token: GITHUB_TOKEN, expiresAtMs: Infinity, viaApp: false };
   }
 
+  // Taken BEFORE any request, see resolveSigTokenExpiry().
+  const mintStartedAtMs = Date.now();
   const jwt = createAppJWT(SIG_APP_ID, SIG_APP_PRIVATE_KEY);
   // Repo-scoped lookup, not /orgs/{org}/installation - the org endpoint
   // 404s when signatures-owner is a user account rather than an org, and
   // this one works for both without needing to branch on account type.
-  const installation = await gh(
-    `/repos/${SIG_OWNER}/${SIG_REPO}/installation`,
-    jwt,
-  );
+  const installation = await gh(sigInstallationApiPath(), jwt);
   // Same reasoning as the tokenResp check below: a 200 OK here doesn't
   // guarantee a usable installation id. Without this check, a malformed
   // response could flow straight into the URL below as "undefined" (or
@@ -476,7 +823,7 @@ async function getSignaturesToken() {
   // or unexpected body (e.g. a proxy/gateway that mangles the response, an
   // empty 200 body which ghRaw() turns into `null`, or a future GitHub API
   // change) must fail loudly right here, not silently flow through as
-  // `_cachedSigToken = undefined/null` and only surface later as a
+  // a cached `undefined`/`null` token and only surface later as a
   // confusing "Bad credentials" 401 on some unrelated request that happens
   // to use it. `tokenResp?.token` (rather than `tokenResp.token`) matters:
   // ghRaw() returns a bare `null` (not `{}`) for a 200 response with an
@@ -495,40 +842,97 @@ async function getSignaturesToken() {
       `GitHub App access_tokens response for /app/installations/${installation.id}/access_tokens is missing a usable "token" field (got ${typeof tokenResp?.token}) - cannot mint a signatures-repo token.`,
     );
   }
-  _cachedSigToken = tokenResp.token.trim(); // valid ~1 hour
-  return _cachedSigToken;
+  return {
+    token: tokenResp.token.trim(),
+    expiresAtMs: resolveSigTokenExpiry(tokenResp.expires_at, mintStartedAtMs),
+    viaApp: true,
+  };
+}
+
+async function getSignaturesToken() {
+  if (isSigTokenFresh(_sigTokenCache)) return _sigTokenCache.token;
+  // A mint is already running - join it instead of minting a second token.
+  if (_sigTokenMint) return _sigTokenMint;
+
+  const mint = mintSignaturesToken()
+    .then((entry) => {
+      _sigTokenCache = entry;
+      return entry.token;
+    })
+    .finally(() => {
+      // Cleared on success AND failure, so a failed mint never poisons later
+      // calls (they simply try again). Only clear our own promise.
+      if (_sigTokenMint === mint) _sigTokenMint = null;
+    });
+  _sigTokenMint = mint;
+  return mint;
+}
+
+// Forget `rejectedToken`, but only if it is still the cached one - if
+// something else already refreshed the cache, that newer token must survive.
+function invalidateSignaturesToken(rejectedToken) {
+  if (
+    _sigTokenCache &&
+    _sigTokenCache.viaApp &&
+    _sigTokenCache.token === rejectedToken
+  ) {
+    _sigTokenCache = null;
+  }
+}
+
+// Runs `fn(token)` with a signatures-repo token and, if GitHub answers 401
+// (token expired/revoked early, or clock skew defeated the proactive check),
+// mints a fresh one and runs `fn` once more. At most ONE retry, so bad
+// credentials can never loop. Only for App-minted tokens: the GITHUB_TOKEN
+// fallback cannot be re-minted, so its 401 is surfaced as-is. Failures while
+// minting happen outside `fn` and propagate untouched.
+//
+// Re-running `fn` is safe because a 401 means the request was rejected
+// before it could do anything, and every `fn` used here (a read, or
+// writeSignatures with its idempotent check-and-append mutate) tolerates
+// being re-run - the 409 retry loop already relies on exactly that.
+async function withSignaturesToken(fn) {
+  const token = await getSignaturesToken();
+  try {
+    return await fn(token);
+  } catch (e) {
+    if (!e || e.status !== 401 || !usesAppAuth()) throw e;
+    console.warn(
+      "::warning::The signatures-repo installation token was rejected (HTTP 401) - minting a fresh one and retrying once.",
+    );
+    invalidateSignaturesToken(token);
+    const freshToken = await getSignaturesToken();
+    if (freshToken === token) throw e; // nothing new to try
+    return await fn(freshToken);
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Signature store (JSON file in the central private repo).
 // ---------------------------------------------------------------------------
 async function readSignatures(token) {
+  // Built (and validated) once, OUTSIDE the try below on purpose: an invalid
+  // SIG_PATH is a configuration error and must surface as one - never be
+  // mistaken for the "file doesn't exist yet" 404 case handled in the catch.
+  const contentsPath = sigContentsApiPath();
   try {
     // The 'object' media type works up to 100 MB (the default response
     // format is only reliable under 1 MB) and still gives us the sha we
     // need for compare-and-swap writes. Files at or under 1 MB come back
     // with content included; bigger files come back empty and we fetch the
     // actual bytes below via the 'raw' media type.
-    const meta = await gh(
-      `/repos/${SIG_OWNER}/${SIG_REPO}/contents/${SIG_PATH}`,
-      token,
-      {
-        headers: { Accept: "application/vnd.github.object+json" },
-      },
-    );
+    const meta = await gh(contentsPath, token, {
+      headers: { Accept: "application/vnd.github.object+json" },
+    });
 
     let text;
     if (meta.content && meta.encoding === "base64") {
       text = Buffer.from(meta.content, "base64").toString("utf8");
     } else {
-      text = await gh(
-        `/repos/${SIG_OWNER}/${SIG_REPO}/contents/${SIG_PATH}`,
-        token,
-        {
-          headers: { Accept: "application/vnd.github.raw+json" },
-          raw: true,
-        },
-      );
+      text = await gh(contentsPath, token, {
+        headers: { Accept: "application/vnd.github.raw+json" },
+        raw: true,
+      });
     }
 
     const data = JSON.parse(text);
@@ -577,7 +981,7 @@ async function writeSignatures(token, mutate, message, attempt = 1) {
     "base64",
   );
   try {
-    await gh(`/repos/${SIG_OWNER}/${SIG_REPO}/contents/${SIG_PATH}`, token, {
+    await gh(sigContentsApiPath(), token, {
       method: "PUT",
       body: JSON.stringify({ message, content, sha: sha || undefined }),
     });
@@ -608,46 +1012,38 @@ async function writeSignatures(token, mutate, message, attempt = 1) {
   }
 }
 
-// `author` is normally a { id, login } pair. We match on the numeric id
-// where we can, since logins are mutable - a released login can be claimed
-// by someone else later, and matching on login alone could hand that
-// person an earlier signature that isn't theirs. A bare login string is
-// also accepted (legacy entries, or callers with no id) and falls back to a
-// login-only comparison.
+// `author` is a { id, login } pair. Matching is on the immutable numeric id
+// ONLY - logins are mutable, and a released login can be claimed by someone
+// else later, so a login comparison could hand that person an earlier
+// signature that isn't theirs. An author without a numeric id (a bare login
+// string, or a malformed shape) is never "signed", and neither is a stored
+// entry without a numeric id: both fail closed rather than degrade to login
+// matching. (handleIssueComment refuses to record an id-less signature in the
+// first place - see assertValidUserId().)
 //
-// Every real caller here passes a well-formed value, but this is also an
-// exported helper (used by tests), so the guards below make sure a
-// malformed shape fails closed ("not signed") instead of throwing.
+// This is also an exported helper (used by tests), so it tolerates garbage
+// entries - readSignatures() keeps malformed entries in place instead of
+// dropping them - and returns false instead of throwing.
 function isSigned(data, author) {
-  if (author == null) return false;
-  const login = typeof author === "string" ? author : author.login;
-  const id = typeof author === "string" ? undefined : author.id;
-  if (typeof login !== "string" || login.length === 0) return false;
-  const l = login.toLowerCase();
-  return data.signatures.some((s) => {
-    // readSignatures() keeps malformed entries around instead of dropping
-    // them (see there), so this has to tolerate a garbage `s` safely.
-    if (!s || typeof s !== "object") return false;
-    if (typeof id === "number" && typeof s.id === "number") {
-      return s.id === id;
-    }
-    // No id on one side (legacy entry, or a caller with only a login) -
-    // fall back to a login comparison instead of refusing to match at all.
-    return typeof s.login === "string" && s.login.toLowerCase() === l;
-  });
+  if (author == null || typeof author !== "object") return false;
+  const id = author.id;
+  if (typeof id !== "number") return false;
+  return data.signatures.some((s) => s && typeof s === "object" && s.id === id);
 }
 
-function isAllowlisted(login) {
-  if (typeof login !== "string" || login.length === 0) return false;
-  const l = login.toLowerCase();
-  return ALLOWLIST.some((a) => a.toLowerCase() === l);
+// `author` is the same { id, login } pair the rest of the code passes around.
+// Only the numeric id is consulted - the login is mutable and reusable. A
+// missing, non-numeric, fractional or otherwise malformed id (including a bare
+// login string) fails closed: not allowlisted.
+function isAllowlisted(author) {
+  if (author == null || typeof author !== "object") return false;
+  return typeof author.id === "number" && ALLOWLIST.ids.has(author.id);
 }
 
-// Same "prefer numeric id, fall back to a case-insensitive login compare"
-// matching rule as isSigned() above (kept as its own small function rather
-// than shared code, so a future change to either doesn't have to reason
-// about the other) - applied here to answer a different question: not
-// "has this identity signed anywhere", but "is this identity one of THIS
+// Same id-only identity rule as isSigned() above (kept as its own small
+// function rather than shared code, so a future change to either doesn't have
+// to reason about the other) - applied here to answer a different question:
+// not "has this identity signed anywhere", but "is this identity one of THIS
 // PR's own commit authors". Used by checkPR to tell a genuine required
 // signer apart from a bystander whose sign-phrase comment didn't actually
 // unblock this particular PR (see the `signerCompletedRequirement` check
@@ -655,14 +1051,7 @@ function isAllowlisted(login) {
 // distinction matters).
 function isSameContributor(a, b) {
   if (!a || !b) return false;
-  if (typeof a.id === "number" && typeof b.id === "number") {
-    return a.id === b.id;
-  }
-  return (
-    typeof a.login === "string" &&
-    typeof b.login === "string" &&
-    a.login.toLowerCase() === b.login.toLowerCase()
-  );
+  return typeof a.id === "number" && typeof b.id === "number" && a.id === b.id;
 }
 
 // Combines a caller's already-known signature snapshot (e.g. the object
@@ -719,7 +1108,7 @@ function mergeSignatures(known, fresh) {
 function signerCompletedRequirement(authors, signer) {
   return (
     !!signer &&
-    !isAllowlisted(signer.login) &&
+    !isAllowlisted(signer) &&
     authors.some((a) => isSameContributor(a, signer))
   );
 }
@@ -930,7 +1319,7 @@ async function listPRCommitAuthors(prNumber) {
   return { authors: [...authors.values()], unresolved: [...unresolvedShas] };
 }
 
-let _cachedBotLogin = null; // one per run, same idea as _cachedSigToken
+let _cachedBotLogin = null; // one per run, same idea as _sigTokenCache (minus expiry - an identity never goes stale)
 async function resolveBotLogin() {
   if (_cachedBotLogin) return _cachedBotLogin;
   try {
@@ -1305,10 +1694,12 @@ async function checkPR(
   // mergeSignatures() and this function's doc comment above for why a
   // caller's own known-fresh write still isn't a substitute for this GET.
   const { authors, unresolved } = await listPRCommitAuthors(prNumber);
-  const freshData = (await readSignatures(await getSignaturesToken())).data;
+  const freshData = (
+    await withSignaturesToken((sigToken) => readSignatures(sigToken))
+  ).data;
   const data = mergeSignatures(knownSignatures, freshData);
   const missing = authors.filter(
-    (a) => !isAllowlisted(a.login) && !isSigned(data, a),
+    (a) => !isAllowlisted(a) && !isSigned(data, a),
   );
 
   if (missing.length === 0 && unresolved.length === 0) {
@@ -1426,13 +1817,18 @@ async function handleIssueComment(payload) {
   if (
     !payload.comment ||
     !payload.comment.user ||
-    typeof payload.comment.user.login !== "string"
+    typeof payload.comment.user.login !== "string" ||
+    payload.comment.user.login.length === 0
   ) {
     // A real issue_comment webhook always carries comment.user. Getting
     // here means a malformed event file or an unexpected caller - fail
-    // loudly instead of a raw TypeError.
+    // loudly instead of a raw TypeError. An EMPTY login is rejected too,
+    // not just a non-string one: isSigned() refuses to match an empty
+    // login (it returns false before it ever compares ids), so signing as
+    // "" would append a brand-new, never-matchable entry on every single
+    // attempt instead of being idempotent.
     throw new Error(
-      "issue_comment payload is missing comment.user.login - malformed or unexpected webhook delivery.",
+      "issue_comment payload is missing comment.user.login (or it is empty) - malformed or unexpected webhook delivery.",
     );
   }
   const prNumber = assertValidPRNumber(
@@ -1443,11 +1839,17 @@ async function handleIssueComment(payload) {
   const commenter = payload.comment.user.login;
 
   if (body.toLowerCase() === SIGN_PHRASE.toLowerCase()) {
-    const sigToken = await getSignaturesToken();
     // The webhook already carries the commenter's numeric id - recording
     // that, not just the login, is what lets the signature survive a later
-    // username change (see isSigned).
-    const commenterId = payload.comment.user.id;
+    // username change (see isSigned). Validated here, before any network
+    // call (including minting the signatures token) and only on this
+    // branch - `recheck` never reads the id, so a malformed id must not
+    // start failing a command that doesn't depend on it. See
+    // assertValidUserId() for why a bad id must never reach the store.
+    const commenterId = assertValidUserId(
+      payload.comment.user.id,
+      "issue_comment payload comment.user.id",
+    );
     const commenterIdentity = { id: commenterId, login: commenter };
 
     // The check-and-append happens inside one mutate() call working on data
@@ -1456,28 +1858,30 @@ async function handleIssueComment(payload) {
     // the 409 retry loop re-running this closure) - each attempt checks the
     // just-fetched state, not a stale snapshot.
     let alreadySigned = false;
-    const writtenSignatures = await writeSignatures(
-      sigToken,
-      (data) => {
-        if (isSigned(data, commenterIdentity)) {
-          alreadySigned = true;
-          return null; // tells writeSignatures: no write needed
-        }
-        return {
-          ...data,
-          signatures: [
-            ...data.signatures,
-            {
-              id: commenterId,
-              login: commenter,
-              pr: `${REPO_OWNER}/${REPO_NAME}#${prNumber}`,
-              commentUrl: payload.comment.html_url,
-              signedAt: new Date().toISOString(),
-            },
-          ],
-        };
-      },
-      `${commenter} signed the CLA`,
+    const writtenSignatures = await withSignaturesToken((sigToken) =>
+      writeSignatures(
+        sigToken,
+        (data) => {
+          if (isSigned(data, commenterIdentity)) {
+            alreadySigned = true;
+            return null; // tells writeSignatures: no write needed
+          }
+          return {
+            ...data,
+            signatures: [
+              ...data.signatures,
+              {
+                id: commenterId,
+                login: commenter,
+                pr: `${REPO_OWNER}/${REPO_NAME}#${prNumber}`,
+                commentUrl: payload.comment.html_url,
+                signedAt: new Date().toISOString(),
+              },
+            ],
+          };
+        },
+        `${commenter} signed the CLA`,
+      ),
     );
 
     if (alreadySigned) {
@@ -1597,6 +2001,9 @@ if (require.main === module) {
 module.exports = {
   isSigned,
   isAllowlisted,
+  // Exported for tests only: the allowlist is parsed once at load, so tests
+  // exercise its grammar directly.
+  parseAllowlist,
   createAppJWT,
   // Exported for tests only, same reasoning as the others below: ghRaw()'s
   // own success-path body parsing (`text ? JSON.parse(text) : null`) is
@@ -1613,9 +2020,24 @@ module.exports = {
   handlePullRequestTarget,
   checkPR,
   getSignaturesToken,
+  // Exported for tests only: the token lifecycle's tunables and its two
+  // pure/near-pure helpers, so tests assert against the real constants
+  // instead of re-typing 60/5 minutes and drifting out of sync.
+  withSignaturesToken,
+  resolveSigTokenExpiry,
+  SIG_TOKEN_LIFETIME_MS,
+  SIG_TOKEN_REFRESH_SKEW_MS,
   postComment,
   validateConfig,
   lockPR,
+  // Exported for tests only (test/sig-path.test.js): the SIG_PATH validator
+  // and URL builders are the single source of truth for what may reach a
+  // signature-store request URL, so they're tested directly instead of only
+  // being inferred through readSignatures()/writeSignatures().
+  findSigPathProblem,
+  encodeRepoPath,
+  sigInstallationApiPath,
+  sigContentsApiPath,
   // Exported for tests only, same as everything above - not part of the
   // action's public contract. Covered directly in test/logic.test.js so a
   // future change to either validator's character rules (e.g. UNSAFE_URL_
@@ -1623,6 +2045,7 @@ module.exports = {
   // caught indirectly through the webhook-handler integration tests.
   assertValidPRNumber,
   assertValidInstallationId,
+  assertValidUserId,
   assertValidSha,
   // Exported for tests only, same reasoning: classifyBotComment() is the
   // exact piece that tells a genuine block apart from unrelated bot

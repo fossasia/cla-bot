@@ -17,10 +17,12 @@ FOSSASIA's projects.
 2. **Every change to `src/cla-bot.js` needs a matching test.** Pick the
    right layer: `test/logic.test.js` for pure functions (no network),
    `test/http.test.js` for anything touching `readSignatures`/`writeSignatures`
-   (mocked `fetch`), `test/integration.test.js` for changes to event
+   (mocked `fetch`), `test/sig-path.test.js` for how `SIG_PATH`/`SIG_OWNER`/
+   `SIG_REPO` become request URLs (validation + encoding), `test/integration.test.js` for changes to event
    orchestration (`handleIssueComment`, `checkPR`), and
    `test/bot-identity*.test.js` for anything about how the bot resolves its
-   own identity. Run `npm test` before opening a PR - CI runs it too, on
+   own identity, and `test/token-expiry.test.js` for anything about the
+   signatures-repo token's lifetime (caching, refresh, 401 recovery). Run `npm test` before opening a PR - CI runs it too, on
    Node 22 and 24.
 3. **This repo requires 100% test coverage (lines, statements, functions
    and branches) on every PR**, enforced by `.github/workflows/coverage.yml`.
