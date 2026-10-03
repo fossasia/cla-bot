@@ -644,17 +644,62 @@ test("validateConfig's SIG_PATH failure message says WHY the path was rejected",
   assert.ok(msg.includes('"#"'), msg);
 });
 
-test("validateConfig accepts SIG_PATH values that always worked and must keep working (spaces, a YAML '|' block's trailing newline, surrounding whitespace, a leading './') - backward compatibility", () => {
-  for (const p of [
-    "signatures/my file.json",
-    "dir with space/cla.json",
-    "a\u00a0b.json",
-    "signatures/cla.json\n",
-    "  signatures/cla.json  ",
-    "./signatures/cla.json",
-  ]) {
-    assertConfigOK({ ...VALID_BASE_CONFIG, SIG_PATH: p });
+// Normalization announces itself with a ::warning:: (see validateConfig), so
+// the acceptance tests below mute console.warn - otherwise every accepted,
+// normalized value would add a real annotation to the CI run's log.
+function withMutedWarnings(fn) {
+  const original = console.warn;
+  const seen = [];
+  console.warn = (m) => seen.push(m);
+  try {
+    fn();
+  } finally {
+    console.warn = original;
   }
+  return seen;
+}
+
+test("validateConfig accepts SIG_PATH values that always worked and must keep working (spaces, trailing whitespace/newline, a leading './', leading and Unicode whitespace as part of the name) - backward compatibility", () => {
+  withMutedWarnings(() => {
+    for (const p of [
+      "signatures/my file.json",
+      "dir with space/cla.json",
+      "a\u00a0b.json",
+      "signatures/cla.json\n",
+      "signatures/cla.json  ",
+      "./signatures/cla.json",
+      " leading/cla.json",
+      "\u00a0signatures/cla.json",
+      "signatures/cla.json\u00a0",
+    ]) {
+      assertConfigOK({ ...VALID_BASE_CONFIG, SIG_PATH: p });
+    }
+  });
+});
+
+test("validateConfig warns - once, as one escaped line - when it normalizes SIG_PATH, and stays silent when it does not", () => {
+  const warned = withMutedWarnings(() =>
+    assertConfigOK({
+      ...VALID_BASE_CONFIG,
+      SIG_PATH: "./signatures/cla.json\n",
+    }),
+  );
+  assert.strictEqual(warned.length, 1);
+  assert.ok(warned[0].startsWith("::warning::SIG_PATH "), warned[0]);
+  assert.ok(!warned[0].includes("\n"), "no raw newline in the warning");
+  assert.ok(warned[0].includes('"./signatures/cla.json\\n"'), warned[0]);
+  assert.ok(
+    warned[0].includes('normalized to "signatures/cla.json"'),
+    warned[0],
+  );
+
+  const silent = withMutedWarnings(() => assertConfigOK(VALID_BASE_CONFIG));
+  assert.deepStrictEqual(silent, []);
+});
+
+test("validateConfig still rejects a value that is nothing but whitespace (ASCII, newline or Unicode) - it normalizes to empty / is empty after trim", () => {
+  assertConfigFails({ ...VALID_BASE_CONFIG, SIG_PATH: " \n " }, "SIG_PATH");
+  assertConfigFails({ ...VALID_BASE_CONFIG, SIG_PATH: "\u00a0" }, "SIG_PATH");
 });
 
 test("validateConfig accepts legitimate-but-unusual SIG_PATH values (hidden dirs, non-ASCII, '+', '@', '~', names merely containing dots)", () => {

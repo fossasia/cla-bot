@@ -73,7 +73,8 @@ const SIG_REPO = process.env.SIG_REPO;
 // Normalized once, here, so every consumer (validation, URL building, log
 // messages) sees the same value. See normalizeSigPath() for exactly what is
 // (and deliberately is not) tolerated.
-const SIG_PATH = normalizeSigPath(process.env.SIG_PATH);
+const SIG_PATH_RAW = process.env.SIG_PATH;
+const SIG_PATH = normalizeSigPath(SIG_PATH_RAW);
 const CLA_DOCUMENT_URL = process.env.CLA_DOCUMENT_URL;
 const ALLOWLIST = (process.env.ALLOWLIST || "")
   .split(",")
@@ -305,9 +306,10 @@ function assertValidSha(value, context) {
 // empty store, and the bot then reads/writes the WRONG file.
 //
 // Three layers, deliberately all kept (none is enough alone):
-//   1. normalizeSigPath() forgives the harmless, previously-working
-//      formatting slips (surrounding whitespace such as the trailing
-//      newline a YAML `|` block adds, and a leading "./").
+//   1. normalizeSigPath() reproduces - explicitly, instead of by accident -
+//      the two formatting slips the old, un-normalized code happened to
+//      tolerate: trailing whitespace/control characters (e.g. the newline a
+//      YAML `|` block adds) and a leading "./". Nothing else is touched.
 //   2. findSigPathProblem() rejects what is ambiguous or unsafe, with a
 //      message that names the actual problem (called by validateConfig).
 //   3. encodeRepoPath() percent-encodes every "/"-separated segment, so
@@ -315,11 +317,12 @@ function assertValidSha(value, context) {
 //      reaches the wire unambiguously - the same treatment PR numbers and
 //      SHAs already get via encodeURIComponent at their call sites.
 //
-// Backward compatibility is deliberate: interior spaces and other non-ASCII
-// whitespace are ALLOWED, because fetch() already sent them as %20 / UTF-8
-// percent-escapes, so the request URL for any such path is byte-for-byte
-// what it was before. Only inputs that were silently mangled, or that are
-// themselves the traversal vector ("%"), are rejected.
+// Backward compatibility is deliberate: whitespace (including leading
+// whitespace and non-ASCII whitespace) is ALLOWED as part of the file name,
+// because fetch() already sent it as %20 / UTF-8 percent-escapes, so the
+// request URL for any such path is byte-for-byte what it was before. Only
+// inputs that were silently mangled, or whose meaning would silently change
+// once encoding is applied ("%", see below), are rejected.
 //
 // Encoding alone is NOT sufficient: encodeURIComponent("..") is still "..",
 // which the URL parser collapses. That is why the URL builders re-run the
@@ -327,24 +330,50 @@ function assertValidSha(value, context) {
 // they can be reached without validateConfig() ever having run.
 // ---------------------------------------------------------------------------
 // Characters never acceptable anywhere in SIG_PATH: backslash, "?" and "#"
-// (URL delimiters), "%" (blocks percent-encoded bypasses such as "%2e%2e" or
-// "%2f"; write the literal character instead, e.g. a space rather than
-// "%20" - encoding is done for you), and C0/DEL/C1 control characters (the
-// URL parser silently strips some of them, and they can forge GitHub
-// Actions log commands since this value is echoed into "::error::" lines).
-// Ordinary whitespace is NOT in this set - see the compatibility note above.
+// (URL delimiters), "%", and C0/DEL/C1 control characters (the URL parser
+// silently strips some of them, and they can forge GitHub Actions log
+// commands since this value is echoed into "::error::" lines). Ordinary
+// whitespace is NOT in this set - see the compatibility note above.
+//
+// Why "%" is rejected rather than simply encoded as "%25": once every
+// segment is encoded, a "%" is no longer a traversal vector. The problem is
+// that its MEANING would change. The old code passed "%XX" through verbatim,
+// so "my%20file.json" addressed "my file.json"; encoding it again would
+// silently address a file literally named "my%20file.json" instead - a
+// 404, which readSignatures() reads as "no signatures yet". Decoding
+// instead would reopen the double-decode class of bugs ("%252e%252e").
+// Failing fast, with a message that says what to write instead, is the only
+// choice that is neither silent nor risky.
 const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
 
-// Tolerates, without changing which file is meant:
-//   - leading/trailing whitespace. Before this fix a trailing newline or
-//     space was silently stripped by the URL parser, so configs carrying one
-//     (e.g. from a YAML `|` block scalar) already worked; trimming keeps them
-//     working explicitly instead of by accident.
-//   - leading "./" prefixes, which the URL parser used to collapse.
-// An unset/empty value falls back to the default; a whitespace-only value
-// normalizes to "" and is then rejected by findSigPathProblem().
+// Normalizes SIG_PATH to EXACTLY the file the pre-validation code addressed,
+// no more and no less. That code interpolated the raw value at the very end
+// of the request URL and handed it to fetch(), whose WHATWG URL parser:
+//   - strips trailing C0-control-or-space characters (U+0000..U+0020) from
+//     the whole URL - which is the end of SIG_PATH. So a trailing space, or
+//     the newline a YAML `|` block scalar adds, never reached the server and
+//     configs carrying one worked.
+//   - collapsed a leading "./" segment.
+// and did NOT touch anything else: leading whitespace stayed part of the file
+// name (as %20), and Unicode whitespace such as NBSP at either end was
+// percent-encoded as part of it. This function reproduces precisely that, so
+// an upgrade can never silently redirect an existing config to a different
+// file - which would be dangerous here, since a read that lands on a missing
+// file looks like "no signatures yet". A blanket String#trim() is NOT
+// equivalent (it also removes leading and Unicode whitespace), and neither is
+// removing normalization altogether (a trailing space would then address
+// "cla.json%20" instead of "cla.json"). validateConfig() reports when
+// normalization changed the value, so it is never invisible.
+//
+// An unset/empty value falls back to the default; a value that is nothing but
+// whitespace normalizes to "" and is then rejected by findSigPathProblem().
+// (A char-code loop, not a /[\x00-\x20]+$/ regex, to stay linear-time on
+// pathological input.)
 function normalizeSigPath(raw) {
-  let p = (raw || "signatures/cla.json").trim();
+  let p = raw || "signatures/cla.json";
+  let end = p.length;
+  while (end > 0 && p.charCodeAt(end - 1) <= 0x20) end -= 1;
+  p = p.slice(0, end);
   while (p.startsWith("./")) p = p.slice(2);
   return p;
 }
@@ -362,6 +391,9 @@ function findSigPathProblem(path) {
     return 'it must name a file, not a directory (no trailing "/")';
   }
   const bad = path.match(SIG_PATH_UNSAFE_CHAR_RE);
+  if (bad && bad[0] === "%") {
+    return 'it contains "%" - percent-encoded input is not supported, because encoding it again would silently address a different file; write the literal character instead (a space, not "%20"), encoding is done for you';
+  }
   if (bad) {
     return `it contains the disallowed character ${JSON.stringify(bad[0])} (backslash, "?", "#", "%" and control characters are not allowed; spaces are fine, and are encoded automatically)`;
   }
@@ -418,6 +450,17 @@ function sigRepoBasePath() {
     ["SIG_OWNER", SIG_OWNER],
     ["SIG_REPO", SIG_REPO],
   ]) {
+    // Not stricter than the URL-safety contract on purpose: once encoded,
+    // the only things that can still misdirect a request are an absent value
+    // (encodeURIComponent(undefined) would silently yield "undefined") and a
+    // dot-segment. Whether a name is a REAL GitHub name is validateConfig()'s
+    // job (GITHUB_LOGIN_RE / GITHUB_REPO_NAME_RE); re-applying those regexes
+    // here would make the encoding below unreachable dead code.
+    if (typeof value !== "string" || value.length === 0) {
+      throw new Error(
+        `Refusing to build a request URL: ${name} is missing or empty.`,
+      );
+    }
     if (value === "." || value === "..") {
       throw new Error(
         `Refusing to build a request URL: ${name} ${JSON.stringify(value)} is a dot-segment.`,
@@ -487,6 +530,14 @@ function validateConfig() {
   } catch (e) {
     fail(
       `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} is not a valid URL.`,
+    );
+  }
+  // Normalization (see normalizeSigPath) reproduces what the old code did
+  // implicitly; say so, rather than leaving a config that differs from what
+  // is actually used invisible.
+  if (SIG_PATH_RAW && SIG_PATH_RAW !== SIG_PATH) {
+    console.warn(
+      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing whitespace/control characters and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
     );
   }
   // App auth is optional (getSignaturesToken falls back to GITHUB_TOKEN when

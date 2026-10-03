@@ -13,10 +13,15 @@
  * WRONG file without any error. These tests pin down that this can't happen.
  *
  * Backward compatibility is part of the contract too (see CONTRIBUTING.md,
- * rule 4): interior spaces / non-ASCII whitespace, surrounding whitespace and
- * a leading "./" all kept working before this change, and must keep doing so
- * with a byte-identical (or, for sub-delimiters, semantically identical)
- * request URL. Only silently-mangled inputs and "%" are rejected.
+ * rule 4): every SIG_PATH the old, un-normalized code accepted must address
+ * EXACTLY the same file now (byte-identical request URL, or - for
+ * sub-delimiters like "+" - a semantically identical one). The old code's
+ * quirks were: fetch()'s URL parser strips TRAILING C0-control-or-space
+ * characters and collapses a leading "./"; everything else - including
+ * LEADING whitespace and Unicode whitespace like NBSP at either end - stayed
+ * part of the file name. The compat tests below therefore compare against
+ * the old code's behaviour on the RAW value (never a pre-trimmed one, which
+ * would hide exactly the divergence they exist to catch).
  *
  * No network, no mocking library. Run: node test/sig-path.test.js
  * (also part of `npm test`).
@@ -161,6 +166,11 @@ const VALID_PATHS = [
   "lead space/ x.json",
   "a\u00a0b/x.json",
   "a\u2028b.json",
+  // Leading whitespace and Unicode whitespace at either end are part of the
+  // file name (the old code percent-encoded them); they are NOT trimmed.
+  " leading.json",
+  "\u00a0nbsp-lead/x.json",
+  "nbsp-trail\u00a0",
 ];
 
 // Paths that must be rejected, each with the reason it matters.
@@ -192,7 +202,6 @@ const INVALID_PATHS = [
   ["a lone UTF-16 surrogate", "a\ud800b.json"],
   ["an empty string", ""],
   ["whitespace only", "   "],
-  ["a '.' segment after a real directory", "a/./b.json"],
   ["a lone '.'", "."],
 ];
 
@@ -252,10 +261,15 @@ const INVALID_PATHS = [
     assert.strictEqual(encodeRepoPath("a+b/c@d.json"), "a%2Bb/c%40d.json");
   });
 
-  await test("encodeRepoPath encodes URL-significant characters that validation still allows ('=' ',' etc.), never leaving a raw '#', '?', or '%' in output", () => {
-    const out = encodeRepoPath("a=b,c;d/e.json");
-    assert.ok(!/[#?\s]/.test(out));
-    assert.strictEqual(decodeURIComponent(out), "a=b,c;d/e.json");
+  await test("encodeRepoPath encodes URL-significant characters that validation still allows ('=' ',' ';' space, non-ASCII): no raw '#', '?' or whitespace in the output, every '%' starts a well-formed escape, and decoding gives the input back", () => {
+    const input = "a=b,c;d e/é.json";
+    const out = encodeRepoPath(input);
+    assert.ok(!/[#?\s]/.test(out), out);
+    assert.ok(!/%(?![0-9A-F]{2})/.test(out), `malformed escape in ${out}`);
+    assert.ok(
+      out.includes("%20") && out.includes("%C3%A9") && out.includes("%3D"),
+    );
+    assert.strictEqual(out.split("/").map(decodeURIComponent).join("/"), input);
   });
 
   await test("encodeRepoPath throws (does not silently produce a URL) for every rejected path", () => {
@@ -409,38 +423,127 @@ const INVALID_PATHS = [
     }
   });
 
-  await test("compat: surrounding whitespace (e.g. the trailing newline a YAML '|' block adds) and a leading './' keep working - normalized to the same file, same URL as the plain path", () => {
+  // The exact whitespace contract, spelled out against the OLD behaviour on
+  // the raw value. Each row: [raw SIG_PATH, what the old code actually
+  // addressed (as a request-path tail)].
+  const COMPAT_ROWS = [
+    // trailing ASCII whitespace / C0 controls: stripped by the URL parser
+    ["signatures/cla.json ", "signatures/cla.json"],
+    ["signatures/cla.json   ", "signatures/cla.json"],
+    ["signatures/cla.json\n", "signatures/cla.json"],
+    ["signatures/cla.json\r\n\t ", "signatures/cla.json"],
+    // (U+001F: another C0 control. NUL itself can't be exercised here -
+    // process.env truncates a value at a NUL byte, so it would pass trivially.)
+    ["signatures/cla.json\x1f", "signatures/cla.json"],
+    // leading "./": collapsed by the URL parser
+    ["./signatures/cla.json", "signatures/cla.json"],
+    ["././signatures/cla.json", "signatures/cla.json"],
+    ["./signatures/cla.json\n", "signatures/cla.json"],
+    // LEADING whitespace: part of the file name, NOT stripped
+    [" signatures/cla.json", "%20signatures/cla.json"],
+    ["  signatures/cla.json  ", "%20%20signatures/cla.json"],
+    ["\u00a0signatures/cla.json", "%C2%A0signatures/cla.json"],
+    // Unicode whitespace at the END: encoded, NOT stripped
+    ["signatures/cla.json\u00a0", "signatures/cla.json%C2%A0"],
+    ["signatures/cla.json\u2003", "signatures/cla.json%E2%80%83"],
+    // " ./x": the first segment is " ." (a real name), not a dot-segment
+    [" ./signatures/cla.json", "%20./signatures/cla.json"],
+  ];
+
+  await test("compat: for every row, the OLD code's behaviour is what the table says (guards the table itself against being wrong)", () => {
+    for (const [raw, expectedTail] of COMPAT_ROWS) {
+      assert.strictEqual(
+        oldPathname(raw),
+        `/repos/fossasia/cla-signatures/contents/${expectedTail}`,
+        JSON.stringify(raw),
+      );
+    }
+  });
+
+  await test("compat: the NEW code addresses exactly what the old code did for every row - compared on the RAW value, never a pre-trimmed one", () => {
+    for (const [raw] of COMPAT_ROWS) {
+      const bot = loadBot({ SIG_PATH: raw });
+      assert.strictEqual(
+        new URL(`${API}${bot.sigContentsApiPath()}`).pathname,
+        oldPathname(raw),
+        JSON.stringify(raw),
+      );
+    }
+  });
+
+  await test("leading whitespace is preserved as part of the path (percent-encoded), never trimmed - a blanket .trim() would silently address a different file", () => {
+    assert.strictEqual(
+      loadBot({ SIG_PATH: " signatures/cla.json" }).sigContentsApiPath(),
+      "/repos/fossasia/cla-signatures/contents/%20signatures/cla.json",
+    );
+    assert.strictEqual(
+      loadBot({ SIG_PATH: "\u00a0signatures/cla.json" }).sigContentsApiPath(),
+      "/repos/fossasia/cla-signatures/contents/%C2%A0signatures/cla.json",
+    );
+    assert.notStrictEqual(
+      loadBot({ SIG_PATH: "  signatures/cla.json  " }).sigContentsApiPath(),
+      loadBot({ SIG_PATH: "signatures/cla.json" }).sigContentsApiPath(),
+    );
+  });
+
+  await test("Unicode whitespace at the END is preserved (percent-encoded), not stripped - only trailing U+0000..U+0020 is", () => {
+    assert.strictEqual(
+      loadBot({ SIG_PATH: "signatures/cla.json\u00a0" }).sigContentsApiPath(),
+      "/repos/fossasia/cla-signatures/contents/signatures/cla.json%C2%A0",
+    );
+  });
+
+  await test("trailing ASCII whitespace/control characters ARE ignored (that is what the old URL parser did), including a mixed run", () => {
     const plain = loadBot({
       SIG_PATH: "signatures/cla.json",
     }).sigContentsApiPath();
     for (const raw of [
+      "signatures/cla.json ",
       "signatures/cla.json\n",
-      "  signatures/cla.json  ",
-      "\tsignatures/cla.json\r\n",
-      "./signatures/cla.json",
-      "././signatures/cla.json",
-      "  ./signatures/cla.json\n",
+      "signatures/cla.json \r\n\t ",
     ]) {
       assert.strictEqual(
         loadBot({ SIG_PATH: raw }).sigContentsApiPath(),
         plain,
         JSON.stringify(raw),
       );
-      // ...and the old code agreed on the file (it just got there by accident):
-      assert.strictEqual(
-        oldPathname(raw.trim()),
-        new URL(`${API}${plain}`).pathname,
-      );
     }
   });
 
-  await test("normalization does not over-reach: '.' / './' / whitespace-only / an interior './' segment are still refused by the builder", () => {
-    for (const raw of [".", "./", "   ", "a/./b.json", ".//x.json"]) {
+  await test("normalization does not over-reach: '.' / './' / whitespace-only / an interior './' segment / a stripped-to-empty value are still refused by the builder", () => {
+    for (const raw of [".", "./", "   ", " \n", "a/./b.json", ".//x.json"]) {
       assert.throws(
         () => loadBot({ SIG_PATH: raw }).sigContentsApiPath(),
         /Refusing to build a request URL/,
         JSON.stringify(raw),
       );
+    }
+  });
+
+  await test("normalization is linear-time: a 200k-character run of spaces in the MIDDLE of the value does not stall (no polynomial-ReDoS)", () => {
+    const raw = `a${" ".repeat(200_000)}b/${"x".repeat(10)}.json`;
+    const t0 = Date.now();
+    loadBot({ SIG_PATH: raw });
+    assert.ok(Date.now() - t0 < 2000, "normalization took suspiciously long");
+  });
+
+  await test("test-data hygiene: VALID_PATHS and INVALID_PATHS contain no duplicates and share no entry", () => {
+    const dup = (arr) => arr.filter((v, i) => arr.indexOf(v) !== i);
+    const invalidValues = INVALID_PATHS.map(([, v]) => v);
+    assert.deepStrictEqual(dup(VALID_PATHS), []);
+    assert.deepStrictEqual(dup(invalidValues), []);
+    assert.deepStrictEqual(
+      VALID_PATHS.filter((v) => invalidValues.includes(v)),
+      [],
+    );
+  });
+
+  // ---- direct builder: absent / empty owner-repo -------------------------
+  await test("both URL builders refuse an empty owner or repo (no silent '/repos//x' or '/repos/undefined/...')", () => {
+    for (const k of ["SIG_OWNER", "SIG_REPO"]) {
+      const bot = loadBot({ [k]: "" });
+      assert.throws(() => bot.sigInstallationApiPath(), /missing or empty/, k);
+      assert.throws(() => bot.sigContentsApiPath(), /missing or empty/, k);
     }
   });
 
@@ -714,25 +817,60 @@ const INVALID_PATHS = [
     }
   });
 
-  await test("CLI: the '%' rejection tells the user to write the literal character instead (the migration path for 'my%20file.json')", () => {
+  await test("CLI: the '%' rejection explains WHY and what to write instead (the migration path for 'my%20file.json')", () => {
     const r = runCli({ SIG_PATH: "my%20file.json" });
     assert.strictEqual(r.status, 1);
-    assert.match(r.stderr, /spaces are fine, and are encoded automatically/);
+    assert.match(r.stderr, /^::error::SIG_PATH /m);
+    assert.match(
+      r.stderr,
+      /encoding it again would silently address a different file/,
+    );
+    assert.match(
+      r.stderr,
+      /write the literal character instead \(a space, not "%20"\)/,
+    );
   });
 
-  for (const p of [
-    "signatures/my file.json",
-    "signatures/cla.json\n",
-    "./signatures/cla.json",
-    "  signatures/cla.json  ",
+  // Previously-working values pass validateConfig (they reach the NEXT check,
+  // the missing event file). Those that normalization changed also announce
+  // it with a ::warning:: - never silently.
+  for (const [p, normalized] of [
+    ["signatures/my file.json", null],
+    [" leading/space.json", null],
+    ["\u00a0nbsp-lead.json", null],
+    ["signatures/cla.json\u00a0", null],
+    ["signatures/cla.json\n", "signatures/cla.json"],
+    ["signatures/cla.json   ", "signatures/cla.json"],
+    ["./signatures/cla.json", "signatures/cla.json"],
   ]) {
-    await test(`CLI: previously-working SIG_PATH ${JSON.stringify(p)} still passes validateConfig (backward compatible)`, () => {
+    await test(`CLI: previously-working SIG_PATH ${JSON.stringify(p)} still passes validateConfig${normalized ? " (with a normalization warning)" : " (no warning - used as-is)"}`, () => {
       const r = runCli({ SIG_PATH: p });
       assert.strictEqual(r.status, 1); // no GITHUB_EVENT_PATH - the NEXT check
       assert.match(r.stderr, /GITHUB_EVENT_PATH not found/);
-      assert.ok(!/SIG_PATH/.test(r.stderr), r.stderr);
+      assert.ok(!/::error::SIG_PATH/.test(r.stderr), r.stderr);
+      if (normalized) {
+        assert.ok(
+          r.stderr.includes(
+            `::warning::SIG_PATH ${JSON.stringify(p)} was normalized to ${JSON.stringify(normalized)}`,
+          ),
+          r.stderr,
+        );
+        // The warning is one line even though the raw value had a newline.
+        for (const line of r.stderr.split("\n")) {
+          assert.ok(!line.startsWith("::warning::pwned"), line);
+        }
+      } else {
+        assert.ok(!/normalized/.test(r.stderr), r.stderr);
+      }
     });
   }
+
+  await test("CLI: a default / already-clean SIG_PATH produces no normalization warning", () => {
+    assert.ok(!/normalized/.test(runCli({}).stderr));
+    assert.ok(
+      !/normalized/.test(runCli({ SIG_PATH: "signatures/cla.json" }).stderr),
+    );
+  });
 
   for (const p of [".", "./", "   "]) {
     await test(`CLI: ${JSON.stringify(p)} is still rejected after normalization`, () => {
