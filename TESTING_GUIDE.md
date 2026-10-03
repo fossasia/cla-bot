@@ -57,7 +57,7 @@ jobs:
           signatures-repo: cla-test # <-- points at itself, not a separate repo
           signatures-path: signatures/cla.json
           cla-document-url: https://github.com/<you>/cla-test/blob/main/README.md
-          allowlist: dependabot[bot]
+          allowlist: "" # or numeric account ids, e.g. 12345678
           # app-id / app-private-key are left blank on purpose - the code
           # falls back to GITHUB_TOKEN, which works fine for this repo
           # since it has read+write access to its own contents.
@@ -187,7 +187,7 @@ with:
   signatures-repo: cla-signatures # <-- a separate repo now
   signatures-path: signatures/cla.json
   cla-document-url: https://github.com/<you>/cla-signatures/blob/main/CLA.md
-  allowlist: dependabot[bot]
+  allowlist: "" # or numeric account ids, e.g. 12345678
   app-id: ${{ secrets.CLA_APP_ID }}
   app-private-key: ${{ secrets.CLA_APP_PRIVATE_KEY }}
 ```
