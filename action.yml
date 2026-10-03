@@ -27,7 +27,17 @@ inputs:
     description: "Name of the private central signatures repo, e.g. cla-signatures"
     required: true
   signatures-path:
-    description: "Path to the JSON file inside the signatures repo"
+    description: >-
+      Path to the JSON file inside the signatures repo. Must be a relative
+      path to a file: no leading or trailing "/", no empty, "." or ".."
+      segments, and no ".git" segment. Trailing whitespace/control characters
+      (such as the newline a YAML "|" block adds) and a leading "./" are
+      ignored; any other whitespace, including leading whitespace, is part of
+      the file name. These characters are rejected: "#", "?", backslash,
+      control characters, and "%" (write the literal character instead - a
+      space, not "%20" - because encoding it again would silently address a
+      different file). Spaces and non-ASCII characters are fine and are
+      percent-encoded automatically.
     required: false
     default: "signatures/cla.json"
   cla-document-url:
