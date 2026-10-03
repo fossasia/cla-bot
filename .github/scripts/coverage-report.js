@@ -28,6 +28,7 @@
 
 const fs = require("fs");
 const path = require("path");
+const { findDataProblems } = require("./verify-coverage.js");
 
 const METRICS = ["lines", "statements", "functions", "branches"];
 
@@ -167,7 +168,10 @@ function formatFileSection(relPath, summary, detail, sourceLines) {
 
   if (detail.uncoveredStatementLines.length > 0) {
     const ranges = toRanges(detail.uncoveredStatementLines);
-    lines.push(`**Missing line coverage:** ${ranges.join(", ")}`);
+    // Deliberately "statements", not "lines": a line can run while another
+    // statement sharing it never did (lines 100% but statements < 100%),
+    // so what is actually missing is a statement that *starts* on these lines.
+    lines.push(`**Uncovered statements on line(s):** ${ranges.join(", ")}`);
 
     let shown = 0;
     const snippetLines = [];
@@ -241,7 +245,13 @@ function main({ cwd = process.cwd(), log = console.log } = {}) {
   const final = readJSON(finalPath);
   const total = summary.total;
 
-  const isFullyCovered = isFileFullyCovered(total);
+  // c8's percentages only describe the files c8 chose to track. The same
+  // independent checks `npm run coverage:check` runs (nothing measured, or
+  // a src file missing from the report) must veto a "100%" here too, or
+  // this comment would say ✅ while the gate fails.
+  const dataProblems = findDataProblems(summary, cwd);
+  const metricsFull = isFileFullyCovered(total);
+  const isFullyCovered = metricsFull && dataProblems.length === 0;
 
   const metricsLine = METRICS.map(
     (m) => `**${total[m].pct}%** ${m} (${total[m].covered}/${total[m].total})`,
@@ -256,42 +266,58 @@ function main({ cwd = process.cwd(), log = console.log } = {}) {
       "Every statement, branch and function is exercised by the test suite. Nice work!",
     );
   } else {
-    bodyParts.push("## ❌ Test coverage is below the required 100%");
-    bodyParts.push(
-      `This project requires **100% test coverage** on every pull request. Current coverage: ${metricsLine}.`,
-    );
-    bodyParts.push("Here's exactly what still needs a test, file by file:");
+    if (metricsFull) {
+      bodyParts.push("## ❌ Test coverage could not be verified");
+      bodyParts.push(
+        `Everything that was measured is at 100% (${metricsLine}), but the coverage data is incomplete, so the 100% requirement is not met.`,
+      );
+    } else {
+      bodyParts.push("## ❌ Test coverage is below the required 100%");
+      bodyParts.push(
+        `This project requires **100% test coverage** on every pull request. Current coverage: ${metricsLine}.`,
+      );
+      bodyParts.push("Here's exactly what still needs a test, file by file:");
 
-    const fileSections = [];
-    for (const [absPath, fileSummary] of Object.entries(summary)) {
-      if (absPath === "total") continue;
-      if (isFileFullyCovered(fileSummary)) continue;
-      const fileCoverage = final[absPath];
-      if (!fileCoverage) continue;
-      const detail = analyzeFile(fileCoverage);
-      const sourceLines = fs.existsSync(absPath)
-        ? fs.readFileSync(absPath, "utf8").split("\n")
-        : [];
-      fileSections.push(
-        formatFileSection(
-          relativize(absPath, cwd),
-          fileSummary,
-          detail,
-          sourceLines,
-        ),
+      const fileSections = [];
+      for (const [absPath, fileSummary] of Object.entries(summary)) {
+        if (absPath === "total") continue;
+        if (isFileFullyCovered(fileSummary)) continue;
+        const fileCoverage = final[absPath];
+        if (!fileCoverage) continue;
+        const detail = analyzeFile(fileCoverage);
+        const sourceLines = fs.existsSync(absPath)
+          ? fs.readFileSync(absPath, "utf8").split("\n")
+          : [];
+        fileSections.push(
+          formatFileSection(
+            relativize(absPath, cwd),
+            fileSummary,
+            detail,
+            sourceLines,
+          ),
+        );
+      }
+
+      // The totals say "below 100%" but no individual file could be broken
+      // down (e.g. coverage-final.json has no entry for it). Say so instead
+      // of leaving the contributor with a header and nothing under it.
+      bodyParts.push(
+        fileSections.length > 0
+          ? fileSections.join("\n\n---\n\n")
+          : "_No per-file breakdown was available in the coverage data._",
       );
     }
 
-    // The totals say "below 100%" but no individual file could be broken
-    // down (e.g. coverage-final.json has no entry for it). Say so instead
-    // of leaving the contributor with a header and nothing under it.
+    if (dataProblems.length > 0) {
+      bodyParts.push(
+        `**Coverage data problems:**\n${dataProblems.map((p) => `- ${p}`).join("\n")}`,
+      );
+    }
+
     bodyParts.push(
-      fileSections.length > 0
-        ? fileSections.join("\n\n---\n\n")
-        : "_No per-file breakdown was available in the coverage data._",
-    );
-    bodyParts.push(
-      "Add or extend tests under `test/` so every line above is executed and every branch is taken both ways, then push again - this comment will update automatically. Run `npm run coverage` locally for the full breakdown.",
+      metricsFull
+        ? "Make sure every file under `src/` is imported by a test and matched by `include` in `.c8rc.json`, then push again - this comment will update automatically."
+        : "Add or extend tests under `test/` so every statement, function and branch listed above is executed (and every branch taken both ways), then push again - this comment will update automatically. Run `npm run coverage` locally for the full breakdown.",
     );
   }
 

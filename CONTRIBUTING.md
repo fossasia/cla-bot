@@ -32,8 +32,8 @@ FOSSASIA's projects.
    functions, untested branches) that gets posted as a PR comment. The 100%
    gate covers the shipped action (`src/`); the CI helper scripts in
    `.github/scripts/` have their own tests (`test/coverage-report.test.js`,
-   `test/post-coverage-comment.test.js`) - update those too if you change
-   them.
+   `test/post-coverage-comment.test.js`, `test/verify-coverage.test.js`) -
+   update those too if you change them.
 4. **Don't weaken any of the security properties** listed at the top of
    `src/cla-bot.js` or in `SECURITY.md` (impersonation guard, exact-match
    allowlist, short-lived tokens, etc.) without discussing it in an issue
@@ -41,6 +41,55 @@ FOSSASIA's projects.
 5. Changes to `action.yml` inputs should stay backward compatible where
    possible; if a breaking change is unavoidable, bump the major version
    tag and note it in `CHANGELOG.md`.
+
+## How the coverage gate is enforced (maintainers)
+
+The 100% rule is only as strong as the files that define it, and a pull
+request can edit those files: `coverage.yml` runs on `pull_request`, so
+GitHub uses the PR's _own_ copy of the workflow, `package.json` and
+`.c8rc.json`. A PR could therefore lower a threshold, narrow `include`, or
+change the test command and still show a green check with the same job
+name. No workflow can fully fix that from inside the PR; it is closed by
+repository settings. Until they are in place, 100% is a convention, not an
+enforced rule.
+
+**What the code does** (`npm run coverage:check`, run by CI):
+
+- `c8 check-coverage` enforces the thresholds in `.c8rc.json`.
+- `.github/scripts/verify-coverage.js` then re-checks independently, because
+  c8 judges only the files it tracked: every `.js`/`.cjs`/`.mjs` file under
+  `src/` must appear in the report, something must actually have been
+  measured, and every metric must be covered === total. "Nothing measured"
+  therefore fails instead of passing as 100% (c8 does exactly that when
+  `include` matches no file).
+- The comment workflow (`coverage-comment.yml`, which always runs the
+  version on `main`) puts a warning at the top of the PR comment whenever a
+  PR changes a gate file (`.c8rc.json`, `package.json`,
+  `package-lock.json`, `.github/CODEOWNERS`, `coverage.yml`,
+  `coverage-comment.yml`, `.github/scripts/**`), so a reviewer cannot miss
+  that the result was measured with the PR's own rules.
+
+**What the repository must be configured to do** (GitHub settings; the
+part that actually makes the gate trustworthy):
+
+1. Add the gate files to `.github/CODEOWNERS`, for example (replace the
+   owner with your maintainers team or handle):
+
+   ```
+   /.c8rc.json                 @fossasia/<maintainers>
+   /package.json               @fossasia/<maintainers>
+   /package-lock.json          @fossasia/<maintainers>
+   /.github/CODEOWNERS         @fossasia/<maintainers>
+   /.github/workflows/         @fossasia/<maintainers>
+   /.github/scripts/           @fossasia/<maintainers>
+   ```
+
+   An empty `CODEOWNERS` file is valid but protects nothing.
+
+2. In the branch protection rule or ruleset for `main`, enable **Require
+   review from Code Owners** - CODEOWNERS entries are inert without it.
+3. Mark the **Enforce 100% coverage** job of the `Test Coverage` workflow as
+   a **required status check**.
 
 ## Releasing a new version
 

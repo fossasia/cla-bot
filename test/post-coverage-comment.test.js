@@ -21,6 +21,9 @@ const {
   resolveTrustedPullRequest,
   neutralizeMentions,
   readReport,
+  gateChangeNotice,
+  isGateFile,
+  NOTICE_RESERVE,
   MARKER,
   BOT_LOGIN,
   MAX_REPORT_BYTES,
@@ -84,10 +87,13 @@ function makeGithub({
   openPrs = [], // what pulls.list returns
   comments = [],
   getError,
+  files = [], // what pulls.listFiles returns
+  filesError,
 } = {}) {
   const calls = {
     pullsGet: [],
     pullsList: [],
+    listFiles: [],
     listComments: [],
     createComment: [],
     updateComment: [],
@@ -104,6 +110,11 @@ function makeGithub({
         list: async (params) => {
           calls.pullsList.push(params);
           return { data: openPrs };
+        },
+        listFiles: async (params) => {
+          calls.listFiles.push(params);
+          if (filesError !== undefined) throw filesError;
+          return { data: files };
         },
       },
       issues: {
@@ -502,7 +513,7 @@ test("skips (and makes no API call at all) when the artifact is missing", async 
     assert.strictEqual(logs.warning.length, 1);
     assert.deepStrictEqual(
       Object.values(calls).map((c) => c.length),
-      [0, 0, 0, 0, 0],
+      [0, 0, 0, 0, 0, 0],
     );
   });
 });
@@ -541,7 +552,7 @@ test("skips (never guesses a target) when the run is linked to more than one PR"
 
 test("skips a report too long for a GitHub comment, before touching the API", async () => {
   await withTmpDir(async (dir) => {
-    writeArtifact(dir, "x".repeat(MAX_COMMENT_LENGTH));
+    writeArtifact(dir, "x".repeat(MAX_COMMENT_LENGTH - NOTICE_RESERVE));
     const { github, calls } = makeGithub({ prs: { 7: openPr(7) } });
     const { core, logs } = makeCore();
     await run(dir, { github, context: samePrContext(), core });
@@ -566,6 +577,160 @@ test("falls back to the current directory when GITHUB_WORKSPACE is unset", async
       process.chdir(previous);
     }
     assert.strictEqual(calls.createComment.length, 1);
+  });
+});
+
+// --- gate-change notice ------------------------------------------------------------------
+
+test("isGateFile matches the files that define the gate and nothing else", () => {
+  for (const name of [
+    ".c8rc.json",
+    "package.json",
+    "package-lock.json",
+    ".github/CODEOWNERS",
+    ".github/workflows/coverage.yml",
+    ".github/workflows/coverage-comment.yml",
+    ".github/scripts/coverage-report.js",
+    ".github/scripts/anything-new.js",
+  ]) {
+    assert.strictEqual(isGateFile(name), true, name);
+  }
+  for (const name of [
+    "src/cla-bot.js",
+    "test/logic.test.js",
+    "README.md",
+    ".github/workflows/ci.yml",
+    "docs/package.json",
+  ]) {
+    assert.strictEqual(isGateFile(name), false, name);
+  }
+});
+
+test("a PR that touches gate files gets a warning ABOVE the report, built from the API's file list", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "## Report body");
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      files: [
+        { filename: "src/cla-bot.js" },
+        { filename: ".c8rc.json" },
+        { filename: ".github/scripts/coverage-report.js" },
+      ],
+    });
+    const { core } = makeCore();
+
+    await run(dir, { github, context: samePrContext(), core });
+
+    assert.deepStrictEqual(calls.listFiles, [
+      { owner: "fossasia", repo: "cla-bot", pull_number: 7, per_page: 100 },
+    ]);
+    const { body } = calls.createComment[0];
+    assert.ok(body.startsWith(`${MARKER}\n> [!WARNING]\n`));
+    assert.match(body, /changes files that define the coverage gate/);
+    assert.match(
+      body,
+      /> - `\.c8rc\.json`\n> - `\.github\/scripts\/coverage-report\.js`/,
+    );
+    assert.ok(!body.includes("src/cla-bot.js"));
+    assert.ok(body.endsWith("\n\n## Report body"));
+  });
+});
+
+test("no warning (body is exactly marker + report) when the PR touches no gate file", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "## Report body");
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      files: [
+        { filename: "src/cla-bot.js" },
+        { filename: "test/logic.test.js" },
+      ],
+    });
+    const { core } = makeCore();
+    await run(dir, { github, context: samePrContext(), core });
+    assert.strictEqual(
+      calls.createComment[0].body,
+      `${MARKER}\n## Report body`,
+    );
+  });
+});
+
+test("a gate file renamed away (only previous_filename matches) is still flagged", async () => {
+  const { github } = makeGithub({
+    files: [{ filename: "config/old.json", previous_filename: ".c8rc.json" }],
+  });
+  const { core } = makeCore();
+  const notice = await gateChangeNotice({
+    github,
+    context: samePrContext(),
+    core,
+    pr: { number: 7 },
+  });
+  assert.match(notice, /> - `\.c8rc\.json`/);
+});
+
+test("the notice lists at most 10 gate files and says how many more there are", async () => {
+  const files = Array.from({ length: 13 }, (_, i) => ({
+    filename: `.github/scripts/s${String(i).padStart(2, "0")}.js`,
+  }));
+  const { github } = makeGithub({ files });
+  const { core } = makeCore();
+  const notice = await gateChangeNotice({
+    github,
+    context: samePrContext(),
+    core,
+    pr: { number: 7 },
+  });
+  assert.strictEqual((notice.match(/^> - `/gm) || []).length, 10);
+  assert.match(notice, /> - \.\.\.and 3 more/);
+});
+
+test("file names are sanitised before being echoed (no Markdown/HTML injection via a crafted path)", async () => {
+  const { github } = makeGithub({
+    files: [{ filename: ".github/scripts/x`<img src=x>\n@victim.js" }],
+  });
+  const { core } = makeCore();
+  const notice = await gateChangeNotice({
+    github,
+    context: samePrContext(),
+    core,
+    pr: { number: 7 },
+  });
+  const line = notice.split("\n").find((l) => l.startsWith("> - `"));
+  assert.strictEqual(line, "> - `.github/scripts/x??img?src?x???victim.js`");
+});
+
+test("if the file list can't be fetched, the comment still posts - with an explicit 'could not check' warning", async () => {
+  for (const filesError of [new Error("rate limited"), "boom"]) {
+    await withTmpDir(async (dir) => {
+      writeArtifact(dir, "## Report body");
+      const { github, calls } = makeGithub({
+        prs: { 7: openPr(7) },
+        filesError,
+      });
+      const { core, logs } = makeCore();
+
+      await run(dir, { github, context: samePrContext(), core });
+
+      assert.match(logs.warning[0], /Could not list PR #7's files/);
+      assert.match(logs.warning[0], /rate limited|boom/);
+      const { body } = calls.createComment[0];
+      assert.match(
+        body,
+        /Could not check whether this PR changes the coverage gate/,
+      );
+      assert.ok(body.endsWith("## Report body"));
+    });
+  }
+});
+
+test("the gate-change check is not run for a stale or unresolved PR (no extra API calls)", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report");
+    const { github, calls } = makeGithub({ prs: { 7: openPr(7, OTHER_SHA) } });
+    const { core } = makeCore();
+    await run(dir, { github, context: samePrContext(), core });
+    assert.strictEqual(calls.listFiles.length, 0);
   });
 });
 

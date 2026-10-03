@@ -7,10 +7,15 @@ name: Test Coverage
 # human-readable PR comment gets posted from a separate, privileged workflow
 # instead of from here.
 #
-# Note: on `pull_request`, GitHub runs the PR's own copy of this file, so a
-# PR could in principle edit the gate itself. Protect .github/, .c8rc.json
-# and package.json with CODEOWNERS / required reviews, and mark the
-# "Enforce 100% coverage" job as a required status check.
+# Note: on `pull_request`, GitHub runs the PR's own copy of this file, and
+# the PR's own package.json / .c8rc.json decide what is measured, so a PR
+# could in principle weaken the gate itself. That can only be closed by
+# repository settings (CODEOWNERS + required code-owner review + this job as
+# a required status check); see "How the coverage gate is enforced" in
+# CONTRIBUTING.md. What the code adds on top: scripts/verify-coverage.js
+# independently refuses "nothing measured" and files missing from the
+# report, and coverage-comment.yml warns reviewers when a PR touches gate
+# files.
 on:
   pull_request:
     branches: [main]
@@ -61,6 +66,9 @@ jobs:
       # report still gets built, summarised and uploaded first; it's turned
       # back into a real job failure by the last step. Skipped automatically
       # if the tests failed (a partial run would report misleading gaps).
+      # `coverage:check` is c8's threshold check PLUS an independent
+      # verification (verify-coverage.js) that something was measured and
+      # every src file is in the report - c8 alone passes on "no data".
       - name: Check coverage threshold
         id: coverage
         continue-on-error: true

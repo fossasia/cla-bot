@@ -39,6 +39,16 @@
  *     bot to ping people or teams, and it is length-checked against
  *     GitHub's comment limit.
  *
+ *  4. The PR can also edit the files that DEFINE the gate (.c8rc.json,
+ *     package.json, coverage.yml ...), because coverage.yml runs the PR's
+ *     own copy on `pull_request`. Only repository rules (CODEOWNERS +
+ *     required reviews + a required status check) can truly prevent that,
+ *     see CONTRIBUTING.md "How the coverage gate is enforced". What this
+ *     privileged job adds is visibility: it lists the PR's changed files
+ *     via the API (not from the artifact) and puts a warning at the top of
+ *     the comment when any gate file is touched, so a reviewer cannot miss
+ *     that the "100%" below was measured with the PR's own rules.
+ *
  * Expected to be invoked from actions/github-script as:
  *   const script = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/post-coverage-comment.js`);
  *   await script({ github, context, core });
@@ -67,6 +77,22 @@ const MAX_REPORT_BYTES = 256 * 1024;
 
 // GitHub rejects comment bodies over 65536 characters.
 const MAX_COMMENT_LENGTH = 65000;
+
+// Room kept for the (trusted) gate-change notice added above the report.
+const NOTICE_RESERVE = 2000;
+
+// Files whose content decides what "100% coverage" means or whether the
+// check runs at all. A change to any of them is flagged to reviewers.
+const GATE_FILES = new Set([
+  ".c8rc.json",
+  "package.json",
+  "package-lock.json",
+  ".github/CODEOWNERS",
+  ".github/workflows/coverage.yml",
+  ".github/workflows/coverage-comment.yml",
+]);
+const GATE_DIR_PREFIX = ".github/scripts/";
+const MAX_LISTED_GATE_FILES = 10;
 
 // Inserts a zero-width space after every "@" that would start a mention
 // (@user, @org/team), which stops GitHub from resolving it into a
@@ -174,6 +200,60 @@ async function resolveTrustedPullRequest({ github, context, core }) {
   return pr;
 }
 
+const isGateFile = (filename) =>
+  GATE_FILES.has(filename) || filename.startsWith(GATE_DIR_PREFIX);
+
+// File names come from the PR, so keep only characters that are inert in
+// Markdown before echoing one back.
+const safeName = (filename) => filename.replace(/[^A-Za-z0-9._\-/]/g, "?");
+
+// Builds the warning shown above the report when the PR touches the files
+// that define the gate. The file list comes from the API for the verified
+// PR, never from the artifact. If it cannot be fetched we say so rather
+// than silently showing nothing, because "no warning" must mean "checked,
+// nothing changed".
+async function gateChangeNotice({ github, context, core, pr }) {
+  const { owner, repo } = context.repo;
+  let files;
+  try {
+    files = await github.paginate(github.rest.pulls.listFiles, {
+      owner,
+      repo,
+      pull_number: pr.number,
+      per_page: 100,
+    });
+  } catch (err) {
+    core.warning(
+      `Could not list PR #${pr.number}'s files to check for gate changes. (${err.message || err})`,
+    );
+    return "> [!WARNING]\n> Could not check whether this PR changes the coverage gate itself (the file list was unavailable). Reviewers: check `.c8rc.json`, `package.json` and `.github/` manually.\n\n";
+  }
+
+  const touched = new Set();
+  for (const file of files) {
+    for (const name of [file.filename, file.previous_filename]) {
+      if (typeof name === "string" && isGateFile(name)) touched.add(name);
+    }
+  }
+  if (touched.size === 0) return "";
+
+  const names = [...touched].sort();
+  const shown = names
+    .slice(0, MAX_LISTED_GATE_FILES)
+    .map((name) => `> - \`${safeName(name)}\``);
+  if (names.length > MAX_LISTED_GATE_FILES) {
+    shown.push(`> - ...and ${names.length - MAX_LISTED_GATE_FILES} more`);
+  }
+  return [
+    "> [!WARNING]",
+    "> **This PR changes files that define the coverage gate.** The result below was measured with this PR's own versions of them, so it proves nothing about the rules on `main`. Reviewers: review these changes by hand.",
+    ">",
+    ...shown,
+    "",
+    "",
+  ].join("\n");
+}
+
 module.exports = async ({ github, context, core }) => {
   const run = context.payload.workflow_run;
   if (!run || !run.head_sha) {
@@ -194,10 +274,13 @@ module.exports = async ({ github, context, core }) => {
     return;
   }
 
-  const commentBody = `${MARKER}\n${neutralizeMentions(report)}`;
-  if (commentBody.length > MAX_COMMENT_LENGTH) {
+  const reportBody = neutralizeMentions(report);
+  if (
+    MARKER.length + 1 + reportBody.length >
+    MAX_COMMENT_LENGTH - NOTICE_RESERVE
+  ) {
     core.warning(
-      `Coverage report is ${commentBody.length} characters, over GitHub's comment limit - skipping comment.`,
+      `Coverage report is ${reportBody.length} characters, over GitHub's comment limit - skipping comment.`,
     );
     return;
   }
@@ -206,6 +289,9 @@ module.exports = async ({ github, context, core }) => {
   if (!pr) {
     return;
   }
+
+  const notice = await gateChangeNotice({ github, context, core, pr });
+  const commentBody = `${MARKER}\n${notice}${reportBody}`;
 
   const { owner, repo } = context.repo;
   const issue_number = pr.number;
@@ -251,7 +337,10 @@ module.exports = async ({ github, context, core }) => {
 module.exports.resolveTrustedPullRequest = resolveTrustedPullRequest;
 module.exports.neutralizeMentions = neutralizeMentions;
 module.exports.readReport = readReport;
+module.exports.gateChangeNotice = gateChangeNotice;
+module.exports.isGateFile = isGateFile;
 module.exports.MARKER = MARKER;
 module.exports.BOT_LOGIN = BOT_LOGIN;
 module.exports.MAX_REPORT_BYTES = MAX_REPORT_BYTES;
 module.exports.MAX_COMMENT_LENGTH = MAX_COMMENT_LENGTH;
+module.exports.NOTICE_RESERVE = NOTICE_RESERVE;

@@ -105,6 +105,18 @@ function uncoveredStatementFile(line) {
   };
 }
 
+// Creates the (empty) source files a fixture claims to have measured, so
+// the independent on-disk check in verify-coverage.js sees a coherent
+// project. Returns their absolute paths.
+function writeSources(dir, ...names) {
+  return names.map((name) => {
+    const file = path.join(dir, "src", name);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    if (!fs.existsSync(file)) fs.writeFileSync(file, "");
+    return file;
+  });
+}
+
 const readReportMd = (dir) =>
   fs.readFileSync(path.join(dir, "coverage", "pr-comment.md"), "utf8");
 
@@ -247,7 +259,7 @@ test("analyzeFile reports no findings for a fully-covered file", () => {
 
 // --- formatFileSection ----------------------------------------------------------
 
-test("formatFileSection surfaces statements in the header and lists missing lines with source snippets", () => {
+test("formatFileSection surfaces statements in the header and lists uncovered statements with source snippets", () => {
   const summary = {
     lines: pct(100, 10, 10),
     statements: pct(90, 9, 10),
@@ -270,7 +282,7 @@ test("formatFileSection surfaces statements in the header and lists missing line
   ]);
   assert.match(section, /### `src\/example\.js`/);
   assert.match(section, /90% statements/);
-  assert.match(section, /Missing line coverage:\*\* 7/);
+  assert.match(section, /Uncovered statements on line\(s\):\*\* 7/);
   assert.match(section, /```js\n7: const unused = 1;\n```/);
 });
 
@@ -372,7 +384,7 @@ test("formatFileSection omits the snippet block when none of the missing lines e
     },
     [],
   );
-  assert.match(section, /Missing line coverage:\*\* 3/);
+  assert.match(section, /Uncovered statements on line\(s\):\*\* 3/);
   assert.ok(!section.includes("```"));
 });
 
@@ -398,11 +410,8 @@ test("closeUnbalancedFence handles text with no fences at all", () => {
 
 test("main() writes a passing report - and ONLY the Markdown file (no PR number / SHA / metadata)", async () => {
   await withTmpDir((dir) => {
-    writeCoverage(
-      dir,
-      { total: fullEntry(), [path.join(dir, "src", "a.js")]: fullEntry() },
-      {},
-    );
+    const [a] = writeSources(dir, "a.js");
+    writeCoverage(dir, { total: fullEntry(), [a]: fullEntry() }, {});
     const result = main({ cwd: dir, log: quiet });
 
     assert.strictEqual(result.isFullyCovered, true);
@@ -420,7 +429,8 @@ test("main() writes a passing report - and ONLY the Markdown file (no PR number 
 
 test("main() defaults to the current working directory", async () => {
   await withTmpDir((dir) => {
-    writeCoverage(dir, { total: fullEntry() }, {});
+    const [a] = writeSources(dir, "a.js");
+    writeCoverage(dir, { total: fullEntry(), [a]: fullEntry() }, {});
     withCwd(dir, () => main({ log: quiet }));
     assert.match(readReportMd(dir), /✅ Test coverage: 100%/);
   });
@@ -451,6 +461,10 @@ test("main() lists a file whose statement coverage alone is below 100% (regressi
     assert.match(md, /src\/partial\.js/);
     assert.match(md, /80% statements/);
     assert.match(md, /2: const b = 2; const c = 3;/);
+    // lines are 100% here, so claiming "line coverage" is missing would be
+    // false: what is missing is a statement on a line that did run.
+    assert.match(md, /Uncovered statements on line\(s\):\*\* 2/);
+    assert.ok(!/line coverage/i.test(md));
   });
 });
 
@@ -502,6 +516,78 @@ test("main() says so when coverage is below 100% but there is no per-file breakd
     const md = readReportMd(dir);
     assert.match(md, /❌ Test coverage is below the required 100%/);
     assert.match(md, /No per-file breakdown was available/);
+  });
+});
+
+test("main() refuses a ✅ when a src file is missing from the report, even though c8's own totals say 100%", async () => {
+  await withTmpDir((dir) => {
+    const [tracked] = writeSources(dir, "tracked.js");
+    writeSources(dir, "new-feature.js"); // on disk, never measured
+    writeCoverage(dir, { total: fullEntry(), [tracked]: fullEntry() }, {});
+
+    const result = main({ cwd: dir, log: quiet });
+
+    assert.strictEqual(result.isFullyCovered, false);
+    const md = readReportMd(dir);
+    assert.match(md, /❌ Test coverage could not be verified/);
+    assert.match(md, /Everything that was measured is at 100%/);
+    assert.match(
+      md,
+      /\*\*Coverage data problems:\*\*\n- src\/new-feature\.js exists but is missing from the coverage report/,
+    );
+    assert.match(
+      md,
+      /Make sure every file under `src\/` is imported by a test/,
+    );
+    assert.ok(!md.includes("✅"));
+  });
+});
+
+test("main() treats a run that measured nothing as a failure, not as 100%", async () => {
+  await withTmpDir((dir) => {
+    const unknown = { pct: "Unknown", covered: 0, total: 0 };
+    const nothing = {
+      lines: unknown,
+      statements: unknown,
+      functions: unknown,
+      branches: unknown,
+    };
+    writeCoverage(dir, { total: nothing }, {});
+
+    const result = main({ cwd: dir, log: quiet });
+
+    assert.strictEqual(result.isFullyCovered, false);
+    const md = readReportMd(dir);
+    assert.match(md, /❌ Test coverage is below the required 100%/);
+    assert.match(md, /No source files were found under src\//);
+    assert.match(md, /No coverage data was collected/);
+    assert.ok(!md.includes("✅"));
+  });
+});
+
+test("main() shows both the per-file gaps and the data problems when both exist", async () => {
+  await withTmpDir((dir) => {
+    const [partial] = writeSources(dir, "partial.js");
+    writeSources(dir, "dropped.js");
+    const entry = {
+      lines: pct(50, 1, 2),
+      statements: pct(50, 1, 2),
+      functions: pct(100, 0, 0),
+      branches: pct(100, 0, 0),
+    };
+    writeCoverage(
+      dir,
+      { total: entry, [partial]: entry },
+      { [partial]: uncoveredStatementFile(2) },
+    );
+
+    main({ cwd: dir, log: quiet });
+
+    const md = readReportMd(dir);
+    assert.match(md, /### `src\/partial\.js`/);
+    assert.match(md, /Uncovered statements on line\(s\):\*\* 2/);
+    assert.match(md, /src\/dropped\.js exists but is missing/);
+    assert.match(md, /Add or extend tests under `test\/`/);
   });
 });
 
@@ -589,7 +675,8 @@ test("main() throws a clear error when the coverage reports are missing", async 
 
 test("the CLI exits 0 and writes the report when coverage data exists", async () => {
   await withTmpDir((dir) => {
-    writeCoverage(dir, { total: fullEntry() }, {});
+    const [a] = writeSources(dir, "a.js");
+    writeCoverage(dir, { total: fullEntry(), [a]: fullEntry() }, {});
     const result = spawnSync(process.execPath, [SCRIPT_PATH], {
       cwd: dir,
       encoding: "utf8",
@@ -674,7 +761,7 @@ test("the report pinpoints the real gaps in genuine c8 output (uncovered functio
     const md = readReportMd(dir);
     assert.match(md, /### `src\/lib\.js`/);
     assert.match(md, /Never called by any test:\*\* `neverCalled` \(line 8\)/);
-    assert.match(md, /Missing line coverage:\*\* 6, 8-10/);
+    assert.match(md, /Uncovered statements on line\(s\):\*\* 6, 8-10/);
     assert.match(md, /Branches with an untested path:\*\* line 6 \(1 path\)/);
   });
 });
