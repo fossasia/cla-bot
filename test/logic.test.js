@@ -24,6 +24,7 @@ const {
   isPrivileged,
   assertValidPRNumber,
   assertValidInstallationId,
+  assertValidUserId,
   assertValidSha,
   classifyBotComment,
   personalSuccessMessage,
@@ -949,6 +950,84 @@ test("assertValidInstallationId's error message includes the given context strin
       ),
     /GitHub App installation lookup for \/repos\/x\/y\/installation is missing a usable "id" field \(got -1\)/,
   );
+});
+
+// --- assertValidUserId ----------------------------------------------------
+// Guards the one value handleIssueComment PERSISTS into the signature store
+// (comment.user.id). Same Number.isSafeInteger + > 0 bar as the two
+// validators above, but called directly (not via a JSON-serialized fetch
+// mock) so NaN/Infinity - which JSON can never carry - are genuinely covered.
+test("assertValidUserId accepts an ordinary positive integer and returns it unchanged", () => {
+  assert.strictEqual(assertValidUserId(12345, "ctx"), 12345);
+});
+
+test("assertValidUserId accepts the smallest valid id (1) and Number.MAX_SAFE_INTEGER (both boundaries, not the offenders)", () => {
+  assert.strictEqual(assertValidUserId(1, "ctx"), 1);
+  assert.strictEqual(
+    assertValidUserId(Number.MAX_SAFE_INTEGER, "ctx"),
+    Number.MAX_SAFE_INTEGER,
+  );
+});
+
+for (const { label, value } of [
+  {
+    label:
+      "undefined (the key was absent - JSON.stringify would silently drop it from the stored entry)",
+    value: undefined,
+  },
+  { label: "null (JSON.stringify would persist a literal null)", value: null },
+  {
+    label:
+      "a numeric string (typeof !== 'number', so isSigned() could never id-match it)",
+    value: "123",
+  },
+  { label: "a non-numeric string", value: "not-a-number" },
+  { label: "an empty string", value: "" },
+  { label: "zero", value: 0 },
+  { label: "negative zero", value: -0 },
+  { label: "a negative integer", value: -5 },
+  { label: "a non-integer float", value: 1.5 },
+  { label: "NaN", value: NaN },
+  { label: "Infinity", value: Infinity },
+  { label: "-Infinity", value: -Infinity },
+  {
+    label: "Number.MAX_SAFE_INTEGER + 1 (an integer, but not a safe one)",
+    value: Number.MAX_SAFE_INTEGER + 1,
+  },
+  { label: "1e100", value: 1e100 },
+  { label: "a boolean", value: true },
+  { label: "an array", value: [123] },
+  { label: "a plain object", value: {} },
+  { label: "a Number wrapper object", value: Object(123) },
+]) {
+  test(`assertValidUserId rejects ${label}`, () => {
+    assert.throws(
+      () => assertValidUserId(value, "ctx"),
+      /expected a positive integer GitHub user id/,
+    );
+  });
+}
+
+test("assertValidUserId's error message includes the context, the rejected value and its type", () => {
+  assert.throws(
+    () => assertValidUserId("123", "issue_comment payload comment.user.id"),
+    /issue_comment payload comment\.user\.id: expected a positive integer GitHub user id, got "123" \(string\)/,
+  );
+  assert.throws(
+    () => assertValidUserId(undefined, "ctx"),
+    /ctx: expected a positive integer GitHub user id, got undefined \(undefined\)/,
+  );
+});
+
+// Documents WHY the validator exists, at the isSigned() level: an entry that
+// was persisted without a usable numeric id is matched by login alone, so a
+// different account that later claims the same login inherits the signature.
+test("isSigned: an id-less stored entry matches a DIFFERENT account with the same login (the weakness assertValidUserId keeps from being created)", () => {
+  const idless = { signatures: [{ login: "mona" }] };
+  assert.strictEqual(isSigned(idless, { id: 999, login: "mona" }), true);
+  const withId = { signatures: [{ id: 111, login: "mona" }] };
+  assert.strictEqual(isSigned(withId, { id: 999, login: "mona" }), false);
+  assert.strictEqual(isSigned(withId, { id: 111, login: "mona" }), true);
 });
 
 test("assertValidSha accepts a real 40-character lowercase-hex sha1 and returns it unchanged", () => {
