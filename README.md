@@ -70,7 +70,7 @@ signatures repo, secrets, and rolling this out to every repo - see
 | `signatures-repo`          | yes      | -                     | Name of the private repo storing signatures.                                                                                                                                                                                                                                                            |
 | `signatures-path`          | no       | `signatures/cla.json` | Relative path to the file inside that repo. Spaces and non-ASCII are fine (encoded automatically); trailing whitespace and a leading `./` are ignored. `#`, `?`, `%`, `\`, control characters, a trailing `/`, empty/`.`/`..` segments and a `.git` segment are rejected. Full rules: see `action.yml`. |
 | `cla-document-url`         | yes      | -                     | Link to the CLA text shown to contributors.                                                                                                                                                                                                                                                             |
-| `allowlist`                | no       | `''`                  | Comma-separated usernames that don't need to sign (exact match only, no wildcards).                                                                                                                                                                                                                     |
+| `allowlist`                | no       | `''`                  | Comma/whitespace-separated numeric GitHub account ids that don't need to sign (no usernames, no wildcards). See [Allowlist](#allowlist).                                                                                                                                                                |
 | `app-id`                   | no       | `''`                  | GitHub App ID, used to get access to the signatures repo.                                                                                                                                                                                                                                               |
 | `app-private-key`          | no       | `''`                  | The GitHub App's private key (should come from a secret).                                                                                                                                                                                                                                               |
 | `require-verified-commits` | no       | `'false'`             | When `true`, only trusts a commit's author if that same account is also its verified committer - hardens against forged authors. Off by default so unsigned-commit workflows keep working.                                                                                                              |
@@ -88,3 +88,39 @@ See `CONTRIBUTING.md` for guidelines and `CHANGELOG.md` for what's changed.
 ## License
 
 Apache-2.0 - see `LICENSE`.
+
+## Allowlist
+
+Accounts on the `allowlist` input (bots such as Dependabot, or trusted
+maintainers) don't need to sign the CLA. The allowlist is a list of **numeric
+GitHub account ids**, separated by commas and/or whitespace (so a multi-line
+YAML value works):
+
+```yaml
+allowlist: |
+  41898282
+  49699333
+  29139614
+```
+
+Ids are matched against the id GitHub itself reports for each commit author
+or co-author - the same identity the signature store is keyed on. They are
+immutable and never reassigned, so a renamed account stays exempt and a
+different account that later claims an old username does **not** inherit the
+exemption. For that reason usernames are deliberately not supported: any entry
+that isn't a plain positive integer (`dependabot[bot]`, `id:5`, `0`, `1e3`, ...)
+fails the run instead of being silently ignored.
+
+Ids of the bots most repositories want to exempt (each one is the number in
+the bot's `ID+name[bot]@users.noreply.github.com` commit email, and matches
+`gh api 'users/NAME[bot]' --jq .id`):
+
+| Bot                   | Account id |
+| --------------------- | ---------- |
+| `github-actions[bot]` | `41898282` |
+| `dependabot[bot]`     | `49699333` |
+| `renovate[bot]`       | `29139614` |
+
+Find an id with `gh api users/NAME --jq .id` (bots included, e.g.
+`gh api 'users/dependabot[bot]' --jq .id`), or open
+`https://api.github.com/users/NAME` in a browser.

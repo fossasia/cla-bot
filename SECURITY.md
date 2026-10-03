@@ -47,8 +47,11 @@ Out of scope:
 3. A PR is only "signed" once everyone who contributed to it (every commit
    author, plus any co-author in a `Co-authored-by:` trailer) is in the
    signature store. Whoever left the sign comment doesn't matter.
-4. The allowlist only does exact string matches - no glob/wildcard, which
-   would let someone bypass signing with a bot-like username.
+4. The allowlist holds immutable numeric GitHub account ids only - no
+   usernames and no glob/wildcard. A username can be renamed and then claimed
+   by a different account, which would inherit a username-based exemption (and
+   a bot-like username could bypass signing); ids are matched against what
+   GitHub itself reports, exactly like the signature store.
 5. This action never checks out or executes code from the pull request - it
    only reads PR/commit metadata via the API.
 
@@ -76,6 +79,16 @@ Out of scope:
   4. Comment `recheck` once satisfied. This re-evaluates the PR but won't
      clear the flagged commit on its own; merging past it is a deliberate
      maintainer call, not something the bot automates.
+
+- Allowlisted accounts (e.g. `github-actions[bot]`, id `41898282`) are
+  recognised by the account GitHub attributes a commit's **author** to, and
+  GitHub does that purely from the commit's git email - which is public
+  (`ID+name[bot]@users.noreply.github.com`) and can be forged by anyone. By
+  default a forged "authored by github-actions[bot]" commit is therefore
+  exempt from signing. Set `require-verified-commits: true` to close this: the
+  author is then only trusted when that same account is also the verified
+  committer, and anything else is flagged for manual review. (Check that your
+  own automation's commits satisfy that before enabling it.)
 
 - The comment-creation POST is deliberately not auto-retried by `gh()`'s
   transient-error retry (see CHANGELOG) - a genuine network blip there

@@ -14,11 +14,12 @@ process.env.SIG_OWNER = process.env.SIG_OWNER || "fossasia";
 process.env.SIG_REPO = process.env.SIG_REPO || "cla-signatures";
 process.env.CLA_DOCUMENT_URL =
   process.env.CLA_DOCUMENT_URL || "https://example.com/CLA.md";
-process.env.ALLOWLIST = "dependabot[bot],renovate[bot]";
+process.env.ALLOWLIST = "99,98";
 
 const {
   isSigned,
   isAllowlisted,
+  parseAllowlist,
   createAppJWT,
   base64url,
   isPrivileged,
@@ -48,114 +49,189 @@ function test(name, fn) {
 }
 
 // --- signature matching ---------------------------------------------------
-test("signature match is case-insensitive", () => {
-  const data = { signatures: [{ login: "AmanKumar" }] };
-  assert.strictEqual(isSigned(data, "amankumar"), true);
-});
-
-test("signature match does not false-positive on unrelated user", () => {
-  const data = { signatures: [{ login: "AmanKumar" }] };
-  assert.strictEqual(isSigned(data, "someoneelse"), false);
-});
-
-test("signature match on empty store returns false", () => {
-  assert.strictEqual(isSigned({ signatures: [] }, "anyone"), false);
-});
-
-// --- identity: signatures survive a GitHub username rename/reclaim -------
-test("signature match is keyed on immutable id, not the (mutable) login", () => {
-  // alice signed while her login was "alice", recorded with her numeric id.
-  const data = { signatures: [{ id: 555, login: "alice" }] };
-  // She has since renamed to "alice-new" - the PR-authors lookup will now
-  // report her under her NEW login, but her id hasn't changed.
-  assert.strictEqual(isSigned(data, { id: 555, login: "alice-new" }), true);
-});
-
-test("a different account that reclaims a released login is NOT treated as already signed", () => {
-  // Same scenario as above, but "alice" is now released and claimed by
-  // someone else entirely (a different numeric id).
-  const data = { signatures: [{ id: 555, login: "alice" }] };
-  assert.strictEqual(isSigned(data, { id: 999, login: "alice" }), false);
-});
-
-test("isSigned still works with a bare login string (legacy call shape / no id available)", () => {
-  const data = { signatures: [{ login: "alice" }] }; // legacy entry, no id
-  assert.strictEqual(isSigned(data, "alice"), true);
-  assert.strictEqual(isSigned(data, "bob"), false);
-});
-
-test("an id match takes priority over a stale login mismatch", () => {
-  const data = { signatures: [{ id: 555, login: "alice-old-name" }] };
+// Identity is the immutable numeric account id ONLY. Logins are mutable and
+// reusable, so they are never consulted.
+test("signature match is keyed on the numeric id; login case/spelling is irrelevant", () => {
+  const data = { signatures: [{ id: 7, login: "AmanKumar" }] };
+  assert.strictEqual(isSigned(data, { id: 7, login: "amankumar" }), true);
   assert.strictEqual(
-    isSigned(data, { id: 555, login: "alice-new-name" }),
+    isSigned(data, { id: 7, login: "totally-different" }),
     true,
   );
 });
 
-// --- allowlist: exact match only, no wildcard bypass ----------------------
-test("allowlist matches exact bot names", () => {
-  assert.strictEqual(isAllowlisted("dependabot[bot]"), true);
-  assert.strictEqual(isAllowlisted("DEPENDABOT[BOT]"), true); // case-insensitive
+test("signature match does not false-positive on an unrelated account", () => {
+  const data = { signatures: [{ id: 7, login: "AmanKumar" }] };
+  assert.strictEqual(isSigned(data, { id: 8, login: "someoneelse" }), false);
+});
+
+test("signature match on empty store returns false", () => {
+  assert.strictEqual(
+    isSigned({ signatures: [] }, { id: 1, login: "anyone" }),
+    false,
+  );
+});
+
+// --- identity: signatures survive a GitHub username rename/reclaim -------
+test("signature match survives a rename: same id, new login", () => {
+  const data = { signatures: [{ id: 555, login: "alice" }] };
+  assert.strictEqual(isSigned(data, { id: 555, login: "alice-new" }), true);
+});
+
+test("a different account that reclaims a released login is NOT treated as already signed", () => {
+  const data = { signatures: [{ id: 555, login: "alice" }] };
+  assert.strictEqual(isSigned(data, { id: 999, login: "alice" }), false);
+});
+
+test("isSigned NEVER falls back to login matching: a bare login string, an id-less author, or an id-less stored entry all fail closed", () => {
+  const withId = { signatures: [{ id: 555, login: "alice" }] };
+  assert.strictEqual(isSigned(withId, "alice"), false, "bare login string");
+  assert.strictEqual(
+    isSigned(withId, { login: "alice" }),
+    false,
+    "author without id",
+  );
+  assert.strictEqual(
+    isSigned(withId, { id: "555", login: "alice" }),
+    false,
+    "string id",
+  );
+  const idless = {
+    signatures: [
+      { login: "alice" },
+      { id: "555", login: "alice" },
+      { id: null },
+    ],
+  };
+  assert.strictEqual(
+    isSigned(idless, { id: 555, login: "alice" }),
+    false,
+    "stored entry without a numeric id",
+  );
+});
+
+// --- allowlist: numeric account ids only ----------------------------------
+// The process-wide ALLOWLIST for this file is "99,98" (set at the top).
+test("allowlist matches an author by numeric id", () => {
+  assert.strictEqual(isAllowlisted({ id: 99, login: "dependabot[bot]" }), true);
+  assert.strictEqual(isAllowlisted({ id: 98, login: "anything" }), true);
+});
+
+test("allowlist ignores the login entirely: a rename stays exempt, a reused login does not inherit", () => {
+  assert.strictEqual(
+    isAllowlisted({ id: 99, login: "renamed-bot[bot]" }),
+    true,
+  );
+  assert.strictEqual(
+    isAllowlisted({ id: 12345, login: "dependabot[bot]" }),
+    false,
+  );
+});
+
+test("allowlist never matches a bare login string or anything without a real numeric id", () => {
+  for (const bad of [
+    "dependabot[bot]",
+    "99",
+    99,
+    null,
+    undefined,
+    {},
+    [],
+    { login: "x" },
+    { id: "99" },
+    { id: 99.5 },
+    { id: NaN },
+    { id: null },
+    { id: [99] },
+  ]) {
+    assert.strictEqual(
+      isAllowlisted(bad),
+      false,
+      `${JSON.stringify(bad)} must fail closed`,
+    );
+  }
+});
+
+test("an all-digit USERNAME equal to an allowlisted id gains nothing (login is never read as an id)", () => {
+  assert.strictEqual(isAllowlisted({ id: 1, login: "99" }), false);
+  assert.strictEqual(isAllowlisted({ id: 1, login: 99 }), false);
 });
 
 test("allowlist does NOT let a human bypass by naming themselves like a bot", () => {
-  assert.strictEqual(isAllowlisted("bot-hacker-123"), false);
-  assert.strictEqual(isAllowlisted("super-bot"), false);
+  assert.strictEqual(isAllowlisted({ id: 1, login: "bot-hacker-123" }), false);
+  assert.strictEqual(isAllowlisted({ id: 1, login: "super-bot" }), false);
 });
 
-// The module-level ALLOWLIST const is `(process.env.ALLOWLIST || "")
-// .split(",").map(trim).filter(Boolean)` - every other test in this file
-// uses a clean, pre-trimmed value ("dependabot[bot],renovate[bot]"), which
-// never actually exercises .trim() or .filter(Boolean) (there's nothing
-// for them to do). This forces a genuinely messy real-world value -
-// surrounding whitespace on some entries, a doubled comma, and a
-// trailing comma - through a fresh module instance, and confirms both
-// that the real names still match despite the mess and that a stray
-// empty segment doesn't itself become a phantom allowlist entry.
-test("ALLOWLIST parsing trims whitespace around entries and drops empty segments (extra/doubled commas, trailing comma)", () => {
-  withFreshBot(
-    { ALLOWLIST: "  dependabot[bot] , ,renovate[bot],,  " },
-    ({ isAllowlisted: freshIsAllowlisted }) => {
-      assert.strictEqual(
-        freshIsAllowlisted("dependabot[bot]"),
-        true,
-        "surrounding whitespace around this entry must be trimmed away",
-      );
-      assert.strictEqual(
-        freshIsAllowlisted("renovate[bot]"),
-        true,
-        "this entry must still match despite the doubled/trailing commas around it",
-      );
-      assert.strictEqual(
-        freshIsAllowlisted(""),
-        false,
-        "an empty login must never match, even though the messy input contained empty comma-separated segments - filter(Boolean) must have dropped them, not turned them into a literal '' allowlist entry",
-      );
-      assert.strictEqual(freshIsAllowlisted("some-other-bot[bot]"), false);
-    },
+test("parseAllowlist accepts ids separated by commas and/or any whitespace (incl. multi-line YAML) and de-duplicates", () => {
+  const { ids, invalid } = parseAllowlist("  42, 7 ,,\n 99\t\r\n42 ,");
+  assert.deepStrictEqual(
+    [...ids].sort((a, b) => a - b),
+    [7, 42, 99],
   );
+  assert.deepStrictEqual(invalid, []);
+});
+
+test("parseAllowlist handles empty/undefined/null/separator-only input", () => {
+  for (const v of ["", undefined, null, "  ,, \n"]) {
+    const r = parseAllowlist(v);
+    assert.strictEqual(r.ids.size + r.invalid.length, 0);
+  }
+});
+
+test("parseAllowlist reports every non-id entry instead of dropping or coercing it", () => {
+  for (const bad of [
+    "dependabot[bot]",
+    "id:42",
+    "0",
+    "-5",
+    "1.5",
+    "1e3",
+    "0x10",
+    "012",
+    "+5",
+    "abc",
+    "42abc",
+    "9007199254740993",
+    "１２３" /* full-width digits */,
+  ]) {
+    const { ids, invalid } = parseAllowlist(bad);
+    assert.strictEqual(ids.size, 0, `${bad} must not yield an id`);
+    assert.deepStrictEqual(invalid, [bad], `${bad} must be reported`);
+  }
+  const mixed = parseAllowlist("5,bot,6");
+  assert.deepStrictEqual([...mixed.ids], [5, 6]);
+  assert.deepStrictEqual(mixed.invalid, ["bot"]);
+});
+
+test("a fresh module honors its own ALLOWLIST value (parsed once at load)", () => {
+  withFreshBot({ ALLOWLIST: " 4242 ,\n 4243" }, ({ isAllowlisted: fresh }) => {
+    assert.strictEqual(fresh({ id: 4242, login: "x" }), true);
+    assert.strictEqual(fresh({ id: 4243, login: "x" }), true);
+    assert.strictEqual(fresh({ id: 99, login: "x" }), false);
+  });
 });
 
 // --- impersonation guard ---------------------------------------------------
 test("a third party signing does not clear the actual PR commit author", () => {
-  const prCommitAuthors = ["real-author"];
-  const store = { signatures: [{ login: "random-commenter" }] };
-  const missing = prCommitAuthors.filter((l) => !isSigned(store, l));
-  assert.deepStrictEqual(missing, ["real-author"]);
+  const prCommitAuthors = [{ id: 1, login: "real-author" }];
+  const store = { signatures: [{ id: 2, login: "random-commenter" }] };
+  const missing = prCommitAuthors.filter((a) => !isSigned(store, a));
+  assert.deepStrictEqual(missing, prCommitAuthors);
 });
 
 test("PR is fully clear only once the actual author signs", () => {
-  const prCommitAuthors = ["real-author"];
-  const store = { signatures: [{ login: "real-author" }] };
-  const missing = prCommitAuthors.filter((l) => !isSigned(store, l));
+  const prCommitAuthors = [{ id: 1, login: "real-author" }];
+  const store = { signatures: [{ id: 1, login: "real-author" }] };
+  const missing = prCommitAuthors.filter((a) => !isSigned(store, a));
   assert.deepStrictEqual(missing, []);
 });
 
 test("multiple commit authors on one PR all must sign independently", () => {
-  const prCommitAuthors = ["alice", "bob"];
-  const store = { signatures: [{ login: "alice" }] };
-  const missing = prCommitAuthors.filter((l) => !isSigned(store, l));
-  assert.deepStrictEqual(missing, ["bob"]);
+  const alice = { id: 1, login: "alice" };
+  const bob = { id: 2, login: "bob" };
+  const store = { signatures: [{ id: 1, login: "alice" }] };
+  const missing = [alice, bob].filter((a) => !isSigned(store, a));
+  assert.deepStrictEqual(missing, [bob]);
 });
 
 // --- base64url ---------------------------------------------------------
@@ -359,6 +435,18 @@ test("isAllowlisted fails closed (returns false, never throws) on malformed logi
   }
 });
 
+test("signerCompletedRequirement uses the signer's id for the allowlist (an allowlisted-by-id signer gets no completion credit, even after a rename)", () => {
+  withFreshBot(
+    { ALLOWLIST: "4242" },
+    ({ signerCompletedRequirement: fresh }) => {
+      const signer = { id: 4242, login: "renamed-trusted" };
+      assert.strictEqual(fresh([signer], signer), false);
+      const reuser = { id: 5, login: "trusted-user" };
+      assert.strictEqual(fresh([reuser], reuser), true);
+    },
+  );
+});
+
 test("isSigned still ignores a well-formed signature entry with a non-string login (defense in depth on stored data too)", () => {
   const data = { signatures: [{ id: 1, login: 123 }] };
   assert.strictEqual(isSigned(data, { id: 2, login: "someone" }), false);
@@ -454,6 +542,10 @@ const VALID_BASE_CONFIG = {
   SIG_REPO: "cla-signatures",
   SIG_PATH: "signatures/cla.json",
   CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+  // Explicitly empty: this file's process-wide ALLOWLIST (set at the top)
+  // contains login entries, which make validateConfig() emit an advisory
+  // warning. Tests asserting an exact warning list must not inherit that.
+  ALLOWLIST: "",
 };
 
 test("validateConfig accepts a well-formed config (baseline sanity check for the tests below)", () => {
@@ -696,6 +788,34 @@ test("validateConfig warns - once, as one escaped line - when it normalizes SIG_
 
   const silent = withMutedWarnings(() => assertConfigOK(VALID_BASE_CONFIG));
   assert.deepStrictEqual(silent, []);
+});
+
+test("validateConfig fails loudly on any non-id ALLOWLIST entry (e.g. a username), naming each offender, with a safely escaped message", () => {
+  for (const bad of ["dependabot[bot]", "id:42", "0", "5,oops", "1e3"]) {
+    assertConfigFails({ ...VALID_BASE_CONFIG, ALLOWLIST: bad }, "ALLOWLIST");
+  }
+  assertConfigFails(
+    { ...VALID_BASE_CONFIG, ALLOWLIST: "42,dependabot[bot]" },
+    '"dependabot[bot]"',
+  );
+  // A control character can't inject a raw extra line into the Actions log
+  // (whitespace splits entries, but other control chars stay in the entry).
+  assertConfigFails(
+    { ...VALID_BASE_CONFIG, ALLOWLIST: "bad\u0007bell" },
+    "bad\\u0007bell",
+  );
+});
+
+test("validateConfig accepts an id-only allowlist (comma/newline separated) and an empty one, silently", () => {
+  for (const ok of ["42,43", "42\n43", " 42 , 43 ,", ""]) {
+    assert.deepStrictEqual(
+      withMutedWarnings(() =>
+        assertConfigOK({ ...VALID_BASE_CONFIG, ALLOWLIST: ok }),
+      ),
+      [],
+      `ALLOWLIST=${JSON.stringify(ok)} should be accepted with no warnings`,
+    );
+  }
 });
 
 test("validateConfig still rejects a value that is nothing but whitespace (ASCII, newline or Unicode) - it normalizes to empty / is empty after trim", () => {
@@ -1020,11 +1140,12 @@ test("assertValidUserId's error message includes the context, the rejected value
 });
 
 // Documents WHY the validator exists, at the isSigned() level: an entry that
-// was persisted without a usable numeric id is matched by login alone, so a
-// different account that later claims the same login inherits the signature.
-test("isSigned: an id-less stored entry matches a DIFFERENT account with the same login (the weakness assertValidUserId keeps from being created)", () => {
+// was persisted without a usable numeric id can never match anyone (fail
+// closed), instead of being matched by login and inherited by whoever later
+// claims that login.
+test("isSigned: an id-less stored entry matches NOBODY - not even the same login", () => {
   const idless = { signatures: [{ login: "mona" }] };
-  assert.strictEqual(isSigned(idless, { id: 999, login: "mona" }), true);
+  assert.strictEqual(isSigned(idless, { id: 999, login: "mona" }), false);
   const withId = { signatures: [{ id: 111, login: "mona" }] };
   assert.strictEqual(isSigned(withId, { id: 999, login: "mona" }), false);
   assert.strictEqual(isSigned(withId, { id: 111, login: "mona" }), true);
@@ -1221,36 +1342,22 @@ test("isSameContributor matches by numeric id even when the logins differ (a ren
   );
 });
 
-test("isSameContributor falls back to a case-insensitive login match when either side has no id", () => {
+test("isSameContributor never falls back to login matching (missing id on either side, or both)", () => {
   assert.strictEqual(
     isSameContributor({ login: "Alice" }, { login: "alice" }),
-    true,
+    false,
   );
-});
-
-// The two tests above only ever exercise BOTH sides having a numeric id,
-// or NEITHER side having one. The asymmetric case - one side has a
-// numeric id (e.g. a commit author resolved via the API) and the other
-// doesn't (e.g. a legacy signature entry, or a bare { login } passed by
-// an older caller) - takes a different code path (falls through to the
-// login-only comparison) and needs its own coverage, since a future
-// change to the id-check condition could silently break just this one
-// asymmetric shape without either existing test noticing.
-test("isSameContributor falls back to a login match when only ONE side has a numeric id (asymmetric shape)", () => {
   assert.strictEqual(
     isSameContributor({ id: 1, login: "alice" }, { login: "alice" }),
-    true,
-    "same login should still match even though only one side carries an id",
+    false,
   );
   assert.strictEqual(
     isSameContributor({ login: "alice" }, { id: 2, login: "alice" }),
-    true,
-    "order of which side has the id must not matter",
+    false,
   );
   assert.strictEqual(
-    isSameContributor({ id: 1, login: "alice" }, { login: "bob" }),
+    isSameContributor({ id: "1", login: "alice" }, { id: "1", login: "alice" }),
     false,
-    "an id on only one side must not cause a false match against a different login",
   );
 });
 

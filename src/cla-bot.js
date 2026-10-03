@@ -16,8 +16,10 @@
  * 3. A PR only counts as "signed" once every one of its real commit authors
  *    (looked up via the API, not whoever left the sign comment) is in the
  *    signature store. Someone else can't sign on a contributor's behalf.
- * 4. The allowlist is an exact, case-insensitive string match only - no
- *    wildcards, so nobody can dodge signing by naming themselves like a bot.
+ * 4. The allowlist is a set of immutable numeric GitHub account ids - no
+ *    logins, no wildcards - so nobody can dodge signing by naming themselves
+ *    like a bot, and a released/renamed login can never inherit an
+ *    exemption. See parseAllowlist()/isAllowlisted().
  * 5. Writes retry with a fresh read on HTTP 409, for when two repos' PRs
  *    write to the same file at once.
  * 6. Every request has a timeout, so a hung call can't stall the whole job.
@@ -44,6 +46,11 @@
  *     login-based allowlist check. It can't verify the named person
  *     actually agreed to be credited; nothing can, since GitHub doesn't
  *     ask.
+ * 11. Same reasoning as 7, applied to the allowlist: it holds numeric
+ *     account ids only, matched against the id GitHub itself reported for
+ *     the author (never against anything a commit/trailer merely claims).
+ *     A non-numeric entry (e.g. a username) fails validateConfig() loudly
+ *     instead of being silently ignored.
  */
 
 "use strict";
@@ -78,10 +85,34 @@ const SIG_REPO = process.env.SIG_REPO;
 const SIG_PATH_RAW = process.env.SIG_PATH;
 const SIG_PATH = normalizeSigPath(SIG_PATH_RAW);
 const CLA_DOCUMENT_URL = process.env.CLA_DOCUMENT_URL;
-const ALLOWLIST = (process.env.ALLOWLIST || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+// The allowlist is a list of immutable numeric GitHub account ids (the same
+// identity the signature store is keyed on), separated by commas and/or any
+// whitespace (so a multi-line YAML value works). Logins are deliberately NOT
+// supported: a login can be renamed and later claimed by a different account,
+// which would then inherit the exemption.
+//
+// Anything that isn't a plain positive integer (a username, "id:5", "0",
+// "1e3", "012", a value beyond Number.MAX_SAFE_INTEGER) is collected in
+// `invalid` rather than dropped or coerced - validateConfig() fails the run on
+// it, because a silently ignored entry would demand a signature from the very
+// account the maintainer meant to exempt.
+const ALLOWLIST_ID_RE = /^[1-9][0-9]*$/;
+function parseAllowlist(raw) {
+  const ids = new Set();
+  const invalid = [];
+  for (const entry of String(raw || "")
+    .split(/[,\s]+/)
+    .filter(Boolean)) {
+    const id = Number(entry);
+    if (ALLOWLIST_ID_RE.test(entry) && Number.isSafeInteger(id)) {
+      ids.add(id);
+    } else {
+      invalid.push(entry);
+    }
+  }
+  return { ids, invalid };
+}
+const ALLOWLIST = parseAllowlist(process.env.ALLOWLIST);
 const SIGN_PHRASE = "I have read the CLA Document and I hereby sign the CLA";
 const STATUS_CONTEXT = "cla/fossasia";
 const BOT_MARKER = "<!-- fossasia-cla-bot:v1 -->";
@@ -569,6 +600,15 @@ function validateConfig() {
       `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing whitespace/control characters and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
     );
   }
+  // A bad entry would otherwise silently exempt nobody (and demand a
+  // signature from the very account the maintainer meant to allowlist), so
+  // fail loudly like every other bad input. JSON.stringify keeps control
+  // characters from injecting extra lines into the Actions log.
+  if (ALLOWLIST.invalid.length) {
+    fail(
+      `ALLOWLIST entries must be numeric GitHub account ids (usernames are not supported - they can be renamed and reclaimed by someone else); invalid: ${ALLOWLIST.invalid.map((e) => JSON.stringify(e)).join(", ")}. Look an id up with: gh api users/NAME --jq .id`,
+    );
+  }
   // App auth is optional (getSignaturesToken falls back to GITHUB_TOKEN when
   // either half is missing), but if a key WAS supplied, check its shape here
   // so a mis-pasted secret fails clearly instead of deep inside crypto.sign().
@@ -972,46 +1012,38 @@ async function writeSignatures(token, mutate, message, attempt = 1) {
   }
 }
 
-// `author` is normally a { id, login } pair. We match on the numeric id
-// where we can, since logins are mutable - a released login can be claimed
-// by someone else later, and matching on login alone could hand that
-// person an earlier signature that isn't theirs. A bare login string is
-// also accepted (legacy entries, or callers with no id) and falls back to a
-// login-only comparison.
+// `author` is a { id, login } pair. Matching is on the immutable numeric id
+// ONLY - logins are mutable, and a released login can be claimed by someone
+// else later, so a login comparison could hand that person an earlier
+// signature that isn't theirs. An author without a numeric id (a bare login
+// string, or a malformed shape) is never "signed", and neither is a stored
+// entry without a numeric id: both fail closed rather than degrade to login
+// matching. (handleIssueComment refuses to record an id-less signature in the
+// first place - see assertValidUserId().)
 //
-// Every real caller here passes a well-formed value, but this is also an
-// exported helper (used by tests), so the guards below make sure a
-// malformed shape fails closed ("not signed") instead of throwing.
+// This is also an exported helper (used by tests), so it tolerates garbage
+// entries - readSignatures() keeps malformed entries in place instead of
+// dropping them - and returns false instead of throwing.
 function isSigned(data, author) {
-  if (author == null) return false;
-  const login = typeof author === "string" ? author : author.login;
-  const id = typeof author === "string" ? undefined : author.id;
-  if (typeof login !== "string" || login.length === 0) return false;
-  const l = login.toLowerCase();
-  return data.signatures.some((s) => {
-    // readSignatures() keeps malformed entries around instead of dropping
-    // them (see there), so this has to tolerate a garbage `s` safely.
-    if (!s || typeof s !== "object") return false;
-    if (typeof id === "number" && typeof s.id === "number") {
-      return s.id === id;
-    }
-    // No id on one side (legacy entry, or a caller with only a login) -
-    // fall back to a login comparison instead of refusing to match at all.
-    return typeof s.login === "string" && s.login.toLowerCase() === l;
-  });
+  if (author == null || typeof author !== "object") return false;
+  const id = author.id;
+  if (typeof id !== "number") return false;
+  return data.signatures.some((s) => s && typeof s === "object" && s.id === id);
 }
 
-function isAllowlisted(login) {
-  if (typeof login !== "string" || login.length === 0) return false;
-  const l = login.toLowerCase();
-  return ALLOWLIST.some((a) => a.toLowerCase() === l);
+// `author` is the same { id, login } pair the rest of the code passes around.
+// Only the numeric id is consulted - the login is mutable and reusable. A
+// missing, non-numeric, fractional or otherwise malformed id (including a bare
+// login string) fails closed: not allowlisted.
+function isAllowlisted(author) {
+  if (author == null || typeof author !== "object") return false;
+  return typeof author.id === "number" && ALLOWLIST.ids.has(author.id);
 }
 
-// Same "prefer numeric id, fall back to a case-insensitive login compare"
-// matching rule as isSigned() above (kept as its own small function rather
-// than shared code, so a future change to either doesn't have to reason
-// about the other) - applied here to answer a different question: not
-// "has this identity signed anywhere", but "is this identity one of THIS
+// Same id-only identity rule as isSigned() above (kept as its own small
+// function rather than shared code, so a future change to either doesn't have
+// to reason about the other) - applied here to answer a different question:
+// not "has this identity signed anywhere", but "is this identity one of THIS
 // PR's own commit authors". Used by checkPR to tell a genuine required
 // signer apart from a bystander whose sign-phrase comment didn't actually
 // unblock this particular PR (see the `signerCompletedRequirement` check
@@ -1019,14 +1051,7 @@ function isAllowlisted(login) {
 // distinction matters).
 function isSameContributor(a, b) {
   if (!a || !b) return false;
-  if (typeof a.id === "number" && typeof b.id === "number") {
-    return a.id === b.id;
-  }
-  return (
-    typeof a.login === "string" &&
-    typeof b.login === "string" &&
-    a.login.toLowerCase() === b.login.toLowerCase()
-  );
+  return typeof a.id === "number" && typeof b.id === "number" && a.id === b.id;
 }
 
 // Combines a caller's already-known signature snapshot (e.g. the object
@@ -1083,7 +1108,7 @@ function mergeSignatures(known, fresh) {
 function signerCompletedRequirement(authors, signer) {
   return (
     !!signer &&
-    !isAllowlisted(signer.login) &&
+    !isAllowlisted(signer) &&
     authors.some((a) => isSameContributor(a, signer))
   );
 }
@@ -1674,7 +1699,7 @@ async function checkPR(
   ).data;
   const data = mergeSignatures(knownSignatures, freshData);
   const missing = authors.filter(
-    (a) => !isAllowlisted(a.login) && !isSigned(data, a),
+    (a) => !isAllowlisted(a) && !isSigned(data, a),
   );
 
   if (missing.length === 0 && unresolved.length === 0) {
@@ -1976,6 +2001,9 @@ if (require.main === module) {
 module.exports = {
   isSigned,
   isAllowlisted,
+  // Exported for tests only: the allowlist is parsed once at load, so tests
+  // exercise its grammar directly.
+  parseAllowlist,
   createAppJWT,
   // Exported for tests only, same reasoning as the others below: ghRaw()'s
   // own success-path body parsing (`text ? JSON.parse(text) : null`) is

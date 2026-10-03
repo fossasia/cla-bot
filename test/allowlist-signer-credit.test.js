@@ -35,7 +35,7 @@ process.env.SIG_OWNER = "fossasia";
 process.env.SIG_REPO = "cla-signatures";
 process.env.SIG_PATH = "signatures/cla.json";
 process.env.CLA_DOCUMENT_URL = "https://example.com/CLA.md";
-process.env.ALLOWLIST = "ci-bot[bot],renovate[bot]";
+process.env.ALLOWLIST = "555,777"; // ids: ci-bot[bot] is 555
 
 const { handleIssueComment } = require("../src/cla-bot.js");
 
