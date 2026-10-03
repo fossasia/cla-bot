@@ -9,37 +9,38 @@
  * from forks (where the pull_request-triggered coverage.yml only ever gets
  * a read-only token, by GitHub's own design - see the comments in both
  * workflow files). It never checks out or executes anything from the PR
- * itself: the only input is the coverage report artifact, which is just
- * JSON/Markdown text, not code.
+ * itself: the only input is the coverage report artifact, a single
+ * Markdown file, not code.
  *
- * TRUST BOUNDARY: the artifact (pr-comment.md / pr-comment-meta.json) was
- * built by coverage-report.js running in the *untrusted* coverage.yml job -
- * the same job that just executed the PR's own test files. That means
- * meta.prNumber cannot be trusted as-is: a malicious test could have
- * tampered with it (or with GITHUB_EVENT_PATH before coverage-report.js
- * read it) to point this privileged, pull-requests:write job at an
- * unrelated PR/issue. To close that off, we only ever use meta.prNumber as
- * a *candidate* to look up, then verify it against data GitHub itself
- * attaches to this trusted workflow_run event: we fetch that candidate PR
- * from the API and require its real head commit to equal
- * context.payload.workflow_run.head_sha (the SHA GitHub recorded as what
- * coverage.yml actually tested). An attacker can forge prNumber, but they
- * cannot forge another PR's real head SHA to match the commit under test,
- * so a forged/stale prNumber fails this check and the comment is skipped.
+ * TRUST BOUNDARY. The artifact was produced by a job that ran the PR's own
+ * (untrusted) test code, so NOTHING in it may decide where or whether this
+ * privileged job writes. Concretely:
  *
- * This same check also fixes a second, unrelated problem: a stale rerun.
- * If an older coverage.yml run's comment job happens to finish after a
- * newer one (out-of-order workflow_run jobs), its recorded head_sha will
- * no longer match the PR's current head (which has since moved to the
- * newer commit), so the stale run is skipped instead of overwriting the
- * sticky comment with outdated results. (coverage-comment.yml's
- * concurrency group additionally serializes runs from the same source
- * branch as a first line of defense - see the comments there - but this
- * SHA check is what actually guarantees correctness, since concurrency
- * only reduces overlap, it doesn't eliminate it.)
+ *  1. WHICH pull request gets the comment is derived only from the
+ *     `workflow_run` event payload, which GitHub itself fills in and PR
+ *     content cannot influence. The artifact carries no PR number at all
+ *     (a forged number would otherwise let a malicious PR make this job
+ *     comment on any other issue or PR - an IDOR).
+ *       - Same-repo PR: `workflow_run.pull_requests` has exactly one entry.
+ *       - Fork PR: GitHub leaves that list EMPTY, so the PR is looked up by
+ *         `<head owner>:<head branch>` and must match the tested commit.
+ *     Zero or several candidates means "can't tell which PR this is", and
+ *     the job skips commenting rather than guess.
+ *  2. WHETHER the report is still current is checked against the PR's live
+ *     head commit (fetched fresh from the API) versus
+ *     `workflow_run.head_sha`, the commit coverage.yml actually tested. If
+ *     a newer push has superseded it, this run is skipped, so a slow,
+ *     out-of-order job can't overwrite the sticky comment with outdated
+ *     results. (coverage-comment.yml's concurrency group only reduces such
+ *     overlap; this check is what makes it correct.)
+ *  3. The report TEXT is still the PR's own output shown back on its own
+ *     PR, so it is treated as untrusted content: it must be a small regular
+ *     file (not a symlink), @mentions are defused so a PR can't use the
+ *     bot to ping people or teams, and it is length-checked against
+ *     GitHub's comment limit.
  *
  * Expected to be invoked from actions/github-script as:
- *   const script = require(process.env.GITHUB_WORKSPACE + '/.github/scripts/post-coverage-comment.js');
+ *   const script = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/post-coverage-comment.js`);
  *   await script({ github, context, core });
  */
 
@@ -52,81 +53,171 @@ const path = require("path");
 // pending/success comments.
 const MARKER = "<!-- cla-bot:coverage-report -->";
 
+// Comments made with the workflow's GITHUB_TOKEN are authored by this
+// account. Matching the exact login (rather than just "is some bot")
+// means another bot - or a person quoting the marker - can never be picked
+// up as "our" comment and edited.
+const BOT_LOGIN = "github-actions[bot]";
+
+const REPORT_FILE = "pr-comment.md";
+
+// coverage-report.js already caps its output at ~60k characters, so a
+// legitimate report is far below this; anything bigger isn't ours.
+const MAX_REPORT_BYTES = 256 * 1024;
+
+// GitHub rejects comment bodies over 65536 characters.
+const MAX_COMMENT_LENGTH = 65000;
+
+// Inserts a zero-width space after every "@" that would start a mention
+// (@user, @org/team), which stops GitHub from resolving it into a
+// notification while leaving the text readable.
+function neutralizeMentions(text) {
+  return text.replace(/@(?=[A-Za-z0-9])/g, "@\u200b");
+}
+
+// Reads the report only if it is a plain, reasonably-sized file. lstat
+// (not stat) so a symlink is reported as a symlink instead of silently
+// followed to somewhere else on the runner.
+function readReport(reportPath, core) {
+  let stat;
+  try {
+    stat = fs.lstatSync(reportPath);
+  } catch {
+    core.warning(
+      `Coverage report artifact not found at ${reportPath} - the coverage job may have failed before it could generate one. Skipping comment.`,
+    );
+    return null;
+  }
+  if (!stat.isFile()) {
+    core.warning(
+      `${reportPath} is not a regular file - skipping comment instead of following it.`,
+    );
+    return null;
+  }
+  if (stat.size > MAX_REPORT_BYTES) {
+    core.warning(
+      `${reportPath} is ${stat.size} bytes, over the ${MAX_REPORT_BYTES}-byte limit for a coverage report - skipping comment.`,
+    );
+    return null;
+  }
+  return fs.readFileSync(reportPath, "utf8");
+}
+
+// Works out which PR this workflow_run is for, using ONLY data GitHub
+// attached to the event (see "TRUST BOUNDARY" above), and confirms that PR
+// is still open and still at the commit that was tested. Returns the live
+// pull request object, or null (after logging why) when the comment should
+// be skipped.
+async function resolveTrustedPullRequest({ github, context, core }) {
+  const run = context.payload.workflow_run;
+  const { owner, repo } = context.repo;
+  const linked = run.pull_requests || [];
+
+  let pr;
+  if (linked.length > 1) {
+    core.warning(
+      `The workflow_run event is linked to ${linked.length} pull requests - can't tell which one this report belongs to, so skipping comment.`,
+    );
+    return null;
+  }
+
+  if (linked.length === 1) {
+    try {
+      ({ data: pr } = await github.rest.pulls.get({
+        owner,
+        repo,
+        pull_number: linked[0].number,
+      }));
+    } catch (err) {
+      core.warning(
+        `Could not fetch PR #${linked[0].number} to verify the coverage report's target - skipping comment. (${err.message || err})`,
+      );
+      return null;
+    }
+  } else {
+    // GitHub leaves workflow_run.pull_requests empty when the PR's head
+    // branch lives in a fork, so look the PR up by "<fork owner>:<branch>".
+    const headOwner = run.head_repository?.owner?.login;
+    if (!headOwner || !run.head_branch) {
+      core.warning(
+        "The workflow_run event has no linked pull request and no head repository/branch to look one up by - skipping comment.",
+      );
+      return null;
+    }
+    const candidates = await github.paginate(github.rest.pulls.list, {
+      owner,
+      repo,
+      state: "open",
+      head: `${headOwner}:${run.head_branch}`,
+      per_page: 100,
+    });
+    const matches = candidates.filter((c) => c.head.sha === run.head_sha);
+    if (matches.length !== 1) {
+      core.warning(
+        `Expected exactly one open pull request at commit ${run.head_sha} on ${headOwner}:${run.head_branch}, found ${matches.length} - skipping comment.`,
+      );
+      return null;
+    }
+    pr = matches[0];
+  }
+
+  if (pr.state !== "open") {
+    core.info(`PR #${pr.number} is no longer open - skipping comment.`);
+    return null;
+  }
+  if (pr.head.sha !== run.head_sha) {
+    core.info(
+      `Coverage report is for commit ${run.head_sha}, but PR #${pr.number}'s current head is ${pr.head.sha} - a newer push has already superseded this run. Skipping comment.`,
+    );
+    return null;
+  }
+  return pr;
+}
+
 module.exports = async ({ github, context, core }) => {
-  const artifactDir = path.join(
+  const run = context.payload.workflow_run;
+  if (!run || !run.head_sha) {
+    core.warning(
+      "No workflow_run head SHA on the triggering event - cannot verify what was tested, skipping comment.",
+    );
+    return;
+  }
+
+  // Cheap local checks first, so a missing artifact never costs an API call.
+  const reportPath = path.join(
     process.env.GITHUB_WORKSPACE || ".",
     "coverage-artifact",
+    REPORT_FILE,
   );
-  const metaPath = path.join(artifactDir, "pr-comment-meta.json");
-  const bodyPath = path.join(artifactDir, "pr-comment.md");
+  const report = readReport(reportPath, core);
+  if (report === null) {
+    return;
+  }
 
-  if (!fs.existsSync(metaPath) || !fs.existsSync(bodyPath)) {
+  const commentBody = `${MARKER}\n${neutralizeMentions(report)}`;
+  if (commentBody.length > MAX_COMMENT_LENGTH) {
     core.warning(
-      `Coverage report artifact not found under ${artifactDir} - the coverage job may have failed before it could generate one. Skipping comment.`,
+      `Coverage report is ${commentBody.length} characters, over GitHub's comment limit - skipping comment.`,
     );
     return;
   }
 
-  const meta = JSON.parse(fs.readFileSync(metaPath, "utf8"));
-
-  // meta.prNumber is only a *candidate* - see the trust-boundary note at
-  // the top of this file. It gets verified below before it's used for
-  // anything.
-  const candidatePrNumber = meta.prNumber;
-  if (!Number.isInteger(candidatePrNumber) || candidatePrNumber <= 0) {
-    core.warning(
-      "No usable pull request number in the coverage report metadata - skipping comment.",
-    );
-    return;
-  }
-
-  // The one piece of this event GitHub itself guarantees is trustworthy:
-  // the exact commit coverage.yml actually ran against.
-  const trustedHeadSha =
-    context.payload.workflow_run && context.payload.workflow_run.head_sha;
-  if (!trustedHeadSha) {
-    core.warning(
-      "No head SHA on the triggering workflow_run event - skipping comment (cannot verify the report's target PR).",
-    );
+  const pr = await resolveTrustedPullRequest({ github, context, core });
+  if (!pr) {
     return;
   }
 
   const { owner, repo } = context.repo;
-
-  let pr;
-  try {
-    pr = await github.rest.pulls.get({
-      owner,
-      repo,
-      pull_number: candidatePrNumber,
-    });
-  } catch (err) {
-    core.warning(
-      `Could not fetch PR #${candidatePrNumber} to verify the coverage report's target - skipping comment. (${err.message || err})`,
-    );
-    return;
-  }
-
-  if (!pr.data || !pr.data.head || pr.data.head.sha !== trustedHeadSha) {
-    core.warning(
-      `Coverage report claims PR #${candidatePrNumber}, but that PR's current head (${
-        pr.data && pr.data.head && pr.data.head.sha
-      }) doesn't match the commit this workflow run actually tested (${trustedHeadSha}) - skipping comment. This is expected for a stale/superseded run, and is also what stops a forged report from targeting the wrong PR.`,
-    );
-    return;
-  }
-
-  const issue_number = candidatePrNumber;
-  const reportBody = fs.readFileSync(bodyPath, "utf8");
-  const commentBody = `${MARKER}\n${reportBody}`;
+  const issue_number = pr.number;
 
   const existing = await github.paginate(github.rest.issues.listComments, {
     owner,
     repo,
     issue_number,
+    per_page: 100,
   });
   const previous = existing.find(
-    (c) => c.user?.type === "Bot" && c.body?.includes(MARKER),
+    (c) => c.user?.login === BOT_LOGIN && c.body?.includes(MARKER),
   );
 
   if (previous) {
@@ -156,3 +247,11 @@ module.exports = async ({ github, context, core }) => {
   // two signals in one place avoids confusing PR authors with a second,
   // differently-named failing check for the same underlying reason.
 };
+
+module.exports.resolveTrustedPullRequest = resolveTrustedPullRequest;
+module.exports.neutralizeMentions = neutralizeMentions;
+module.exports.readReport = readReport;
+module.exports.MARKER = MARKER;
+module.exports.BOT_LOGIN = BOT_LOGIN;
+module.exports.MAX_REPORT_BYTES = MAX_REPORT_BYTES;
+module.exports.MAX_COMMENT_LENGTH = MAX_COMMENT_LENGTH;

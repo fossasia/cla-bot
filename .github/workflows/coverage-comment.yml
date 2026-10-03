@@ -5,10 +5,14 @@ name: Post Coverage Comment
 # triggered by a fork PR (GitHub's own security default) - not enough to
 # post a comment. This workflow instead triggers on `workflow_run` after
 # coverage.yml finishes, which runs in the base repo's context with real
-# permissions, and its only job is to read the report *artifact* (plain
-# JSON/Markdown, not code) that coverage.yml already built and post it.
+# permissions, and its only job is to read the report *artifact* (one
+# Markdown file, not code) that coverage.yml already built and post it.
 # This is the standard safe pattern for commenting from untrusted PRs -
 # see https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
+#
+# Which PR gets the comment, and whether the report is still current, are
+# decided from this event's own payload - never from the artifact. See the
+# TRUST BOUNDARY notes in .github/scripts/post-coverage-comment.js.
 #
 # Note for future maintainers: `workflow_run` always executes the version
 # of *this* workflow file that's on the default branch, regardless of what
@@ -17,7 +21,7 @@ on:
   # zizmor flags workflow_run as a dangerous trigger by default because it's
   # frequently misused to run privileged code against untrusted PR input.
   # This job never does that: it only ever checks out this repo's own
-  # default-branch content and reads a JSON/Markdown artifact as inert data
+  # default-branch scripts and reads one Markdown artifact as inert data
   # (see post-coverage-comment.js) - it never checks out, evals, or executes
   # anything from the triggering pull request. Verified safe per
   # https://docs.zizmor.sh/audits/#dangerous-triggers.
@@ -27,31 +31,29 @@ on:
 
 permissions: {}
 
-# Keyed by PR number (falling back to the run id for a non-PR workflow_run,
-# e.g. a future push trigger) rather than by this run's own id, so that an
-# older, slower comment job for the same PR is cancelled once a newer push
-# has already queued its own run - the primary defense against an
-# out-of-order write. post-coverage-comment.js's head-sha check (see that
-# file) is the backstop that makes this correct even if two runs still end
-# up racing despite cancellation (e.g. one was already mid-API-call when
-# cancelled).
+# Keyed by the head repo + branch rather than a PR number, because
+# workflow_run.pull_requests is EMPTY for fork PRs - keying on it would
+# leave every fork run in its own group and never cancel a superseded one.
+# post-coverage-comment.js's head-sha check is the backstop that makes
+# ordering correct even if two runs still race despite cancellation.
 concurrency:
-  group: coverage-comment-${{ github.event.workflow_run.pull_requests[0].number || github.event.workflow_run.id }}
+  group: coverage-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
   cancel-in-progress: true
 
 jobs:
   comment:
+    name: Post coverage comment
     # Only pull_request-triggered runs of coverage.yml produce a PR-shaped
     # report; a push-to-main run of the same workflow has no PR to comment
     # on. (coverage.yml is currently pull_request-only, so this is mostly
     # future-proofing if a push trigger is ever added.)
     if: github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
-      pull-requests: write
-      # Needed to download an artifact from a different workflow run via
-      # download-artifact's run-id input, even within the same repo.
-      actions: read
+      contents: read # to check out our own trusted script
+      pull-requests: write # to create/update the sticky coverage comment
+      actions: read # to download an artifact from a different workflow run
     steps:
       # Only used to fetch our own trusted comment-posting script - this
       # checks out whatever is on the default branch (workflow_run never
@@ -60,6 +62,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          sparse-checkout: .github/scripts
 
       - name: Download coverage report artifact
         id: download

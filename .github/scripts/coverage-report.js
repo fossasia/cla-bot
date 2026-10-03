@@ -9,23 +9,51 @@
  * keeping with the rest of this project - see package.json's description.
  *
  * Reads:  coverage/coverage-summary.json, coverage/coverage-final.json
- * Writes: coverage/pr-comment.md, coverage/pr-comment-meta.json
+ * Writes: coverage/pr-comment.md
  *
- * Run after `npm run coverage` (which is what actually enforces the
- * threshold and fails the job - this script never itself changes the
- * job's exit code, it only formats a report from whatever c8 produced).
+ * Run after `npm run test:coverage-nocheck` (or `npm run coverage`). This
+ * script never itself changes the job's exit code because of low coverage -
+ * it only formats a report from whatever c8 produced. The pass/fail gate is
+ * `npm run coverage:check`.
+ *
+ * TRUST NOTE: this runs inside coverage.yml, in the same job that just
+ * executed the PR's own test files (untrusted PR content), so everything it
+ * writes must be treated as untrusted by whoever consumes it. That is why
+ * it deliberately emits ONLY the Markdown body - no PR number, no commit
+ * SHA, no status flag. The privileged comment workflow
+ * (coverage-comment.yml / post-coverage-comment.js) works out the target
+ * PR and the commit under test from GitHub's own workflow_run event data,
+ * never from this job's output.
  */
 
 const fs = require("fs");
 const path = require("path");
 
-const COVERAGE_DIR = path.join(process.cwd(), "coverage");
-const SUMMARY_PATH = path.join(COVERAGE_DIR, "coverage-summary.json");
-const FINAL_PATH = path.join(COVERAGE_DIR, "coverage-final.json");
-const OUT_MD = path.join(COVERAGE_DIR, "pr-comment.md");
-const OUT_META = path.join(COVERAGE_DIR, "pr-comment-meta.json");
-
 const METRICS = ["lines", "statements", "functions", "branches"];
+
+// GitHub caps issue/PR comment bodies at 65536 characters. Leave headroom
+// for the truncation notice itself and for the sticky-comment marker the
+// posting step prepends.
+const MAX_COMMENT_LENGTH = 60000;
+
+// Caps how many lines of source snippet we inline per file, so a file with
+// hundreds of uncovered lines still produces a readable (and GitHub
+// comment-length-safe) report instead of dumping the whole file.
+const MAX_SNIPPET_LINES_PER_FILE = 25;
+
+// Resolved on every call (not once at require time) so the paths always
+// follow the *current* working directory - this is what makes main()
+// testable from a scratch directory, and it avoids a stale-path bug if a
+// caller chdir()s after requiring this module.
+function resolvePaths(cwd) {
+  const coverageDir = path.join(cwd, "coverage");
+  return {
+    coverageDir,
+    summaryPath: path.join(coverageDir, "coverage-summary.json"),
+    finalPath: path.join(coverageDir, "coverage-final.json"),
+    outMd: path.join(coverageDir, "pr-comment.md"),
+  };
+}
 
 function readJSON(filePath) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -64,8 +92,15 @@ function sourceSnippet(sourceLines, lineNumber) {
   return text === undefined ? null : text.trim();
 }
 
-function relativize(absolutePath) {
-  return path.relative(process.cwd(), absolutePath).split(path.sep).join("/");
+function relativize(absolutePath, cwd = process.cwd()) {
+  return path.relative(cwd, absolutePath).split(path.sep).join("/");
+}
+
+// A file only counts as fully covered when ALL FOUR metrics are 100%.
+// Checking just lines/branches/functions is a real bug: two statements on
+// one source line leave `lines` at 100% while `statements` is below it.
+function isFileFullyCovered(fileSummary) {
+  return METRICS.every((metric) => fileSummary[metric].pct === 100);
 }
 
 function analyzeFile(fileCoverage) {
@@ -116,11 +151,6 @@ function closeUnbalancedFence(text) {
   const isUnbalanced = (text.match(/^```/gm) || []).length % 2 === 1;
   return isUnbalanced ? `${text}\n\`\`\`` : text;
 }
-
-// Caps how many lines of source snippet we inline per file, so a file with
-// hundreds of uncovered lines still produces a readable (and GitHub
-// comment-length-safe) report instead of dumping the whole file.
-const MAX_SNIPPET_LINES_PER_FILE = 25;
 
 function formatFileSection(relPath, summary, detail, sourceLines) {
   const lines = [
@@ -198,19 +228,20 @@ function formatFileSection(relPath, summary, detail, sourceLines) {
   return lines.join("\n\n");
 }
 
-function main() {
-  if (!fs.existsSync(SUMMARY_PATH) || !fs.existsSync(FINAL_PATH)) {
-    console.error(
-      `Coverage reports not found under ${COVERAGE_DIR}. Run "npm run coverage" first (with --reporter=json-summary --reporter=json).`,
+function main({ cwd = process.cwd(), log = console.log } = {}) {
+  const { coverageDir, summaryPath, finalPath, outMd } = resolvePaths(cwd);
+
+  if (!fs.existsSync(summaryPath) || !fs.existsSync(finalPath)) {
+    throw new Error(
+      `Coverage reports not found under ${coverageDir}. Run "npm run coverage" first (the c8 config in .c8rc.json already emits the json-summary and json reporters this script reads).`,
     );
-    process.exit(1);
   }
 
-  const summary = readJSON(SUMMARY_PATH);
-  const final = readJSON(FINAL_PATH);
+  const summary = readJSON(summaryPath);
+  const final = readJSON(finalPath);
   const total = summary.total;
 
-  const isFullyCovered = METRICS.every((m) => total[m].pct === 100);
+  const isFullyCovered = isFileFullyCovered(total);
 
   const metricsLine = METRICS.map(
     (m) => `**${total[m].pct}%** ${m} (${total[m].covered}/${total[m].total})`,
@@ -234,14 +265,7 @@ function main() {
     const fileSections = [];
     for (const [absPath, fileSummary] of Object.entries(summary)) {
       if (absPath === "total") continue;
-      if (
-        fileSummary.lines.pct === 100 &&
-        fileSummary.statements.pct === 100 &&
-        fileSummary.branches.pct === 100 &&
-        fileSummary.functions.pct === 100
-      ) {
-        continue;
-      }
+      if (isFileFullyCovered(fileSummary)) continue;
       const fileCoverage = final[absPath];
       if (!fileCoverage) continue;
       const detail = analyzeFile(fileCoverage);
@@ -250,7 +274,7 @@ function main() {
         : [];
       fileSections.push(
         formatFileSection(
-          relativize(absPath),
+          relativize(absPath, cwd),
           fileSummary,
           detail,
           sourceLines,
@@ -258,9 +282,16 @@ function main() {
       );
     }
 
-    bodyParts.push(fileSections.join("\n\n---\n\n"));
+    // The totals say "below 100%" but no individual file could be broken
+    // down (e.g. coverage-final.json has no entry for it). Say so instead
+    // of leaving the contributor with a header and nothing under it.
     bodyParts.push(
-      "Add or extend tests under `test/` so every line above is executed and every branch is taken both ways, then push again - this comment will update automatically.",
+      fileSections.length > 0
+        ? fileSections.join("\n\n---\n\n")
+        : "_No per-file breakdown was available in the coverage data._",
+    );
+    bodyParts.push(
+      "Add or extend tests under `test/` so every line above is executed and every branch is taken both ways, then push again - this comment will update automatically. Run `npm run coverage` locally for the full breakdown.",
     );
   }
 
@@ -270,71 +301,43 @@ function main() {
 
   let markdown = bodyParts.join("\n\n");
 
-  // GitHub caps issue/PR comment bodies at 65536 characters. Leave headroom
-  // for the truncation notice itself and for the sticky-comment marker the
-  // posting step prepends.
-  const MAX_COMMENT_LENGTH = 60000;
   if (markdown.length > MAX_COMMENT_LENGTH) {
+    // .slice() counts UTF-16 code units, so the cut can land between the two
+    // halves of an astral character (e.g. an emoji in a source snippet).
+    // Drop a dangling high surrogate rather than emit a malformed string.
+    const cut = markdown
+      .slice(0, MAX_COMMENT_LENGTH)
+      .replace(/[\uD800-\uDBFF]$/, "");
     markdown =
-      closeUnbalancedFence(markdown.slice(0, MAX_COMMENT_LENGTH)) +
+      closeUnbalancedFence(cut) +
       "\n\n---\n**⚠️ Report truncated** - too many files/lines to list here. Run `npm run coverage` locally for the full breakdown.";
   }
 
-  fs.writeFileSync(OUT_MD, markdown, "utf8");
+  fs.writeFileSync(outMd, markdown, "utf8");
+  log(markdown);
 
-  // NOTE ON TRUST: this whole script runs inside coverage.yml, in the same
-  // job that just executed the PR's own test files (untrusted PR content).
-  // A malicious test could have tampered with GITHUB_EVENT_PATH - or with
-  // anything else in this process - before this line runs. So prNumber
-  // below (and this entire metadata file) MUST be treated as an untrusted
-  // hint only. The privileged workflow (coverage-comment.yml /
-  // post-coverage-comment.js) re-derives and verifies the real target PR
-  // itself from trusted workflow_run data before ever posting anything -
-  // it does not take this value as authoritative.
-  const eventPath = process.env.GITHUB_EVENT_PATH;
-  let prNumber = null;
-  if (eventPath && fs.existsSync(eventPath)) {
-    const event = readJSON(eventPath);
-    prNumber = (event.pull_request && event.pull_request.number) || null;
-  }
-
-  fs.writeFileSync(
-    OUT_META,
-    JSON.stringify(
-      {
-        prNumber,
-        status: isFullyCovered ? "pass" : "fail",
-        pct: {
-          lines: total.lines.pct,
-          statements: total.statements.pct,
-          functions: total.functions.pct,
-          branches: total.branches.pct,
-        },
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
-
-  console.log(markdown);
-  if (!prNumber) {
-    console.warn(
-      "No pull_request number found in the event payload - the comment step will skip posting.",
-    );
-  }
+  return { isFullyCovered, markdown };
 }
 
 if (require.main === module) {
-  main();
+  try {
+    main();
+  } catch (err) {
+    console.error(err.message);
+    process.exitCode = 1;
+  }
 }
 
 module.exports = {
   main,
   analyzeFile,
+  isFileFullyCovered,
   toRanges,
   formatFileSection,
   relativize,
+  resolvePaths,
   sourceSnippet,
   closeUnbalancedFence,
+  MAX_COMMENT_LENGTH,
+  MAX_SNIPPET_LINES_PER_FILE,
 };

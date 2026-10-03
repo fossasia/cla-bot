@@ -80,6 +80,7 @@ signatures repo, secrets, and rolling this out to every repo - see
 
 ```bash
 npm test                       # runs all the tests, no network needed
+npm run coverage               # same, but fails below 100% line/statement/function/branch coverage
 node --check src/cla-bot.js    # quick syntax check
 ```
 

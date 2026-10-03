@@ -12,7 +12,7 @@ FOSSASIA's projects.
    compromised" risk this project exists to avoid. If you think one is
    genuinely justified, open an issue first. (CI tooling is a different
    bar: `.github/workflows/ci.yml` installs `js-yaml` purely to validate
-   `action.yml`'s structure - it never ships with the action, so it doesn't
+   `action.yml`'s structure, and `c8` measures test coverage - neither ships with the action, so it doesn't
    count against this rule.)
 2. **Every change to `src/cla-bot.js` needs a matching test.** Pick the
    right layer: `test/logic.test.js` for pure functions (no network),
@@ -29,7 +29,11 @@ FOSSASIA's projects.
    Run `npm run coverage` locally before pushing - it fails the same way CI
    does if anything is untested, and `npm run coverage:report` turns that
    into the same human-readable breakdown (missing lines, never-called
-   functions, untested branches) that gets posted as a PR comment.
+   functions, untested branches) that gets posted as a PR comment. The 100%
+   gate covers the shipped action (`src/`); the CI helper scripts in
+   `.github/scripts/` have their own tests (`test/coverage-report.test.js`,
+   `test/post-coverage-comment.test.js`) - update those too if you change
+   them.
 4. **Don't weaken any of the security properties** listed at the top of
    `src/cla-bot.js` or in `SECURITY.md` (impersonation guard, exact-match
    allowlist, short-lived tokens, etc.) without discussing it in an issue

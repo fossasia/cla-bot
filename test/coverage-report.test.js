@@ -1,35 +1,21 @@
 "use strict";
 /**
- * Offline unit + integration tests for .github/scripts/coverage-report.js.
- * No network calls. Run: node test/coverage-report.test.js (or `npm test`)
+ * Offline tests for .github/scripts/coverage-report.js - the script that
+ * turns c8's output into the "Test Coverage" PR comment. No network.
+ * Run: node test/coverage-report.test.js (also part of `npm test`).
  *
- * This script isn't part of the shipped action (`src/cla-bot.js`), so it's
- * intentionally out of scope for the project's 100%-coverage gate (see
- * .c8rc.json's `include`, and CONTRIBUTING.md's dependency rule for the
- * same src/ vs. CI-tooling split) - but it's still part of the new
- * security-sensitive comment-posting mechanism, so it gets its own
- * targeted tests here, run as part of the regular `npm test` suite.
+ * The script isn't part of the shipped action (src/cla-bot.js), so it is
+ * deliberately outside the 100%-coverage gate (.c8rc.json only includes
+ * src/**), but it sits inside the CI gate itself - if it silently
+ * misreported, contributors would be told the wrong thing - so it is tested
+ * thoroughly anyway, including against genuine c8 output.
  */
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 
-let passed = 0;
-function test(name, fn) {
-  try {
-    fn();
-    console.log(`PASS: ${name}`);
-    passed += 1;
-  } catch (e) {
-    console.error(`FAIL: ${name}\n - ${e.message}`);
-    process.exitCode = 1;
-  }
-}
-
-// coverage-report.js resolves its input/output paths from process.cwd() at
-// require time, so each scenario below gets its own scratch directory and
-// its own fresh require (via a cleared require-cache entry) pointed at it.
 const SCRIPT_PATH = path.join(
   __dirname,
   "..",
@@ -37,141 +23,236 @@ const SCRIPT_PATH = path.join(
   "scripts",
   "coverage-report.js",
 );
+const report = require(SCRIPT_PATH);
+const {
+  main,
+  toRanges,
+  sourceSnippet,
+  relativize,
+  resolvePaths,
+  isFileFullyCovered,
+  analyzeFile,
+  formatFileSection,
+  closeUnbalancedFence,
+  MAX_COMMENT_LENGTH,
+  MAX_SNIPPET_LINES_PER_FILE,
+} = report;
 
-function loadInScratchDir(dir) {
-  const prevCwd = process.cwd();
+// Cases are collected and run one at a time at the bottom of the file:
+// several of them chdir() or spawn processes, so letting them interleave
+// would make them flaky.
+const cases = [];
+function test(name, fn) {
+  cases.push({ name, fn });
+}
+
+function mkTmpDir() {
+  return fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-coverage-report-"));
+}
+
+async function withTmpDir(fn) {
+  const dir = mkTmpDir();
+  try {
+    return await fn(dir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function withCwd(dir, fn) {
+  const previous = process.cwd();
   process.chdir(dir);
-  delete require.cache[require.resolve(SCRIPT_PATH)];
-  const mod = require(SCRIPT_PATH);
-  process.chdir(prevCwd);
-  return mod;
+  try {
+    return fn();
+  } finally {
+    process.chdir(previous);
+  }
 }
 
-function makeScratchDir() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "coverage-report-test-"));
-  fs.mkdirSync(path.join(dir, "coverage"));
-  return dir;
-}
+// main() prints the report for the CI log; keep test output readable.
+const quiet = () => {};
 
-function writeCoverageFixture(dir, { summary, final }) {
+const pct = (value, covered, total) => ({ pct: value, covered, total });
+const fullEntry = () => ({
+  lines: pct(100, 10, 10),
+  statements: pct(100, 10, 10),
+  functions: pct(100, 2, 2),
+  branches: pct(100, 4, 4),
+});
+
+function writeCoverage(dir, summary, final) {
+  fs.mkdirSync(path.join(dir, "coverage"), { recursive: true });
   fs.writeFileSync(
     path.join(dir, "coverage", "coverage-summary.json"),
     JSON.stringify(summary),
-    "utf8",
   );
   fs.writeFileSync(
     path.join(dir, "coverage", "coverage-final.json"),
     JSON.stringify(final),
-    "utf8",
   );
 }
 
-function pctEntry(pct, covered, total) {
-  return { pct, covered, total };
-}
-
-function fullyCoveredEntry() {
+// A one-statement, no-branch, no-function istanbul file entry whose single
+// statement (on `line`) was never executed.
+function uncoveredStatementFile(line) {
   return {
-    lines: pctEntry(100, 10, 10),
-    statements: pctEntry(100, 10, 10),
-    functions: pctEntry(100, 2, 2),
-    branches: pctEntry(100, 4, 4),
+    statementMap: { 0: { start: { line } } },
+    s: { 0: 0 },
+    fnMap: {},
+    f: {},
+    branchMap: {},
+    b: {},
   };
 }
 
-// --- toRanges --------------------------------------------------------------
+const readReportMd = (dir) =>
+  fs.readFileSync(path.join(dir, "coverage", "pr-comment.md"), "utf8");
 
-const { toRanges, analyzeFile, formatFileSection, relativize, sourceSnippet } =
-  loadInScratchDir(makeScratchDir());
+// --- toRanges ---------------------------------------------------------------
 
 test("toRanges collapses consecutive line numbers into a single range", () => {
-  assert.deepStrictEqual(toRanges([1, 2, 3]), ["1-3"]);
+  assert.deepStrictEqual(toRanges([10, 11, 12]), ["10-12"]);
 });
 
-test("toRanges keeps non-consecutive line numbers as separate entries", () => {
-  assert.deepStrictEqual(toRanges([1, 5, 6, 20]), ["1", "5-6", "20"]);
+test("toRanges keeps non-consecutive lines as separate entries", () => {
+  assert.deepStrictEqual(toRanges([5, 8, 9, 20]), ["5", "8-9", "20"]);
 });
 
-test("toRanges de-duplicates and sorts out-of-order input", () => {
-  assert.deepStrictEqual(toRanges([5, 3, 3, 4]), ["3-5"]);
+test("toRanges de-duplicates and sorts unsorted, repeated input", () => {
+  assert.deepStrictEqual(toRanges([3, 1, 2, 2, 1]), ["1-3"]);
 });
 
 test("toRanges returns an empty array for no lines", () => {
   assert.deepStrictEqual(toRanges([]), []);
 });
 
-// --- sourceSnippet / relativize ---------------------------------------------
+// --- sourceSnippet / relativize / resolvePaths ---------------------------------
 
-test("sourceSnippet returns the trimmed source line for a valid line number", () => {
-  assert.strictEqual(sourceSnippet(["  const x = 1;  "], 1), "const x = 1;");
+test("sourceSnippet returns the trimmed text of the requested (1-indexed) line", () => {
+  const lines = ["const a = 1;", "  if (a) {", "    return a;", "  }"];
+  assert.strictEqual(sourceSnippet(lines, 2), "if (a) {");
 });
 
-test("sourceSnippet returns null for a line number past the end of the file", () => {
-  assert.strictEqual(sourceSnippet(["one line"], 5), null);
+test("sourceSnippet returns null for a line number outside the file", () => {
+  assert.strictEqual(sourceSnippet(["only one line"], 5), null);
+  assert.strictEqual(sourceSnippet(["only one line"], 0), null);
 });
 
-test("relativize converts an absolute path to a forward-slash relative path", () => {
-  const abs = path.join(process.cwd(), "src", "cla-bot.js");
-  assert.strictEqual(relativize(abs), "src/cla-bot.js");
+test("relativize converts an absolute path to a forward-slash path relative to the given cwd", () => {
+  const cwd = path.join(path.sep, "work", "repo");
+  assert.strictEqual(
+    relativize(path.join(cwd, "src", "cla-bot.js"), cwd),
+    "src/cla-bot.js",
+  );
 });
 
-// --- analyzeFile -------------------------------------------------------------
+test("relativize defaults to the current working directory", () => {
+  assert.strictEqual(
+    relativize(path.join(process.cwd(), "src", "cla-bot.js")),
+    "src/cla-bot.js",
+  );
+});
 
-test("analyzeFile reports uncovered statement lines, functions and branch paths", () => {
-  const fileCoverage = {
-    statementMap: {
-      0: { start: { line: 5 } },
-      1: { start: { line: 6 } },
-    },
-    s: { 0: 0, 1: 3 },
+test("resolvePaths follows the directory it is given, not wherever the module was first loaded", () => {
+  const resolved = resolvePaths(path.join(path.sep, "somewhere"));
+  assert.strictEqual(
+    resolved.summaryPath,
+    path.join(path.sep, "somewhere", "coverage", "coverage-summary.json"),
+  );
+  assert.strictEqual(
+    resolved.outMd,
+    path.join(path.sep, "somewhere", "coverage", "pr-comment.md"),
+  );
+});
+
+// --- isFileFullyCovered ---------------------------------------------------------
+// The exact bug a reviewer flagged: a file can be 100% on lines, branches
+// and functions while a *statement* is still uncovered (two statements on
+// one line), so all four metrics have to be checked.
+
+test("isFileFullyCovered is true only when all four metrics are 100%", () => {
+  assert.strictEqual(isFileFullyCovered(fullEntry()), true);
+});
+
+for (const metric of ["lines", "statements", "functions", "branches"]) {
+  test(`isFileFullyCovered is false when only ${metric} is below 100%`, () => {
+    const entry = fullEntry();
+    entry[metric] = pct(99.5, 199, 200);
+    assert.strictEqual(isFileFullyCovered(entry), false);
+  });
+}
+
+test("isFileFullyCovered treats a non-numeric pct (c8's 'Unknown') as not covered", () => {
+  const entry = fullEntry();
+  entry.branches = { pct: "Unknown", covered: 0, total: 0 };
+  assert.strictEqual(isFileFullyCovered(entry), false);
+});
+
+// --- analyzeFile ----------------------------------------------------------------
+
+test("analyzeFile extracts uncovered statement lines, uncovered functions and per-line untaken-branch counts", () => {
+  const detail = analyzeFile({
+    statementMap: { 0: { start: { line: 1 } }, 1: { start: { line: 2 } } },
+    s: { 0: 1, 1: 0 },
     fnMap: {
-      0: { name: "doThing", decl: { start: { line: 10 } } },
-      1: { name: "(anonymous_0)", decl: { start: { line: 20 } } },
+      0: { name: "used", decl: { start: { line: 1 } } },
+      1: { name: "unused", decl: { start: { line: 5 } } },
+      2: { name: "(anonymous_0)", decl: { start: { line: 6 } } },
+      3: { decl: { start: { line: 7 } } },
     },
-    f: { 0: 0, 1: 0 },
+    f: { 0: 3, 1: 0, 2: 0, 3: 0 },
     branchMap: {
-      0: {
-        loc: { start: { line: 30 } },
-        locations: [{ start: { line: 30 } }, { start: { line: 31 } }],
-      },
+      0: { locations: [{ start: { line: 7 } }] },
+      1: { locations: [{ start: { line: 7 } }] },
+      2: { locations: [{ start: { line: 9 } }] },
     },
-    b: { 0: [1, 0] },
-  };
+    b: { 0: [0], 1: [0], 2: [1] },
+  });
 
-  const detail = analyzeFile(fileCoverage);
-
-  assert.deepStrictEqual(detail.uncoveredStatementLines, [5]);
+  assert.deepStrictEqual(detail.uncoveredStatementLines, [2]);
   assert.deepStrictEqual(detail.uncoveredFunctions, [
-    { name: "doThing", line: 10 },
-    { name: "(anonymous function)", line: 20 },
+    { name: "unused", line: 5 },
+    { name: "(anonymous function)", line: 6 },
+    { name: "(anonymous function)", line: 7 },
   ]);
-  assert.strictEqual(detail.branchLineCounts.get(31), 1);
-  assert.strictEqual(detail.branchLineCounts.has(30), false);
+  assert.strictEqual(detail.branchLineCounts.get(7), 2);
+  assert.strictEqual(detail.branchLineCounts.has(9), false);
+});
+
+test("analyzeFile falls back to the branch's own loc when it has no per-path locations", () => {
+  const detail = analyzeFile({
+    statementMap: {},
+    s: {},
+    fnMap: {},
+    f: {},
+    branchMap: { 0: { loc: { start: { line: 12 } }, locations: [] } },
+    b: { 0: [0] },
+  });
+  assert.strictEqual(detail.branchLineCounts.get(12), 1);
 });
 
 test("analyzeFile reports no findings for a fully-covered file", () => {
-  const fileCoverage = {
+  const detail = analyzeFile({
     statementMap: { 0: { start: { line: 1 } } },
     s: { 0: 1 },
     fnMap: {},
     f: {},
     branchMap: {},
     b: {},
-  };
-  const detail = analyzeFile(fileCoverage);
+  });
   assert.deepStrictEqual(detail.uncoveredStatementLines, []);
   assert.deepStrictEqual(detail.uncoveredFunctions, []);
   assert.strictEqual(detail.branchLineCounts.size, 0);
 });
 
-// --- formatFileSection -------------------------------------------------------
+// --- formatFileSection ----------------------------------------------------------
 
-test("formatFileSection includes statement coverage in the header (regression: a file at 100% lines/branches/functions but not statements must still be visible)", () => {
+test("formatFileSection surfaces statements in the header and lists missing lines with source snippets", () => {
   const summary = {
-    lines: pctEntry(100, 10, 10),
-    statements: pctEntry(90, 9, 10),
-    functions: pctEntry(100, 2, 2),
-    branches: pctEntry(100, 4, 4),
+    lines: pct(100, 10, 10),
+    statements: pct(90, 9, 10),
+    functions: pct(100, 2, 2),
+    branches: pct(100, 4, 4),
   };
   const detail = {
     uncoveredStatementLines: [7],
@@ -187,34 +268,115 @@ test("formatFileSection includes statement coverage in the header (regression: a
     "",
     "const unused = 1;",
   ]);
+  assert.match(section, /### `src\/example\.js`/);
   assert.match(section, /90% statements/);
   assert.match(section, /Missing line coverage:\*\* 7/);
   assert.match(section, /```js\n7: const unused = 1;\n```/);
 });
 
-test("formatFileSection lists uncovered functions and branch paths", () => {
+test("formatFileSection lists never-called functions (sorted by line) and untested branch lines", () => {
   const summary = {
-    lines: pctEntry(80, 8, 10),
-    statements: pctEntry(80, 8, 10),
-    functions: pctEntry(50, 1, 2),
-    branches: pctEntry(50, 1, 2),
+    lines: pct(80, 8, 10),
+    statements: pct(80, 8, 10),
+    functions: pct(50, 1, 2),
+    branches: pct(50, 1, 2),
   };
   const detail = {
     uncoveredStatementLines: [],
-    uncoveredFunctions: [{ name: "helper", line: 3 }],
-    branchLineCounts: new Map([[9, 2]]),
+    uncoveredFunctions: [
+      { name: "later", line: 30 },
+      { name: "helper", line: 3 },
+    ],
+    branchLineCounts: new Map([
+      [9, 2],
+      [5, 1],
+    ]),
   };
-  const section = formatFileSection("src/example.js", summary, detail, []);
-  assert.match(section, /Never called by any test:\*\* `helper` \(line 3\)/);
+  const section = formatFileSection("src/example.js", summary, detail, [
+    "a",
+    "b",
+    "c",
+    "d",
+    "if (x) {}",
+  ]);
   assert.match(
     section,
-    /Branches with an untested path:\*\* line 9 \(2 paths\)/,
+    /Never called by any test:\*\* `helper` \(line 3\), `later` \(line 30\)/,
   );
+  assert.match(
+    section,
+    /Branches with an untested path:\*\* line 5 \(1 path\), line 9 \(2 paths\)/,
+  );
+  assert.match(section, /5: if \(x\) \{\}  \/\/ 1 path through this line/);
+  // Line 9 is beyond the 5-line source: still listed, with an empty snippet.
+  assert.match(section, /9:   \/\/ 2 paths through this line/);
 });
 
-// --- closeUnbalancedFence ------------------------------------------------
+test("formatFileSection caps the inlined snippets and says how many were left out (singular and plural)", () => {
+  const total = MAX_SNIPPET_LINES_PER_FILE + 2;
+  const lines = Array.from({ length: total }, (_, i) => `line${i + 1}();`);
+  const allLines = lines.map((_, i) => i + 1);
+  const summary = {
+    lines: pct(10, 1, 10),
+    statements: pct(10, 1, 10),
+    functions: pct(100, 1, 1),
+    branches: pct(10, 1, 10),
+  };
 
-const { closeUnbalancedFence } = loadInScratchDir(makeScratchDir());
+  const plural = formatFileSection(
+    "src/big.js",
+    summary,
+    {
+      uncoveredStatementLines: allLines,
+      uncoveredFunctions: [],
+      branchLineCounts: new Map(allLines.map((n) => [n, 1])),
+    },
+    lines,
+  );
+  assert.match(plural, /\.\.\. \(2 more uncovered lines\)/);
+  assert.match(plural, /\.\.\. \(2 more lines with an untested branch\)/);
+  assert.ok(!plural.includes(`${total}: line${total}();`));
+
+  const singular = formatFileSection(
+    "src/big.js",
+    summary,
+    {
+      uncoveredStatementLines: allLines.slice(
+        0,
+        MAX_SNIPPET_LINES_PER_FILE + 1,
+      ),
+      uncoveredFunctions: [],
+      branchLineCounts: new Map(
+        allLines.slice(0, MAX_SNIPPET_LINES_PER_FILE + 1).map((n) => [n, 1]),
+      ),
+    },
+    lines,
+  );
+  assert.match(singular, /\.\.\. \(1 more uncovered line\)/);
+  assert.match(singular, /\.\.\. \(1 more line with an untested branch\)/);
+});
+
+test("formatFileSection omits the snippet block when none of the missing lines exist in the source", () => {
+  const section = formatFileSection(
+    "src/gone.js",
+    {
+      lines: pct(0, 0, 1),
+      statements: pct(0, 0, 1),
+      functions: pct(100, 0, 0),
+      branches: pct(100, 0, 0),
+    },
+    {
+      uncoveredStatementLines: [3],
+      uncoveredFunctions: [],
+      branchLineCounts: new Map(),
+    },
+    [],
+  );
+  assert.match(section, /Missing line coverage:\*\* 3/);
+  assert.ok(!section.includes("```"));
+});
+
+// --- closeUnbalancedFence -------------------------------------------------------
 
 test("closeUnbalancedFence leaves already-balanced text untouched", () => {
   const text = "before\n```js\ncode\n```\nafter";
@@ -225,134 +387,318 @@ test("closeUnbalancedFence closes a fence left open by a hard truncation cut", (
   const text = "before\n```js\nsome code that got cut off mid-block";
   const result = closeUnbalancedFence(text);
   assert.strictEqual(result, `${text}\n\`\`\``);
-  // The result must have a balanced (even) number of fence markers.
   assert.strictEqual((result.match(/^```/gm) || []).length % 2, 0);
 });
 
 test("closeUnbalancedFence handles text with no fences at all", () => {
-  assert.strictEqual(
-    closeUnbalancedFence("just plain text"),
-    "just plain text",
-  );
+  assert.strictEqual(closeUnbalancedFence("plain text"), "plain text");
 });
 
-// --- main() integration ------------------------------------------------------
+// --- main() ---------------------------------------------------------------------
 
-test("main() reports 100% pass status and writes matching metadata when everything is covered", () => {
-  const dir = makeScratchDir();
-  writeCoverageFixture(dir, {
-    summary: {
-      total: fullyCoveredEntry(),
-      [path.join(dir, "src", "a.js")]: fullyCoveredEntry(),
-    },
-    final: {},
+test("main() writes a passing report - and ONLY the Markdown file (no PR number / SHA / metadata)", async () => {
+  await withTmpDir((dir) => {
+    writeCoverage(
+      dir,
+      { total: fullEntry(), [path.join(dir, "src", "a.js")]: fullEntry() },
+      {},
+    );
+    const result = main({ cwd: dir, log: quiet });
+
+    assert.strictEqual(result.isFullyCovered, true);
+    const md = readReportMd(dir);
+    assert.match(md, /✅ Test coverage: 100%/);
+    assert.match(md, /\*\*100%\*\* lines \(10\/10\)/);
+    assert.strictEqual(md, result.markdown);
+    assert.deepStrictEqual(fs.readdirSync(path.join(dir, "coverage")).sort(), [
+      "coverage-final.json",
+      "coverage-summary.json",
+      "pr-comment.md",
+    ]);
   });
-  process.env.GITHUB_EVENT_PATH = "";
-  const { main } = loadInScratchDir(dir);
-  const prevCwd = process.cwd();
-  process.chdir(dir);
-  try {
-    main();
-  } finally {
-    process.chdir(prevCwd);
-  }
-
-  const md = fs.readFileSync(
-    path.join(dir, "coverage", "pr-comment.md"),
-    "utf8",
-  );
-  const meta = JSON.parse(
-    fs.readFileSync(path.join(dir, "coverage", "pr-comment-meta.json"), "utf8"),
-  );
-
-  assert.match(md, /✅ Test coverage: 100%/);
-  assert.strictEqual(meta.status, "pass");
-  assert.strictEqual(meta.pct.statements, 100);
 });
 
-test("main() lists a file whose statement coverage alone is below 100% (regression for the per-file statements-pct bug)", () => {
-  const dir = makeScratchDir();
-  const filePath = path.join(dir, "src", "partial.js");
-  const summaryEntry = {
-    lines: pctEntry(100, 5, 5),
-    statements: pctEntry(80, 4, 5),
-    functions: pctEntry(100, 1, 1),
-    branches: pctEntry(100, 0, 0),
-  };
-  writeCoverageFixture(dir, {
-    summary: {
-      total: {
-        lines: pctEntry(100, 5, 5),
-        statements: pctEntry(80, 4, 5),
-        functions: pctEntry(100, 1, 1),
-        branches: pctEntry(100, 0, 0),
+test("main() defaults to the current working directory", async () => {
+  await withTmpDir((dir) => {
+    writeCoverage(dir, { total: fullEntry() }, {});
+    withCwd(dir, () => main({ log: quiet }));
+    assert.match(readReportMd(dir), /✅ Test coverage: 100%/);
+  });
+});
+
+test("main() lists a file whose statement coverage alone is below 100% (regression: per-file statements bug)", async () => {
+  await withTmpDir((dir) => {
+    const file = path.join(dir, "src", "partial.js");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "const a = 1;\nconst b = 2; const c = 3;\n");
+    const entry = {
+      lines: pct(100, 5, 5),
+      statements: pct(80, 4, 5),
+      functions: pct(100, 1, 1),
+      branches: pct(100, 0, 0),
+    };
+    writeCoverage(
+      dir,
+      { total: entry, [file]: entry },
+      { [file]: uncoveredStatementFile(2) },
+    );
+
+    const result = main({ cwd: dir, log: quiet });
+
+    assert.strictEqual(result.isFullyCovered, false);
+    const md = readReportMd(dir);
+    assert.match(md, /❌ Test coverage is below the required 100%/);
+    assert.match(md, /src\/partial\.js/);
+    assert.match(md, /80% statements/);
+    assert.match(md, /2: const b = 2; const c = 3;/);
+  });
+});
+
+test("main() skips fully-covered files and files with no detailed data, and still lists the rest", async () => {
+  await withTmpDir((dir) => {
+    const covered = path.join(dir, "src", "covered.js");
+    const noDetail = path.join(dir, "src", "no-detail.js");
+    const partial = path.join(dir, "src", "partial.js");
+    const partialEntry = {
+      lines: pct(50, 1, 2),
+      statements: pct(50, 1, 2),
+      functions: pct(100, 0, 0),
+      branches: pct(100, 0, 0),
+    };
+    writeCoverage(
+      dir,
+      {
+        total: partialEntry,
+        [covered]: fullEntry(),
+        [noDetail]: partialEntry,
+        [partial]: partialEntry,
       },
-      [filePath]: summaryEntry,
-    },
-    final: {
-      [filePath]: {
-        statementMap: { 0: { start: { line: 2 } } },
-        s: { 0: 0 },
-        fnMap: {},
-        f: {},
-        branchMap: {},
-        b: {},
+      // No entry for no-detail.js; partial.js's source isn't on disk.
+      {
+        [covered]: uncoveredStatementFile(1),
+        [partial]: uncoveredStatementFile(2),
       },
-    },
-  });
-  process.env.GITHUB_EVENT_PATH = "";
-  const { main } = loadInScratchDir(dir);
-  const prevCwd = process.cwd();
-  process.chdir(dir);
-  try {
-    main();
-  } finally {
-    process.chdir(prevCwd);
-  }
+    );
 
-  const md = fs.readFileSync(
-    path.join(dir, "coverage", "pr-comment.md"),
-    "utf8",
-  );
-  assert.match(md, /❌ Test coverage is below the required 100%/);
-  // Before the fix, a file at 100% lines/branches/functions but <100%
-  // statements was silently skipped from the file-by-file breakdown.
-  assert.match(md, /src\/partial\.js/);
-  assert.match(md, /80% statements/);
+    main({ cwd: dir, log: quiet });
+
+    const md = readReportMd(dir);
+    assert.match(md, /### `src\/partial\.js`/);
+    assert.ok(!md.includes("covered.js"));
+    assert.ok(!md.includes("no-detail.js"));
+  });
 });
 
-test("main() records the event's pull_request number in metadata as an (untrusted) hint, and writes no comment/posting decision itself", () => {
-  const dir = makeScratchDir();
-  writeCoverageFixture(dir, {
-    summary: { total: fullyCoveredEntry() },
-    final: {},
+test("main() says so when coverage is below 100% but there is no per-file breakdown to show", async () => {
+  await withTmpDir((dir) => {
+    const entry = {
+      lines: pct(50, 1, 2),
+      statements: pct(50, 1, 2),
+      functions: pct(100, 0, 0),
+      branches: pct(100, 0, 0),
+    };
+    writeCoverage(dir, { total: entry }, {});
+    main({ cwd: dir, log: quiet });
+    const md = readReportMd(dir);
+    assert.match(md, /❌ Test coverage is below the required 100%/);
+    assert.match(md, /No per-file breakdown was available/);
   });
-  const eventPath = path.join(dir, "event.json");
-  fs.writeFileSync(
-    eventPath,
-    JSON.stringify({ pull_request: { number: 42 } }),
-    "utf8",
-  );
-  process.env.GITHUB_EVENT_PATH = eventPath;
-  const { main } = loadInScratchDir(dir);
-  const prevCwd = process.cwd();
-  process.chdir(dir);
-  try {
-    main();
-  } finally {
-    process.chdir(prevCwd);
-    delete process.env.GITHUB_EVENT_PATH;
-  }
-
-  const meta = JSON.parse(
-    fs.readFileSync(path.join(dir, "coverage", "pr-comment-meta.json"), "utf8"),
-  );
-  assert.strictEqual(meta.prNumber, 42);
 });
 
-console.log(`\n${passed} test(s) passed.`);
-if (process.exitCode) {
-  console.error("\nSOME TESTS FAILED.");
-} else {
-  console.log("ALL TESTS PASSED.");
+test("main() truncates an over-long report and closes any code fence the cut landed inside", async () => {
+  await withTmpDir((dir) => {
+    // One file whose inlined snippet block alone dwarfs the limit, so the
+    // cut provably lands inside that block's ```js fence.
+    const file = path.join(dir, "src", "huge.js");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const hugeLine = `call(${"x".repeat(5000)});`;
+    fs.writeFileSync(file, Array(30).fill(hugeLine).join("\n"));
+    const statementMap = {};
+    const s = {};
+    for (let i = 0; i < 30; i += 1) {
+      statementMap[i] = { start: { line: i + 1 } };
+      s[i] = 0;
+    }
+    const entry = {
+      lines: pct(0, 0, 30),
+      statements: pct(0, 0, 30),
+      functions: pct(100, 0, 0),
+      branches: pct(100, 0, 0),
+    };
+    writeCoverage(
+      dir,
+      { total: entry, [file]: entry },
+      { [file]: { statementMap, s, fnMap: {}, f: {}, branchMap: {}, b: {} } },
+    );
+
+    main({ cwd: dir, log: quiet });
+
+    const md = readReportMd(dir);
+    assert.match(md, /Report truncated/);
+    assert.strictEqual((md.match(/^```/gm) || []).length % 2, 0);
+    assert.ok(md.length < MAX_COMMENT_LENGTH + 500);
+  });
+});
+
+test("main() never cuts an astral character (e.g. an emoji in a source line) in half when truncating", async () => {
+  const lone =
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
+  // The cut lands on a high surrogate for exactly one of two fillers that
+  // differ by one code unit; run both so the guard is exercised regardless
+  // of how long the (changeable) report header happens to be.
+  for (const filler of ["", "x"]) {
+    await withTmpDir((dir) => {
+      const file = path.join(dir, "src", "emoji.js");
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const line = `${filler}${"😀".repeat(30000)}`;
+      fs.writeFileSync(file, `${line}\n`);
+      const entry = {
+        lines: pct(0, 0, 1),
+        statements: pct(0, 0, 1),
+        functions: pct(100, 0, 0),
+        branches: pct(100, 0, 0),
+      };
+      writeCoverage(
+        dir,
+        { total: entry, [file]: entry },
+        { [file]: uncoveredStatementFile(1) },
+      );
+      const result = main({ cwd: dir, log: quiet });
+      assert.match(result.markdown, /Report truncated/);
+      // Checked in memory AND on disk: writing a lone surrogate as UTF-8
+      // silently turns it into U+FFFD, so the file alone would hide it.
+      assert.ok(
+        !lone.test(result.markdown),
+        "report must not contain a dangling surrogate",
+      );
+      assert.ok(!readReportMd(dir).includes("\uFFFD"));
+    });
+  }
+});
+
+test("main() throws a clear error when the coverage reports are missing", async () => {
+  await withTmpDir((dir) => {
+    assert.throws(
+      () => main({ cwd: dir, log: quiet }),
+      /Coverage reports not found under .*coverage/,
+    );
+  });
+});
+
+// --- CLI entrypoint -----------------------------------------------------------------
+
+test("the CLI exits 0 and writes the report when coverage data exists", async () => {
+  await withTmpDir((dir) => {
+    writeCoverage(dir, { total: fullEntry() }, {});
+    const result = spawnSync(process.execPath, [SCRIPT_PATH], {
+      cwd: dir,
+      encoding: "utf8",
+    });
+    assert.strictEqual(result.status, 0, result.stderr);
+    assert.match(result.stdout, /✅ Test coverage: 100%/);
+    assert.match(readReportMd(dir), /✅ Test coverage: 100%/);
+  });
+});
+
+test("the CLI prints the problem and exits 1 (instead of a stack trace) when coverage data is missing", async () => {
+  await withTmpDir((dir) => {
+    const result = spawnSync(process.execPath, [SCRIPT_PATH], {
+      cwd: dir,
+      encoding: "utf8",
+    });
+    assert.strictEqual(result.status, 1);
+    assert.match(result.stderr, /Coverage reports not found/);
+    assert.ok(!result.stderr.includes("    at "), "no stack trace");
+  });
+});
+
+// --- against genuine c8 output ---------------------------------------------------------
+// Hand-written fixtures can drift from what c8 really emits (c8 gets major
+// version bumps from Dependabot). This runs the real c8 on a tiny project
+// with a known gap and checks the report pinpoints exactly that gap.
+
+test("the report pinpoints the real gaps in genuine c8 output (uncovered function, lines and branch)", async () => {
+  await withTmpDir((dir) => {
+    fs.mkdirSync(path.join(dir, "src"));
+    fs.mkdirSync(path.join(dir, "test"));
+    fs.writeFileSync(
+      path.join(dir, "src", "lib.js"),
+      [
+        '"use strict";',
+        "function used(x) {",
+        "  if (x > 0) {",
+        '    return "pos";',
+        "  }",
+        '  return "neg";',
+        "}",
+        "function neverCalled() {",
+        "  return 42;",
+        "}",
+        "module.exports = { used, neverCalled };",
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      path.join(dir, "test", "t.js"),
+      'require("../src/lib.js").used(1);\n',
+    );
+
+    // The real c8, with the outer run's coverage collection switched off so
+    // this inner run's data isn't mixed into it.
+    const env = { ...process.env };
+    delete env.NODE_V8_COVERAGE;
+    const c8 = spawnSync(
+      process.execPath,
+      [
+        require.resolve("c8/bin/c8.js"),
+        // Explicit, absolute output locations inside the scratch dir: the
+        // inner run must never share (and with c8's default `clean`, wipe)
+        // the outer run's coverage data.
+        `--reports-dir=${path.join(dir, "coverage")}`,
+        `--temp-directory=${path.join(dir, "coverage", "tmp")}`,
+        "--reporter=json-summary",
+        "--reporter=json",
+        "--all",
+        "--include=src/**/*.js",
+        "--check-coverage=false",
+        process.execPath,
+        "test/t.js",
+      ],
+      { cwd: dir, env, encoding: "utf8" },
+    );
+    assert.strictEqual(c8.status, 0, c8.stderr);
+
+    const result = main({ cwd: dir, log: quiet });
+
+    assert.strictEqual(result.isFullyCovered, false);
+    const md = readReportMd(dir);
+    assert.match(md, /### `src\/lib\.js`/);
+    assert.match(md, /Never called by any test:\*\* `neverCalled` \(line 8\)/);
+    assert.match(md, /Missing line coverage:\*\* 6, 8-10/);
+    assert.match(md, /Branches with an untested path:\*\* line 6 \(1 path\)/);
+  });
+});
+
+// --- runner -----------------------------------------------------------------------------
+
+async function runAll() {
+  let passed = 0;
+  for (const { name, fn } of cases) {
+    try {
+      await fn();
+      console.log(`PASS: ${name}`);
+      passed += 1;
+    } catch (e) {
+      console.error(`FAIL: ${name}\n - ${e.stack}`);
+      process.exitCode = 1;
+    }
+  }
+  console.log(`\n${passed}/${cases.length} test(s) passed.`);
+  if (process.exitCode) {
+    console.error("SOME TESTS FAILED.");
+  } else {
+    console.log("ALL TESTS PASSED.");
+  }
 }
+
+runAll();
