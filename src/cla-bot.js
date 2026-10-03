@@ -7,7 +7,9 @@
  *
  * ── Security properties (read before changing anything below) ───────────
  * 1. Writes to the signatures repo use a short-lived GitHub App token,
- *    minted fresh each run. No long-lived PAT is ever stored.
+ *    minted on demand and never persisted. It is re-minted before it
+ *    expires (and once more on a 401), so a long run can't outlive it. No
+ *    long-lived PAT is ever stored. See getSignaturesToken().
  * 2. Everything else (comments, statuses) uses the job's own `GITHUB_TOKEN`,
  *    which has no access to the signatures repo - a leaked token can't
  *    reach it.
@@ -684,18 +686,76 @@ function createAppJWT(appId, privateKeyPem) {
   return `${unsigned}.${base64url(signer.sign(privateKeyPem))}`;
 }
 
-let _cachedSigToken = null; // one per run, no need to mint more than once
-async function getSignaturesToken() {
-  if (_cachedSigToken) return _cachedSigToken;
+// ---------------------------------------------------------------------------
+// Signatures-repo token lifecycle.
+//
+// A GitHub App installation token lives ~1 hour; the access_tokens response
+// carries the authoritative `expires_at`. In the normal case a run takes
+// seconds, so one mint per run is plenty - but the sign-phrase flow mints
+// FIRST (to write the signature) and only reads the store again at the very
+// end of checkPR(), after listPRCommitAuthors() has paged through every
+// commit and resolved every co-author trailer. On a huge PR, a slow or
+// rate-limited API, or a long-lived self-hosted runner, that gap can outlast
+// the token, and the final read would fail with a 401 AFTER the signature
+// was already persisted - leaving the PR's status/comment stale. So:
+//
+//  1. The cache remembers when the token expires and re-mints once it is
+//     within SIG_TOKEN_REFRESH_SKEW_MS of that (proactive refresh).
+//  2. withSignaturesToken() additionally recovers from a 401 on a
+//     signatures-repo request - a token revoked early, or a runner clock
+//     that disagrees with GitHub's - by minting a fresh token and retrying
+//     exactly once (reactive refresh).
+//  3. Concurrent callers share one in-flight mint instead of each minting.
+// ---------------------------------------------------------------------------
+// GitHub documents installation tokens as valid for one hour. Also the
+// ceiling for any `expires_at` we are told about: we never trust a token to
+// outlive the documented lifetime, whatever the response claims.
+const SIG_TOKEN_LIFETIME_MS = 60 * 60 * 1000;
+// Refresh this long BEFORE the real expiry, so a token is never handed out
+// that dies mid-request, and so modest clock drift between this runner and
+// GitHub is absorbed.
+const SIG_TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
-  if (!SIG_APP_ID || !SIG_APP_PRIVATE_KEY) {
+let _sigTokenCache = null; // { token, expiresAtMs, viaApp } | null
+let _sigTokenMint = null; // in-flight mint promise, shared by concurrent callers
+
+function usesAppAuth() {
+  return Boolean(SIG_APP_ID && SIG_APP_PRIVATE_KEY);
+}
+
+// When should a freshly minted token be considered dead? Uses the response's
+// `expires_at` when it is a parseable date, never later than the documented
+// 1-hour lifetime counted from when the mint REQUEST started (the
+// conservative end - the token was necessarily created after that). A
+// missing/unparseable `expires_at` falls back to that same ceiling: caching
+// NaN here would make every later freshness check false and silently
+// re-mint on every single call.
+function resolveSigTokenExpiry(expiresAt, mintStartedAtMs) {
+  const ceiling = mintStartedAtMs + SIG_TOKEN_LIFETIME_MS;
+  if (typeof expiresAt !== "string") return ceiling;
+  const parsed = Date.parse(expiresAt);
+  if (!Number.isFinite(parsed)) return ceiling;
+  return Math.min(parsed, ceiling);
+}
+
+function isSigTokenFresh(entry) {
+  return (
+    entry !== null && Date.now() < entry.expiresAtMs - SIG_TOKEN_REFRESH_SKEW_MS
+  );
+}
+
+async function mintSignaturesToken() {
+  if (!usesAppAuth()) {
     console.warn(
       "::warning::SIG_APP_ID/SIG_APP_PRIVATE_KEY not set - falling back to GITHUB_TOKEN. Cross-repo writes will only work if the signatures repo equals the current repo.",
     );
-    _cachedSigToken = GITHUB_TOKEN;
-    return _cachedSigToken;
+    // The job's own GITHUB_TOKEN is not ours to refresh - it lives for the
+    // whole job, so this entry never goes stale.
+    return { token: GITHUB_TOKEN, expiresAtMs: Infinity, viaApp: false };
   }
 
+  // Taken BEFORE any request, see resolveSigTokenExpiry().
+  const mintStartedAtMs = Date.now();
   const jwt = createAppJWT(SIG_APP_ID, SIG_APP_PRIVATE_KEY);
   // Repo-scoped lookup, not /orgs/{org}/installation - the org endpoint
   // 404s when signatures-owner is a user account rather than an org, and
@@ -723,7 +783,7 @@ async function getSignaturesToken() {
   // or unexpected body (e.g. a proxy/gateway that mangles the response, an
   // empty 200 body which ghRaw() turns into `null`, or a future GitHub API
   // change) must fail loudly right here, not silently flow through as
-  // `_cachedSigToken = undefined/null` and only surface later as a
+  // a cached `undefined`/`null` token and only surface later as a
   // confusing "Bad credentials" 401 on some unrelated request that happens
   // to use it. `tokenResp?.token` (rather than `tokenResp.token`) matters:
   // ghRaw() returns a bare `null` (not `{}`) for a 200 response with an
@@ -742,8 +802,69 @@ async function getSignaturesToken() {
       `GitHub App access_tokens response for /app/installations/${installation.id}/access_tokens is missing a usable "token" field (got ${typeof tokenResp?.token}) - cannot mint a signatures-repo token.`,
     );
   }
-  _cachedSigToken = tokenResp.token.trim(); // valid ~1 hour
-  return _cachedSigToken;
+  return {
+    token: tokenResp.token.trim(),
+    expiresAtMs: resolveSigTokenExpiry(tokenResp.expires_at, mintStartedAtMs),
+    viaApp: true,
+  };
+}
+
+async function getSignaturesToken() {
+  if (isSigTokenFresh(_sigTokenCache)) return _sigTokenCache.token;
+  // A mint is already running - join it instead of minting a second token.
+  if (_sigTokenMint) return _sigTokenMint;
+
+  const mint = mintSignaturesToken()
+    .then((entry) => {
+      _sigTokenCache = entry;
+      return entry.token;
+    })
+    .finally(() => {
+      // Cleared on success AND failure, so a failed mint never poisons later
+      // calls (they simply try again). Only clear our own promise.
+      if (_sigTokenMint === mint) _sigTokenMint = null;
+    });
+  _sigTokenMint = mint;
+  return mint;
+}
+
+// Forget `rejectedToken`, but only if it is still the cached one - if
+// something else already refreshed the cache, that newer token must survive.
+function invalidateSignaturesToken(rejectedToken) {
+  if (
+    _sigTokenCache &&
+    _sigTokenCache.viaApp &&
+    _sigTokenCache.token === rejectedToken
+  ) {
+    _sigTokenCache = null;
+  }
+}
+
+// Runs `fn(token)` with a signatures-repo token and, if GitHub answers 401
+// (token expired/revoked early, or clock skew defeated the proactive check),
+// mints a fresh one and runs `fn` once more. At most ONE retry, so bad
+// credentials can never loop. Only for App-minted tokens: the GITHUB_TOKEN
+// fallback cannot be re-minted, so its 401 is surfaced as-is. Failures while
+// minting happen outside `fn` and propagate untouched.
+//
+// Re-running `fn` is safe because a 401 means the request was rejected
+// before it could do anything, and every `fn` used here (a read, or
+// writeSignatures with its idempotent check-and-append mutate) tolerates
+// being re-run - the 409 retry loop already relies on exactly that.
+async function withSignaturesToken(fn) {
+  const token = await getSignaturesToken();
+  try {
+    return await fn(token);
+  } catch (e) {
+    if (!e || e.status !== 401 || !usesAppAuth()) throw e;
+    console.warn(
+      "::warning::The signatures-repo installation token was rejected (HTTP 401) - minting a fresh one and retrying once.",
+    );
+    invalidateSignaturesToken(token);
+    const freshToken = await getSignaturesToken();
+    if (freshToken === token) throw e; // nothing new to try
+    return await fn(freshToken);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,7 +1294,7 @@ async function listPRCommitAuthors(prNumber) {
   return { authors: [...authors.values()], unresolved: [...unresolvedShas] };
 }
 
-let _cachedBotLogin = null; // one per run, same idea as _cachedSigToken
+let _cachedBotLogin = null; // one per run, same idea as _sigTokenCache (minus expiry - an identity never goes stale)
 async function resolveBotLogin() {
   if (_cachedBotLogin) return _cachedBotLogin;
   try {
@@ -1548,7 +1669,9 @@ async function checkPR(
   // mergeSignatures() and this function's doc comment above for why a
   // caller's own known-fresh write still isn't a substitute for this GET.
   const { authors, unresolved } = await listPRCommitAuthors(prNumber);
-  const freshData = (await readSignatures(await getSignaturesToken())).data;
+  const freshData = (
+    await withSignaturesToken((sigToken) => readSignatures(sigToken))
+  ).data;
   const data = mergeSignatures(knownSignatures, freshData);
   const missing = authors.filter(
     (a) => !isAllowlisted(a.login) && !isSigned(data, a),
@@ -1702,7 +1825,6 @@ async function handleIssueComment(payload) {
       payload.comment.user.id,
       "issue_comment payload comment.user.id",
     );
-    const sigToken = await getSignaturesToken();
     const commenterIdentity = { id: commenterId, login: commenter };
 
     // The check-and-append happens inside one mutate() call working on data
@@ -1711,28 +1833,30 @@ async function handleIssueComment(payload) {
     // the 409 retry loop re-running this closure) - each attempt checks the
     // just-fetched state, not a stale snapshot.
     let alreadySigned = false;
-    const writtenSignatures = await writeSignatures(
-      sigToken,
-      (data) => {
-        if (isSigned(data, commenterIdentity)) {
-          alreadySigned = true;
-          return null; // tells writeSignatures: no write needed
-        }
-        return {
-          ...data,
-          signatures: [
-            ...data.signatures,
-            {
-              id: commenterId,
-              login: commenter,
-              pr: `${REPO_OWNER}/${REPO_NAME}#${prNumber}`,
-              commentUrl: payload.comment.html_url,
-              signedAt: new Date().toISOString(),
-            },
-          ],
-        };
-      },
-      `${commenter} signed the CLA`,
+    const writtenSignatures = await withSignaturesToken((sigToken) =>
+      writeSignatures(
+        sigToken,
+        (data) => {
+          if (isSigned(data, commenterIdentity)) {
+            alreadySigned = true;
+            return null; // tells writeSignatures: no write needed
+          }
+          return {
+            ...data,
+            signatures: [
+              ...data.signatures,
+              {
+                id: commenterId,
+                login: commenter,
+                pr: `${REPO_OWNER}/${REPO_NAME}#${prNumber}`,
+                commentUrl: payload.comment.html_url,
+                signedAt: new Date().toISOString(),
+              },
+            ],
+          };
+        },
+        `${commenter} signed the CLA`,
+      ),
     );
 
     if (alreadySigned) {
@@ -1868,6 +1992,13 @@ module.exports = {
   handlePullRequestTarget,
   checkPR,
   getSignaturesToken,
+  // Exported for tests only: the token lifecycle's tunables and its two
+  // pure/near-pure helpers, so tests assert against the real constants
+  // instead of re-typing 60/5 minutes and drifting out of sync.
+  withSignaturesToken,
+  resolveSigTokenExpiry,
+  SIG_TOKEN_LIFETIME_MS,
+  SIG_TOKEN_REFRESH_SKEW_MS,
   postComment,
   validateConfig,
   lockPR,
