@@ -21,7 +21,8 @@ FOSSASIA's projects.
    `SIG_REPO` become request URLs (validation + encoding), `test/integration.test.js` for changes to event
    orchestration (`handleIssueComment`, `checkPR`), and
    `test/bot-identity*.test.js` for anything about how the bot resolves its
-   own identity. Run `npm test` before opening a PR - CI runs it too, on
+   own identity, and `test/token-expiry.test.js` for anything about the
+   signatures-repo token's lifetime (caching, refresh, 401 recovery). Run `npm test` before opening a PR - CI runs it too, on
    Node 22 and 24.
 3. **Don't weaken any of the security properties** listed at the top of
    `src/cla-bot.js` or in `SECURITY.md` (impersonation guard, exact-match
