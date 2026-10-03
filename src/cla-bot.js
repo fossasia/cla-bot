@@ -255,6 +255,33 @@ function assertValidInstallationId(value, context) {
   return value;
 }
 
+// A GitHub account id (user.id in every webhook/REST user object) is always a
+// positive integer. Same trust boundary and same bar as the two validators
+// above, but with a different consequence for getting it wrong: this value
+// is PERSISTED into the signature store, and isSigned() only matches on id
+// when both sides are numbers (typeof === "number"). An entry written with
+// a missing/null/string/zero/negative/fractional id is therefore not
+// rejected anywhere later - it just silently degrades, forever, to the
+// login-only comparison that the id-keying exists to avoid (a released
+// login claimed by a different person would inherit the old signature; see
+// security property 7 at the top of this file). JSON.stringify makes the
+// missing case invisible, too: `{ id: undefined }` simply drops the key, so
+// the stored entry looks like a perfectly ordinary legacy record.
+//
+// Fail loudly BEFORE anything is written instead - exactly what the
+// existing comment.user.login guard does for the login. Real GitHub
+// payloads never trip this (user.id is a required integer in GitHub's own
+// schema, for bots and the "ghost" placeholder user alike), so it only ever
+// fires on a corrupted event file or a non-GitHub caller.
+function assertValidUserId(value, context) {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(
+      `${context}: expected a positive integer GitHub user id, got ${JSON.stringify(value)} (${typeof value}) - refusing to record a signature that could only be matched by login.`,
+    );
+  }
+  return value;
+}
+
 // Real git commit SHAs are lowercase hex (40 chars for sha1, 64 for
 // sha256), but test/tooling code sometimes uses opaque placeholder strings
 // in their place, so this deliberately doesn't require hex - it only
@@ -1642,13 +1669,18 @@ async function handleIssueComment(payload) {
   if (
     !payload.comment ||
     !payload.comment.user ||
-    typeof payload.comment.user.login !== "string"
+    typeof payload.comment.user.login !== "string" ||
+    payload.comment.user.login.length === 0
   ) {
     // A real issue_comment webhook always carries comment.user. Getting
     // here means a malformed event file or an unexpected caller - fail
-    // loudly instead of a raw TypeError.
+    // loudly instead of a raw TypeError. An EMPTY login is rejected too,
+    // not just a non-string one: isSigned() refuses to match an empty
+    // login (it returns false before it ever compares ids), so signing as
+    // "" would append a brand-new, never-matchable entry on every single
+    // attempt instead of being idempotent.
     throw new Error(
-      "issue_comment payload is missing comment.user.login - malformed or unexpected webhook delivery.",
+      "issue_comment payload is missing comment.user.login (or it is empty) - malformed or unexpected webhook delivery.",
     );
   }
   const prNumber = assertValidPRNumber(
@@ -1659,11 +1691,18 @@ async function handleIssueComment(payload) {
   const commenter = payload.comment.user.login;
 
   if (body.toLowerCase() === SIGN_PHRASE.toLowerCase()) {
-    const sigToken = await getSignaturesToken();
     // The webhook already carries the commenter's numeric id - recording
     // that, not just the login, is what lets the signature survive a later
-    // username change (see isSigned).
-    const commenterId = payload.comment.user.id;
+    // username change (see isSigned). Validated here, before any network
+    // call (including minting the signatures token) and only on this
+    // branch - `recheck` never reads the id, so a malformed id must not
+    // start failing a command that doesn't depend on it. See
+    // assertValidUserId() for why a bad id must never reach the store.
+    const commenterId = assertValidUserId(
+      payload.comment.user.id,
+      "issue_comment payload comment.user.id",
+    );
+    const sigToken = await getSignaturesToken();
     const commenterIdentity = { id: commenterId, login: commenter };
 
     // The check-and-append happens inside one mutate() call working on data
@@ -1847,6 +1886,7 @@ module.exports = {
   // caught indirectly through the webhook-handler integration tests.
   assertValidPRNumber,
   assertValidInstallationId,
+  assertValidUserId,
   assertValidSha,
   // Exported for tests only, same reasoning: classifyBotComment() is the
   // exact piece that tells a genuine block apart from unrelated bot
