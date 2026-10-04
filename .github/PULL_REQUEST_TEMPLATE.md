@@ -6,6 +6,8 @@
 
 <!-- Why is this change needed? Link to any related issue if applicable -->
 
+---
+
 ## Type of change
 
 - [ ] Bug fix (non-breaking change that fixes an issue)
@@ -19,7 +21,11 @@
 - [ ] The change is covered by the existing test suite (or new tests were added)
 - [ ] I have run `npm test` locally and all tests pass
 
+---
+
 ### Behavioural / Breaking changes
+
+> **If this is not a behavioural or breaking change, just write `N/A` below.**
 
 If this PR changes existing behaviour (even if it is an improvement):
 
@@ -30,4 +36,4 @@ If this PR changes existing behaviour (even if it is an improvement):
 
 **Link to examine new behaviour:** 
 
-<!-- Example: https://github.com/your-username/cla-bot/pull/123 -->
+<!-- Example: https://github.com/your-username/cla-bot/pull/123  OR  just write N/A -->
