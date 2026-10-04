@@ -28,6 +28,8 @@ const {
   isSupersededBy,
   runOrder,
   commitFooter,
+  unavailableReport,
+  UNAVAILABLE_MARKER,
   MARKER,
   BOT_LOGIN,
   MAX_REPORT_BYTES,
@@ -172,8 +174,7 @@ function samePrContext(overrides = {}) {
     repo: repoCtx,
     payload: {
       workflow_run: {
-        id: 1,
-        run_number: 5,
+        id: 5,
         run_attempt: 1,
         created_at: RUN_CREATED,
         head_sha: SHA,
@@ -222,6 +223,10 @@ function run(workspace, { github, context, core }) {
 const ourComment = (id, body) => ({ id, user: { login: BOT_LOGIN }, body });
 const tagged = (number, attempt, rest = "report") =>
   `${MARKER}\n<!-- cla-bot:coverage-run ${number}.${attempt} -->\n${rest}`;
+
+// A comment exactly as the script writes it: marker, run tag, FULL-SHA tag.
+const taggedAt = (sha, rest = "report", number = 5, attempt = 1) =>
+  `${MARKER}\n<!-- cla-bot:coverage-run ${number}.${attempt} -->\n<!-- cla-bot:coverage-sha ${sha} -->\n${rest}`;
 
 // --- sanitizeReport ---------------------------------------------------------------
 
@@ -305,12 +310,12 @@ test("readReport refuses a file over the size limit", async () => {
 
 // --- runOrder / isSupersededBy / commitFooter ----------------------------------------------
 
-test("runOrder reads the trusted run number and attempt, defaulting the attempt to 1", () => {
-  assert.deepStrictEqual(runOrder({ run_number: 5, run_attempt: 2 }), {
+test("runOrder reads the trusted run ID and attempt, defaulting the attempt to 1", () => {
+  assert.deepStrictEqual(runOrder({ id: 5, run_attempt: 2 }), {
     number: 5,
     attempt: 2,
   });
-  assert.deepStrictEqual(runOrder({ run_number: "7" }), {
+  assert.deepStrictEqual(runOrder({ id: "7" }), {
     number: 7,
     attempt: 1,
   });
@@ -319,13 +324,13 @@ test("runOrder reads the trusted run number and attempt, defaulting the attempt 
 test("runOrder returns null for missing or unusable values (so no tag and no ordering guard)", () => {
   for (const bad of [
     {},
-    { run_number: 0 },
-    { run_number: -3 },
-    { run_number: 1.5 },
-    { run_number: "abc" },
-    { run_number: 5, run_attempt: 0 },
-    { run_number: 5, run_attempt: "x" },
-    { run_number: 2 ** 60 },
+    { id: 0 },
+    { id: -3 },
+    { id: 1.5 },
+    { id: "abc" },
+    { id: 5, run_attempt: 0 },
+    { id: 5, run_attempt: "x" },
+    { id: 2 ** 60 },
   ]) {
     assert.strictEqual(runOrder(bad), null, JSON.stringify(bad));
   }
@@ -681,7 +686,7 @@ test("updates our existing sticky comment instead of posting a second one", asyn
     assert.strictEqual(calls.updateComment[0].comment_id, 555);
     assert.strictEqual(
       calls.updateComment[0].body,
-      `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\nfresh report\n\n<sub>Measured at commit \`deadbee\`.</sub>`,
+      `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n<!-- cla-bot:coverage-sha deadbeefdeadbeefdeadbeefdeadbeefdeadbeef -->\nfresh report\n\n<sub>Measured at commit \`deadbee\`.</sub>`,
     );
     assert.match(
       logs.info.join("\n"),
@@ -850,7 +855,7 @@ test("a rerun (attempt 2) of the same run replaces the first attempt's comment",
   });
 });
 
-test("without a usable run number the comment is still posted, just untagged and unguarded", async () => {
+test("without a usable run ID the comment is still posted, just untagged and unguarded", async () => {
   await withTmpDir(async (dir) => {
     writeArtifact(dir, "report");
     const { github, calls } = makeGithub({
@@ -859,13 +864,55 @@ test("without a usable run number the comment is still posted, just untagged and
     });
     await run(dir, {
       github,
-      context: samePrContext({ run_number: undefined }),
+      context: samePrContext({ id: undefined }),
       core: makeCore().core,
     });
     assert.strictEqual(calls.updateComment.length, 1);
-    assert.ok(calls.updateComment[0].body.startsWith(`${MARKER}\nreport`));
+    assert.ok(
+      calls.updateComment[0].body.startsWith(
+        `${MARKER}\n<!-- cla-bot:coverage-sha deadbeefdeadbeefdeadbeefdeadbeefdeadbeef -->\nreport`,
+      ),
+    );
     assert.ok(!calls.updateComment[0].body.includes("coverage-run"));
   });
+});
+
+test("a leftover tag from the OLD 'Test Coverage' workflow (run number 23) can't outrank a new CI run ID", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report");
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(55, tagged(23, 1, "old workflow report"))],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ id: 25000000000 }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.match(calls.updateComment[0].body, /coverage-run 25000000000\.1/);
+  });
+});
+
+test("coverage-comment.yml runs the post step even when the artifact download failed (so a missing report is reported, not ignored)", () => {
+  const workflow = yaml.load(
+    fs.readFileSync(
+      path.join(
+        __dirname,
+        "..",
+        ".github",
+        "workflows",
+        "coverage-comment.yml",
+      ),
+      "utf8",
+    ),
+  );
+  const steps = workflow.jobs.comment.steps;
+  const post = steps.find((st) => /github-script/.test(st.uses || ""));
+  assert.ok(post, "the github-script step must exist");
+  assert.strictEqual(post.if, undefined, "must not be gated on the download");
+  const download = steps.find((st) => /download-artifact/.test(st.uses || ""));
+  assert.strictEqual(download["continue-on-error"], true);
 });
 
 test("coverage-comment.yml serialises comment jobs per branch (never cancel-in-progress) so two jobs can't interleave read-then-write", () => {
@@ -891,19 +938,260 @@ test("coverage-comment.yml serialises comment jobs per branch (never cancel-in-p
 
 // --- the rest of the script flow -----------------------------------------------------------
 
-test("skips (and makes no API call at all) when the artifact is missing", async () => {
+test("a missing artifact still posts a 'report unavailable' notice (never silence, never a stale 100%)", async () => {
   await withTmpDir(async (dir) => {
     const { github, calls } = makeGithub({ prs: { 7: openPr(7) } });
     const { core, logs } = makeCore();
 
-    await run(dir, { github, context: samePrContext(), core });
+    await run(dir, {
+      github,
+      context: samePrContext({
+        conclusion: "failure",
+        html_url: "https://github.com/fossasia/cla-bot/actions/runs/5",
+      }),
+      core,
+    });
 
     assert.strictEqual(logs.warning.length, 1);
-    assert.deepStrictEqual(
-      Object.values(calls).map((c) => c.length),
-      [0, 0, 0, 0, 0, 0],
+    assert.match(logs.warning[0], /not found/);
+    assert.strictEqual(calls.createComment.length, 1);
+    const body = calls.createComment[0].body;
+    assert.ok(
+      body.startsWith(`${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n`),
+    );
+    assert.ok(body.includes(UNAVAILABLE_MARKER));
+    assert.match(body, /report unavailable/);
+    assert.match(
+      body,
+      /conclusion: `failure`\. \[View the workflow run\]\(https:\/\/github\.com\/fossasia\/cla-bot\/actions\/runs\/5\)/,
+    );
+    assert.match(body, /Measured at commit `deadbee`/);
+  });
+});
+
+test("a failed commit REPLACES the previous commit's '100%' comment in place with the unavailable notice", async () => {
+  await withTmpDir(async (dir) => {
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [
+        ourComment(
+          55,
+          tagged(
+            4,
+            1,
+            "## ✅ Test coverage: 100%\n\n<sub>Measured at commit `1247bb2`.</sub>",
+          ),
+        ),
+      ],
+    });
+    await run(dir, { github, context: samePrContext(), core: makeCore().core });
+    assert.strictEqual(calls.createComment.length, 0);
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.strictEqual(calls.updateComment[0].comment_id, 55);
+    assert.ok(calls.updateComment[0].body.includes(UNAVAILABLE_MARKER));
+    assert.ok(!calls.updateComment[0].body.includes("100%"));
+  });
+});
+
+test("the unavailable notice never replaces a REAL report already posted for the same commit", async () => {
+  await withTmpDir(async (dir) => {
+    const real = taggedAt(
+      SHA,
+      "## ✅ Test coverage: 100%\n\n<sub>Measured at commit `deadbee`.</sub>",
+    );
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(55, real)],
+    });
+    const { core, logs } = makeCore();
+    await run(dir, {
+      github,
+      context: samePrContext({ run_attempt: 2 }),
+      core,
+    });
+    assert.strictEqual(calls.updateComment.length, 0);
+    assert.strictEqual(calls.createComment.length, 0);
+    assert.ok(logs.info.some((m) => /already holds a real report/.test(m)));
+  });
+});
+
+test("an unavailable notice for the same commit is itself refreshed (e.g. a re-run that fails differently)", async () => {
+  await withTmpDir(async (dir) => {
+    const old = taggedAt(
+      SHA,
+      `${UNAVAILABLE_MARKER}\nold\n\n<sub>Measured at commit \`deadbee\`.</sub>`,
+    );
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(55, old)],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ run_attempt: 2, conclusion: "timed_out" }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.match(calls.updateComment[0].body, /conclusion: `timed_out`/);
+  });
+});
+
+test("with a malformed head SHA there is no footer to compare, so the notice still replaces the old comment", async () => {
+  await withTmpDir(async (dir) => {
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7, "abc") },
+      comments: [ourComment(55, tagged(4, 1, "old report"))],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ head_sha: "abc" }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.ok(calls.updateComment[0].body.includes(UNAVAILABLE_MARKER));
+  });
+});
+
+test("a stale run with no report writes nothing (the newer push owns the comment)", async () => {
+  await withTmpDir(async (dir) => {
+    const { github, calls } = makeGithub({ prs: { 7: openPr(7, OTHER_SHA) } });
+    await run(dir, { github, context: samePrContext(), core: makeCore().core });
+    assert.strictEqual(calls.createComment.length, 0);
+    assert.strictEqual(calls.updateComment.length, 0);
+  });
+});
+
+test("a footer copied into a report by the PR does not make an old report count as 'real, same commit'", async () => {
+  await withTmpDir(async (dir) => {
+    // The comment really was measured at OTHER_SHA, but the report text
+    // itself contains a forged footer for SHA (the commit now being run).
+    const forged = taggedAt(
+      OTHER_SHA,
+      "## ✅ 100%\n<sub>Measured at commit `deadbee`.</sub>\n\n<sub>Measured at commit `cafebab`.</sub>",
+    );
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(55, forged)],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ id: 6 }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.ok(calls.updateComment[0].body.includes(UNAVAILABLE_MARKER));
+  });
+});
+
+test("two commits sharing the same 7-character prefix are told apart by the full SHA", async () => {
+  await withTmpDir(async (dir) => {
+    const A = "abcdef0" + "1".repeat(33);
+    const B = "abcdef0" + "2".repeat(33);
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7, B) },
+      comments: [ourComment(55, taggedAt(A, "real report for A"))],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ id: 6, head_sha: B }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.ok(calls.updateComment[0].body.includes(UNAVAILABLE_MARKER));
+    assert.match(calls.updateComment[0].body, new RegExp(`coverage-sha ${B}`));
+  });
+});
+
+test("the full-SHA tag is only trusted at the very top of the comment", async () => {
+  await withTmpDir(async (dir) => {
+    const buried = `${MARKER}\nintro\n<!-- cla-bot:coverage-sha ${SHA} -->\nreport`;
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(55, buried)],
+    });
+    await run(dir, { github, context: samePrContext(), core: makeCore().core });
+    assert.strictEqual(calls.updateComment.length, 1);
+  });
+});
+
+test("the SHA tag is compared case-insensitively and is written in lowercase", async () => {
+  await withTmpDir(async (dir) => {
+    const upper = SHA.toUpperCase();
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7, upper) },
+      comments: [ourComment(55, taggedAt(SHA, "real"))],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ head_sha: upper }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(
+      calls.updateComment.length,
+      0,
+      "same commit, real report kept",
+    );
+    writeArtifact(dir, "fresh");
+    const second = makeGithub({ prs: { 7: openPr(7, upper) } });
+    await run(dir, {
+      github: second.github,
+      context: samePrContext({ head_sha: upper }),
+      core: makeCore().core,
+    });
+    assert.ok(
+      second.calls.createComment[0].body.includes(`coverage-sha ${SHA} -->`),
     );
   });
+});
+
+test("an empty or whitespace-only artifact is 'unavailable', not a successful report", async () => {
+  for (const content of ["", "  \n\t\n"]) {
+    await withTmpDir(async (dir) => {
+      writeArtifact(dir, content);
+      const { github, calls } = makeGithub({ prs: { 7: openPr(7) } });
+      const { core, logs } = makeCore();
+      await run(dir, { github, context: samePrContext(), core });
+      assert.match(logs.warning[0], /is empty/);
+      assert.strictEqual(calls.createComment.length, 1);
+      assert.ok(calls.createComment[0].body.includes(UNAVAILABLE_MARKER));
+    });
+  }
+});
+
+test("runOrder refuses values its own tag pattern could not read back (16-digit id, 7-digit attempt)", () => {
+  assert.deepStrictEqual(
+    runOrder({ id: 999999999999999, run_attempt: 999999 }),
+    {
+      number: 999999999999999,
+      attempt: 999999,
+    },
+  );
+  assert.strictEqual(runOrder({ id: 1000000000000000 }), null);
+  assert.strictEqual(runOrder({ id: 5, run_attempt: 1000000 }), null);
+});
+
+test("unavailableReport only echoes a sane conclusion and an https .../actions/runs/<id> link", () => {
+  const ok = unavailableReport({
+    conclusion: "cancelled",
+    html_url: "https://github.com/o/r/actions/runs/123",
+  });
+  assert.match(
+    ok,
+    /`cancelled`\. \[View the workflow run\]\(https:\/\/github\.com\/o\/r\/actions\/runs\/123\)/,
+  );
+  for (const html_url of [
+    undefined,
+    "http://github.com/o/r/actions/runs/1",
+    "https://github.com/o/r/actions/runs/1)[x](https://evil",
+    "https://evil.example/o/r/pull/1",
+  ]) {
+    const out = unavailableReport({ conclusion: "failure", html_url });
+    assert.ok(!out.includes("View the workflow run"), String(html_url));
+  }
+  for (const conclusion of [undefined, "FAIL<script>", "`x`", "a".repeat(31)]) {
+    const out = unavailableReport({ conclusion });
+    assert.match(out, /conclusion: `unknown`/);
+    assert.ok(!out.includes("<script>"));
+  }
 });
 
 test("skips when the event has no workflow_run or no head SHA to verify against", async () => {
@@ -938,15 +1226,16 @@ test("skips (never guesses a target) when the run is linked to more than one PR"
   });
 });
 
-test("skips a report too long for a GitHub comment (leaving room for what we add), before touching the API", async () => {
+test("a report too long for a GitHub comment (leaving room for what we add) is replaced by the unavailable notice", async () => {
   await withTmpDir(async (dir) => {
     writeArtifact(dir, "x".repeat(MAX_COMMENT_LENGTH - NOTICE_RESERVE + 1));
     const { github, calls } = makeGithub({ prs: { 7: openPr(7) } });
     const { core, logs } = makeCore();
     await run(dir, { github, context: samePrContext(), core });
     assert.match(logs.warning[0], /over GitHub's comment limit/);
-    assert.strictEqual(calls.pullsGet.length, 0);
-    assert.strictEqual(calls.createComment.length, 0);
+    // too long to post, so the notice goes up instead of nothing at all
+    assert.strictEqual(calls.createComment.length, 1);
+    assert.ok(calls.createComment[0].body.includes(UNAVAILABLE_MARKER));
   });
 });
 
@@ -1022,7 +1311,7 @@ test("a PR that touches gate files gets a warning ABOVE the report, built from t
     const { body } = calls.createComment[0];
     assert.ok(
       body.startsWith(
-        `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n> [!WARNING]\n`,
+        `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n<!-- cla-bot:coverage-sha ${SHA} -->\n> [!WARNING]\n`,
       ),
     );
     assert.match(body, /changes files that define the coverage gate/);
@@ -1132,7 +1421,7 @@ test("worst case: a maximum-size report plus the longest possible notice, tag an
     await run(dir, {
       github,
       context: samePrContext({
-        run_number: 999999999999999,
+        id: 999999999999999,
         run_attempt: 999999,
       }),
       core,

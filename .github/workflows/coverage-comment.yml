@@ -84,8 +84,13 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           path: coverage-artifact
 
+      # Deliberately NOT conditional on the download: when the coverage job
+      # produced no report (tests failed, job crashed ...) the script still
+      # runs and replaces the previous commit's comment with a "report
+      # unavailable" notice, instead of leaving an outdated "100%" on the PR.
+      # The script itself skips runs that are no longer current (superseded
+      # or cancelled by a newer push).
       - name: Post or update the sticky PR comment
-        if: steps.download.outcome == 'success'
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
