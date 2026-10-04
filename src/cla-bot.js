@@ -1523,7 +1523,24 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
     .filter((c) => c.body === body)
     .sort((a, b) => a.id - b.id);
   // Keep the newest (highest id), delete the rest.
-  for (const dup of matching.slice(0, -1)) {
+  const duplicates = matching.slice(0, -1);
+  if (duplicates.length > 0) {
+    // Observability only - nothing below depends on it. Reaching this point
+    // means two runs posted the identical comment before either one saw the
+    // other's, which is exactly what the workflow-level `concurrency:` group
+    // exists to prevent. Surfacing it in the Actions log lets a maintainer
+    // notice a consuming workflow that is missing (or has misconfigured)
+    // that group, instead of the cleanup silently masking it. Worded as
+    // "likely" and "check" rather than a diagnosis: a group that IS set can
+    // still be bypassed (e.g. two different workflows commenting on the same
+    // PR). Logged BEFORE the deletes, so it also appears when a delete then
+    // fails; says "found", not "deleted", for the same reason. Only the
+    // count and PR number are included - no comment content.
+    console.warn(
+      `::warning::Found ${duplicates.length} duplicate bot comment(s) on PR #${prNumber} and removing them - two runs likely posted the same comment at the same time. If this keeps happening, check that the consuming workflow sets the \`concurrency:\` group shown in examples/consumer-workflow.yml (see SECURITY.md).`,
+    );
+  }
+  for (const dup of duplicates) {
     try {
       await gh(
         `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${encodeURIComponent(dup.id)}`,

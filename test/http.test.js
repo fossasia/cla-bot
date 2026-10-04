@@ -1367,9 +1367,15 @@ function fakeResponse(status, jsonBody, headers = {}) {
         "expected the 503 to be retried once and succeed on the 2nd DELETE attempt",
       );
       assert.strictEqual(
-        warnings.length,
+        warnings.filter((w) => w.includes("Could not delete duplicate comment"))
+          .length,
         0,
         "a DELETE that eventually succeeds via gh()'s own retry loop must never reach the outer 'could not delete' warning",
+      );
+      assert.strictEqual(
+        warnings.filter((w) => w.includes("duplicate bot comment(s)")).length,
+        1,
+        "the cleanup found a duplicate, so it must have logged its one summary warning",
       );
     } finally {
       global.setTimeout = originalSetTimeout;
@@ -1440,9 +1446,15 @@ function fakeResponse(status, jsonBody, headers = {}) {
         "expected 1 timed-out DELETE attempt followed by 1 successful retry",
       );
       assert.strictEqual(
-        warnings.length,
+        warnings.filter((w) => w.includes("Could not delete duplicate comment"))
+          .length,
         0,
         "a DELETE that recovers via retry must never reach the outer per-comment warning",
+      );
+      assert.strictEqual(
+        warnings.filter((w) => w.includes("duplicate bot comment(s)")).length,
+        1,
+        "the cleanup found a duplicate, so it must have logged its one summary warning",
       );
     } finally {
       global.setTimeout = originalSetTimeout;
