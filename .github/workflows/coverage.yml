@@ -7,15 +7,23 @@ name: Test Coverage
 # human-readable PR comment gets posted from a separate, privileged workflow
 # instead of from here.
 #
-# Note: on `pull_request`, GitHub runs the PR's own copy of this file, and
-# the PR's own package.json / .c8rc.json decide what is measured, so a PR
-# could in principle weaken the gate itself. That can only be closed by
-# repository settings (CODEOWNERS + required code-owner review + this job as
-# a required status check); see "How the coverage gate is enforced" in
-# CONTRIBUTING.md. What the code adds on top: scripts/verify-coverage.js
-# independently refuses "nothing measured" and files missing from the
-# report, and coverage-comment.yml warns reviewers when a PR touches gate
-# files.
+# Threat model, so nobody over- or under-trusts this gate:
+#
+# - On `pull_request`, GitHub runs the PR's own copy of this file, and the
+#   PR's own package.json / .c8rc.json / scripts decide what is measured, so
+#   a PR could in principle weaken the gate itself. That can only be closed
+#   by repository settings (CODEOWNERS + required code-owner review + this
+#   job as a required status check); see "How the coverage gate is
+#   enforced" in CONTRIBUTING.md. coverage-comment.yml additionally warns
+#   reviewers when a PR touches a gate file.
+# - The tests are PR-controlled code that runs before the gate. So the gate
+#   does not trust the workspace the tests ran in: after them it verifies
+#   that no tracked/untracked file changed, reinstalls node_modules from the
+#   lockfile (a pristine c8), and calls c8 and verify-coverage.js directly
+#   rather than through package.json scripts. This catches a test that
+#   rewrites .c8rc.json, a script or src/ (deliberately or by accident). It
+#   cannot stop a test that forges coverage data, or one that edits this very
+#   workflow; reviewing the PR can.
 on:
   pull_request:
     branches: [main]
@@ -50,37 +58,63 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      # Deliberately split into two steps. Running `c8 npm test` in one go
-      # would collapse two very different failures - "a test failed" and
-      # "the tests all passed but coverage is below 100%" - into the same
-      # non-zero exit, so a broken test would get reported to the
-      # contributor as a coverage problem. Here the test run explicitly
-      # opts out of the threshold check (`--check-coverage=false`) and
-      # fails the job immediately on a genuine test failure, while the
-      # threshold is asserted separately further down.
+      # Deliberately split from the threshold check. Running `c8 npm test`
+      # in one go would collapse two very different failures - "a test
+      # failed" and "the tests all passed but coverage is below 100%" - into
+      # the same non-zero exit, so a broken test would get reported to the
+      # contributor as a coverage problem. Here the test run explicitly opts
+      # out of the threshold (`--check-coverage=false`) and fails the job
+      # immediately on a genuine test failure.
       - name: Run tests
         id: tests
         run: npm run test:coverage-nocheck
 
-      # Captured rather than failing straight away so the human-readable
-      # report still gets built, summarised and uploaded first; it's turned
-      # back into a real job failure by the last step. Skipped automatically
-      # if the tests failed (a partial run would report misleading gaps).
-      # `coverage:check` is c8's threshold check PLUS an independent
-      # verification (verify-coverage.js) that something was measured and
-      # every src file is in the report - c8 alone passes on "no data".
+      # The tests are untrusted code that ran in this checkout. Refuse to
+      # evaluate the gate if they changed anything that is not git-ignored
+      # (coverage/ and node_modules/ are ignored): that is where the gate's
+      # own inputs live - .c8rc.json, package.json, the scripts, src/.
+      - name: Verify the tests left the checkout untouched
+        id: untouched
+        run: |
+          changes="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$changes" ]; then
+            echo "::error::The test run modified files in the checkout. Tests must only write to temporary directories; the coverage gate cannot trust a workspace the tests changed. Changed files:"
+            echo "$changes"
+            exit 1
+          fi
+
+      # node_modules is git-ignored, so the check above cannot see a test
+      # tampering with c8 itself. Reinstalling from the lockfile throws it
+      # away and restores a pristine copy before it is used for the gate.
+      - name: Reinstall pristine dependencies
+        id: reinstall
+        run: npm ci --ignore-scripts
+
+      # c8's threshold check PLUS an independent verification
+      # (verify-coverage.js) that something was measured, every src file and
+      # the action's entrypoint are in the report - c8 alone passes on "no
+      # data". Both are called directly, not through package.json scripts, so
+      # the gate does not depend on what those scripts say. Both always run
+      # so a contributor sees every problem at once; the step fails if either
+      # does. Captured (continue-on-error) rather than failing straight away
+      # so the human-readable report still gets built first; it is turned
+      # back into a real job failure by the last step.
       - name: Check coverage threshold
         id: coverage
         continue-on-error: true
-        run: npm run coverage:check
+        run: |
+          status=0
+          node node_modules/c8/bin/c8.js check-coverage || status=1
+          node .github/scripts/verify-coverage.js || status=1
+          exit "$status"
 
-      # Only meaningful once every test passed: coverage from a half-failed
-      # run would blame the contributor for gaps that are really test
-      # failures.
+      # Only meaningful once the tests passed and the checkout was verified:
+      # coverage from a half-failed or tampered run would blame the
+      # contributor for gaps that are really something else.
       - name: Build PR comment from the coverage report
-        if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.reinstall.outcome == 'success' }}
         continue-on-error: true
-        run: npm run coverage:report
+        run: node .github/scripts/coverage-report.js
 
       # Written directly into this job's own summary (not just stdout) so
       # the exact missing lines/functions/branches are easy to find even
@@ -89,7 +123,7 @@ jobs:
       # default branch, workflow_run (see coverage-comment.yml) has nothing
       # to trigger off yet.
       - name: Add coverage report to the job summary
-        if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.reinstall.outcome == 'success' }}
         continue-on-error: true
         run: |
           if [ -f coverage/pr-comment.md ]; then
@@ -103,7 +137,7 @@ jobs:
       # body is uploaded: the comment workflow takes everything else (which
       # PR, which commit) from GitHub's own event data, never from here.
       - name: Upload coverage report for the comment workflow
-        if: ${{ !cancelled() && steps.tests.outcome == 'success' }}
+        if: ${{ !cancelled() && steps.reinstall.outcome == 'success' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: coverage-pr-comment
@@ -111,11 +145,12 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
-      # Reaching this step at all means every test passed (the "Run tests"
-      # step above would have failed the job otherwise), so this really is
-      # a coverage shortfall and the message can say so unambiguously.
+      # Reaching this step at all means every test passed and the checkout
+      # was untouched (those steps would have failed the job otherwise), so
+      # this really is a coverage shortfall and the message can say so
+      # unambiguously.
       - name: Enforce coverage threshold
         if: steps.coverage.outcome == 'failure'
         run: |
-          echo "::error::All tests passed, but coverage is below the required 100% - see the job summary (or the PR comment, once this workflow exists on the default branch) for exactly which lines, statements, functions and branches are missing, or run 'npm run coverage' locally."
+          echo "::error::All tests passed, but coverage is below the required 100% or could not be verified - see the job summary (or the PR comment, once this workflow exists on the default branch) for exactly which lines, statements, functions and branches are missing, or run 'npm run coverage' locally."
           exit 1

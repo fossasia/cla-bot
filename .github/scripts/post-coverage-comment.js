@@ -23,31 +23,50 @@
  *     comment on any other issue or PR - an IDOR).
  *       - Same-repo PR: `workflow_run.pull_requests` has exactly one entry.
  *       - Fork PR: GitHub leaves that list EMPTY, so the PR is looked up by
- *         `<head owner>:<head branch>` and must match the tested commit.
+ *         `<head owner>:<head branch>` among ALL PRs (open or closed) at
+ *         the tested commit that already existed when the run was created.
+ *         Requiring "already existed" is what stops an old run from being
+ *         attached to a LATER PR that merely reuses the same fork branch
+ *         and commit (old PR closed, new one opened at the same SHA). If it
+ *         is not exactly one such PR, or that PR is not open, we skip.
  *     Zero or several candidates means "can't tell which PR this is", and
  *     the job skips commenting rather than guess.
- *  2. WHETHER the report is still current is checked against the PR's live
- *     head commit (fetched fresh from the API) versus
- *     `workflow_run.head_sha`, the commit coverage.yml actually tested. If
- *     a newer push has superseded it, this run is skipped, so a slow,
- *     out-of-order job can't overwrite the sticky comment with outdated
- *     results. (coverage-comment.yml's concurrency group only reduces such
- *     overlap; this check is what makes it correct.)
+ *  2. WHETHER the report is still current. Checking the PR's live head
+ *     against `workflow_run.head_sha` (the commit coverage.yml tested)
+ *     once is NOT enough on its own: a push can land between that check
+ *     and the write, and the check and the write cannot be made atomic
+ *     through the REST API. So freshness is enforced in layers, each
+ *     closing part of the window:
+ *       a. the head SHA is checked when the PR is resolved AND again
+ *          immediately before the comment is written;
+ *       b. each comment carries a hidden tag with the workflow run number
+ *          and attempt (from the trusted event payload), and an older run
+ *          never overwrites a comment written by a newer one, whatever
+ *          order the jobs happen to finish in;
+ *       c. coverage-comment.yml serialises these jobs per branch
+ *          (concurrency without cancel-in-progress), so two jobs never
+ *          read-then-write the same comment at once.
+ *     What is left is a window of milliseconds in which an old report can
+ *     be visible; it is corrected as soon as the newer run's comment job
+ *     runs, because (b) lets the newer run overwrite it. The visible
+ *     "measured at commit" line lets a reader spot a stale comment, which
+ *     can still happen if the newer run fails before producing a report.
  *  3. The report TEXT is still the PR's own output shown back on its own
  *     PR, so it is treated as untrusted content: it must be a small regular
  *     file (not a symlink), @mentions are defused so a PR can't use the
- *     bot to ping people or teams, and it is length-checked against
- *     GitHub's comment limit.
- *
+ *     bot to ping people or teams, HTML comment openers are defused so it
+ *     can't hide content or imitate our hidden tag, and it is
+ *     length-checked against GitHub's comment limit.
  *  4. The PR can also edit the files that DEFINE the gate (.c8rc.json,
- *     package.json, coverage.yml ...), because coverage.yml runs the PR's
- *     own copy on `pull_request`. Only repository rules (CODEOWNERS +
- *     required reviews + a required status check) can truly prevent that,
- *     see CONTRIBUTING.md "How the coverage gate is enforced". What this
- *     privileged job adds is visibility: it lists the PR's changed files
- *     via the API (not from the artifact) and puts a warning at the top of
- *     the comment when any gate file is touched, so a reviewer cannot miss
- *     that the "100%" below was measured with the PR's own rules.
+ *     package.json, action.yml, coverage.yml ...), because coverage.yml runs
+ *     the PR's own copy on `pull_request`. Only repository rules
+ *     (CODEOWNERS + required reviews + a required status check) can truly
+ *     prevent that, see CONTRIBUTING.md "How the coverage gate is
+ *     enforced". What this privileged job adds is visibility: it lists the
+ *     PR's changed files via the API (not from the artifact) and puts a
+ *     warning at the top of the comment when any gate file is touched, so a
+ *     reviewer cannot miss that the "100%" below was measured with the
+ *     PR's own rules.
  *
  * Expected to be invoked from actions/github-script as:
  *   const script = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/post-coverage-comment.js`);
@@ -78,13 +97,18 @@ const MAX_REPORT_BYTES = 256 * 1024;
 // GitHub rejects comment bodies over 65536 characters.
 const MAX_COMMENT_LENGTH = 65000;
 
-// Room kept for the (trusted) gate-change notice added above the report.
+// Room kept for everything WE add around the report: marker, run tag, the
+// gate-change notice and the commit footer. Worst case is about 1.6k
+// characters (see MAX_LISTED_GATE_FILES / MAX_NAME_LENGTH below, and the
+// test that computes it), so 2000 is a guaranteed bound, not a guess.
 const NOTICE_RESERVE = 2000;
 
-// Files whose content decides what "100% coverage" means or whether the
-// check runs at all. A change to any of them is flagged to reviewers.
+// Files whose content decides what "100% coverage" means, what counts as
+// the shipped code, or whether the check runs at all. A change to any of
+// them is flagged to reviewers.
 const GATE_FILES = new Set([
   ".c8rc.json",
+  "action.yml",
   "package.json",
   "package-lock.json",
   ".github/CODEOWNERS",
@@ -93,12 +117,22 @@ const GATE_FILES = new Set([
 ]);
 const GATE_DIR_PREFIX = ".github/scripts/";
 const MAX_LISTED_GATE_FILES = 10;
+// File names come from the PR and can be ~255 characters each; cap what is
+// echoed so the notice has a hard upper bound.
+const MAX_NAME_LENGTH = 80;
+
+const RUN_TAG_PATTERN =
+  /^<!-- cla-bot:coverage-report -->\n<!-- cla-bot:coverage-run (\d{1,15})\.(\d{1,6}) -->/;
 
 // Inserts a zero-width space after every "@" that would start a mention
 // (@user, @org/team), which stops GitHub from resolving it into a
-// notification while leaving the text readable.
-function neutralizeMentions(text) {
-  return text.replace(/@(?=[A-Za-z0-9])/g, "@\u200b");
+// notification while leaving the text readable. Likewise "<!--" is split so
+// the report can neither hide content in an HTML comment nor imitate the
+// hidden tags this script writes.
+function sanitizeReport(text) {
+  return text
+    .replace(/@(?=[A-Za-z0-9])/g, "@\u200b")
+    .replace(/<!--/g, "<!\u200b--");
 }
 
 // Reads the report only if it is a plain, reasonably-sized file. lstat
@@ -127,6 +161,17 @@ function readReport(reportPath, core) {
     return null;
   }
   return fs.readFileSync(reportPath, "utf8");
+}
+
+// "Did this PR already exist when the workflow run was created?" Both
+// timestamps are set by GitHub. Anything unparsable counts as "no", so a
+// malformed value can only ever make us skip, never comment.
+function existedBefore(pr, run) {
+  const prCreated = Date.parse(pr.created_at);
+  const runCreated = Date.parse(run.created_at);
+  return !Number.isNaN(prCreated) && !Number.isNaN(runCreated)
+    ? prCreated <= runCreated
+    : false;
 }
 
 // Works out which PR this workflow_run is for, using ONLY data GitHub
@@ -170,42 +215,87 @@ async function resolveTrustedPullRequest({ github, context, core }) {
       );
       return null;
     }
+    // ALL states, not just open: a closed PR that was at this commit when
+    // the run started is exactly what makes the target ambiguous.
     const candidates = await github.paginate(github.rest.pulls.list, {
       owner,
       repo,
-      state: "open",
+      state: "all",
       head: `${headOwner}:${run.head_branch}`,
       per_page: 100,
     });
-    const matches = candidates.filter((c) => c.head.sha === run.head_sha);
+    const matches = candidates.filter(
+      (c) => c.head.sha === run.head_sha && existedBefore(c, run),
+    );
     if (matches.length !== 1) {
       core.warning(
-        `Expected exactly one open pull request at commit ${run.head_sha} on ${headOwner}:${run.head_branch}, found ${matches.length} - skipping comment.`,
+        `Expected exactly one pull request at commit ${run.head_sha} on ${headOwner}:${run.head_branch} that existed when this run started, found ${matches.length} - skipping comment.`,
       );
       return null;
     }
     pr = matches[0];
   }
 
+  return isCurrent(pr, run, core) ? pr : null;
+}
+
+// The PR must be open and still at the commit that was tested.
+function isCurrent(pr, run, core) {
   if (pr.state !== "open") {
     core.info(`PR #${pr.number} is no longer open - skipping comment.`);
-    return null;
+    return false;
   }
   if (pr.head.sha !== run.head_sha) {
     core.info(
       `Coverage report is for commit ${run.head_sha}, but PR #${pr.number}'s current head is ${pr.head.sha} - a newer push has already superseded this run. Skipping comment.`,
     );
-    return null;
+    return false;
   }
-  return pr;
+  return true;
+}
+
+// {number, attempt} of the triggering run, or null when the payload does
+// not carry usable values (then no tag is written and no ordering guard is
+// applied, which only loses the extra protection).
+function runOrder(run) {
+  const number = Number(run.run_number);
+  const attempt = Number(run.run_attempt ?? 1);
+  return Number.isSafeInteger(number) &&
+    number > 0 &&
+    Number.isSafeInteger(attempt) &&
+    attempt > 0
+    ? { number, attempt }
+    : null;
+}
+
+const runTag = ({ number, attempt }) =>
+  `<!-- cla-bot:coverage-run ${number}.${attempt} -->`;
+
+// True when the existing comment was written by a NEWER run than this one.
+// Only the tag at the very top of the body (the part this script wrote) is
+// read; anything an artifact could add sits below it and is ignored.
+function isSupersededBy(previousBody, order) {
+  const match = RUN_TAG_PATTERN.exec(previousBody || "");
+  if (!match || !order) return false;
+  const number = Number(match[1]);
+  const attempt = Number(match[2]);
+  return (
+    number > order.number ||
+    (number === order.number && attempt > order.attempt)
+  );
 }
 
 const isGateFile = (filename) =>
   GATE_FILES.has(filename) || filename.startsWith(GATE_DIR_PREFIX);
 
 // File names come from the PR, so keep only characters that are inert in
-// Markdown before echoing one back.
-const safeName = (filename) => filename.replace(/[^A-Za-z0-9._\-/]/g, "?");
+// Markdown before echoing one back, and cap the length.
+function safeName(filename) {
+  const clean = filename.replace(/[^A-Za-z0-9._\-/]/g, "?");
+  return clean.length > MAX_NAME_LENGTH
+    ? `${clean.slice(0, MAX_NAME_LENGTH)}...`
+    : clean;
+}
 
 // Builds the warning shown above the report when the PR touches the files
 // that define the gate. The file list comes from the API for the verified
@@ -226,7 +316,7 @@ async function gateChangeNotice({ github, context, core, pr }) {
     core.warning(
       `Could not list PR #${pr.number}'s files to check for gate changes. (${err.message || err})`,
     );
-    return "> [!WARNING]\n> Could not check whether this PR changes the coverage gate itself (the file list was unavailable). Reviewers: check `.c8rc.json`, `package.json` and `.github/` manually.\n\n";
+    return "> [!WARNING]\n> Could not check whether this PR changes the coverage gate itself (the file list was unavailable). Reviewers: check `.c8rc.json`, `package.json`, `action.yml` and `.github/` manually.\n\n";
   }
 
   const touched = new Set();
@@ -254,6 +344,14 @@ async function gateChangeNotice({ github, context, core, pr }) {
   ].join("\n");
 }
 
+// Visible, trusted line saying which commit the report is for, so a stale
+// comment is recognisable at a glance.
+function commitFooter(run) {
+  return /^[0-9a-f]{40}$/i.test(run.head_sha)
+    ? `\n\n<sub>Measured at commit \`${run.head_sha.slice(0, 7)}\`.</sub>`
+    : "";
+}
+
 module.exports = async ({ github, context, core }) => {
   const run = context.payload.workflow_run;
   if (!run || !run.head_sha) {
@@ -274,11 +372,8 @@ module.exports = async ({ github, context, core }) => {
     return;
   }
 
-  const reportBody = neutralizeMentions(report);
-  if (
-    MARKER.length + 1 + reportBody.length >
-    MAX_COMMENT_LENGTH - NOTICE_RESERVE
-  ) {
+  const reportBody = sanitizeReport(report);
+  if (reportBody.length > MAX_COMMENT_LENGTH - NOTICE_RESERVE) {
     core.warning(
       `Coverage report is ${reportBody.length} characters, over GitHub's comment limit - skipping comment.`,
     );
@@ -290,11 +385,21 @@ module.exports = async ({ github, context, core }) => {
     return;
   }
 
-  const notice = await gateChangeNotice({ github, context, core, pr });
-  const commentBody = `${MARKER}\n${notice}${reportBody}`;
-
   const { owner, repo } = context.repo;
   const issue_number = pr.number;
+  const order = runOrder(run);
+
+  const notice = await gateChangeNotice({ github, context, core, pr });
+  const header = order ? `${MARKER}\n${runTag(order)}\n` : `${MARKER}\n`;
+  const commentBody = `${header}${notice}${reportBody}${commitFooter(run)}`;
+  // NOTICE_RESERVE is a proven bound (see its comment), so this cannot
+  // trip; it is the last line of defence against a 422 from GitHub.
+  if (commentBody.length > MAX_COMMENT_LENGTH) {
+    core.warning(
+      `Comment would be ${commentBody.length} characters, over GitHub's limit - skipping comment.`,
+    );
+    return;
+  }
 
   const existing = await github.paginate(github.rest.issues.listComments, {
     owner,
@@ -305,6 +410,33 @@ module.exports = async ({ github, context, core }) => {
   const previous = existing.find(
     (c) => c.user?.login === BOT_LOGIN && c.body?.includes(MARKER),
   );
+
+  if (previous && isSupersededBy(previous.body, order)) {
+    core.info(
+      `Comment ${previous.id} on PR #${issue_number} was written by a newer coverage run - not overwriting it with this older one.`,
+    );
+    return;
+  }
+
+  // Second freshness check, as close to the write as the API allows. A push
+  // that lands after this point is handled by the run-order tag above and
+  // by the newer run's own comment job (see "TRUST BOUNDARY" 2).
+  let latest;
+  try {
+    ({ data: latest } = await github.rest.pulls.get({
+      owner,
+      repo,
+      pull_number: issue_number,
+    }));
+  } catch (err) {
+    core.warning(
+      `Could not re-check PR #${issue_number} before commenting - skipping comment. (${err.message || err})`,
+    );
+    return;
+  }
+  if (!isCurrent(latest, run, core)) {
+    return;
+  }
 
   if (previous) {
     await github.rest.issues.updateComment({
@@ -335,12 +467,17 @@ module.exports = async ({ github, context, core }) => {
 };
 
 module.exports.resolveTrustedPullRequest = resolveTrustedPullRequest;
-module.exports.neutralizeMentions = neutralizeMentions;
+module.exports.sanitizeReport = sanitizeReport;
 module.exports.readReport = readReport;
 module.exports.gateChangeNotice = gateChangeNotice;
 module.exports.isGateFile = isGateFile;
+module.exports.isSupersededBy = isSupersededBy;
+module.exports.runOrder = runOrder;
+module.exports.commitFooter = commitFooter;
 module.exports.MARKER = MARKER;
 module.exports.BOT_LOGIN = BOT_LOGIN;
 module.exports.MAX_REPORT_BYTES = MAX_REPORT_BYTES;
 module.exports.MAX_COMMENT_LENGTH = MAX_COMMENT_LENGTH;
 module.exports.NOTICE_RESERVE = NOTICE_RESERVE;
+module.exports.MAX_LISTED_GATE_FILES = MAX_LISTED_GATE_FILES;
+module.exports.MAX_NAME_LENGTH = MAX_NAME_LENGTH;

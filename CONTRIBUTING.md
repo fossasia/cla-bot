@@ -46,25 +46,38 @@ FOSSASIA's projects.
 
 The 100% rule is only as strong as the files that define it, and a pull
 request can edit those files: `coverage.yml` runs on `pull_request`, so
-GitHub uses the PR's _own_ copy of the workflow, `package.json` and
-`.c8rc.json`. A PR could therefore lower a threshold, narrow `include`, or
-change the test command and still show a green check with the same job
+GitHub uses the PR's _own_ copy of the workflow, `package.json`,
+`.c8rc.json` and `.github/scripts/`. A PR could therefore lower a
+threshold, narrow `include`, point `action.yml` at an unmeasured script,
+or change the test command and still show a green check with the same job
 name. No workflow can fully fix that from inside the PR; it is closed by
 repository settings. Until they are in place, 100% is a convention, not an
 enforced rule.
 
-**What the code does** (`npm run coverage:check`, run by CI):
+**What the code does** (CI job "Enforce 100% coverage"):
 
 - `c8 check-coverage` enforces the thresholds in `.c8rc.json`.
-- `.github/scripts/verify-coverage.js` then re-checks independently, because
-  c8 judges only the files it tracked: every `.js`/`.cjs`/`.mjs` file under
+- `.github/scripts/verify-coverage.js` re-checks independently, because c8
+  judges only the files it tracked: every `.js`/`.cjs`/`.mjs` file under
   `src/` must appear in the report, something must actually have been
   measured, and every metric must be covered === total. "Nothing measured"
   therefore fails instead of passing as 100% (c8 does exactly that when
   `include` matches no file).
+- The same script checks that what ships is what is measured: `action.yml`
+  may only run `node` scripts that live under `src/` (no inline `-e` or
+  preloaded `-r` code, no other directory), and nothing in `src/` may load
+  a relative module from outside `src/`.
+- The tests are untrusted code that runs before the gate, so the gate does
+  not trust the workspace they ran in: it fails if the tests changed any
+  file in the checkout (tests must only write to temp directories),
+  reinstalls `node_modules` from the lockfile, and calls `c8` and
+  `verify-coverage.js` directly instead of through `package.json` scripts.
+  This catches tampering with `.c8rc.json`, the scripts, `src/` or `c8`
+  itself. It cannot stop a test that forges coverage data or a PR that
+  edits the workflow - only review can.
 - The comment workflow (`coverage-comment.yml`, which always runs the
   version on `main`) puts a warning at the top of the PR comment whenever a
-  PR changes a gate file (`.c8rc.json`, `package.json`,
+  PR changes a gate file (`.c8rc.json`, `action.yml`, `package.json`,
   `package-lock.json`, `.github/CODEOWNERS`, `coverage.yml`,
   `coverage-comment.yml`, `.github/scripts/**`), so a reviewer cannot miss
   that the result was measured with the PR's own rules.
@@ -77,6 +90,7 @@ part that actually makes the gate trustworthy):
 
    ```
    /.c8rc.json                 @fossasia/<maintainers>
+   /action.yml                 @fossasia/<maintainers>
    /package.json               @fossasia/<maintainers>
    /package-lock.json          @fossasia/<maintainers>
    /.github/CODEOWNERS         @fossasia/<maintainers>

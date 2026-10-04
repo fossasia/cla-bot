@@ -33,12 +33,19 @@ permissions: {}
 
 # Keyed by the head repo + branch rather than a PR number, because
 # workflow_run.pull_requests is EMPTY for fork PRs - keying on it would
-# leave every fork run in its own group and never cancel a superseded one.
-# post-coverage-comment.js's head-sha check is the backstop that makes
-# ordering correct even if two runs still race despite cancellation.
+# leave every fork run in its own group.
+#
+# cancel-in-progress is deliberately FALSE: jobs for one branch must run one
+# at a time, never overlap. With true, a cancelled job can still be mid-way
+# through reading and then writing the comment while its replacement starts,
+# which is exactly the read-then-write interleaving the freshness checks in
+# post-coverage-comment.js are trying to avoid. Queued (not yet started)
+# runs are still collapsed by GitHub to the newest one. The head-SHA checks
+# and the run-number tag in that script make the order jobs happen to run in
+# irrelevant.
 concurrency:
   group: coverage-comment-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   comment:
@@ -81,3 +88,4 @@ jobs:
           script: |
             const script = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/post-coverage-comment.js`);
             await script({ github, context, core });
+  

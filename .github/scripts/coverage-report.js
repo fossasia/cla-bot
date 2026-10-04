@@ -56,9 +56,29 @@ function resolvePaths(cwd) {
   };
 }
 
-function readJSON(filePath) {
-  return JSON.parse(fs.readFileSync(filePath, "utf8"));
+// Reads a file, or returns null if it does not exist. Reading and handling
+// ENOENT is atomic, unlike "check it exists, then read it", where the file
+// can vanish or change in between (CodeQL js/file-system-race).
+function readOptional(filePath) {
+  try {
+    return fs.readFileSync(filePath, "utf8");
+  } catch (err) {
+    if (err.code === "ENOENT") return null;
+    throw err;
+  }
 }
+
+// Source text and names are inserted into Markdown, so anything that could
+// start a new Markdown line mid-snippet has to go. That includes a lone CR
+// and the Unicode line/paragraph separators, not just \n: a source line
+// like "a\r```\rb" would otherwise close our code fence and let the rest of
+// the line render as Markdown. (Every snippet line is also prefixed with its
+// line number, so a snippet line can never itself start with a fence.)
+const LINE_BREAKS_AND_CONTROLS = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g;
+const scrub = (text) => text.replace(LINE_BREAKS_AND_CONTROLS, " ");
+
+// Text placed inside `inline code` spans: also cannot contain a backtick.
+const inlineCode = (text) => scrub(text).replace(/`/g, "'");
 
 // Collapses a sorted list of line numbers into "12, 30-33, 41" style ranges
 // so a file with fifty uncovered lines doesn't turn into a fifty-item list.
@@ -90,7 +110,7 @@ function toRanges(lines) {
 // useful than guessing a label from data that doesn't encode it.
 function sourceSnippet(sourceLines, lineNumber) {
   const text = sourceLines[lineNumber - 1];
-  return text === undefined ? null : text.trim();
+  return text === undefined ? null : scrub(text).trim();
 }
 
 function relativize(absolutePath, cwd = process.cwd()) {
@@ -155,13 +175,13 @@ function closeUnbalancedFence(text) {
 
 function formatFileSection(relPath, summary, detail, sourceLines) {
   const lines = [
-    `### \`${relPath}\` — ${summary.lines.pct}% lines, ${summary.statements.pct}% statements, ${summary.branches.pct}% branches, ${summary.functions.pct}% functions`,
+    `### \`${inlineCode(relPath)}\` — ${summary.lines.pct}% lines, ${summary.statements.pct}% statements, ${summary.branches.pct}% branches, ${summary.functions.pct}% functions`,
   ];
 
   if (detail.uncoveredFunctions.length > 0) {
     const fns = detail.uncoveredFunctions
       .sort((a, b) => a.line - b.line)
-      .map((fn) => `\`${fn.name}\` (line ${fn.line})`)
+      .map((fn) => `\`${inlineCode(fn.name)}\` (line ${fn.line})`)
       .join(", ");
     lines.push(`**Never called by any test:** ${fns}`);
   }
@@ -235,14 +255,16 @@ function formatFileSection(relPath, summary, detail, sourceLines) {
 function main({ cwd = process.cwd(), log = console.log } = {}) {
   const { coverageDir, summaryPath, finalPath, outMd } = resolvePaths(cwd);
 
-  if (!fs.existsSync(summaryPath) || !fs.existsSync(finalPath)) {
+  const summaryText = readOptional(summaryPath);
+  const finalText = readOptional(finalPath);
+  if (summaryText === null || finalText === null) {
     throw new Error(
       `Coverage reports not found under ${coverageDir}. Run "npm run coverage" first (the c8 config in .c8rc.json already emits the json-summary and json reporters this script reads).`,
     );
   }
 
-  const summary = readJSON(summaryPath);
-  const final = readJSON(finalPath);
+  const summary = JSON.parse(summaryText);
+  const final = JSON.parse(finalText);
   const total = summary.total;
 
   // c8's percentages only describe the files c8 chose to track. The same
@@ -285,9 +307,8 @@ function main({ cwd = process.cwd(), log = console.log } = {}) {
         const fileCoverage = final[absPath];
         if (!fileCoverage) continue;
         const detail = analyzeFile(fileCoverage);
-        const sourceLines = fs.existsSync(absPath)
-          ? fs.readFileSync(absPath, "utf8").split("\n")
-          : [];
+        const source = readOptional(absPath);
+        const sourceLines = source === null ? [] : source.split("\n");
         fileSections.push(
           formatFileSection(
             relativize(absPath, cwd),

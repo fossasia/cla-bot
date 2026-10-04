@@ -9,25 +9,32 @@
  * The behaviour that matters most here is the TRUST BOUNDARY. The report
  * artifact comes from a job that ran the PR's own test code, so these
  * tests check that nothing in it can redirect the comment to another
- * issue, revive a stale run, or smuggle in notifications.
+ * issue, revive a stale run, attach an old run to a later PR that reuses
+ * the same fork branch, or smuggle in notifications.
  */
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const yaml = require("js-yaml");
 
 const postComment = require("../.github/scripts/post-coverage-comment.js");
 const {
   resolveTrustedPullRequest,
-  neutralizeMentions,
+  sanitizeReport,
   readReport,
   gateChangeNotice,
   isGateFile,
-  NOTICE_RESERVE,
+  isSupersededBy,
+  runOrder,
+  commitFooter,
   MARKER,
   BOT_LOGIN,
   MAX_REPORT_BYTES,
   MAX_COMMENT_LENGTH,
+  NOTICE_RESERVE,
+  MAX_LISTED_GATE_FILES,
+  MAX_NAME_LENGTH,
 } = postComment;
 
 const cases = [];
@@ -37,6 +44,9 @@ function test(name, fn) {
 
 const SHA = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef";
 const OTHER_SHA = "cafebabecafebabecafebabecafebabecafebabe";
+const RUN_CREATED = "2026-10-04T10:00:00Z";
+const BEFORE_RUN = "2026-10-01T00:00:00Z";
+const AFTER_RUN = "2026-10-04T10:05:00Z";
 
 async function withTmpDir(fn) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-post-comment-"));
@@ -82,11 +92,17 @@ function makeCore() {
 // Mirrors the slice of the Octokit surface the script uses. `paginate`
 // behaves like actions/github-script's: it calls the endpoint function it
 // is handed and returns the flattened array of items.
+//
+// pulls.get answers from `prs` (pull_number -> PR object), falling back to
+// `openPrs`. A value that is an ARRAY is a sequence of answers, one per
+// call (the last one repeats), which is how the tests model "the PR's head
+// moved between two reads".
 function makeGithub({
-  prs = {}, // pull_number -> live PR object, for pulls.get
+  prs = {},
   openPrs = [], // what pulls.list returns
   comments = [],
-  getError,
+  getError, // pulls.get always rejects with this
+  getErrorOnCall, // pulls.get rejects only on this (1-based) call
   files = [], // what pulls.listFiles returns
   filesError,
 } = {}) {
@@ -105,7 +121,20 @@ function makeGithub({
         get: async (params) => {
           calls.pullsGet.push(params);
           if (getError !== undefined) throw getError;
-          return { data: prs[params.pull_number] };
+          if (getErrorOnCall === calls.pullsGet.length) {
+            throw new Error("transient failure");
+          }
+          let answer =
+            prs[params.pull_number] ??
+            openPrs.find((p) => p.number === params.pull_number);
+          if (Array.isArray(answer)) {
+            const index = Math.min(
+              calls.pullsGet.length - 1,
+              answer.length - 1,
+            );
+            answer = answer[index];
+          }
+          return { data: answer };
         },
         list: async (params) => {
           calls.pullsList.push(params);
@@ -144,6 +173,9 @@ function samePrContext(overrides = {}) {
     payload: {
       workflow_run: {
         id: 1,
+        run_number: 5,
+        run_attempt: 1,
+        created_at: RUN_CREATED,
         head_sha: SHA,
         head_branch: "feature",
         head_repository: { owner: { login: "fossasia" } },
@@ -166,6 +198,7 @@ function forkContext(overrides = {}) {
 const openPr = (number, sha = SHA, extra = {}) => ({
   number,
   state: "open",
+  created_at: BEFORE_RUN,
   head: { sha },
   ...extra,
 });
@@ -186,10 +219,14 @@ function run(workspace, { github, context, core }) {
   );
 }
 
-// --- neutralizeMentions --------------------------------------------------------
+const ourComment = (id, body) => ({ id, user: { login: BOT_LOGIN }, body });
+const tagged = (number, attempt, rest = "report") =>
+  `${MARKER}\n<!-- cla-bot:coverage-run ${number}.${attempt} -->\n${rest}`;
 
-test("neutralizeMentions defuses @user and @org/team mentions but keeps the text readable", () => {
-  const out = neutralizeMentions("cc @alice and @fossasia/maintainers, thanks");
+// --- sanitizeReport ---------------------------------------------------------------
+
+test("sanitizeReport defuses @user and @org/team mentions but keeps the text readable", () => {
+  const out = sanitizeReport("cc @alice and @fossasia/maintainers, thanks");
   assert.ok(!/@(?=[A-Za-z0-9])/.test(out), "no live mention may remain");
   assert.strictEqual(
     out.replace(/\u200b/g, ""),
@@ -197,15 +234,23 @@ test("neutralizeMentions defuses @user and @org/team mentions but keeps the text
   );
 });
 
-test("neutralizeMentions leaves a bare @ and non-mention text alone", () => {
-  assert.strictEqual(
-    neutralizeMentions("a @ b, @-x, 100%"),
-    "a @ b, @-x, 100%",
-  );
+test("sanitizeReport leaves a bare @ and non-mention text alone", () => {
+  assert.strictEqual(sanitizeReport("a @ b, @-x, 100%"), "a @ b, @-x, 100%");
 });
 
-test("neutralizeMentions handles back-to-back @ characters", () => {
-  assert.strictEqual(neutralizeMentions("@@x"), "@@\u200bx");
+test("sanitizeReport handles back-to-back @ characters", () => {
+  assert.strictEqual(sanitizeReport("@@x"), "@@\u200bx");
+});
+
+test("sanitizeReport splits every HTML comment opener so the report can't hide content or fake our tags", () => {
+  const out = sanitizeReport(
+    "a <!-- hidden --> b <!-- cla-bot:coverage-run 999999.1 --> c",
+  );
+  assert.ok(!out.includes("<!--"));
+  assert.strictEqual(
+    out.replace(/\u200b/g, ""),
+    "a <!-- hidden --> b <!-- cla-bot:coverage-run 999999.1 --> c",
+  );
 });
 
 // --- readReport -------------------------------------------------------------------
@@ -258,6 +303,70 @@ test("readReport refuses a file over the size limit", async () => {
   });
 });
 
+// --- runOrder / isSupersededBy / commitFooter ----------------------------------------------
+
+test("runOrder reads the trusted run number and attempt, defaulting the attempt to 1", () => {
+  assert.deepStrictEqual(runOrder({ run_number: 5, run_attempt: 2 }), {
+    number: 5,
+    attempt: 2,
+  });
+  assert.deepStrictEqual(runOrder({ run_number: "7" }), {
+    number: 7,
+    attempt: 1,
+  });
+});
+
+test("runOrder returns null for missing or unusable values (so no tag and no ordering guard)", () => {
+  for (const bad of [
+    {},
+    { run_number: 0 },
+    { run_number: -3 },
+    { run_number: 1.5 },
+    { run_number: "abc" },
+    { run_number: 5, run_attempt: 0 },
+    { run_number: 5, run_attempt: "x" },
+    { run_number: 2 ** 60 },
+  ]) {
+    assert.strictEqual(runOrder(bad), null, JSON.stringify(bad));
+  }
+});
+
+test("isSupersededBy is true only when the existing comment is from a strictly newer run/attempt", () => {
+  const order = { number: 5, attempt: 2 };
+  assert.strictEqual(isSupersededBy(tagged(6, 1), order), true);
+  assert.strictEqual(isSupersededBy(tagged(5, 3), order), true);
+  assert.strictEqual(isSupersededBy(tagged(5, 2), order), false);
+  assert.strictEqual(isSupersededBy(tagged(5, 1), order), false);
+  assert.strictEqual(isSupersededBy(tagged(4, 9), order), false);
+});
+
+test("isSupersededBy ignores bodies without our tag at the very top, and ignores everything when this run has no order", () => {
+  const order = { number: 5, attempt: 1 };
+  assert.strictEqual(isSupersededBy(undefined, order), false);
+  assert.strictEqual(isSupersededBy(null, order), false);
+  assert.strictEqual(
+    isSupersededBy(`${MARKER}\nold untagged report`, order),
+    false,
+  );
+  // A tag buried below the top (e.g. injected through the report) is not read.
+  assert.strictEqual(
+    isSupersededBy(
+      `${MARKER}\ntext\n<!-- cla-bot:coverage-run 99.1 -->`,
+      order,
+    ),
+    false,
+  );
+  assert.strictEqual(isSupersededBy(tagged(99, 1), null), false);
+});
+
+test("commitFooter shows the 7-character commit, and nothing for a malformed SHA", () => {
+  assert.match(
+    commitFooter({ head_sha: SHA }),
+    /Measured at commit `deadbee`\./,
+  );
+  assert.strictEqual(commitFooter({ head_sha: "not-a-sha" }), "");
+});
+
 // --- resolveTrustedPullRequest ----------------------------------------------------
 
 test("resolveTrustedPullRequest returns the live PR for a same-repo run linked to exactly one PR", async () => {
@@ -276,7 +385,7 @@ test("resolveTrustedPullRequest returns the live PR for a same-repo run linked t
   assert.strictEqual(logs.warning.length, 0);
 });
 
-test("resolveTrustedPullRequest finds a fork PR (empty pull_requests) by '<fork owner>:<branch>' and the tested commit", async () => {
+test("resolveTrustedPullRequest finds a fork PR (empty pull_requests) by '<fork owner>:<branch>' among ALL PRs and the tested commit", async () => {
   const { github, calls } = makeGithub({
     openPrs: [openPr(41, OTHER_SHA), openPr(42, SHA)],
   });
@@ -289,7 +398,7 @@ test("resolveTrustedPullRequest finds a fork PR (empty pull_requests) by '<fork 
   assert.strictEqual(pr.number, 42);
   assert.strictEqual(calls.pullsGet.length, 0);
   assert.strictEqual(calls.pullsList[0].head, "contributor:my-fix");
-  assert.strictEqual(calls.pullsList[0].state, "open");
+  assert.strictEqual(calls.pullsList[0].state, "all");
 });
 
 test("resolveTrustedPullRequest treats a missing pull_requests field like an empty one", async () => {
@@ -345,7 +454,7 @@ test("resolveTrustedPullRequest skips a fork run that has no head owner or no he
   }
 });
 
-test("resolveTrustedPullRequest skips a fork run when no open PR is at the tested commit", async () => {
+test("resolveTrustedPullRequest skips a fork run when no PR is at the tested commit", async () => {
   const { github } = makeGithub({ openPrs: [openPr(41, OTHER_SHA)] });
   const { core, logs } = makeCore();
   assert.strictEqual(
@@ -355,7 +464,7 @@ test("resolveTrustedPullRequest skips a fork run when no open PR is at the teste
   assert.match(logs.warning[0], /found 0/);
 });
 
-test("resolveTrustedPullRequest skips a fork run when several open PRs share that branch and commit (ambiguous)", async () => {
+test("resolveTrustedPullRequest skips a fork run when several PRs share that branch and commit (ambiguous)", async () => {
   const { github } = makeGithub({ openPrs: [openPr(41), openPr(42)] });
   const { core, logs } = makeCore();
   assert.strictEqual(
@@ -365,9 +474,106 @@ test("resolveTrustedPullRequest skips a fork run when several open PRs share tha
   assert.match(logs.warning[0], /found 2/);
 });
 
-test("resolveTrustedPullRequest skips a PR that is no longer open", async () => {
+// The reviewed lifecycle bug: old PR closes -> a NEW PR reuses the same fork
+// branch and exact same commit -> the old run finishes. The old run must not
+// be attached to the new PR.
+test("fork PR lifecycle: an old run is NOT attached to a later PR that reuses the same fork branch and commit", async () => {
   const { github } = makeGithub({
+    openPrs: [
+      openPr(41, SHA, { state: "closed", created_at: BEFORE_RUN }),
+      openPr(42, SHA, { created_at: AFTER_RUN }), // opened after the run started
+    ],
+  });
+  const { core, logs } = makeCore();
+  assert.strictEqual(
+    await resolveTrustedPullRequest({ github, context: forkContext(), core }),
+    null,
+  );
+  // Only the old (closed) PR existed when the run started, so that is the
+  // one candidate - and it is closed, so nothing is posted anywhere.
+  assert.match(logs.info[0], /PR #41 is no longer open/);
+  assert.strictEqual(logs.warning.length, 0);
+});
+
+test("fork PR lifecycle: a PR created after the run started is never its target, even with no other PR", async () => {
+  const { github } = makeGithub({
+    openPrs: [openPr(42, SHA, { created_at: AFTER_RUN })],
+  });
+  const { core, logs } = makeCore();
+  assert.strictEqual(
+    await resolveTrustedPullRequest({ github, context: forkContext(), core }),
+    null,
+  );
+  assert.match(logs.warning[0], /found 0/);
+});
+
+test("fork PR lifecycle: if the old PR is closed and was the only PR at that commit, the run is skipped, not retargeted", async () => {
+  const { github } = makeGithub({
+    openPrs: [openPr(41, SHA, { state: "closed" })],
+  });
+  const { core, logs } = makeCore();
+  assert.strictEqual(
+    await resolveTrustedPullRequest({ github, context: forkContext(), core }),
+    null,
+  );
+  assert.match(logs.info[0], /no longer open/);
+});
+
+test("fork PR lifecycle: a closed PR that existed at the run's start still makes a second one ambiguous", async () => {
+  const { github } = makeGithub({
+    openPrs: [
+      openPr(41, SHA, { state: "closed" }),
+      openPr(42, SHA, { created_at: BEFORE_RUN }),
+    ],
+  });
+  const { core, logs } = makeCore();
+  assert.strictEqual(
+    await resolveTrustedPullRequest({ github, context: forkContext(), core }),
+    null,
+  );
+  assert.match(logs.warning[0], /found 2/);
+});
+
+test("fork PR lifecycle: a PR created in the same instant as the run is accepted, a missing or garbled timestamp is not", async () => {
+  const same = makeGithub({
+    openPrs: [openPr(42, SHA, { created_at: RUN_CREATED })],
+  });
+  assert.strictEqual(
+    (
+      await resolveTrustedPullRequest({
+        github: same.github,
+        context: forkContext(),
+        core: makeCore().core,
+      })
+    ).number,
+    42,
+  );
+
+  for (const [prCreated, runCreated] of [
+    [undefined, RUN_CREATED],
+    ["garbage", RUN_CREATED],
+    [BEFORE_RUN, undefined],
+    [BEFORE_RUN, "garbage"],
+  ]) {
+    const { github } = makeGithub({
+      openPrs: [openPr(42, SHA, { created_at: prCreated })],
+    });
+    assert.strictEqual(
+      await resolveTrustedPullRequest({
+        github,
+        context: forkContext({ created_at: runCreated }),
+        core: makeCore().core,
+      }),
+      null,
+      `${prCreated} / ${runCreated}`,
+    );
+  }
+});
+
+test("same-repo lifecycle: a run linked to a PR that has since been closed is skipped (not moved to a newer PR)", async () => {
+  const { github, calls } = makeGithub({
     prs: { 7: openPr(7, SHA, { state: "closed" }) },
+    openPrs: [openPr(8, SHA, { created_at: AFTER_RUN })],
   });
   const { core, logs } = makeCore();
   assert.strictEqual(
@@ -375,6 +581,7 @@ test("resolveTrustedPullRequest skips a PR that is no longer open", async () => 
     null,
   );
   assert.match(logs.info[0], /no longer open/);
+  assert.strictEqual(calls.pullsList.length, 0);
 });
 
 test("resolveTrustedPullRequest skips a stale run whose commit has been superseded by a newer push", async () => {
@@ -409,6 +616,7 @@ test("posts to the PR GitHub says the run belongs to - an attacker-planted PR nu
     assert.strictEqual(calls.createComment[0].issue_number, 7);
     for (const call of [
       ...calls.pullsGet,
+      ...calls.listFiles,
       ...calls.listComments,
       ...calls.createComment,
       ...calls.updateComment,
@@ -418,7 +626,7 @@ test("posts to the PR GitHub says the run belongs to - an attacker-planted PR nu
   });
 });
 
-test("posts a new sticky comment (marker first, mentions defused) on a fork PR found by branch + commit", async () => {
+test("posts a new sticky comment (marker, run tag, mentions defused, commit footer) on a fork PR found by branch + commit", async () => {
   await withTmpDir(async (dir) => {
     writeArtifact(dir, "## Report\nping @victim and @org/team");
     const { github, calls } = makeGithub({ openPrs: [openPr(42)] });
@@ -429,12 +637,31 @@ test("posts a new sticky comment (marker first, mentions defused) on a fork PR f
     assert.strictEqual(calls.createComment.length, 1);
     const { issue_number, body } = calls.createComment[0];
     assert.strictEqual(issue_number, 42);
-    assert.ok(body.startsWith(`${MARKER}\n`));
+    assert.ok(
+      body.startsWith(`${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n`),
+    );
     assert.ok(!/@(?=[A-Za-z0-9])/.test(body), "mentions must be defused");
+    assert.ok(body.endsWith("\n\n<sub>Measured at commit `deadbee`.</sub>"));
     assert.match(
       logs.info.join("\n"),
       /Posted a new coverage comment on PR #42/,
     );
+  });
+});
+
+test("a forged run tag inside the report can neither be parsed as ours nor block a later run", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report\n<!-- cla-bot:coverage-run 999999.1 -->\nmore");
+    const { github, calls } = makeGithub({ prs: { 7: openPr(7) } });
+    await run(dir, { github, context: samePrContext(), core: makeCore().core });
+
+    const { body } = calls.createComment[0];
+    assert.strictEqual(
+      (body.match(/<!-- cla-bot:coverage-run/g) || []).length,
+      1,
+    );
+    assert.strictEqual(isSupersededBy(body, { number: 6, attempt: 1 }), false);
+    assert.strictEqual(isSupersededBy(body, { number: 4, attempt: 1 }), true);
   });
 });
 
@@ -443,9 +670,7 @@ test("updates our existing sticky comment instead of posting a second one", asyn
     writeArtifact(dir, "fresh report");
     const { github, calls } = makeGithub({
       prs: { 7: openPr(7) },
-      comments: [
-        { id: 555, user: { login: BOT_LOGIN }, body: `${MARKER}\nold report` },
-      ],
+      comments: [ourComment(555, `${MARKER}\nold report`)],
     });
     const { core, logs } = makeCore();
 
@@ -454,7 +679,10 @@ test("updates our existing sticky comment instead of posting a second one", asyn
     assert.strictEqual(calls.createComment.length, 0);
     assert.strictEqual(calls.updateComment.length, 1);
     assert.strictEqual(calls.updateComment[0].comment_id, 555);
-    assert.strictEqual(calls.updateComment[0].body, `${MARKER}\nfresh report`);
+    assert.strictEqual(
+      calls.updateComment[0].body,
+      `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\nfresh report\n\n<sub>Measured at commit \`deadbee\`.</sub>`,
+    );
     assert.match(
       logs.info.join("\n"),
       /Updated existing coverage comment \(id 555\)/,
@@ -488,6 +716,8 @@ test("never edits a comment that merely quotes the marker unless the github-acti
   });
 });
 
+// --- freshness (TOCTOU) ------------------------------------------------------------------
+
 test("skips posting when the report is stale (a newer push already superseded this run)", async () => {
   await withTmpDir(async (dir) => {
     writeArtifact(dir, "report");
@@ -502,6 +732,164 @@ test("skips posting when the report is stale (a newer push already superseded th
     assert.ok(logs.info.some((m) => m.includes("superseded")));
   });
 });
+
+test("re-checks the PR head right before writing: a push that lands after the first check blocks the write", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report");
+    // First read: still at the tested commit. Second read (just before the
+    // write): a newer commit has landed.
+    const { github, calls } = makeGithub({
+      prs: { 7: [openPr(7, SHA), openPr(7, OTHER_SHA)] },
+    });
+    const { core, logs } = makeCore();
+
+    await run(dir, { github, context: samePrContext(), core });
+
+    assert.strictEqual(calls.pullsGet.length, 2);
+    assert.strictEqual(calls.createComment.length, 0);
+    assert.strictEqual(calls.updateComment.length, 0);
+    assert.ok(logs.info.some((m) => m.includes("superseded")));
+  });
+});
+
+test("re-checks that the PR is still open right before writing", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report");
+    const { github, calls } = makeGithub({
+      prs: { 7: [openPr(7), openPr(7, SHA, { state: "closed" })] },
+    });
+    const { core, logs } = makeCore();
+    await run(dir, { github, context: samePrContext(), core });
+    assert.strictEqual(calls.createComment.length, 0);
+    assert.ok(logs.info.some((m) => m.includes("no longer open")));
+  });
+});
+
+test("skips (rather than writing blind) when the pre-write re-check itself fails", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report");
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      getErrorOnCall: 2,
+    });
+    const { core, logs } = makeCore();
+    await run(dir, { github, context: samePrContext(), core });
+    assert.strictEqual(calls.createComment.length, 0);
+    assert.strictEqual(calls.updateComment.length, 0);
+    assert.match(logs.warning[0], /Could not re-check PR #7/);
+    assert.match(logs.warning[0], /transient failure/);
+  });
+});
+
+test("the pre-write re-check also tolerates a non-Error rejection", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report");
+    const { github, calls } = makeGithub({ prs: { 7: openPr(7) } });
+    let call = 0;
+    const originalGet = github.rest.pulls.get;
+    github.rest.pulls.get = async (params) => {
+      call += 1;
+      if (call === 2) throw "plain string failure";
+      return originalGet(params);
+    };
+    const { core, logs } = makeCore();
+    await run(dir, { github, context: samePrContext(), core });
+    assert.strictEqual(calls.createComment.length, 0);
+    assert.match(logs.warning[0], /plain string failure/);
+  });
+});
+
+test("an OLDER run never overwrites a comment written by a NEWER run, whatever order the jobs finish in", async () => {
+  for (const [existing, expectWrite] of [
+    [tagged(6, 1), false], // newer run number
+    [tagged(5, 2), false], // same run, later attempt
+    [tagged(5, 1), true], // same run and attempt (idempotent refresh)
+    [tagged(4, 3), true], // older run
+    [`${MARKER}\nuntagged older-format report`, true], // pre-existing comment
+    [`${MARKER}\nfoo\n<!-- cla-bot:coverage-run 99.1 -->`, true], // tag not at the top
+  ]) {
+    await withTmpDir(async (dir) => {
+      writeArtifact(dir, "report");
+      const { github, calls } = makeGithub({
+        prs: { 7: openPr(7) },
+        comments: [ourComment(555, existing)],
+      });
+      const { core, logs } = makeCore();
+
+      await run(dir, { github, context: samePrContext(), core });
+
+      assert.strictEqual(
+        calls.updateComment.length,
+        expectWrite ? 1 : 0,
+        existing,
+      );
+      if (!expectWrite) {
+        assert.ok(logs.info.some((m) => m.includes("newer coverage run")));
+        assert.strictEqual(calls.createComment.length, 0);
+        // And it never even spends the extra freshness call.
+        assert.strictEqual(calls.pullsGet.length, 1);
+      }
+    });
+  }
+});
+
+test("a rerun (attempt 2) of the same run replaces the first attempt's comment", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report");
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(555, tagged(5, 1))],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ run_attempt: 2 }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.ok(calls.updateComment[0].body.includes("coverage-run 5.2 -->"));
+  });
+});
+
+test("without a usable run number the comment is still posted, just untagged and unguarded", async () => {
+  await withTmpDir(async (dir) => {
+    writeArtifact(dir, "report");
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(555, tagged(99, 1))],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ run_number: undefined }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.ok(calls.updateComment[0].body.startsWith(`${MARKER}\nreport`));
+    assert.ok(!calls.updateComment[0].body.includes("coverage-run"));
+  });
+});
+
+test("coverage-comment.yml serialises comment jobs per branch (never cancel-in-progress) so two jobs can't interleave read-then-write", () => {
+  const workflow = yaml.load(
+    fs.readFileSync(
+      path.join(
+        __dirname,
+        "..",
+        ".github",
+        "workflows",
+        "coverage-comment.yml",
+      ),
+      "utf8",
+    ),
+  );
+  assert.ok(workflow.concurrency, "a concurrency group must exist");
+  assert.strictEqual(workflow.concurrency["cancel-in-progress"], false);
+  assert.match(
+    workflow.concurrency.group,
+    /head_repository\.full_name.*head_branch/,
+  );
+});
+
+// --- the rest of the script flow -----------------------------------------------------------
 
 test("skips (and makes no API call at all) when the artifact is missing", async () => {
   await withTmpDir(async (dir) => {
@@ -550,9 +938,9 @@ test("skips (never guesses a target) when the run is linked to more than one PR"
   });
 });
 
-test("skips a report too long for a GitHub comment, before touching the API", async () => {
+test("skips a report too long for a GitHub comment (leaving room for what we add), before touching the API", async () => {
   await withTmpDir(async (dir) => {
-    writeArtifact(dir, "x".repeat(MAX_COMMENT_LENGTH - NOTICE_RESERVE));
+    writeArtifact(dir, "x".repeat(MAX_COMMENT_LENGTH - NOTICE_RESERVE + 1));
     const { github, calls } = makeGithub({ prs: { 7: openPr(7) } });
     const { core, logs } = makeCore();
     await run(dir, { github, context: samePrContext(), core });
@@ -585,6 +973,7 @@ test("falls back to the current directory when GITHUB_WORKSPACE is unset", async
 test("isGateFile matches the files that define the gate and nothing else", () => {
   for (const name of [
     ".c8rc.json",
+    "action.yml",
     "package.json",
     "package-lock.json",
     ".github/CODEOWNERS",
@@ -601,6 +990,7 @@ test("isGateFile matches the files that define the gate and nothing else", () =>
     "README.md",
     ".github/workflows/ci.yml",
     "docs/package.json",
+    "examples/action.yml",
   ]) {
     assert.strictEqual(isGateFile(name), false, name);
   }
@@ -614,6 +1004,7 @@ test("a PR that touches gate files gets a warning ABOVE the report, built from t
       files: [
         { filename: "src/cla-bot.js" },
         { filename: ".c8rc.json" },
+        { filename: "action.yml" },
         { filename: ".github/scripts/coverage-report.js" },
       ],
     });
@@ -625,18 +1016,22 @@ test("a PR that touches gate files gets a warning ABOVE the report, built from t
       { owner: "fossasia", repo: "cla-bot", pull_number: 7, per_page: 100 },
     ]);
     const { body } = calls.createComment[0];
-    assert.ok(body.startsWith(`${MARKER}\n> [!WARNING]\n`));
+    assert.ok(
+      body.startsWith(
+        `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n> [!WARNING]\n`,
+      ),
+    );
     assert.match(body, /changes files that define the coverage gate/);
     assert.match(
       body,
-      /> - `\.c8rc\.json`\n> - `\.github\/scripts\/coverage-report\.js`/,
+      /> - `\.c8rc\.json`\n> - `\.github\/scripts\/coverage-report\.js`\n> - `action\.yml`/,
     );
     assert.ok(!body.includes("src/cla-bot.js"));
-    assert.ok(body.endsWith("\n\n## Report body"));
+    assert.match(body, /\n\n## Report body\n\n<sub>Measured at commit/);
   });
 });
 
-test("no warning (body is exactly marker + report) when the PR touches no gate file", async () => {
+test("no warning when the PR touches no gate file", async () => {
   await withTmpDir(async (dir) => {
     writeArtifact(dir, "## Report body");
     const { github, calls } = makeGithub({
@@ -648,10 +1043,7 @@ test("no warning (body is exactly marker + report) when the PR touches no gate f
     });
     const { core } = makeCore();
     await run(dir, { github, context: samePrContext(), core });
-    assert.strictEqual(
-      calls.createComment[0].body,
-      `${MARKER}\n## Report body`,
-    );
+    assert.ok(!calls.createComment[0].body.includes("[!WARNING]"));
   });
 });
 
@@ -681,7 +1073,10 @@ test("the notice lists at most 10 gate files and says how many more there are", 
     core,
     pr: { number: 7 },
   });
-  assert.strictEqual((notice.match(/^> - `/gm) || []).length, 10);
+  assert.strictEqual(
+    (notice.match(/^> - `/gm) || []).length,
+    MAX_LISTED_GATE_FILES,
+  );
   assert.match(notice, /> - \.\.\.and 3 more/);
 });
 
@@ -698,6 +1093,57 @@ test("file names are sanitised before being echoed (no Markdown/HTML injection v
   });
   const line = notice.split("\n").find((l) => l.startsWith("> - `"));
   assert.strictEqual(line, "> - `.github/scripts/x??img?src?x???victim.js`");
+});
+
+test("very long file names are truncated, so the notice has a hard upper bound", async () => {
+  const files = Array.from({ length: 12 }, (_, i) => ({
+    filename: `.github/scripts/${String(i).padStart(2, "0")}${"a".repeat(240)}.js`,
+  }));
+  const { github } = makeGithub({ files });
+  const { core } = makeCore();
+  const notice = await gateChangeNotice({
+    github,
+    context: samePrContext(),
+    core,
+    pr: { number: 7 },
+  });
+  for (const line of notice.split("\n").filter((l) => l.startsWith("> - `"))) {
+    // "> - `" + name + "...`"
+    assert.ok(line.length <= 5 + MAX_NAME_LENGTH + 3 + 1, line.length);
+  }
+  assert.match(notice, /\.\.\.`$/m);
+});
+
+test("worst case: a maximum-size report plus the longest possible notice, tag and footer still fits in one comment", async () => {
+  await withTmpDir(async (dir) => {
+    const report = "x".repeat(MAX_COMMENT_LENGTH - NOTICE_RESERVE);
+    writeArtifact(dir, report);
+    const files = Array.from({ length: 40 }, (_, i) => ({
+      filename: `.github/scripts/${String(i).padStart(2, "0")}${"a".repeat(240)}.js`,
+      previous_filename: `.github/scripts/old-${i}${"b".repeat(240)}.js`,
+    }));
+    const { github, calls } = makeGithub({ prs: { 7: openPr(7) }, files });
+    const { core, logs } = makeCore();
+
+    await run(dir, {
+      github,
+      context: samePrContext({
+        run_number: 999999999999999,
+        run_attempt: 999999,
+      }),
+      core,
+    });
+
+    assert.strictEqual(logs.warning.length, 0, logs.warning.join("\n"));
+    assert.strictEqual(calls.createComment.length, 1);
+    const { body } = calls.createComment[0];
+    assert.ok(body.length <= MAX_COMMENT_LENGTH, body.length);
+    const overhead = body.length - report.length;
+    assert.ok(
+      overhead < NOTICE_RESERVE,
+      `our additions (${overhead}) must stay below NOTICE_RESERVE (${NOTICE_RESERVE})`,
+    );
+  });
 });
 
 test("if the file list can't be fetched, the comment still posts - with an explicit 'could not check' warning", async () => {
@@ -719,7 +1165,7 @@ test("if the file list can't be fetched, the comment still posts - with an expli
         body,
         /Could not check whether this PR changes the coverage gate/,
       );
-      assert.ok(body.endsWith("## Report body"));
+      assert.match(body, /## Report body/);
     });
   }
 });

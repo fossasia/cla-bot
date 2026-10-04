@@ -13,7 +13,7 @@
     "coverage:report": "node .github/scripts/coverage-report.js"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   },
   "dependencies": {},
   "devDependencies": {

@@ -112,7 +112,10 @@ function writeSources(dir, ...names) {
   return names.map((name) => {
     const file = path.join(dir, "src", name);
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    if (!fs.existsSync(file)) fs.writeFileSync(file, "");
+    // Append mode creates the file if it is missing and never truncates an
+    // existing one - one atomic call, instead of "check, then write"
+    // (CodeQL js/file-system-race).
+    fs.writeFileSync(file, "", { flag: "a" });
     return file;
   });
 }
@@ -386,6 +389,101 @@ test("formatFileSection omits the snippet block when none of the missing lines e
   );
   assert.match(section, /Uncovered statements on line\(s\):\*\* 3/);
   assert.ok(!section.includes("```"));
+});
+
+// --- Markdown safety of source text ---------------------------------------------------------
+// Source lines and names are inserted into Markdown code fences / inline
+// code. Nothing in them may be able to start a new Markdown line (a lone CR
+// counts as one) or close the fence early.
+
+const MARKDOWN_LINE_BREAK = /\r\n|\r|\n|\u2028|\u2029/;
+const fenceLines = (markdown) =>
+  markdown.split(MARKDOWN_LINE_BREAK).filter((line) => /^ {0,3}```/.test(line));
+
+test("sourceSnippet turns CR, line separators and control characters into spaces", () => {
+  assert.strictEqual(
+    sourceSnippet(["a\r```\rb\u2028c\u2029d\u0000e\tf\u007f"], 1),
+    "a ``` b c d e f",
+  );
+});
+
+test("a source line containing ``` (alone, or after a CR) cannot close the code fence or start a new Markdown line", () => {
+  const section = formatFileSection(
+    "src/tricky.js",
+    {
+      lines: pct(0, 0, 4),
+      statements: pct(0, 0, 4),
+      functions: pct(100, 0, 0),
+      branches: pct(100, 0, 0),
+    },
+    {
+      uncoveredStatementLines: [1, 2, 3, 4],
+      uncoveredFunctions: [],
+      branchLineCounts: new Map(),
+    },
+    [
+      "```",
+      "x\r```\r<img src=x onerror=alert(1)>",
+      "const s = '```js';",
+      "y\u2028```\u2029z",
+    ],
+  );
+  // Exactly our own opening and closing fence, nothing injected.
+  assert.strictEqual(fenceLines(section).length, 2, section);
+  assert.strictEqual(
+    section.split(MARKDOWN_LINE_BREAK).filter((l) => /^\d+: /.test(l)).length,
+    4,
+  );
+});
+
+test("function names and file paths cannot break out of their inline-code spans", () => {
+  const section = formatFileSection(
+    "src/we`ird\nname.js",
+    {
+      lines: pct(50, 1, 2),
+      statements: pct(50, 1, 2),
+      functions: pct(50, 1, 2),
+      branches: pct(100, 0, 0),
+    },
+    {
+      uncoveredStatementLines: [],
+      uncoveredFunctions: [{ name: "a`b\r```c", line: 3 }],
+      branchLineCounts: new Map(),
+    },
+    [],
+  );
+  assert.ok(section.includes("### `src/we'ird name.js`"), section);
+  assert.ok(section.includes("`a'b '''c` (line 3)"), section);
+  assert.strictEqual(fenceLines(section).length, 0);
+});
+
+test("a truncated report whose snippets contain fence-like text still ends with balanced fences", async () => {
+  await withTmpDir((dir) => {
+    const file = path.join(dir, "src", "fences.js");
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const line = "```" + "x".repeat(5000) + "\r```";
+    fs.writeFileSync(file, Array(30).fill(line).join("\n"));
+    const statementMap = {};
+    const s = {};
+    for (let i = 0; i < 30; i += 1) {
+      statementMap[i] = { start: { line: i + 1 } };
+      s[i] = 0;
+    }
+    const entry = {
+      lines: pct(0, 0, 30),
+      statements: pct(0, 0, 30),
+      functions: pct(100, 0, 0),
+      branches: pct(100, 0, 0),
+    };
+    writeCoverage(
+      dir,
+      { total: entry, [file]: entry },
+      { [file]: { statementMap, s, fnMap: {}, f: {}, branchMap: {}, b: {} } },
+    );
+    const { markdown } = main({ cwd: dir, log: quiet });
+    assert.match(markdown, /Report truncated/);
+    assert.strictEqual(fenceLines(markdown).length % 2, 0);
+  });
 });
 
 // --- closeUnbalancedFence -------------------------------------------------------

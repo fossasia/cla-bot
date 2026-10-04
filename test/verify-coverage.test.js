@@ -28,6 +28,8 @@ const {
   listSourceFiles,
   findDataProblems,
   findThresholdProblems,
+  findEntrypointProblems,
+  findImportProblems,
 } = require(SCRIPT_PATH);
 
 const cases = [];
@@ -186,6 +188,374 @@ test("findThresholdProblems reports a metric that is missing from the report ent
     "branches coverage is missing from the report.",
   ]);
   assert.strictEqual(findThresholdProblems({}).length, 4);
+});
+
+// --- action.yml: the shipped entrypoint must be measured -----------------------------------
+
+const trackedSet = (dir, ...rels) =>
+  new Set(rels.map((rel) => path.join(dir, ...rel.split("/"))));
+
+// A composite action whose single script step has the given `run` text
+// (and, optionally, step env).
+function compositeAction(run, env) {
+  return [
+    "name: t",
+    "runs:",
+    '  using: "composite"',
+    "  steps:",
+    "    - uses: actions/setup-node@v1",
+    "    - shell: bash",
+    ...(env
+      ? [
+          "      env:",
+          ...Object.entries(env).map(([k, v]) => `        ${k}: ${v}`),
+        ]
+      : []),
+    `      run: ${run}`,
+    "",
+  ].join("\n");
+}
+const ACTION_PATH_ENV = { ACTION_PATH: "${{ github.action_path }}" };
+
+test("the REAL action.yml runs only measured scripts under src/ (the shipped entrypoint is inside the gate)", () => {
+  assert.deepStrictEqual(
+    findEntrypointProblems(REPO_ROOT, new Set(listSourceFiles(REPO_ROOT))),
+    [],
+  );
+});
+
+test('findEntrypointProblems accepts the project\'s own shape: node "$ACTION_PATH/src/x.js" with ACTION_PATH = github.action_path', async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "action.yml": compositeAction(
+        'node "$ACTION_PATH/src/x.js"',
+        ACTION_PATH_ENV,
+      ),
+    });
+    assert.deepStrictEqual(
+      findEntrypointProblems(dir, trackedSet(dir, "src/x.js")),
+      [],
+    );
+  });
+});
+
+test("findEntrypointProblems accepts ${ACTION_PATH}, the github.action_path expression, unquoted scripts and node options", async () => {
+  await withTmpDir((dir) => {
+    for (const run of [
+      'node "${ACTION_PATH}/src/x.js"',
+      "node '${{ github.action_path }}/src/x.js'",
+      "node ${{ github.action_path }}/src/x.js",
+      'node --max-old-space-size=512 "$ACTION_PATH/src/x.js" && echo done',
+    ]) {
+      writeFiles(dir, {
+        "action.yml": compositeAction(JSON.stringify(run), ACTION_PATH_ENV),
+      });
+      assert.deepStrictEqual(
+        findEntrypointProblems(dir, trackedSet(dir, "src/x.js")),
+        [],
+        run,
+      );
+    }
+  });
+});
+
+test("findEntrypointProblems has nothing to verify when there is no action.yml", async () => {
+  await withTmpDir((dir) => {
+    assert.deepStrictEqual(findEntrypointProblems(dir, new Set()), []);
+  });
+});
+
+test("findEntrypointProblems flags a script outside src/ (the action.yml bypass)", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "action.yml": compositeAction(
+        'node "$ACTION_PATH/scripts/evil.js"',
+        ACTION_PATH_ENV,
+      ),
+      "scripts/evil.js": "",
+    });
+    const problems = findEntrypointProblems(dir, trackedSet(dir, "src/x.js"));
+    assert.strictEqual(problems.length, 1);
+    assert.match(
+      problems[0],
+      /runs scripts\/evil\.js, which is outside src\/ and therefore never measured/,
+    );
+  });
+});
+
+test("findEntrypointProblems flags a script that is under src/ but missing from the report", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "action.yml": compositeAction(
+        'node "$ACTION_PATH/src/ghost.js"',
+        ACTION_PATH_ENV,
+      ),
+    });
+    const problems = findEntrypointProblems(dir, trackedSet(dir, "src/x.js"));
+    assert.match(
+      problems[0],
+      /runs src\/ghost\.js, but it is missing from the coverage report/,
+    );
+  });
+});
+
+test("findEntrypointProblems flags inline (-e/-p), preloaded (-r/--require/--import) code, which is never measured", async () => {
+  await withTmpDir((dir) => {
+    for (const run of [
+      "node -e \"require('./x')\"",
+      'node --eval="1" "$ACTION_PATH/src/x.js"',
+      "node -p 1",
+      'node -r ./pre.js "$ACTION_PATH/src/x.js"',
+      'node --require=./pre.js "$ACTION_PATH/src/x.js"',
+      'node --import ./pre.mjs "$ACTION_PATH/src/x.js"',
+    ]) {
+      writeFiles(dir, {
+        "action.yml": compositeAction(JSON.stringify(run), ACTION_PATH_ENV),
+      });
+      const problems = findEntrypointProblems(dir, trackedSet(dir, "src/x.js"));
+      assert.ok(
+        problems.some((p) => /inline or preloaded code/.test(p)),
+        run,
+      );
+    }
+  });
+});
+
+test("findEntrypointProblems flags locations it cannot verify: other roots, '..', variables, a repointed ACTION_PATH or none at all", async () => {
+  await withTmpDir((dir) => {
+    const cases = [
+      ["node ./src/x.js", ACTION_PATH_ENV],
+      ["node src/x.js", ACTION_PATH_ENV],
+      ["node /abs/src/x.js", ACTION_PATH_ENV],
+      ['node "$ACTION_PATH/../x.js"', ACTION_PATH_ENV],
+      ['node "$ACTION_PATH/src/../../x.js"', ACTION_PATH_ENV],
+      ['node "$ACTION_PATH/src/$X.js"', ACTION_PATH_ENV],
+      ['node "$OTHER/src/x.js"', ACTION_PATH_ENV],
+      // ACTION_PATH redefined to a different tree, or not defined by the step:
+      [
+        'node "$ACTION_PATH/src/x.js"',
+        { ACTION_PATH: "${{ github.workspace }}/evil" },
+      ],
+      ['node "$ACTION_PATH/src/x.js"', undefined],
+      ['node "${ACTION_PATH}/src/x.js"', { OTHER: "1" }],
+    ];
+    for (const [run, env] of cases) {
+      writeFiles(dir, {
+        "action.yml": compositeAction(JSON.stringify(run), env),
+      });
+      const problems = findEntrypointProblems(dir, trackedSet(dir, "src/x.js"));
+      assert.ok(
+        problems.some((p) => /from a location the gate cannot verify/.test(p)),
+        `${run} ${JSON.stringify(env)} -> ${problems}`,
+      );
+    }
+  });
+});
+
+test("findEntrypointProblems requires the action to run some node script from src/", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, { "action.yml": compositeAction("echo hello") });
+    assert.match(
+      findEntrypointProblems(dir, new Set())[0],
+      /does not run any node script from src\//,
+    );
+  });
+});
+
+test("findEntrypointProblems ignores steps without a run, and tolerates a composite action with no steps list", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "action.yml":
+        "runs:\n  using: composite\n  steps:\n    - uses: a/b@v1\n    - null\n",
+    });
+    assert.match(
+      findEntrypointProblems(dir, new Set())[0],
+      /does not run any node script/,
+    );
+    writeFiles(dir, { "action.yml": "runs:\n  using: composite\n" });
+    assert.match(
+      findEntrypointProblems(dir, new Set())[0],
+      /does not run any node script/,
+    );
+  });
+});
+
+test("findEntrypointProblems checks the main/pre/post scripts of a node action", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "action.yml":
+        "runs:\n  using: node24\n  main: src/main.js\n  pre: src/pre.js\n  post: dist/post.js\n",
+    });
+    const problems = findEntrypointProblems(
+      dir,
+      trackedSet(dir, "src/main.js"),
+    );
+    assert.strictEqual(problems.length, 2);
+    assert.ok(problems.some((p) => /src\/pre\.js, but it is missing/.test(p)));
+    assert.ok(
+      problems.some((p) => /dist\/post\.js, which is outside src\//.test(p)),
+    );
+
+    writeFiles(dir, {
+      "action.yml": "runs:\n  using: node24\n  main: src/main.js\n",
+    });
+    assert.deepStrictEqual(
+      findEntrypointProblems(dir, trackedSet(dir, "src/main.js")),
+      [],
+    );
+
+    writeFiles(dir, { "action.yml": "runs:\n  using: node24\n" });
+    assert.match(
+      findEntrypointProblems(dir, new Set())[0],
+      /without a `main` script/,
+    );
+  });
+});
+
+test("findEntrypointProblems rejects action types it can't verify, and unusable files", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "action.yml": "runs:\n  using: docker\n  image: Dockerfile\n",
+    });
+    assert.match(
+      findEntrypointProblems(dir, new Set())[0],
+      /runs\.using "docker"/,
+    );
+
+    writeFiles(dir, { "action.yml": "name: no-runs\n" });
+    assert.match(
+      findEntrypointProblems(dir, new Set())[0],
+      /no `runs` section/,
+    );
+
+    writeFiles(dir, { "action.yml": "just a string\n" });
+    assert.match(
+      findEntrypointProblems(dir, new Set())[0],
+      /no `runs` section/,
+    );
+
+    writeFiles(dir, { "action.yml": "runs: [unclosed\n  - : :\n" });
+    assert.match(
+      findEntrypointProblems(dir, new Set())[0],
+      /could not be parsed/,
+    );
+  });
+});
+
+test("findDataProblems includes the entrypoint and import problems", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "src/a.js": 'require("../outside.js");\n',
+      "action.yml": compositeAction(
+        'node "$ACTION_PATH/tools/x.js"',
+        ACTION_PATH_ENV,
+      ),
+    });
+    const summary = {
+      total: fullMetrics(),
+      [path.join(dir, "src", "a.js")]: fullMetrics(),
+    };
+    const problems = findDataProblems(summary, dir);
+    assert.ok(
+      problems.some((p) =>
+        /outside src\/ and therefore never measured/.test(p),
+      ),
+    );
+    assert.ok(problems.some((p) => /tools\/x\.js/.test(p)));
+  });
+});
+
+// --- imports that leave src/ ----------------------------------------------------------------
+
+test("findImportProblems allows built-ins, packages and relative imports that stay inside src/", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "src/a.js": [
+        'const fs = require("fs");',
+        'const b = require("./lib/b.js");',
+        'const c = require("./lib");',
+        'const self = require(".");',
+        'const dyn = import("./lib/b.js");',
+        'import d from "./lib/b.js";',
+        'import "./lib/b.js";',
+        'const pkg = require("some-package");',
+      ].join("\n"),
+      "src/lib/b.js": 'require("../a.js"); require("../lib/b.js");',
+    });
+    assert.deepStrictEqual(findImportProblems(dir, listSourceFiles(dir)), []);
+  });
+});
+
+test("findImportProblems flags require/import/dynamic import of a relative path outside src/", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "src/a.js": [
+        'require("../vendor/x.js");',
+        "require('../../elsewhere');",
+        'import("../dyn.js");',
+        'import e from "../esm.mjs";',
+        'import "../side-effect.js";',
+        'require("..");',
+        "require(`../tpl.js`);",
+      ].join("\n"),
+    });
+    const problems = findImportProblems(dir, listSourceFiles(dir));
+    assert.strictEqual(problems.length, 7);
+    for (const spec of [
+      "../vendor/x.js",
+      "../../elsewhere",
+      "../dyn.js",
+      "../esm.mjs",
+      "../side-effect.js",
+      "..",
+      "../tpl.js",
+    ]) {
+      assert.ok(
+        problems.some((p) => p.includes(`loads "${spec}"`)),
+        spec,
+      );
+    }
+  });
+});
+
+test("findImportProblems skips a file that vanished between listing and reading", async () => {
+  await withTmpDir((dir) => {
+    assert.deepStrictEqual(
+      findImportProblems(dir, [path.join(dir, "src", "gone.js")]),
+      [],
+    );
+  });
+});
+
+// --- reading files without check-then-use races -------------------------------------------------
+
+test("listSourceFiles treats a missing src/ or a src that is a plain file as 'no sources', but surfaces real I/O errors", async () => {
+  await withTmpDir((dir) => {
+    fs.writeFileSync(path.join(dir, "src"), "i am a file, not a directory");
+    assert.deepStrictEqual(listSourceFiles(dir), []);
+  });
+  await withTmpDir((dir) => {
+    const original = fs.readdirSync;
+    fs.readdirSync = () => {
+      throw Object.assign(new Error("disk on fire"), { code: "EIO" });
+    };
+    try {
+      assert.throws(() => listSourceFiles(dir), /disk on fire/);
+    } finally {
+      fs.readdirSync = original;
+    }
+  });
+});
+
+test("verify() surfaces a real read error instead of reporting 'not found' (only ENOENT means missing)", async () => {
+  await withTmpDir((dir) => {
+    // A directory where the summary file should be: reading it fails with
+    // EISDIR, which must not be mistaken for "the file is missing".
+    fs.mkdirSync(path.join(dir, "coverage", "coverage-summary.json"), {
+      recursive: true,
+    });
+    assert.throws(() => verify({ cwd: dir }), /EISDIR/);
+  });
 });
 
 // --- verify() and the CLI ---------------------------------------------------------------
@@ -359,6 +729,30 @@ test("REAL c8 + the project's .c8rc.json: a fully tested project passes both c8 
       "test/t.js": 'require("../src/lib.js").a();\n',
     });
     const run = runC8(dir, [process.execPath, "test/t.js"]);
+    assert.strictEqual(run.status, 0, run.stdout + run.stderr);
+    assert.deepStrictEqual(verify({ cwd: dir }), []);
+  });
+});
+
+test("REAL c8: a child process spawned with a stripped environment is still measured (the e2e CLI tests rely on this)", async () => {
+  await withTmpDir((dir) => {
+    useProjectConfig(dir);
+    writeFiles(dir, {
+      // The `if` body can only ever run in the child, where it is the entry point.
+      "src/cli.js":
+        'if (require.main === module) { process.stdout.write("ran"); }\nmodule.exports = {};\n',
+      "test/t.js": [
+        'const { spawnSync } = require("child_process");',
+        'const path = require("path");',
+        'const cli = path.join(__dirname, "..", "src", "cli.js");',
+        "// Like test/e2e.test.js: only PATH is passed on, never the parent env.",
+        'const r = spawnSync(process.execPath, [cli], { env: { PATH: process.env.PATH }, encoding: "utf8" });',
+        'if (r.stdout !== "ran") process.exit(3);',
+        "",
+      ].join("\n"),
+    });
+    const run = runC8(dir, [process.execPath, "test/t.js"]);
+    // 100% (c8 exits 0) means the child's execution was recorded.
     assert.strictEqual(run.status, 0, run.stdout + run.stderr);
     assert.deepStrictEqual(verify({ cwd: dir }), []);
   });
