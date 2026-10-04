@@ -1,7 +1,7 @@
 ---
 name: Future Reference
 about: Notes, ideas, or things to keep for future consideration
-title: "[Future]: "
+title: "Future: "
 labels: ["future"]
 ---
 
