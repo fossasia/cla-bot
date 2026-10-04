@@ -39,18 +39,30 @@
  *     closing part of the window:
  *       a. the head SHA is checked when the PR is resolved AND again
  *          immediately before the comment is written;
- *       b. each comment carries a hidden tag with the workflow run number
- *          and attempt (from the trusted event payload), and an older run
+ *       b. each comment carries a hidden tag with the workflow run ID and
+ *          attempt (from the trusted event payload), and an older run
  *          never overwrites a comment written by a newer one, whatever
- *          order the jobs happen to finish in;
+ *          order the jobs happen to finish in. The run ID is used, NOT
+ *          `run_number`: run numbers are counted per workflow file, so
+ *          they restart whenever a workflow is renamed or replaced (as
+ *          happened when coverage.yml became part of ci.yml - a leftover
+ *          "23.1" tag from the old workflow could otherwise outrank every
+ *          run of the new one and freeze the comment). Run IDs are
+ *          globally increasing across all workflows;
  *       c. coverage-comment.yml serialises these jobs per branch
  *          (concurrency without cancel-in-progress), so two jobs never
  *          read-then-write the same comment at once.
  *     What is left is a window of milliseconds in which an old report can
  *     be visible; it is corrected as soon as the newer run's comment job
  *     runs, because (b) lets the newer run overwrite it. The visible
- *     "measured at commit" line lets a reader spot a stale comment, which
- *     can still happen if the newer run fails before producing a report.
+ *     "measured at commit" line lets a reader spot a stale comment.
+ *  2b. A run that produces NO usable report (tests failed, the checkout was
+ *     modified, the job crashed ...) must not leave the previous commit's
+ *     "100%" sitting on the PR as if it were current. For a run that is
+ *     still current, the sticky comment is replaced by an explicit "report
+ *     unavailable" notice with a link to the run. It never replaces a real
+ *     report that was already posted for the SAME commit (e.g. a flaky
+ *     artifact download on a re-run).
  *  3. The report TEXT is still the PR's own output shown back on its own
  *     PR, so it is treated as untrusted content: it must be a small regular
  *     file (not a symlink), @mentions are defused so a PR can't use the
@@ -78,6 +90,11 @@
 
 const fs = require("fs");
 const path = require("path");
+
+// Hidden marker, only present in the "report unavailable" notice, so the
+// "never replace a real report for the same commit" check can tell the two
+// apart. A report can't forge it: sanitizeReport splits every "<!--".
+const UNAVAILABLE_MARKER = "<!-- cla-bot:coverage-unavailable -->";
 
 // Hidden marker so we find and update our own previous comment instead of
 // piling up a new one on every push - the same "one sticky status comment"
@@ -159,11 +176,11 @@ function readReport(reportPath, core) {
   } catch (err) {
     if (err.code === "ELOOP") {
       core.warning(
-        `${reportPath} is not a regular file - skipping comment instead of following it.`,
+        `${reportPath} is not a regular file - treating the report as unavailable instead of following it.`,
       );
     } else {
       core.warning(
-        `Coverage report artifact not found at ${reportPath} - the coverage job may have failed before it could generate one. Skipping comment.`,
+        `Coverage report artifact not found at ${reportPath} - the coverage job may have failed before it could generate one.`,
       );
     }
     return null;
@@ -172,13 +189,13 @@ function readReport(reportPath, core) {
     const stat = fs.fstatSync(fd);
     if (!stat.isFile()) {
       core.warning(
-        `${reportPath} is not a regular file - skipping comment instead of following it.`,
+        `${reportPath} is not a regular file - treating the report as unavailable instead of following it.`,
       );
       return null;
     }
     if (stat.size > MAX_REPORT_BYTES) {
       core.warning(
-        `${reportPath} is ${stat.size} bytes, over the ${MAX_REPORT_BYTES}-byte limit for a coverage report - skipping comment.`,
+        `${reportPath} is ${stat.size} bytes, over the ${MAX_REPORT_BYTES}-byte limit for a coverage report - treating it as unavailable.`,
       );
       return null;
     }
@@ -283,7 +300,7 @@ function isCurrent(pr, run, core) {
 // not carry usable values (then no tag is written and no ordering guard is
 // applied, which only loses the extra protection).
 function runOrder(run) {
-  const number = Number(run.run_number);
+  const number = Number(run.id);
   const attempt = Number(run.run_attempt ?? 1);
   return Number.isSafeInteger(number) &&
     number > 0 &&
@@ -370,6 +387,53 @@ async function gateChangeNotice({ github, context, core, pr }) {
   ].join("\n");
 }
 
+// The values GitHub documents for a workflow run's `conclusion`.
+const KNOWN_CONCLUSIONS = new Set([
+  "success",
+  "failure",
+  "cancelled",
+  "timed_out",
+  "action_required",
+  "neutral",
+  "skipped",
+  "stale",
+  "startup_failure",
+]);
+
+// Replaces the report when this run produced none. Everything interpolated
+// comes from the trusted event payload and is validated first: the
+// conclusion must be one of GitHub's own values, and the link must be an https .../actions/runs/<digits> URL.
+function unavailableReport(run) {
+  const conclusion = KNOWN_CONCLUSIONS.has(run.conclusion)
+    ? run.conclusion
+    : "unknown";
+  const link =
+    /^https:\/\/[A-Za-z0-9.-]+\/[\w.-]+\/[\w.-]+\/actions\/runs\/\d+$/.test(
+      String(run.html_url),
+    )
+      ? ` [View the workflow run](${run.html_url}).`
+      : "";
+  return [
+    UNAVAILABLE_MARKER,
+    "## ⚠️ Test coverage: report unavailable",
+    "",
+    "No coverage report was produced for this commit: the tests or the coverage job failed (or the run ended early) before it could be built. Coverage figures posted earlier on this PR are **out of date**. Fix the failure and push again.",
+    "",
+    `Workflow run conclusion: \`${conclusion}\`.${link}`,
+    "",
+    "<sub>This comment is updated in place on every push.</sub>",
+  ].join("\n");
+}
+
+// True when an existing comment already holds a REAL report for this run's
+// commit, so an "unavailable" notice must not replace it.
+function hasReportForCommit(body, run) {
+  const footer = commitFooter(run).trim();
+  return (
+    footer !== "" && body.includes(footer) && !body.includes(UNAVAILABLE_MARKER)
+  );
+}
+
 // Visible, trusted line saying which commit the report is for, so a stale
 // comment is recognisable at a glance.
 function commitFooter(run) {
@@ -387,23 +451,27 @@ module.exports = async ({ github, context, core }) => {
     return;
   }
 
-  // Cheap local checks first, so a missing artifact never costs an API call.
+  // Cheap local read first; whatever it finds, the freshness checks below decide
+  // whether anything is written.
   const reportPath = path.join(
     process.env.GITHUB_WORKSPACE || ".",
     "coverage-artifact",
     REPORT_FILE,
   );
+  // A missing/unusable report no longer ends the run: the job goes on and
+  // replaces the previous (now outdated) comment with a "report
+  // unavailable" notice, see 2b above.
+  let reportBody = null;
   const report = readReport(reportPath, core);
-  if (report === null) {
-    return;
-  }
-
-  const reportBody = sanitizeReport(report);
-  if (reportBody.length > MAX_COMMENT_LENGTH - NOTICE_RESERVE) {
-    core.warning(
-      `Coverage report is ${reportBody.length} characters, over GitHub's comment limit - skipping comment.`,
-    );
-    return;
+  if (report !== null) {
+    const sanitized = sanitizeReport(report);
+    if (sanitized.length > MAX_COMMENT_LENGTH - NOTICE_RESERVE) {
+      core.warning(
+        `Coverage report is ${sanitized.length} characters, over GitHub's comment limit - treating it as unavailable.`,
+      );
+    } else {
+      reportBody = sanitized;
+    }
   }
 
   const pr = await resolveTrustedPullRequest({ github, context, core });
@@ -417,7 +485,8 @@ module.exports = async ({ github, context, core }) => {
 
   const notice = await gateChangeNotice({ github, context, core, pr });
   const header = order ? `${MARKER}\n${runTag(order)}\n` : `${MARKER}\n`;
-  const commentBody = `${header}${notice}${reportBody}${commitFooter(run)}`;
+  const body = reportBody === null ? unavailableReport(run) : reportBody;
+  const commentBody = `${header}${notice}${body}${commitFooter(run)}`;
   // NOTICE_RESERVE is a proven bound (see its comment and the test that
   // computes the worst case), so this cannot trip: the report was already
   // checked against MAX_COMMENT_LENGTH - NOTICE_RESERVE above. It stays as
@@ -446,6 +515,17 @@ module.exports = async ({ github, context, core }) => {
   if (previous && isSupersededBy(previous.body, order)) {
     core.info(
       `Comment ${previous.id} on PR #${issue_number} was written by a newer coverage run - not overwriting it with this older one.`,
+    );
+    return;
+  }
+
+  if (
+    reportBody === null &&
+    previous &&
+    hasReportForCommit(previous.body, run)
+  ) {
+    core.info(
+      `No report for commit ${run.head_sha}, but comment ${previous.id} on PR #${issue_number} already holds a real report for it - keeping that one.`,
     );
     return;
   }
@@ -505,6 +585,8 @@ module.exports.gateChangeNotice = gateChangeNotice;
 module.exports.isGateFile = isGateFile;
 module.exports.isSupersededBy = isSupersededBy;
 module.exports.runOrder = runOrder;
+module.exports.unavailableReport = unavailableReport;
+module.exports.UNAVAILABLE_MARKER = UNAVAILABLE_MARKER;
 module.exports.commitFooter = commitFooter;
 module.exports.MARKER = MARKER;
 module.exports.BOT_LOGIN = BOT_LOGIN;
