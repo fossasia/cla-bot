@@ -1,29 +1,42 @@
 name: Test Coverage
 
-# This workflow is the actual enforcement gate: it fails the job (and
-# therefore the PR's status check) whenever coverage is below 100%. It
+# Reusable workflow, called from ci.yml (that is what makes it part of the
+# single "Required checks pass" gate - see .github/rulesets/main.json). It
+# fails the job (and therefore the gate) whenever coverage is below 100%. It
 # deliberately runs with read-only, no-secret permissions so it's safe to
 # execute on pull requests from forks - see coverage-comment.yml for how the
 # human-readable PR comment gets posted from a separate, privileged workflow
 # instead of from here.
 #
+# No push / pull_request / schedule triggers of its own (they would run it
+# twice) and no `concurrency:` of its own (inside a reusable workflow
+# `github.workflow` is the CALLER's name, which would collide with ci.yml's
+# group and get the run cancelled). `workflow_dispatch` is kept only to
+# re-run it by hand. ci.yml owns concurrency for the whole gate.
+#
 # Threat model, so nobody over- or under-trusts this gate:
 #
-# - On `pull_request`, GitHub runs the PR's own copy of this file, and the
-#   PR's own package.json / .c8rc.json / scripts decide what is measured, so
-#   a PR could in principle weaken the gate itself. That can only be closed
-#   by repository settings (CODEOWNERS + required code-owner review + this
-#   job as a required status check); see "How the coverage gate is
-#   enforced" in CONTRIBUTING.md. coverage-comment.yml additionally warns
-#   reviewers when a PR touches a gate file.
+# - On `pull_request`, GitHub runs the PR's own copy of ci.yml (and
+#   therefore of this file), and the PR's own package.json / .c8rc.json /
+#   scripts decide what is measured, so a PR could in principle weaken the
+#   gate itself by editing this file, ci.yml, or the scripts it calls. This
+#   repository's branch protection deliberately does NOT add a required
+#   code-owner/human review on top of CI for that case (see "Branch
+#   protection has exactly one required condition" in
+#   .github/rulesets/README.md) - anyone with write access can merge as
+#   soon as the single "Required checks pass" check is green, including a
+#   PR that edits the gate itself. coverage-comment.yml still posts a
+#   visible warning on the PR when a gate file is touched, so this is never
+#   silent, but it is a visibility aid, not a hard block. See "How the
+#   coverage gate is enforced" in CONTRIBUTING.md for the full write-up of
+#   this trade-off, and for how to add a required review back if a given
+#   repository/team wants it.
 # - The tests are PR-controlled code that runs before the gate. So the gate
 #   does not trust the workspace the tests ran in: after them it verifies
 #   that no tracked/untracked file changed, reinstalls node_modules from the
 #   lockfile (a pristine c8), and calls c8 and verify-coverage.js directly
 #   rather than through package.json scripts. This catches a test that
-#   rewrites .c8rc.json, a script or src/ (deliberately or by accident). It
-#   cannot stop a test that forges coverage data, or one that edits this very
-#   workflow; reviewing the PR can.
+#   rewrites .c8rc.json, a script or src/ (deliberately or by accident).
 #
 # ACCEPTED RESIDUAL RISK - read before trusting the green check:
 #   100% is enforced against HONEST pull requests. A MALICIOUS test can still
@@ -32,22 +45,17 @@ name: Test Coverage
 #   run in this very job with write access to that directory. A test that
 #   writes a forged file claiming every src/**/*.js line is hit makes both
 #   `c8 check-coverage` and verify-coverage.js pass. The only complete fixes
-#   are a second, trusted job that never executes PR code, or signed
-#   coverage artifacts; both are disproportionate for this project. The
-#   control is HUMAN REVIEW: CODEOWNERS + "Require review from Code Owners"
-#   + this job as a required check (CONTRIBUTING.md). The git-status check
-#   below, the lockfile reinstall and verify-coverage.js's static checks
-#   catch mistakes and lazy tampering, not a determined adversary.
+#   are a second, trusted job that never executes PR code, signed coverage
+#   artifacts, or a required human review - all considered and intentionally
+#   not applied here (see above). The git-status check below, the lockfile
+#   reinstall and verify-coverage.js's static checks catch mistakes and lazy
+#   tampering, not a determined adversary.
 on:
-  pull_request:
-    branches: [main]
+  workflow_call: {}
+  workflow_dispatch: {}
 
 permissions:
   contents: read
-
-concurrency:
-  group: coverage-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
 
 jobs:
   coverage:

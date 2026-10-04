@@ -1,13 +1,16 @@
 name: Post Coverage Comment
 
-# Split out from coverage.yml on purpose. coverage.yml runs on `pull_request`
-# and therefore only ever gets a read-only, secret-less GITHUB_TOKEN when
-# triggered by a fork PR (GitHub's own security default) - not enough to
-# post a comment. This workflow instead triggers on `workflow_run` after
-# coverage.yml finishes, which runs in the base repo's context with real
-# permissions, and its only job is to read the report *artifact* (one
-# Markdown file, not code) that coverage.yml already built and post it.
-# This is the standard safe pattern for commenting from untrusted PRs -
+# Split out from coverage.yml on purpose. coverage.yml is now a reusable
+# workflow called from ci.yml, which runs on `pull_request` and therefore
+# only ever gets a read-only, secret-less GITHUB_TOKEN when triggered by a
+# fork PR (GitHub's own security default) - not enough to post a comment.
+# This workflow instead triggers on `workflow_run` after the CI run
+# finishes (note: it listens for the workflow named "CI", not "Test
+# Coverage" - coverage.yml's runs are now part of the caller's "CI" run),
+# which runs in the base repo's context with real permissions, and its only
+# job is to read the report *artifact* (one Markdown file, not code) that
+# coverage.yml already built and post it. This is the standard safe pattern
+# for commenting from untrusted PRs -
 # see https://securitylab.github.com/resources/github-actions-preventing-pwn-requests/
 #
 # Which PR gets the comment, and whether the report is still current, are
@@ -16,7 +19,8 @@ name: Post Coverage Comment
 #
 # Note for future maintainers: `workflow_run` always executes the version
 # of *this* workflow file that's on the default branch, regardless of what
-# a PR changes - so edits here only take effect once merged to main.
+# a PR changes - so edits here only take effect once merged to main. If
+# ci.yml's `name:` is ever renamed, update `workflows:` below to match.
 on:
   # zizmor flags workflow_run as a dangerous trigger by default because it's
   # frequently misused to run privileged code against untrusted PR input.
@@ -26,7 +30,7 @@ on:
   # anything from the triggering pull request. Verified safe per
   # https://docs.zizmor.sh/audits/#dangerous-triggers.
   workflow_run: # zizmor: ignore[dangerous-triggers]
-    workflows: ["Test Coverage"]
+    workflows: ["CI"]
     types: [completed]
 
 permissions: {}
@@ -50,10 +54,9 @@ concurrency:
 jobs:
   comment:
     name: Post coverage comment
-    # Only pull_request-triggered runs of coverage.yml produce a PR-shaped
-    # report; a push-to-main run of the same workflow has no PR to comment
-    # on. (coverage.yml is currently pull_request-only, so this is mostly
-    # future-proofing if a push trigger is ever added.)
+    # CI also runs on push, schedule and manual dispatch; only the
+    # pull_request-triggered runs produce a PR-shaped report with a PR to
+    # comment on.
     if: github.event.workflow_run.event == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -88,4 +91,3 @@ jobs:
           script: |
             const script = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/post-coverage-comment.js`);
             await script({ github, context, core });
-  
