@@ -23,10 +23,33 @@
  *
  *  - action.yml (a composite action) must run only `node` scripts that live
  *    under src/ and are in the report, and must not run inline (`-e`) or
- *    preloaded (`-r`) code, which is never measured. Otherwise action.yml
- *    could be pointed at an unmeasured script while src/ stays at 100%.
+ *    preloaded (`-r`, `--import`, `--loader`) code, which is never measured.
+ *    That covers the same flags smuggled in through NODE_OPTIONS: in a
+ *    step's `env`, as a `NODE_OPTIONS=... node ...` prefix, or via
+ *    `export NODE_OPTIONS=...` / `echo NODE_OPTIONS=... >> $GITHUB_ENV` in
+ *    any step. A NODE_OPTIONS value built from an expression or variable
+ *    (`${{ inputs.x }}`, `$X`) cannot be evaluated here, so it is rejected
+ *    too. Otherwise action.yml could be pointed at an unmeasured script, or
+ *    preload one, while src/ stays at 100%.
  *  - No file under src/ may load a relative module from outside src/ (also
- *    never measured).
+ *    never measured), and src/ may not contain symlinks (a link such as
+ *    src/x.js -> ../tools/x.js would look like measured source but run
+ *    code from elsewhere).
+ *
+ * Known limits (best-effort static guards, deliberately not "fixed"):
+ *
+ *  - Only literal specifiers are followed: require(path.join(__dirname,
+ *    "../x.js")), import(variable), createRequire() and the like are
+ *    invisible. Resolving every dynamic load statically is undecidable.
+ *  - Shell indirection around `node` (`env node`, `${NODE:-node}`,
+ *    `command node`) is not parsed; the project's action.yml uses the plain
+ *    form and a regex cannot chase every wrapper without false positives.
+ *  - The test process that produces the coverage data is PR code. A
+ *    malicious test can forge the V8 coverage files that c8 reads (c8 trusts
+ *    any JSON in its temp dir) and so fake 100%. Preventing that needs a
+ *    second trusted job that never runs PR code, or signed coverage
+ *    artifacts. The accepted control is CODEOWNERS + required review: 100%
+ *    is enforced against honest PRs, review is what stops a hostile one.
  *
  * Scope: every .js/.cjs/.mjs file under src/ (the shipped action). If a
  * file type here is not matched by .c8rc.json's `include`, it is reported
@@ -59,23 +82,45 @@ function readOptional(filePath) {
   }
 }
 
-// Absolute paths of every source file under <cwd>/src, sorted.
-function listSourceFiles(cwd) {
-  const root = path.join(cwd, SOURCE_DIR);
-  let entries;
+// Every directory entry under <cwd>/src (recursive), or [] when src/ is
+// missing or not a directory. Other I/O errors are real and are surfaced.
+function readSourceEntries(cwd) {
   try {
-    entries = fs.readdirSync(root, { recursive: true, withFileTypes: true });
+    return fs.readdirSync(path.join(cwd, SOURCE_DIR), {
+      recursive: true,
+      withFileTypes: true,
+    });
   } catch (err) {
     if (err.code === "ENOENT" || err.code === "ENOTDIR") return [];
     throw err;
   }
-  return entries
+}
+
+const entryPath = (entry) => path.join(entry.parentPath, entry.name);
+
+// Absolute paths of every source file under <cwd>/src, sorted.
+function listSourceFiles(cwd) {
+  return readSourceEntries(cwd)
     .filter(
       (entry) =>
         entry.isFile() && SOURCE_EXTENSIONS.has(path.extname(entry.name)),
     )
-    .map((entry) => path.join(entry.parentPath, entry.name))
+    .map(entryPath)
     .sort();
+}
+
+// A symlink under src/ is neither a file nor a directory to readdir, so it
+// would be skipped by listSourceFiles while still being runnable
+// (src/x.js -> ../tools/x.js). Refuse them outright.
+function findSymlinkProblems(cwd) {
+  return readSourceEntries(cwd)
+    .filter((entry) => entry.isSymbolicLink())
+    .map(entryPath)
+    .sort()
+    .map(
+      (link) =>
+        `${toPosix(path.relative(cwd, link))} is a symlink inside ${SOURCE_DIR}/, which could run code from outside the measured tree. Replace it with a real file.`,
+    );
 }
 
 const toPosix = (p) => p.split(path.sep).join("/");
@@ -100,8 +145,73 @@ const ACTION_ROOT_PREFIXES = [
 // `node [options] <script>`, with the script optionally quoted.
 const NODE_INVOCATION =
   /(?:^|[\s;&|(])node((?:[ \t]+-[^\s]*)*)[ \t]+(?:"([^"\n]*)"|'([^'\n]*)'|((?:\$\{\{[^}\n]*\}\}|[^\s"';&|)])+))/g;
+// Flags that make node run code other than the measured script: inline
+// code, preloaded modules and (customisation) loaders.
 const INLINE_CODE_FLAG =
-  /(?:^|\s)(?:-e|-p|-r|--eval|--print|--require|--import)(?:=|\s|$)/;
+  /(?:^|\s)(?:-e|-p|-r|--eval|--print|--require|--import|--loader|--experimental-loader)(?:=|\s|$)/;
+
+// `NODE_OPTIONS=<value>` (also `+=`) in a run script: a quoted value is
+// taken whole; a bare one runs to the end of the line, because it may sit
+// inside a larger quoted string (echo "NODE_OPTIONS=--a --require x" >> ...).
+const NODE_OPTIONS_ASSIGNMENT =
+  /\bNODE_OPTIONS\+?=(?:"([^"]*)"|'([^']*)'|([^\n]*))/gi;
+
+// `NODE_OPTIONS=--require ./x.js` makes node preload code exactly like
+// `node -r`, but the flag is not on the node command line, so it has to be
+// looked for where the variable gets set. `$NODE_OPTIONS` / `${NODE_OPTIONS}`
+// appending to itself is harmless on its own and is ignored.
+const NODE_OPTIONS_SELF_REFERENCE = /\$\{?NODE_OPTIONS\}?/g;
+
+const shownValue = (value) =>
+  JSON.stringify(value.length > 80 ? `${value.slice(0, 80)}...` : value);
+
+// `flagText` is searched for preload/inline flags; `indirectText` for
+// expressions or variables whose value the gate cannot know (a PR could hide
+// "--require ..." in an input default and reference it from here).
+function nodeOptionsProblem(flagText, indirectText) {
+  const flags = flagText.replace(NODE_OPTIONS_SELF_REFERENCE, "");
+  if (INLINE_CODE_FLAG.test(flags)) {
+    return `action.yml sets NODE_OPTIONS with inline or preloaded code (${shownValue(flagText)}), which is never measured.`;
+  }
+  if (/[$`]/.test(indirectText.replace(NODE_OPTIONS_SELF_REFERENCE, ""))) {
+    return `action.yml sets NODE_OPTIONS from an expression or variable (${shownValue(indirectText)}), which the coverage gate cannot verify.`;
+  }
+  return null;
+}
+
+// Every place a composite step can set NODE_OPTIONS: its `env`, and its
+// `run` script (prefix assignment, export, a write to $GITHUB_ENV ...).
+// Checked for ALL steps, not just the ones that run node: a variable set in
+// an earlier step reaches a later step's node.
+function findNodeOptionsProblems(step) {
+  const problems = [];
+  const record = (problem) => {
+    if (problem !== null) problems.push(problem);
+  };
+
+  if (step.env && typeof step.env === "object") {
+    for (const [name, raw] of Object.entries(step.env)) {
+      if (!/^NODE_OPTIONS$/i.test(name)) continue;
+      const value = String(raw ?? "");
+      record(nodeOptionsProblem(value, value));
+    }
+  }
+
+  if (typeof step.run === "string") {
+    // Join backslash line continuations so one logical line is one line.
+    const script = step.run.replace(/\\\r?\n/g, " ");
+    for (const match of script.matchAll(NODE_OPTIONS_ASSIGNMENT)) {
+      const quoted = match[1] ?? match[2];
+      if (quoted !== undefined) {
+        record(nodeOptionsProblem(quoted, quoted));
+      } else {
+        const bare = match[3];
+        record(nodeOptionsProblem(bare, bare.trimStart().split(/\s+/)[0]));
+      }
+    }
+  }
+  return problems;
+}
 
 function findEntrypointProblems(cwd, tracked) {
   const text = readOptional(path.join(cwd, "action.yml"));
@@ -128,7 +238,9 @@ function findEntrypointProblems(cwd, tracked) {
 
   if (runs.using === "composite") {
     for (const step of Array.isArray(runs.steps) ? runs.steps : []) {
-      if (!step || typeof step.run !== "string") continue;
+      if (!step || typeof step !== "object") continue;
+      problems.push(...findNodeOptionsProblems(step));
+      if (typeof step.run !== "string") continue;
       for (const match of step.run.matchAll(NODE_INVOCATION)) {
         const options = match[1] || "";
         const target = match[2] ?? match[3] ?? match[4];
@@ -253,6 +365,7 @@ function findDataProblems(summary, cwd) {
 
   problems.push(...findEntrypointProblems(cwd, tracked));
   problems.push(...findImportProblems(cwd, sources));
+  problems.push(...findSymlinkProblems(cwd));
   return problems;
 }
 
@@ -275,7 +388,7 @@ function verify({ cwd = process.cwd() } = {}) {
   const text = readOptional(summaryPath);
   if (text === null) {
     return [
-      `${path.relative(cwd, summaryPath) || summaryPath} not found - run "npm run test:coverage-nocheck" first.`,
+      `${path.relative(cwd, summaryPath)} not found - run "npm run test:coverage-nocheck" first.`,
     ];
   }
   const summary = JSON.parse(text);
@@ -300,6 +413,8 @@ module.exports = {
   findDataProblems,
   findThresholdProblems,
   findEntrypointProblems,
+  findNodeOptionsProblems,
   findImportProblems,
+  findSymlinkProblems,
   SOURCE_DIR,
 };

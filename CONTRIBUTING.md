@@ -12,8 +12,8 @@ FOSSASIA's projects.
    compromised" risk this project exists to avoid. If you think one is
    genuinely justified, open an issue first. (CI tooling is a different
    bar: `.github/workflows/ci.yml` installs `js-yaml` purely to validate
-   `action.yml`'s structure, and `c8` measures test coverage - neither ships with the action, so it doesn't
-   count against this rule.)
+   `action.yml`'s structure, and `c8` measures test coverage. Neither ships
+   with the action, so neither counts against this rule.)
 2. **Every change to `src/cla-bot.js` needs a matching test.** Pick the
    right layer: `test/logic.test.js` for pure functions (no network),
    `test/http.test.js` for anything touching `readSignatures`/`writeSignatures`
@@ -33,7 +33,8 @@ FOSSASIA's projects.
    gate covers the shipped action (`src/`); the CI helper scripts in
    `.github/scripts/` have their own tests (`test/coverage-report.test.js`,
    `test/post-coverage-comment.test.js`, `test/verify-coverage.test.js`) -
-   update those too if you change them.
+   update those too if you change them (`npm run coverage:scripts` applies
+   the same 100% rule to them).
 4. **Don't weaken any of the security properties** listed at the top of
    `src/cla-bot.js` or in `SECURITY.md` (impersonation guard, exact-match
    allowlist, short-lived tokens, etc.) without discussing it in an issue
@@ -65,16 +66,25 @@ enforced rule.
   `include` matches no file).
 - The same script checks that what ships is what is measured: `action.yml`
   may only run `node` scripts that live under `src/` (no inline `-e` or
-  preloaded `-r` code, no other directory), and nothing in `src/` may load
-  a relative module from outside `src/`.
+  preloaded `-r` / `--import` / `--loader` code, no other directory), and
+  nothing in `src/` may load a relative module from outside `src/`. Preloads
+  smuggled in through `NODE_OPTIONS` are rejected too, wherever a step sets
+  it: its `env`, a `NODE_OPTIONS=... node ...` prefix, `export NODE_OPTIONS=...`
+  or an `echo NODE_OPTIONS=... >> "$GITHUB_ENV"`. A value built from an
+  expression or variable (`${{ inputs.x }}`, `$X`) cannot be checked and is
+  rejected as well; harmless values such as `--max-old-space-size=4096` are
+  fine. `src/` may not contain symlinks, which could run code from outside
+  the measured tree.
 - The tests are untrusted code that runs before the gate, so the gate does
   not trust the workspace they ran in: it fails if the tests changed any
   file in the checkout (tests must only write to temp directories),
   reinstalls `node_modules` from the lockfile, and calls `c8` and
   `verify-coverage.js` directly instead of through `package.json` scripts.
-  This catches tampering with `.c8rc.json`, the scripts, `src/` or `c8`
-  itself. It cannot stop a test that forges coverage data or a PR that
-  edits the workflow - only review can.
+  It also fails if the tests hid an edit from git with
+  `update-index --assume-unchanged` / `--skip-worktree`. This catches
+  tampering with `.c8rc.json`, the scripts, `src/` or `c8` itself. It cannot
+  stop a test that forges coverage data or a PR that edits the workflow -
+  only review can.
 - The comment workflow (`coverage-comment.yml`, which always runs the
   version on `main`) puts a warning at the top of the PR comment whenever a
   PR changes a gate file (`.c8rc.json`, `action.yml`, `package.json`,
@@ -82,23 +92,32 @@ enforced rule.
   `coverage-comment.yml`, `.github/scripts/**`), so a reviewer cannot miss
   that the result was measured with the PR's own rules.
 
+**Known limits** (accepted on purpose, so nobody over-trusts the check):
+
+- **Forged coverage.** 100% is enforced against honest pull requests. The
+  tests are the measurement vehicle, and `c8` trusts any V8 coverage JSON in
+  its temp directory, so a malicious test can write a forged file claiming
+  every line of `src/` is hit and pass both `c8 check-coverage` and
+  `verify-coverage.js`. Closing this needs a second trusted job that never
+  runs PR code, or signed coverage artifacts - disproportionate here. Code
+  owner review is the control.
+- **Dynamic imports.** Only literal specifiers are followed:
+  `require(path.join(__dirname, "../x.js"))`, `import(variable)` and
+  `createRequire()` are invisible. Resolving every dynamic load statically is
+  undecidable, so this is a best-effort guard.
+- **Shell indirection.** `env node`, `${NODE:-node}` and `command node` are
+  not parsed; `action.yml` uses the plain `node "$ACTION_PATH/src/..."` form.
+
 **What the repository must be configured to do** (GitHub settings; the
 part that actually makes the gate trustworthy):
 
-1. Add the gate files to `.github/CODEOWNERS`, for example (replace the
-   owner with your maintainers team or handle):
-
-   ```
-   /.c8rc.json                 @fossasia/<maintainers>
-   /action.yml                 @fossasia/<maintainers>
-   /package.json               @fossasia/<maintainers>
-   /package-lock.json          @fossasia/<maintainers>
-   /.github/CODEOWNERS         @fossasia/<maintainers>
-   /.github/workflows/         @fossasia/<maintainers>
-   /.github/scripts/           @fossasia/<maintainers>
-   ```
-
-   An empty `CODEOWNERS` file is valid but protects nothing.
+1. Keep the gate files in `.github/CODEOWNERS`. The repository ships one
+   that names `@fossasia/cla-admins` for `.c8rc.json`, `action.yml`, `src/`,
+   `package.json`, `package-lock.json`, `.github/CODEOWNERS`,
+   `.github/workflows/` and `.github/scripts/`. If your maintainers team has
+   a different handle, replace it in every line. The team must have explicit
+   **write** access to this repository, or GitHub silently ignores its
+   entries. An empty or missing `CODEOWNERS` file protects nothing.
 
 2. In the branch protection rule or ruleset for `main`, enable **Require
    review from Code Owners** - CODEOWNERS entries are inert without it.
@@ -139,6 +158,7 @@ git clone https://github.com/fossasia/cla-bot.git
 cd cla-bot
 npm test              # runs the full offline unit-test suite
 npm run coverage       # same, plus a coverage report - fails if any line, statement, branch or function isn't hit
+npm run coverage:scripts   # the same 100% rule applied to the CI helper scripts in .github/scripts/
 node --check src/cla-bot.js   # quick syntax check
 ```
 

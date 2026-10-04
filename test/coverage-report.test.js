@@ -760,6 +760,88 @@ test("main() never cuts an astral character (e.g. an emoji in a source line) in 
   }
 });
 
+test("main() rethrows a real read error instead of reporting the coverage data as missing (only ENOENT means missing)", async () => {
+  await withTmpDir((dir) => {
+    // A directory where the summary file should be: reading it fails with
+    // EISDIR, which must not be mistaken for "not found".
+    fs.mkdirSync(path.join(dir, "coverage", "coverage-summary.json"), {
+      recursive: true,
+    });
+    fs.writeFileSync(path.join(dir, "coverage", "coverage-final.json"), "{}");
+    assert.throws(() => main({ cwd: dir, log: quiet }), /EISDIR/);
+  });
+});
+
+test("main() explains a summary with no usable total section instead of a raw TypeError", async () => {
+  await withTmpDir((dir) => {
+    for (const summary of [
+      {},
+      { total: null },
+      { total: { lines: pct(100, 1, 1) } }, // other metrics missing
+    ]) {
+      writeCoverage(dir, summary, {});
+      assert.throws(
+        () => main({ cwd: dir, log: quiet }),
+        /has no usable "total" section/,
+      );
+    }
+  });
+});
+
+test("main() keeps every data problem on one bullet even when a name from the PR contains line breaks, fences or headings", async () => {
+  await withTmpDir((dir) => {
+    const [tracked] = writeSources(dir, "tracked.js");
+    // Legal on Linux: a file name with newlines, a fence and a fake heading.
+    const evil = "evil\n```\n## ✅ Test coverage: 100%\n- fake.js";
+    writeSources(dir, evil + ".js");
+    writeCoverage(dir, { total: fullEntry(), [tracked]: fullEntry() }, {});
+
+    main({ cwd: dir, log: quiet });
+
+    const md = readReportMd(dir);
+    // The forged text survives only as inline words inside the one bullet:
+    // no line of the report may BE a success heading or open a code fence.
+    assert.ok(!/^## ✅/m.test(md), "no forged success heading");
+    assert.ok(!/^```/m.test(md), "no forged code fence");
+    const problems = md
+      .split("**Coverage data problems:**\n")[1]
+      .split("\n\n")[0]
+      .split("\n");
+    assert.strictEqual(problems.length, 1, "exactly one bullet");
+    assert.match(
+      problems[0],
+      /^- src\/evil .*exists but is missing from the coverage report/,
+    );
+  });
+});
+
+test("main() never writes through a symlink left at coverage/pr-comment.md by an earlier step", async () => {
+  await withTmpDir((dir) => {
+    const [tracked] = writeSources(dir, "a.js");
+    writeCoverage(dir, { total: fullEntry(), [tracked]: fullEntry() }, {});
+    const victim = path.join(dir, "victim.json");
+    fs.writeFileSync(victim, '{"keep":"me"}');
+    const out = path.join(dir, "coverage", "pr-comment.md");
+    fs.symlinkSync(victim, out);
+
+    main({ cwd: dir, log: quiet });
+
+    assert.strictEqual(fs.readFileSync(victim, "utf8"), '{"keep":"me"}');
+    assert.ok(!fs.lstatSync(out).isSymbolicLink(), "the link was replaced");
+    assert.match(fs.readFileSync(out, "utf8"), /Test coverage: 100%/);
+  });
+});
+
+test("main() overwrites a stale report from a previous run", async () => {
+  await withTmpDir((dir) => {
+    const [tracked] = writeSources(dir, "a.js");
+    writeCoverage(dir, { total: fullEntry(), [tracked]: fullEntry() }, {});
+    fs.writeFileSync(path.join(dir, "coverage", "pr-comment.md"), "stale");
+    main({ cwd: dir, log: quiet });
+    assert.ok(!readReportMd(dir).includes("stale"));
+  });
+});
+
 test("main() throws a clear error when the coverage reports are missing", async () => {
   await withTmpDir((dir) => {
     assert.throws(

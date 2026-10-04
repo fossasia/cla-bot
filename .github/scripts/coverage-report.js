@@ -266,6 +266,11 @@ function main({ cwd = process.cwd(), log = console.log } = {}) {
   const summary = JSON.parse(summaryText);
   const final = JSON.parse(finalText);
   const total = summary.total;
+  if (!total || METRICS.some((metric) => !total[metric])) {
+    throw new Error(
+      `${summaryPath} has no usable "total" section (every one of ${METRICS.join(", ")} is required), so no report can be built.`,
+    );
+  }
 
   // c8's percentages only describe the files c8 chose to track. The same
   // independent checks `npm run coverage:check` runs (nothing measured, or
@@ -331,7 +336,10 @@ function main({ cwd = process.cwd(), log = console.log } = {}) {
 
     if (dataProblems.length > 0) {
       bodyParts.push(
-        `**Coverage data problems:**\n${dataProblems.map((p) => `- ${p}`).join("\n")}`,
+        // Problems quote names taken from the PR (file names, import
+        // specifiers), so line breaks and control characters are scrubbed:
+        // one problem must stay one bullet, never a forged heading or fence.
+        `**Coverage data problems:**\n${dataProblems.map((p) => `- ${scrub(p)}`).join("\n")}`,
       );
     }
 
@@ -360,7 +368,13 @@ function main({ cwd = process.cwd(), log = console.log } = {}) {
       "\n\n---\n**⚠️ Report truncated** - too many files/lines to list here. Run `npm run coverage` locally for the full breakdown.";
   }
 
-  fs.writeFileSync(outMd, markdown, "utf8");
+  // The tests that ran earlier are PR code and may have left a symlink at
+  // this path. A plain write would follow it and overwrite its target, so
+  // remove whatever is there first (rmSync removes a link, never its
+  // target) and then create the file exclusively ("wx" refuses to follow or
+  // reuse anything that appeared in between).
+  fs.rmSync(outMd, { force: true });
+  fs.writeFileSync(outMd, markdown, { encoding: "utf8", flag: "wx" });
   log(markdown);
 
   return { isFullyCovered, markdown };

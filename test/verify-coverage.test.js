@@ -29,7 +29,9 @@ const {
   findDataProblems,
   findThresholdProblems,
   findEntrypointProblems,
+  findNodeOptionsProblems,
   findImportProblems,
+  findSymlinkProblems,
 } = require(SCRIPT_PATH);
 
 const cases = [];
@@ -321,6 +323,235 @@ test("findEntrypointProblems flags inline (-e/-p), preloaded (-r/--require/--imp
   });
 });
 
+test("findEntrypointProblems flags loader flags on the node command line too (--loader / --experimental-loader)", async () => {
+  await withTmpDir((dir) => {
+    for (const run of [
+      'node --loader ./hooks.mjs "$ACTION_PATH/src/x.js"',
+      'node --experimental-loader=./hooks.mjs "$ACTION_PATH/src/x.js"',
+    ]) {
+      writeFiles(dir, {
+        "action.yml": compositeAction(JSON.stringify(run), ACTION_PATH_ENV),
+      });
+      const problems = findEntrypointProblems(dir, trackedSet(dir, "src/x.js"));
+      assert.ok(
+        problems.some((p) => /inline or preloaded code/.test(p)),
+        run,
+      );
+    }
+  });
+});
+
+// --- NODE_OPTIONS: preloading without a flag on the node command line --------------------
+//
+// `env: { NODE_OPTIONS: "--require ./evil.js" }` followed by a perfectly
+// plain `node "$ACTION_PATH/src/x.js"` preloads evil.js, and coverage never
+// sees it. The flag has to be caught where the variable is set.
+
+const PRELOAD_PROBLEM = /NODE_OPTIONS with inline or preloaded code/;
+const INDIRECT_PROBLEM = /NODE_OPTIONS from an expression or variable/;
+
+test("findNodeOptionsProblems flags a preload/inline flag in a step's env (any step, any spelling of the name)", () => {
+  for (const value of [
+    "--require ${{ github.action_path }}/tools/evil.js",
+    "-r ./evil.js",
+    "--require=./evil.js",
+    "--import ./evil.mjs",
+    "--experimental-loader ./hooks.mjs",
+    "--loader=./hooks.mjs",
+    "-e 1",
+    "--max-old-space-size=4096 --require ./evil.js", // after a harmless flag
+  ]) {
+    // `uses:` steps have no `run`; their env still reaches node later on.
+    const problems = findNodeOptionsProblems({ env: { NODE_OPTIONS: value } });
+    assert.strictEqual(problems.length, 1, value);
+    assert.match(problems[0], PRELOAD_PROBLEM, value);
+  }
+  // Windows environment variable names are case-insensitive.
+  assert.match(
+    findNodeOptionsProblems({ env: { node_options: "-r ./x.js" } })[0],
+    PRELOAD_PROBLEM,
+  );
+});
+
+test("findNodeOptionsProblems flags NODE_OPTIONS set inside a run script: prefix, export, += and $GITHUB_ENV writes", () => {
+  for (const run of [
+    'NODE_OPTIONS="--require ./evil.js" node "$ACTION_PATH/src/x.js"',
+    "NODE_OPTIONS='--require ./evil.js' node \"$ACTION_PATH/src/x.js\"",
+    'NODE_OPTIONS=--require ./evil.js node "$ACTION_PATH/src/x.js"',
+    'export NODE_OPTIONS="--import ./evil.mjs"',
+    "export NODE_OPTIONS=--require=./evil.js",
+    'NODE_OPTIONS+=" --require ./evil.js" node x',
+    // Carried to a LATER step through the environment file:
+    'echo "NODE_OPTIONS=--require ./evil.js" >> "$GITHUB_ENV"',
+    'echo "NODE_OPTIONS=--max-old-space-size=1 --require ./evil.js" >> "$GITHUB_ENV"',
+    // A backslash continuation does not hide the flag on the next line:
+    'export NODE_OPTIONS="--max-old-space-size=1 \\\n  --require ./evil.js"',
+    "NODE_OPTIONS=--max-old-space-size=1 \\\n  --require ./evil.js node x",
+    // Appending to the existing value still adds the flag:
+    'export NODE_OPTIONS="$NODE_OPTIONS -r ./evil.js"',
+    'export NODE_OPTIONS="${NODE_OPTIONS} --require ./evil.js"',
+    // Windows shells:
+    "set node_options=--require ./evil.js",
+    '$env:NODE_OPTIONS="--require ./evil.js"',
+  ]) {
+    const problems = findNodeOptionsProblems({ run });
+    assert.ok(
+      problems.length >= 1 && problems.every((p) => PRELOAD_PROBLEM.test(p)),
+      run,
+    );
+  }
+});
+
+test("findNodeOptionsProblems rejects a NODE_OPTIONS value it cannot evaluate (expression, variable, command substitution)", () => {
+  for (const step of [
+    { env: { NODE_OPTIONS: "${{ inputs.node-options }}" } },
+    { env: { NODE_OPTIONS: "--max-old-space-size=${{ inputs.mem }}" } },
+    { env: { NODE_OPTIONS: "$EXTRA" } },
+    { run: 'export NODE_OPTIONS="${{ inputs.node-options }}"' },
+    { run: 'export NODE_OPTIONS="$EXTRA"' },
+    { run: 'export NODE_OPTIONS="`cat opts.txt`"' },
+    { run: 'NODE_OPTIONS=$EXTRA node "$ACTION_PATH/src/x.js"' },
+    { run: 'NODE_OPTIONS=${{ inputs.x }} node "$ACTION_PATH/src/x.js"' },
+  ]) {
+    const problems = findNodeOptionsProblems(step);
+    assert.strictEqual(problems.length, 1, JSON.stringify(step));
+    assert.match(problems[0], INDIRECT_PROBLEM, JSON.stringify(step));
+  }
+});
+
+test("findNodeOptionsProblems allows harmless NODE_OPTIONS, and anything unrelated to the variable", () => {
+  for (const step of [
+    { env: { NODE_OPTIONS: "--max-old-space-size=4096" } },
+    { env: { NODE_OPTIONS: "--enable-source-maps --no-warnings" } },
+    { env: { NODE_OPTIONS: "" } },
+    { env: { NODE_OPTIONS: null } },
+    { env: { NODE_OPTIONS: 4096 } },
+    { env: { OTHER: "--require ./x.js" } },
+    { env: "not a mapping" },
+    {},
+    { run: "echo hello" },
+    {
+      run: 'NODE_OPTIONS=--max-old-space-size=4096 node "$ACTION_PATH/src/x.js"',
+    },
+    { run: 'export NODE_OPTIONS="--max-old-space-size=4096"' },
+    { run: 'echo "NODE_OPTIONS=--max-old-space-size=4096" >> "$GITHUB_ENV"' },
+    { run: 'export NODE_OPTIONS="$NODE_OPTIONS --max-old-space-size=4096"' },
+    { run: 'export NODE_OPTIONS="${NODE_OPTIONS} --enable-source-maps"' },
+    // Only the variable NODE_OPTIONS matters, not names that merely end in it:
+    { run: "MY_NODE_OPTIONS=--require ./x.js" },
+    // A flag-looking word AFTER a harmless value in a quoted string is still flagged,
+    // but a script argument after the closing quote is not part of the value:
+    { run: 'NODE_OPTIONS="--max-old-space-size=1" node x --require-thing' },
+  ]) {
+    assert.deepStrictEqual(
+      findNodeOptionsProblems(step),
+      [],
+      JSON.stringify(step),
+    );
+  }
+});
+
+test("findNodeOptionsProblems echoes a long offending value truncated, so a report stays small", () => {
+  const long = `--require ./${"a".repeat(500)}.js`;
+  const [problem] = findNodeOptionsProblems({ env: { NODE_OPTIONS: long } });
+  assert.match(problem, PRELOAD_PROBLEM);
+  assert.ok(problem.includes("..."), "value is truncated");
+  assert.ok(problem.length < 300, `message stays short (${problem.length})`);
+});
+
+test("findEntrypointProblems applies the NODE_OPTIONS check to the real shape of the bypass, in a composite action.yml", async () => {
+  await withTmpDir((dir) => {
+    const withEnvStep = (env, run) =>
+      [
+        "name: t",
+        "runs:",
+        '  using: "composite"',
+        "  steps:",
+        "    - uses: actions/setup-node@v1",
+        "      env:",
+        ...Object.entries(env).map(
+          ([k, v]) => `        ${k}: ${JSON.stringify(v)}`,
+        ),
+        "    - shell: bash",
+        "      env:",
+        '        ACTION_PATH: "${{ github.action_path }}"',
+        `      run: ${JSON.stringify(run)}`,
+        "",
+      ].join("\n");
+    const clean = 'node "$ACTION_PATH/src/x.js"';
+    const tracked = trackedSet(dir, "src/x.js");
+
+    // 1. env on the node step itself, with a plain-looking run line
+    writeFiles(dir, {
+      "action.yml": compositeAction(JSON.stringify(clean), {
+        ...ACTION_PATH_ENV,
+        NODE_OPTIONS: JSON.stringify(
+          "--require ${{ github.action_path }}/tools/evil.js",
+        ),
+      }),
+    });
+    assert.ok(
+      findEntrypointProblems(dir, tracked).some((p) => PRELOAD_PROBLEM.test(p)),
+      "env on the node step",
+    );
+
+    // 2. env on an earlier, unrelated step
+    writeFiles(dir, {
+      "action.yml": withEnvStep({ NODE_OPTIONS: "--require ./evil.js" }, clean),
+    });
+    assert.ok(
+      findEntrypointProblems(dir, tracked).some((p) => PRELOAD_PROBLEM.test(p)),
+      "env on an earlier step",
+    );
+
+    // 3. inline prefix and export inside the run script
+    for (const run of [
+      `NODE_OPTIONS="--require ./evil.js" ${clean}`,
+      `export NODE_OPTIONS="--require ./evil.js"\n${clean}`,
+    ]) {
+      writeFiles(dir, { "action.yml": withEnvStep({ OTHER: "1" }, run) });
+      assert.ok(
+        findEntrypointProblems(dir, tracked).some((p) =>
+          PRELOAD_PROBLEM.test(p),
+        ),
+        run,
+      );
+    }
+
+    // 4. the harmless version of all of the above passes
+    writeFiles(dir, {
+      "action.yml": withEnvStep(
+        { NODE_OPTIONS: "--max-old-space-size=4096" },
+        `NODE_OPTIONS=--max-old-space-size=4096 ${clean}`,
+      ),
+    });
+    assert.deepStrictEqual(findEntrypointProblems(dir, tracked), []);
+  });
+});
+
+test("findEntrypointProblems skips composite steps that are not mappings", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "action.yml": [
+        "name: t",
+        "runs:",
+        '  using: "composite"',
+        "  steps:",
+        "    - just a string",
+        "    - 42",
+        "    - shell: bash",
+        '      env: { ACTION_PATH: "${{ github.action_path }}" }',
+        '      run: node "$ACTION_PATH/src/x.js"',
+        "",
+      ].join("\n"),
+    });
+    assert.deepStrictEqual(
+      findEntrypointProblems(dir, trackedSet(dir, "src/x.js")),
+      [],
+    );
+  });
+});
+
 test("findEntrypointProblems flags locations it cannot verify: other roots, '..', variables, a repointed ACTION_PATH or none at all", async () => {
   await withTmpDir((dir) => {
     const cases = [
@@ -528,6 +759,54 @@ test("findImportProblems skips a file that vanished between listing and reading"
 });
 
 // --- reading files without check-then-use races -------------------------------------------------
+
+// --- symlinks under src/ ------------------------------------------------------------------
+
+test("findSymlinkProblems flags a symlink under src/ (file or directory) and ignores real files", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "src/real.js": "module.exports = 1;\n",
+      "src/nested/deep.js": "module.exports = 2;\n",
+      "tools/evil.js": "console.log('unmeasured');\n",
+    });
+    assert.deepStrictEqual(findSymlinkProblems(dir), []);
+
+    fs.symlinkSync("../tools/evil.js", path.join(dir, "src", "linked.js"));
+    fs.symlinkSync("../../tools", path.join(dir, "src", "nested", "tools-dir"));
+    const problems = findSymlinkProblems(dir);
+    assert.strictEqual(problems.length, 2);
+    assert.match(problems[0], /^src\/linked\.js is a symlink inside src\//);
+    assert.match(
+      problems[1],
+      /^src\/nested\/tools-dir is a symlink inside src\//,
+    );
+  });
+});
+
+test("findSymlinkProblems has nothing to say when src/ does not exist", async () => {
+  await withTmpDir((dir) => {
+    assert.deepStrictEqual(findSymlinkProblems(dir), []);
+  });
+});
+
+test("findDataProblems includes the symlink problem (a link can pass for measured source)", async () => {
+  await withTmpDir((dir) => {
+    writeFiles(dir, {
+      "src/real.js": "module.exports = 1;\n",
+      "tools/evil.js": "console.log('unmeasured');\n",
+    });
+    fs.symlinkSync("../tools/evil.js", path.join(dir, "src", "linked.js"));
+    const summary = {
+      total: fullMetrics(),
+      [path.join(dir, "src", "real.js")]: fullMetrics(),
+    };
+    assert.ok(
+      findDataProblems(summary, dir).some((p) =>
+        /src\/linked\.js is a symlink/.test(p),
+      ),
+    );
+  });
+});
 
 test("listSourceFiles treats a missing src/ or a src that is a plain file as 'no sources', but surfaces real I/O errors", async () => {
   await withTmpDir((dir) => {

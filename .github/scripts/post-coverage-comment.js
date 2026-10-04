@@ -392,14 +392,20 @@ module.exports = async ({ github, context, core }) => {
   const notice = await gateChangeNotice({ github, context, core, pr });
   const header = order ? `${MARKER}\n${runTag(order)}\n` : `${MARKER}\n`;
   const commentBody = `${header}${notice}${reportBody}${commitFooter(run)}`;
-  // NOTICE_RESERVE is a proven bound (see its comment), so this cannot
-  // trip; it is the last line of defence against a 422 from GitHub.
+  // NOTICE_RESERVE is a proven bound (see its comment and the test that
+  // computes the worst case), so this cannot trip: the report was already
+  // checked against MAX_COMMENT_LENGTH - NOTICE_RESERVE above. It stays as
+  // the last line of defence against a 422 from GitHub if someone later
+  // lengthens the notice without raising the reserve. Excluded from
+  // coverage because no input can reach it today.
+  /* c8 ignore start */
   if (commentBody.length > MAX_COMMENT_LENGTH) {
     core.warning(
       `Comment would be ${commentBody.length} characters, over GitHub's limit - skipping comment.`,
     );
     return;
   }
+  /* c8 ignore stop */
 
   const existing = await github.paginate(github.rest.issues.listComments, {
     owner,

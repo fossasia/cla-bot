@@ -24,6 +24,20 @@ name: Test Coverage
 #   rewrites .c8rc.json, a script or src/ (deliberately or by accident). It
 #   cannot stop a test that forges coverage data, or one that edits this very
 #   workflow; reviewing the PR can.
+#
+# ACCEPTED RESIDUAL RISK - read before trusting the green check:
+#   100% is enforced against HONEST pull requests. A MALICIOUS test can still
+#   forge coverage: c8 builds its report from the V8 coverage JSON files in
+#   its temp dir (coverage/tmp) and trusts whatever is there, and the tests
+#   run in this very job with write access to that directory. A test that
+#   writes a forged file claiming every src/**/*.js line is hit makes both
+#   `c8 check-coverage` and verify-coverage.js pass. The only complete fixes
+#   are a second, trusted job that never executes PR code, or signed
+#   coverage artifacts; both are disproportionate for this project. The
+#   control is HUMAN REVIEW: CODEOWNERS + "Require review from Code Owners"
+#   + this job as a required check (CONTRIBUTING.md). The git-status check
+#   below, the lockfile reinstall and verify-coverage.js's static checks
+#   catch mistakes and lazy tampering, not a determined adversary.
 on:
   pull_request:
     branches: [main]
@@ -80,6 +94,17 @@ jobs:
           if [ -n "$changes" ]; then
             echo "::error::The test run modified files in the checkout. Tests must only write to temporary directories; the coverage gate cannot trust a workspace the tests changed. Changed files:"
             echo "$changes"
+            exit 1
+          fi
+          # `git update-index --assume-unchanged` / `--skip-worktree` make
+          # git status (and git diff) ignore edits to a tracked file, so a
+          # test could change .c8rc.json and still pass the check above.
+          # After a fresh checkout every tracked file is listed with the
+          # plain "H" tag; anything else was flagged by the tests.
+          hidden="$(git ls-files -v | grep -v '^H ' || true)"
+          if [ -n "$hidden" ]; then
+            echo "::error::The test run hid changes to tracked files from git (assume-unchanged / skip-worktree). Flagged files:"
+            echo "$hidden"
             exit 1
           fi
 
