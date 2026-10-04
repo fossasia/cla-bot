@@ -4376,7 +4376,7 @@ function makeFakeGitHub({
   // body that carries no usable login - the third branch beyond "succeeds
   // with a real login" (bot-identity-success.test.js) and "the request
   // itself fails" (bot-identity.test.js). Needs its own fresh module
-  // instance, same reasoning as those two files: _cachedBotLogin is a
+  // instance, same reasoning as those two files: _botLoginLookup is a
   // module-scope cache.
   // ===========================================================================
   await test("resolveBotLogin falls back to DEFAULT_BOT_LOGIN when GET /user succeeds but the body has no usable login (empty object)", async () => {

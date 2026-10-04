@@ -1159,41 +1159,83 @@ function classifyBotComment(body) {
 const NEW_NOREPLY = /^(\d+)\+([^@]+)@users\.noreply\.github\.com$/i;
 const OLD_NOREPLY = /^([^@+]+)@users\.noreply\.github\.com$/i;
 
-const _userIdCache = new Map(); // login (lowercased) -> id | null (not found)
+// ---------------------------------------------------------------------------
+// Identity lookups (login -> id, id -> login, and the bot's own login).
+//
+// All three used to be "check the cache -> await a GitHub API call -> store
+// the result". Because the cache held the finished VALUE, there was an await
+// between the check and the store: two callers asking for the same key at the
+// same time both missed the cache and each sent their own request (a
+// check-then-act race - the same shape getSignaturesToken() already guards
+// against for the token mint).
+//
+// So the cache now holds the PROMISE, stored synchronously (no await between
+// the lookup and the set) before the request is even awaited. Every caller -
+// the first, a concurrent one, or a much later one - receives that same
+// promise, so exactly ONE request is made per key for the life of the run.
+//
+// Why a rejected promise can never get stuck in these caches: each fetcher
+// below catches every failure itself and resolves to a fallback value (null,
+// or the default bot login), so the promises never reject. Failed lookups are
+// cached on purpose, exactly as before (an unresolvable co-author costs one
+// request per run, not one per commit, and an unresolved id is flagged for
+// manual review - it fails closed, never open). If a fetcher is ever changed
+// so that it can reject, it must also evict its own entry, or one failure
+// would be replayed to every later caller.
+//
+// In practice nothing calls these concurrently today (listPRCommitAuthors()
+// walks commits one at a time); this keeps that from silently becoming a bug
+// the day someone parallelizes it for speed.
+// ---------------------------------------------------------------------------
+const _userIdLookups = new Map(); // login (lowercased) -> Promise<id | null>
 async function resolveUserIdByLogin(login) {
   const key = login.toLowerCase();
-  if (_userIdCache.has(key)) return _userIdCache.get(key);
-  let id = null;
+  let lookup = _userIdLookups.get(key);
+  if (lookup === undefined) {
+    lookup = fetchUserIdByLogin(login);
+    _userIdLookups.set(key, lookup);
+  }
+  return lookup;
+}
+
+// Never rejects - see the block comment above.
+async function fetchUserIdByLogin(login) {
   try {
     const user = await gh(`/users/${encodeURIComponent(login)}`, GITHUB_TOKEN);
-    if (user && typeof user.id === "number") id = user.id;
+    if (user && typeof user.id === "number") return user.id;
   } catch (e) {
     // 404 or a transient failure - either way this falls through to
     // "unresolved" at the call site rather than being silently dropped.
   }
-  _userIdCache.set(key, id);
-  return id;
+  return null;
 }
 
-const _loginByIdCache = new Map(); // id -> login | null (not found)
+const _loginByIdLookups = new Map(); // id -> Promise<login | null>
 // GET /user/{account_id} gives us the current, GitHub-verified login for an
 // id, instead of trusting whatever login string sits next to that id in a
 // commit trailer (see extractCoAuthors - the trailer is free text, so an
 // "id+login" pair in it doesn't prove they belong to the same account).
 async function resolveLoginById(id) {
-  if (_loginByIdCache.has(id)) return _loginByIdCache.get(id);
-  let login = null;
+  let lookup = _loginByIdLookups.get(id);
+  if (lookup === undefined) {
+    lookup = fetchLoginById(id);
+    _loginByIdLookups.set(id, lookup);
+  }
+  return lookup;
+}
+
+// Never rejects - see the block comment above.
+async function fetchLoginById(id) {
   try {
     const user = await gh(`/user/${encodeURIComponent(id)}`, GITHUB_TOKEN);
     if (user && typeof user.login === "string" && user.login.length > 0) {
-      login = user.login;
+      return user.login;
     }
   } catch (e) {
     // 404 (deleted account, or no such id) or transient failure - falls
     // through to unresolved.
   }
-  _loginByIdCache.set(id, login);
-  return login;
+  return null;
 }
 
 // A Co-authored-by: trailer in a commit message is free text - GitHub never
@@ -1319,9 +1361,18 @@ async function listPRCommitAuthors(prNumber) {
   return { authors: [...authors.values()], unresolved: [...unresolvedShas] };
 }
 
-let _cachedBotLogin = null; // one per run, same idea as _sigTokenCache (minus expiry - an identity never goes stale)
+// One lookup per run, shared by every caller - same idea as the identity
+// lookups above (see the block comment there for why the PROMISE is what is
+// stored, and why it can never reject), minus a key: an identity never goes
+// stale, so unlike the signatures token there is no expiry either.
+let _botLoginLookup = null; // Promise<string> | null
 async function resolveBotLogin() {
-  if (_cachedBotLogin) return _cachedBotLogin;
+  if (_botLoginLookup === null) _botLoginLookup = fetchBotLogin();
+  return _botLoginLookup;
+}
+
+// Never rejects: any failure resolves to DEFAULT_BOT_LOGIN.
+async function fetchBotLogin() {
   try {
     // Works for a PAT or user-scoped token. The standard GITHUB_TOKEN isn't
     // one of those, so this is expected to fail in the normal setup - we
@@ -1329,15 +1380,11 @@ async function resolveBotLogin() {
     // consumer using a different kind of token, so dedupe still compares
     // against the right identity instead of a hardcoded guess.
     const me = await gh("/user", GITHUB_TOKEN);
-    if (me && me.login) {
-      _cachedBotLogin = me.login;
-      return _cachedBotLogin;
-    }
+    if (me && me.login) return me.login;
   } catch (e) {
     // Expected for the standard GITHUB_TOKEN - fall through to the default.
   }
-  _cachedBotLogin = DEFAULT_BOT_LOGIN;
-  return _cachedBotLogin;
+  return DEFAULT_BOT_LOGIN;
 }
 
 async function getExistingBotComments(
