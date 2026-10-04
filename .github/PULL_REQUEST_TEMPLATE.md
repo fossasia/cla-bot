@@ -6,13 +6,18 @@
 
 <!-- Why is this change needed? Link to any related issue if applicable -->
 
+
 ## Type of change
+
+<!-- Please mark the relevant option with an `x`: -->
 
 - [ ] Bug fix (non-breaking change that fixes an issue)
 - [ ] New feature (non-breaking change that adds functionality)
 - [ ] Behavioural / Breaking change (fix existing behaviour or public interface)
 
 ## Checklist
+
+<!--Please mark the completed items with an `x`: -->
 
 - [ ] I have added / updated relevant tests
 - [ ] I have updated `CHANGELOG.md` (if the change is user-visible)
