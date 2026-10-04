@@ -976,9 +976,11 @@ test("isGateFile matches the files that define the gate and nothing else", () =>
     "action.yml",
     "package.json",
     "package-lock.json",
-    ".github/CODEOWNERS",
+    ".github/workflows/ci.yml",
     ".github/workflows/coverage.yml",
     ".github/workflows/coverage-comment.yml",
+    ".github/workflows/anything-new.yml",
+    ".github/rulesets/main.json",
     ".github/scripts/coverage-report.js",
     ".github/scripts/anything-new.js",
   ]) {
@@ -988,7 +990,9 @@ test("isGateFile matches the files that define the gate and nothing else", () =>
     "src/cla-bot.js",
     "test/logic.test.js",
     "README.md",
-    ".github/workflows/ci.yml",
+    ".github/CODEOWNERS",
+    ".github/dependabot.yml",
+    ".github/PULL_REQUEST_TEMPLATE.md",
     "docs/package.json",
     "examples/action.yml",
   ]) {
