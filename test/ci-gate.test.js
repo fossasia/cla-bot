@@ -19,6 +19,8 @@
  *  - any `astral-sh/setup-uv` step (zizmor.yml) pins an exact uv version
  *    plus its SHA-256 and disables the cache, so a compromised uv release
  *    cannot silently alter a required check;
+ *  - zizmor.yml has a non-SARIF "fail on findings" run (SARIF exits 0 even
+ *    with findings) and its SARIF upload is best-effort on pull_request;
  *  - the ruleset-as-code requires exactly the gate's check name and
  *    nothing else, and does NOT require any approvals or code-owner
  *    review - this repository's deliberate choice (see
@@ -269,6 +271,55 @@ test("every setup-uv step pins an exact uv version AND its SHA-256 (no unverifie
   assert.ok(
     found > 0,
     "expected zizmor.yml to install uv via astral-sh/setup-uv",
+  );
+});
+
+test("zizmor.yml really fails on findings: a non-SARIF run is the gate, and the SARIF upload cannot break fork/Dependabot PRs", () => {
+  const doc = readYaml(path.join(WORKFLOWS, "zizmor.yml"));
+  const steps = doc.jobs.zizmor.steps;
+  const zizmorRuns = steps.filter(
+    (s) => typeof s.run === "string" && /\bzizmor@/.test(s.run),
+  );
+  // `--format=sarif` always exits 0, so it can never be the only zizmor run.
+  const gates = zizmorRuns.filter(
+    (s) =>
+      /--format[= ](github|plain|json|json-v1)\b/.test(s.run) &&
+      !/--format[= ]sarif/.test(s.run),
+  );
+  assert.strictEqual(
+    gates.length,
+    1,
+    "exactly one zizmor step must use a non-SARIF format (github/plain/json): it is the one that exits non-zero on findings",
+  );
+  const gate = gates[0];
+  assert.ok(
+    !/--no-exit-codes|\|\||;\s*true|--min-severity|--min-confidence/.test(
+      gate.run,
+    ),
+    "the gating zizmor step must not disable exit codes, swallow its status or filter findings out",
+  );
+  assert.ok(
+    gate["continue-on-error"] === undefined ||
+      gate["continue-on-error"] === false,
+    "the gating zizmor step must not be continue-on-error",
+  );
+  assert.ok(
+    String(gate.if ?? "").includes("!cancelled()"),
+    "the gate must use `if: !cancelled()` so findings are enforced even when the best-effort upload fails",
+  );
+  const upload = steps.find((s) =>
+    String(s.uses ?? "").startsWith("github/codeql-action/upload-sarif@"),
+  );
+  assert.ok(upload, "zizmor.yml must still upload the SARIF results");
+  assert.ok(
+    String(upload["continue-on-error"]).includes(
+      "github.event_name == 'pull_request'",
+    ),
+    "SARIF upload must be best-effort on pull_request (fork/Dependabot tokens are read-only), but stay strict on push/schedule",
+  );
+  assert.ok(
+    steps.indexOf(gate) > steps.indexOf(upload),
+    "the gate runs after the upload so the Security tab is updated before the job goes red",
   );
 });
 

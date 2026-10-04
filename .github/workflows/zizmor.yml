@@ -57,13 +57,36 @@ jobs:
           checksum: "fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63"
           enable-cache: false
 
-      - name: Run zizmor
-        run: uvx "zizmor@${ZIZMOR_VERSION}" --format=sarif . > results.sarif
+      # Two runs on purpose, because zizmor's exit code depends on the format:
+      #  * `--format=sarif` ALWAYS exits 0, findings or not. It is only used
+      #    to feed the Security tab, so `--no-exit-codes` is passed explicitly
+      #    (a real tool failure - crash, bad config - still fails the step).
+      #  * the "Fail on findings" step below is the actual gate: any finding
+      #    makes zizmor exit non-zero (11-14 by severity), which turns this
+      #    job - and therefore "Required checks pass" - red. `--format=github`
+      #    also prints each finding as an inline annotation on the PR.
+      - name: Run zizmor (SARIF for code scanning)
+        run: uvx "zizmor@${ZIZMOR_VERSION}" --format=sarif --no-exit-codes . > results.sarif
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # Pull requests from forks and from Dependabot get a read-only token, so
+      # the upload cannot get `security-events: write` there and fails for a
+      # reason that has nothing to do with the code under test. Findings are
+      # still enforced by the next step, so on pull_request the upload is
+      # best-effort; on push / schedule / manual runs (trusted token) a failed
+      # upload still fails the job.
       - name: Upload SARIF file
         uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         with:
           sarif_file: results.sarif
           category: zizmor
+
+      # `!cancelled()` so findings are still reported and enforced even if the
+      # best-effort upload above failed (it would otherwise skip this step).
+      - name: Fail on findings
+        if: ${{ !cancelled() }}
+        run: uvx "zizmor@${ZIZMOR_VERSION}" --format=github .
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
