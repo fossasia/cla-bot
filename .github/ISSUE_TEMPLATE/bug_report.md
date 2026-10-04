@@ -5,6 +5,7 @@ title: "[Bug]: "
 labels: ["bug"]
 ---
 
+
 > **⚠️ Security Vulnerability?**  
 > Please **do not** report security vulnerabilities here.  
 > Instead, report them privately using [GitHub Security Advisories](https://github.com/fossasia/cla-bot/security/advisories/new).
