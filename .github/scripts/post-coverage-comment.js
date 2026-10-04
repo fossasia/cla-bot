@@ -135,32 +135,49 @@ function sanitizeReport(text) {
     .replace(/<!--/g, "<!\u200b--");
 }
 
-// Reads the report only if it is a plain, reasonably-sized file. lstat
-// (not stat) so a symlink is reported as a symlink instead of silently
-// followed to somewhere else on the runner.
+// Reads the report only if it is a plain, reasonably-sized file. The file is
+// opened ONCE with O_NOFOLLOW (a symlink makes the open fail with ELOOP
+// instead of being silently followed to somewhere else on the runner), and
+// the type check, the size check and the read all use that one descriptor.
+// There is no "check the path, then use the path" gap in which the file
+// could be swapped (CodeQL js/file-system-race).
 function readReport(reportPath, core) {
-  let stat;
+  let fd;
   try {
-    stat = fs.lstatSync(reportPath);
-  } catch {
-    core.warning(
-      `Coverage report artifact not found at ${reportPath} - the coverage job may have failed before it could generate one. Skipping comment.`,
+    fd = fs.openSync(
+      reportPath,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
     );
+  } catch (err) {
+    if (err.code === "ELOOP") {
+      core.warning(
+        `${reportPath} is not a regular file - skipping comment instead of following it.`,
+      );
+    } else {
+      core.warning(
+        `Coverage report artifact not found at ${reportPath} - the coverage job may have failed before it could generate one. Skipping comment.`,
+      );
+    }
     return null;
   }
-  if (!stat.isFile()) {
-    core.warning(
-      `${reportPath} is not a regular file - skipping comment instead of following it.`,
-    );
-    return null;
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile()) {
+      core.warning(
+        `${reportPath} is not a regular file - skipping comment instead of following it.`,
+      );
+      return null;
+    }
+    if (stat.size > MAX_REPORT_BYTES) {
+      core.warning(
+        `${reportPath} is ${stat.size} bytes, over the ${MAX_REPORT_BYTES}-byte limit for a coverage report - skipping comment.`,
+      );
+      return null;
+    }
+    return fs.readFileSync(fd, "utf8");
+  } finally {
+    fs.closeSync(fd);
   }
-  if (stat.size > MAX_REPORT_BYTES) {
-    core.warning(
-      `${reportPath} is ${stat.size} bytes, over the ${MAX_REPORT_BYTES}-byte limit for a coverage report - skipping comment.`,
-    );
-    return null;
-  }
-  return fs.readFileSync(reportPath, "utf8");
 }
 
 // "Did this PR already exist when the workflow run was created?" Both

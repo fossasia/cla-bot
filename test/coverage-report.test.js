@@ -827,8 +827,19 @@ test("main() never writes through a symlink left at coverage/pr-comment.md by an
     main({ cwd: dir, log: quiet });
 
     assert.strictEqual(fs.readFileSync(victim, "utf8"), '{"keep":"me"}');
-    assert.ok(!fs.lstatSync(out).isSymbolicLink(), "the link was replaced");
-    assert.match(fs.readFileSync(out, "utf8"), /Test coverage: 100%/);
+    // One open() answers both questions at once, so there is no "check the
+    // path, then use it" gap (CodeQL js/file-system-race): O_NOFOLLOW makes
+    // the open fail with ELOOP if the path is still a symlink, and the
+    // content is then read from the descriptor, not from the path again.
+    const fd = fs.openSync(
+      out,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+    );
+    try {
+      assert.match(fs.readFileSync(fd, "utf8"), /Test coverage: 100%/);
+    } finally {
+      fs.closeSync(fd);
+    }
   });
 });
 
