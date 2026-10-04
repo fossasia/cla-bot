@@ -224,6 +224,10 @@ const ourComment = (id, body) => ({ id, user: { login: BOT_LOGIN }, body });
 const tagged = (number, attempt, rest = "report") =>
   `${MARKER}\n<!-- cla-bot:coverage-run ${number}.${attempt} -->\n${rest}`;
 
+// A comment exactly as the script writes it: marker, run tag, FULL-SHA tag.
+const taggedAt = (sha, rest = "report", number = 5, attempt = 1) =>
+  `${MARKER}\n<!-- cla-bot:coverage-run ${number}.${attempt} -->\n<!-- cla-bot:coverage-sha ${sha} -->\n${rest}`;
+
 // --- sanitizeReport ---------------------------------------------------------------
 
 test("sanitizeReport defuses @user and @org/team mentions but keeps the text readable", () => {
@@ -682,7 +686,7 @@ test("updates our existing sticky comment instead of posting a second one", asyn
     assert.strictEqual(calls.updateComment[0].comment_id, 555);
     assert.strictEqual(
       calls.updateComment[0].body,
-      `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\nfresh report\n\n<sub>Measured at commit \`deadbee\`.</sub>`,
+      `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n<!-- cla-bot:coverage-sha deadbeefdeadbeefdeadbeefdeadbeefdeadbeef -->\nfresh report\n\n<sub>Measured at commit \`deadbee\`.</sub>`,
     );
     assert.match(
       logs.info.join("\n"),
@@ -864,7 +868,11 @@ test("without a usable run ID the comment is still posted, just untagged and ung
       core: makeCore().core,
     });
     assert.strictEqual(calls.updateComment.length, 1);
-    assert.ok(calls.updateComment[0].body.startsWith(`${MARKER}\nreport`));
+    assert.ok(
+      calls.updateComment[0].body.startsWith(
+        `${MARKER}\n<!-- cla-bot:coverage-sha deadbeefdeadbeefdeadbeefdeadbeefdeadbeef -->\nreport`,
+      ),
+    );
     assert.ok(!calls.updateComment[0].body.includes("coverage-run"));
   });
 });
@@ -987,9 +995,8 @@ test("a failed commit REPLACES the previous commit's '100%' comment in place wit
 
 test("the unavailable notice never replaces a REAL report already posted for the same commit", async () => {
   await withTmpDir(async (dir) => {
-    const real = tagged(
-      5,
-      1,
+    const real = taggedAt(
+      SHA,
       "## ✅ Test coverage: 100%\n\n<sub>Measured at commit `deadbee`.</sub>",
     );
     const { github, calls } = makeGithub({
@@ -1010,9 +1017,8 @@ test("the unavailable notice never replaces a REAL report already posted for the
 
 test("an unavailable notice for the same commit is itself refreshed (e.g. a re-run that fails differently)", async () => {
   await withTmpDir(async (dir) => {
-    const old = tagged(
-      5,
-      1,
+    const old = taggedAt(
+      SHA,
       `${UNAVAILABLE_MARKER}\nold\n\n<sub>Measured at commit \`deadbee\`.</sub>`,
     );
     const { github, calls } = makeGithub({
@@ -1052,6 +1058,115 @@ test("a stale run with no report writes nothing (the newer push owns the comment
     assert.strictEqual(calls.createComment.length, 0);
     assert.strictEqual(calls.updateComment.length, 0);
   });
+});
+
+test("a footer copied into a report by the PR does not make an old report count as 'real, same commit'", async () => {
+  await withTmpDir(async (dir) => {
+    // The comment really was measured at OTHER_SHA, but the report text
+    // itself contains a forged footer for SHA (the commit now being run).
+    const forged = taggedAt(
+      OTHER_SHA,
+      "## ✅ 100%\n<sub>Measured at commit `deadbee`.</sub>\n\n<sub>Measured at commit `cafebab`.</sub>",
+    );
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(55, forged)],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ id: 6 }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.ok(calls.updateComment[0].body.includes(UNAVAILABLE_MARKER));
+  });
+});
+
+test("two commits sharing the same 7-character prefix are told apart by the full SHA", async () => {
+  await withTmpDir(async (dir) => {
+    const A = "abcdef0" + "1".repeat(33);
+    const B = "abcdef0" + "2".repeat(33);
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7, B) },
+      comments: [ourComment(55, taggedAt(A, "real report for A"))],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ id: 6, head_sha: B }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(calls.updateComment.length, 1);
+    assert.ok(calls.updateComment[0].body.includes(UNAVAILABLE_MARKER));
+    assert.match(calls.updateComment[0].body, new RegExp(`coverage-sha ${B}`));
+  });
+});
+
+test("the full-SHA tag is only trusted at the very top of the comment", async () => {
+  await withTmpDir(async (dir) => {
+    const buried = `${MARKER}\nintro\n<!-- cla-bot:coverage-sha ${SHA} -->\nreport`;
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7) },
+      comments: [ourComment(55, buried)],
+    });
+    await run(dir, { github, context: samePrContext(), core: makeCore().core });
+    assert.strictEqual(calls.updateComment.length, 1);
+  });
+});
+
+test("the SHA tag is compared case-insensitively and is written in lowercase", async () => {
+  await withTmpDir(async (dir) => {
+    const upper = SHA.toUpperCase();
+    const { github, calls } = makeGithub({
+      prs: { 7: openPr(7, upper) },
+      comments: [ourComment(55, taggedAt(SHA, "real"))],
+    });
+    await run(dir, {
+      github,
+      context: samePrContext({ head_sha: upper }),
+      core: makeCore().core,
+    });
+    assert.strictEqual(
+      calls.updateComment.length,
+      0,
+      "same commit, real report kept",
+    );
+    writeArtifact(dir, "fresh");
+    const second = makeGithub({ prs: { 7: openPr(7, upper) } });
+    await run(dir, {
+      github: second.github,
+      context: samePrContext({ head_sha: upper }),
+      core: makeCore().core,
+    });
+    assert.ok(
+      second.calls.createComment[0].body.includes(`coverage-sha ${SHA} -->`),
+    );
+  });
+});
+
+test("an empty or whitespace-only artifact is 'unavailable', not a successful report", async () => {
+  for (const content of ["", "  \n\t\n"]) {
+    await withTmpDir(async (dir) => {
+      writeArtifact(dir, content);
+      const { github, calls } = makeGithub({ prs: { 7: openPr(7) } });
+      const { core, logs } = makeCore();
+      await run(dir, { github, context: samePrContext(), core });
+      assert.match(logs.warning[0], /is empty/);
+      assert.strictEqual(calls.createComment.length, 1);
+      assert.ok(calls.createComment[0].body.includes(UNAVAILABLE_MARKER));
+    });
+  }
+});
+
+test("runOrder refuses values its own tag pattern could not read back (16-digit id, 7-digit attempt)", () => {
+  assert.deepStrictEqual(
+    runOrder({ id: 999999999999999, run_attempt: 999999 }),
+    {
+      number: 999999999999999,
+      attempt: 999999,
+    },
+  );
+  assert.strictEqual(runOrder({ id: 1000000000000000 }), null);
+  assert.strictEqual(runOrder({ id: 5, run_attempt: 1000000 }), null);
 });
 
 test("unavailableReport only echoes a sane conclusion and an https .../actions/runs/<id> link", () => {
@@ -1196,7 +1311,7 @@ test("a PR that touches gate files gets a warning ABOVE the report, built from t
     const { body } = calls.createComment[0];
     assert.ok(
       body.startsWith(
-        `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n> [!WARNING]\n`,
+        `${MARKER}\n<!-- cla-bot:coverage-run 5.1 -->\n<!-- cla-bot:coverage-sha ${SHA} -->\n> [!WARNING]\n`,
       ),
     );
     assert.match(body, /changes files that define the coverage gate/);

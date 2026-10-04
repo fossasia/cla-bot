@@ -146,6 +146,23 @@ const MAX_LISTED_GATE_FILES = 10;
 // echoed so the notice has a hard upper bound.
 const MAX_NAME_LENGTH = 80;
 
+const SHA_PATTERN = /^[0-9a-f]{40}$/i;
+
+// Largest values RUN_TAG_PATTERN can read back (15 and 6 digits). runOrder
+// refuses anything bigger, so a tag we write is always one we can parse.
+const MAX_RUN_ID = 999999999999999;
+const MAX_RUN_ATTEMPT = 999999;
+
+// The script-written hidden tag holding the FULL 40-character SHA a comment
+// was measured at. Machine decisions ("is this comment already the real
+// report for this commit?") use ONLY this tag, never the visible 7-character
+// footer: the footer is ambiguous between commits sharing a prefix, and its
+// text can be copied into a report by the PR. The tag is read only at the
+// very top of the body (right after our marker and optional run tag), where
+// nothing from the report can reach - sanitizeReport splits every "<!--".
+const COMMIT_TAG_PATTERN =
+  /^<!-- cla-bot:coverage-report -->\n(?:<!-- cla-bot:coverage-run \d{1,15}\.\d{1,6} -->\n)?<!-- cla-bot:coverage-sha ([0-9a-f]{40}) -->\n/;
+
 const RUN_TAG_PATTERN =
   /^<!-- cla-bot:coverage-report -->\n<!-- cla-bot:coverage-run (\d{1,15})\.(\d{1,6}) -->/;
 
@@ -304,14 +321,18 @@ function runOrder(run) {
   const attempt = Number(run.run_attempt ?? 1);
   return Number.isSafeInteger(number) &&
     number > 0 &&
+    number <= MAX_RUN_ID &&
     Number.isSafeInteger(attempt) &&
-    attempt > 0
+    attempt > 0 &&
+    attempt <= MAX_RUN_ATTEMPT
     ? { number, attempt }
     : null;
 }
 
 const runTag = ({ number, attempt }) =>
   `<!-- cla-bot:coverage-run ${number}.${attempt} -->`;
+
+const shaTag = (sha) => `<!-- cla-bot:coverage-sha ${sha.toLowerCase()} -->`;
 
 // True when the existing comment was written by a NEWER run than this one.
 // Only the tag at the very top of the body (the part this script wrote) is
@@ -426,18 +447,21 @@ function unavailableReport(run) {
 }
 
 // True when an existing comment already holds a REAL report for this run's
-// commit, so an "unavailable" notice must not replace it.
+// commit, so an "unavailable" notice must not replace it. Compares the full
+// SHA from the hidden tag (see COMMIT_TAG_PATTERN), not the visible footer.
 function hasReportForCommit(body, run) {
-  const footer = commitFooter(run).trim();
+  const match = COMMIT_TAG_PATTERN.exec(body);
   return (
-    footer !== "" && body.includes(footer) && !body.includes(UNAVAILABLE_MARKER)
+    match !== null &&
+    match[1] === run.head_sha.toLowerCase() &&
+    !body.includes(UNAVAILABLE_MARKER)
   );
 }
 
 // Visible, trusted line saying which commit the report is for, so a stale
 // comment is recognisable at a glance.
 function commitFooter(run) {
-  return /^[0-9a-f]{40}$/i.test(run.head_sha)
+  return SHA_PATTERN.test(run.head_sha)
     ? `\n\n<sub>Measured at commit \`${run.head_sha.slice(0, 7)}\`.</sub>`
     : "";
 }
@@ -463,7 +487,11 @@ module.exports = async ({ github, context, core }) => {
   // unavailable" notice, see 2b above.
   let reportBody = null;
   const report = readReport(reportPath, core);
-  if (report !== null) {
+  if (report !== null && report.trim() === "") {
+    core.warning(
+      `${reportPath} is empty - treating the report as unavailable.`,
+    );
+  } else if (report !== null) {
     const sanitized = sanitizeReport(report);
     if (sanitized.length > MAX_COMMENT_LENGTH - NOTICE_RESERVE) {
       core.warning(
@@ -484,7 +512,14 @@ module.exports = async ({ github, context, core }) => {
   const order = runOrder(run);
 
   const notice = await gateChangeNotice({ github, context, core, pr });
-  const header = order ? `${MARKER}\n${runTag(order)}\n` : `${MARKER}\n`;
+  const header = [
+    MARKER,
+    order ? runTag(order) : null,
+    SHA_PATTERN.test(run.head_sha) ? shaTag(run.head_sha) : null,
+  ]
+    .filter((line) => line !== null)
+    .map((line) => `${line}\n`)
+    .join("");
   const body = reportBody === null ? unavailableReport(run) : reportBody;
   const commentBody = `${header}${notice}${body}${commitFooter(run)}`;
   // NOTICE_RESERVE is a proven bound (see its comment and the test that
