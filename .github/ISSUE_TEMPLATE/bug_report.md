@@ -1,7 +1,9 @@
+---
 name: Bug Report
 about: Report a bug or unexpected behaviour in the CLA bot
 title: "[Bug]: "
 labels: ["bug"]
+---
 
 > **⚠️ Security Vulnerability?**  
 > Please **do not** report security vulnerabilities here.  
