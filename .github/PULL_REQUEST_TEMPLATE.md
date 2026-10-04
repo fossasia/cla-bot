@@ -6,8 +6,6 @@
 
 <!-- Why is this change needed? Link to any related issue if applicable -->
 
----
-
 ## Type of change
 
 - [ ] Bug fix (non-breaking change that fixes an issue)
@@ -21,7 +19,6 @@
 - [ ] The change is covered by the existing test suite (or new tests were added)
 - [ ] I have run `npm test` locally and all tests pass
 
----
 
 ### Behavioural / Breaking changes
 
