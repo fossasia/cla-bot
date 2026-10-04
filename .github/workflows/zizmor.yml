@@ -32,8 +32,30 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install the latest version of uv
+      # uv itself is pinned AND checksum-verified. Without `version`, setup-uv
+      # installs whatever uv is newest, and for a version it has no built-in
+      # checksum for it skips verification entirely, so a compromised uv
+      # release could tamper with zizmor's result (and turn this required
+      # check green). With `version` + `checksum` the run fails closed if the
+      # downloaded archive differs by even one byte.
+      #
+      # `checksum` is the SHA-256 of the uv-x86_64-unknown-linux-gnu.tar.gz
+      # release asset (ubuntu-latest is x86_64); it is published next to the
+      # asset as `<asset>.sha256` on the uv release page. Dependabot cannot
+      # bump these two values, so update them together by hand:
+      #   V=<new uv version>
+      #   curl -fsSL "https://github.com/astral-sh/uv/releases/download/$V/uv-x86_64-unknown-linux-gnu.tar.gz.sha256"
+      # test/ci-gate.test.js fails if `version` is not exact or `checksum` is
+      # missing / not a SHA-256. Last checked: 2026-10-05.
+      #
+      # `enable-cache: false`: nothing here benefits from a uv cache, and
+      # restoring one would let a poisoned cache entry influence a security check.
+      - name: Install uv (pinned and checksum-verified)
         uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: "0.12.17"
+          checksum: "fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63"
+          enable-cache: false
 
       - name: Run zizmor
         run: uvx "zizmor@${ZIZMOR_VERSION}" --format=sarif . > results.sarif

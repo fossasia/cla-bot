@@ -16,6 +16,9 @@
  *    deadlocks against the caller's and GitHub cancels the run);
  *  - coverage-comment.yml still listens to the workflow that now carries
  *    the coverage artifact;
+ *  - any `astral-sh/setup-uv` step (zizmor.yml) pins an exact uv version
+ *    plus its SHA-256 and disables the cache, so a compromised uv release
+ *    cannot silently alter a required check;
  *  - the ruleset-as-code requires exactly the gate's check name and
  *    nothing else, and does NOT require any approvals or code-owner
  *    review - this repository's deliberate choice (see
@@ -228,6 +231,45 @@ test("no CODEOWNERS file is shipped (an unused one invites someone to half-enabl
       "CODEOWNERS must stay empty/absent: this repository does not require code-owner review (see .github/rulesets/README.md)",
     );
   }
+});
+
+test("every setup-uv step pins an exact uv version AND its SHA-256 (no unverified `latest` uv in a required check)", () => {
+  let found = 0;
+  for (const file of workflowFiles) {
+    const doc = readYaml(path.join(WORKFLOWS, file));
+    for (const [jobId, job] of Object.entries(doc.jobs ?? {})) {
+      for (const step of job.steps ?? []) {
+        if (
+          typeof step.uses !== "string" ||
+          !step.uses.startsWith("astral-sh/setup-uv@")
+        ) {
+          continue;
+        }
+        found += 1;
+        const where = `${file} > ${jobId} > ${step.name ?? step.uses}`;
+        const w = step.with ?? {};
+        assert.match(
+          String(w.version ?? ""),
+          /^\d+\.\d+\.\d+$/,
+          `${where}: \`version\` must be an exact uv release (not unset, \`latest\` or a range): setup-uv only verifies checksums for versions it knows`,
+        );
+        assert.match(
+          String(w.checksum ?? ""),
+          /^[0-9a-f]{64}$/,
+          `${where}: \`checksum\` must be the lowercase SHA-256 of the uv release archive so a tampered download fails closed`,
+        );
+        assert.strictEqual(
+          w["enable-cache"],
+          false,
+          `${where}: \`enable-cache\` must be false (a restored cache must not influence a security check)`,
+        );
+      }
+    }
+  }
+  assert.ok(
+    found > 0,
+    "expected zizmor.yml to install uv via astral-sh/setup-uv",
+  );
 });
 
 async function runAll() {
