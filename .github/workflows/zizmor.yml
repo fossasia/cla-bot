@@ -1,12 +1,13 @@
 name: "GitHub Actions Security Analysis with zizmor"
 
+# Reusable workflow, called from ci.yml (that is what makes it part of the
+# single "Required checks pass" gate). No push / pull_request / schedule
+# triggers of its own (they would run this check twice) and no
+# `concurrency:` (inside a reusable workflow `github.workflow` is the
+# CALLER's name, which would collide with ci.yml's group and get the run
+# cancelled). `workflow_dispatch` is kept only to re-run it by hand.
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
-  schedule:
-    - cron: "43 4 * * 1"
+  workflow_call: {}
   workflow_dispatch: {}
 
 env:
@@ -16,14 +17,11 @@ env:
 
 permissions: {}
 
-concurrency:
-  group: zizmor-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   zizmor:
     name: zizmor
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       security-events: write # required for upload-sarif to publish results to the Security tab
       contents: read # only strictly needed if this repo is ever made private

@@ -58,15 +58,18 @@
  *     can't hide content or imitate our hidden tag, and it is
  *     length-checked against GitHub's comment limit.
  *  4. The PR can also edit the files that DEFINE the gate (.c8rc.json,
- *     package.json, action.yml, coverage.yml ...), because coverage.yml runs
- *     the PR's own copy on `pull_request`. Only repository rules
- *     (CODEOWNERS + required reviews + a required status check) can truly
- *     prevent that, see CONTRIBUTING.md "How the coverage gate is
- *     enforced". What this privileged job adds is visibility: it lists the
- *     PR's changed files via the API (not from the artifact) and puts a
- *     warning at the top of the comment when any gate file is touched, so a
- *     reviewer cannot miss that the "100%" below was measured with the
- *     PR's own rules.
+ *     package.json, action.yml, ci.yml, coverage.yml ...), because ci.yml
+ *     (which calls coverage.yml) runs the PR's own copy on `pull_request`.
+ *     This repository deliberately does not require a human/code-owner
+ *     review on top of CI (see "Branch protection has exactly one required
+ *     condition" in .github/rulesets/README.md), so nothing here can
+ *     *block* such a PR - the required status check is the only gate, and
+ *     it would be evaluated with the PR's own, possibly weakened, rules.
+ *     What this privileged job adds is visibility, not enforcement: it
+ *     lists the PR's changed files via the API (not from the artifact) and
+ *     puts a warning at the top of the comment when any gate file is
+ *     touched, so nobody reading the PR can miss that the "100%" below was
+ *     measured with the PR's own rules.
  *
  * Expected to be invoked from actions/github-script as:
  *   const script = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/post-coverage-comment.js`);
@@ -111,11 +114,16 @@ const GATE_FILES = new Set([
   "action.yml",
   "package.json",
   "package-lock.json",
-  ".github/CODEOWNERS",
-  ".github/workflows/coverage.yml",
-  ".github/workflows/coverage-comment.yml",
 ]);
-const GATE_DIR_PREFIX = ".github/scripts/";
+// ci.yml defines the single required check ("Required checks pass") and
+// the workflows it calls (coverage.yml included) define what that check
+// means, so every workflow file counts, as do the scripts they run and the
+// ruleset-as-code that wires the check into branch protection.
+const GATE_DIR_PREFIXES = [
+  ".github/scripts/",
+  ".github/workflows/",
+  ".github/rulesets/",
+];
 const MAX_LISTED_GATE_FILES = 10;
 // File names come from the PR and can be ~255 characters each; cap what is
 // echoed so the notice has a hard upper bound.
@@ -303,7 +311,8 @@ function isSupersededBy(previousBody, order) {
 }
 
 const isGateFile = (filename) =>
-  GATE_FILES.has(filename) || filename.startsWith(GATE_DIR_PREFIX);
+  GATE_FILES.has(filename) ||
+  GATE_DIR_PREFIXES.some((prefix) => filename.startsWith(prefix));
 
 // File names come from the PR, so keep only characters that are inert in
 // Markdown before echoing one back, and cap the length.
@@ -482,8 +491,8 @@ module.exports = async ({ github, context, core }) => {
   }
 
   // Deliberately not core.setFailed() here: the actual pass/fail gate for
-  // branch protection is coverage.yml's own job (it runs directly on
-  // pull_request, so it can be marked as a required status check). This
+  // branch protection is coverage.yml's own job, called from ci.yml, whose
+  // failure fails the single required "Required checks pass" check. This
   // workflow's only responsibility is posting the comment - keeping the
   // two signals in one place avoids confusing PR authors with a second,
   // differently-named failing check for the same underlying reason.
