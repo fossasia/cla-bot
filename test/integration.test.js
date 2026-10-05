@@ -259,6 +259,118 @@ function makeFakeGitHub({
     );
   });
 
+  // The signature lookups are index-backed (see SignatureIndex), so this runs
+  // the real flows against a store of realistic size. It checks the verdict,
+  // not speed: who is listed as missing, who is thanked, and that signers at
+  // the start, middle and end of the file are all found.
+  await test("at scale: a 20,000-signature store and a 61-author PR give exactly the right verdict on both the sign path and the recheck path", async () => {
+    const STORE = 20_000;
+    const storeEntry = (i) => ({ id: 100_000 + i, login: `signed${i}` });
+    const signatures = Array.from({ length: STORE }, (_, i) => storeEntry(i));
+    const commit = (n, id, login) => ({
+      sha: `c${n}`,
+      author: { id, login },
+      parents: [{ sha: "p" }],
+      commit: { author: { email: `${login}@example.com` } },
+    });
+
+    // 30 PR authors who are already in the store: first, middle, last and a
+    // spread in between.
+    const signedIdx = [
+      ...new Set([
+        0,
+        10_000,
+        STORE - 1,
+        ...Array.from({ length: 27 }, (_, k) => ((k + 1) * 617) % STORE),
+      ]),
+    ];
+    assert.strictEqual(signedIdx.length, 30);
+    const unsignedLogins = Array.from({ length: 30 }, (_, k) => `unsigned${k}`);
+    const commits = [
+      ...signedIdx.map((i, n) =>
+        commit(n, storeEntry(i).id, storeEntry(i).login),
+      ),
+      ...unsignedLogins.map((login, k) => commit(100 + k, 500_000 + k, login)),
+      commit(999, 777_777, "newcomer"), // signs below
+    ];
+
+    const gh = makeFakeGitHub({
+      commits,
+      initialSignatures: { version: 1, signatures },
+    });
+    global.fetch = gh.fetch;
+
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "newcomer" } },
+      comment: {
+        user: { id: 777_777, login: "newcomer" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "https://github.com/fossasia/testrepo/pull/1#issuecomment-1",
+        author_association: "NONE",
+      },
+    });
+
+    assert.strictEqual(gh.signatures.signatures.length, STORE + 1);
+    assert.strictEqual(
+      gh.signatures.signatures.filter((e) => e.id === 777_777).length,
+      1,
+      "recorded exactly once",
+    );
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    const pending = gh.comments[gh.comments.length - 1].body;
+    for (const login of unsignedLogins) {
+      assert.ok(
+        pending.includes(`- @${login}\n`) || pending.includes(`- @${login}`),
+        login,
+      );
+    }
+    for (const i of signedIdx) {
+      assert.ok(
+        !pending.includes(`@${storeEntry(i).login}\n`),
+        `${storeEntry(i).login} wrongly listed`,
+      );
+    }
+    assert.ok(
+      !pending.includes("@newcomer"),
+      "the signer just signed and is not missing",
+    );
+    assert.ok(
+      gh.comments.some((c) =>
+        c.body.includes("@newcomer Thank you for signing the CLA!"),
+      ),
+    );
+
+    // Same PR, everyone now in the store, checked through `recheck` (no
+    // known snapshot, so the index built while reading is reused directly).
+    const everyone = [
+      ...signatures,
+      ...unsignedLogins.map((login, k) => ({ id: 500_000 + k, login })),
+      { id: 777_777, login: "newcomer" },
+    ];
+    const gh2 = makeFakeGitHub({
+      commits,
+      initialSignatures: { version: 1, signatures: everyone },
+    });
+    global.fetch = gh2.fetch;
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "newcomer" } },
+      comment: {
+        user: { id: 777_777, login: "newcomer" },
+        body: "recheck",
+        html_url: "https://github.com/fossasia/testrepo/pull/1#issuecomment-2",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh2.statuses[gh2.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh2.signatures.signatures.length,
+      everyone.length,
+      "recheck writes nothing",
+    );
+  });
+
   await test("a random third party commenting the sign phrase does NOT clear a PR authored by someone else", async () => {
     const gh = makeFakeGitHub({
       commits: [
