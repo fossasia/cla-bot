@@ -1,6 +1,6 @@
 "use strict";
 /**
- * Companion to bot-identity.test.js covers the opposite branch (GET /user
+ * Companion to bot-identity.test.js. This one covers the opposite branch (GET /user
  * succeeding, e.g. because a PAT was passed instead of the standard
  * GITHUB_TOKEN). Kept in its own file for the same reason: resolveBotLogin()
  * caches its result at module scope for the life of the process.
