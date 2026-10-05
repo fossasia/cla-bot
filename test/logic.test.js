@@ -18,6 +18,7 @@ process.env.ALLOWLIST = "99,98";
 
 const {
   isSigned,
+  SignatureIndex,
   isAllowlisted,
   parseAllowlist,
   createAppJWT,
@@ -1418,6 +1419,259 @@ test("mergeSignatures prefers the fresh entry over a matching known one (same id
     version: 1,
     signatures: [{ id: 1, login: "new-name" }],
   });
+});
+
+// --- SignatureIndex: O(1) lookups with the exact semantics of the old scan ---
+// isSigned() and mergeSignatures() used to scan the signature array (O(n) per
+// question, O(n^2) for the merge). They now probe a SignatureIndex. These tests
+// pin down three things: the index's own edge cases, that behaviour is
+// identical to the old linear code (differential test against a verbatim copy
+// of it), and that the complexity really is what it claims (counted reads of
+// stored entries, so nothing here depends on wall-clock timing).
+
+// Verbatim copies of the pre-index implementations. Reference only.
+function legacyIsSigned(data, author) {
+  if (author == null || typeof author !== "object") return false;
+  const id = author.id;
+  if (typeof id !== "number") return false;
+  return data.signatures.some((s) => s && typeof s === "object" && s.id === id);
+}
+function legacyMergeSignatures(known, fresh) {
+  if (!known) return fresh;
+  const keptFromKnown = known.signatures.filter(
+    (k) => !fresh.signatures.some((f) => isSameContributor(k, f)),
+  );
+  return {
+    version: fresh.version,
+    signatures: [...keptFromKnown, ...fresh.signatures],
+  };
+}
+
+// Small seeded PRNG (mulberry32) so a failure is reproducible.
+function seededRandom(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+test("SignatureIndex answers has() for numeric ids of well-formed entries and nothing else", () => {
+  const index = new SignatureIndex([
+    { id: 1, login: "alice" },
+    { id: 2 }, // no login: still indexed, isSigned() always matched on id alone
+    { id: 3, login: 123 }, // wrong-typed login: same
+    { id: 3, login: "dup" }, // duplicate id: harmless
+  ]);
+  for (const id of [1, 2, 3]) assert.strictEqual(index.has(id), true, `${id}`);
+  for (const id of [0, 4, -1, "1", "2", null, undefined, {}, [], 1.5]) {
+    assert.strictEqual(index.has(id), false, `has(${String(id)})`);
+  }
+});
+
+test("SignatureIndex never indexes an entry without a usable numeric id (fails closed)", () => {
+  const index = new SignatureIndex([
+    null,
+    undefined,
+    42,
+    "oops",
+    [],
+    true,
+    { login: "no-id" },
+    { id: "555", login: "string-id" },
+    { id: null },
+    { id: undefined },
+    { id: {} },
+    { id: NaN }, // typeof NaN is "number", but it must never match anything
+    // Only plain objects count, as with the old `typeof s === "object"` rule.
+    // A function (or anything else non-object) that merely carries an id is not
+    // a signature record.
+    Object.assign(() => {}, { id: 555 }),
+  ]);
+  for (const probe of [555, "555", null, undefined, NaN, 0, 42]) {
+    assert.strictEqual(index.has(probe), false, `has(${String(probe)})`);
+  }
+});
+
+test("SignatureIndex keeps matching like === does: 0 and -0 are the same id, Infinity is allowed", () => {
+  const index = new SignatureIndex([{ id: 0 }, { id: Infinity }]);
+  assert.strictEqual(index.has(-0), true);
+  assert.strictEqual(index.has(Infinity), true);
+  assert.strictEqual(index.has(-Infinity), false);
+});
+
+test("SignatureIndex.add() indexes a single entry and ignores a bad one", () => {
+  const index = new SignatureIndex([]);
+  index.add({ id: 9, login: "late" });
+  index.add(null);
+  index.add({ id: "10" });
+  assert.strictEqual(index.has(9), true);
+  assert.strictEqual(index.has(10), false);
+});
+
+test("SignatureIndex is a snapshot: later changes to the source array are not seen, so callers rebuild for new data", () => {
+  const signatures = [{ id: 1, login: "a" }];
+  const index = new SignatureIndex(signatures);
+  signatures.push({ id: 2, login: "b" });
+  assert.strictEqual(index.has(2), false);
+  assert.strictEqual(new SignatureIndex(signatures).has(2), true);
+});
+
+test("SignatureIndex throws a TypeError on a non-array, like the scan it replaced", () => {
+  assert.throws(() => new SignatureIndex(undefined), TypeError);
+  assert.throws(() => isSigned({}, { id: 1, login: "x" }), TypeError);
+});
+
+test("isSigned accepts a prebuilt SignatureIndex and gives the same answers as a plain data object", () => {
+  const data = { signatures: [{ id: 7, login: "AmanKumar" }] };
+  const index = new SignatureIndex(data.signatures);
+  assert.strictEqual(isSigned(index, { id: 7, login: "renamed" }), true);
+  assert.strictEqual(isSigned(index, { id: 8, login: "AmanKumar" }), false);
+  assert.strictEqual(isSigned(index, "AmanKumar"), false);
+  assert.strictEqual(isSigned(index, { id: "7", login: "x" }), false);
+  assert.strictEqual(isSigned(index, { id: NaN, login: "x" }), false);
+  assert.strictEqual(isSigned(index, null), false);
+});
+
+test("isSigned with a malformed author answers false without touching the store (no throwaway index built for junk input)", () => {
+  const { counter, signatures } = countingStore(500);
+  for (const bad of [
+    null,
+    undefined,
+    "alice",
+    42,
+    {},
+    { login: "x" },
+    { id: "1" },
+    { id: null },
+  ]) {
+    assert.strictEqual(isSigned({ signatures }, bad), false);
+  }
+  assert.strictEqual(counter.reads, 0);
+});
+
+test("isSigned and mergeSignatures behave exactly like the old linear scan on thousands of random stores, including garbage entries", () => {
+  const rnd = seededRandom(0xc1a);
+  const pick = (arr) => arr[Math.floor(rnd() * arr.length)];
+  const entry = () => {
+    const n = 1 + Math.floor(rnd() * 40); // small id range: many collisions
+    return pick([
+      () => ({ id: n, login: `u${n}` }),
+      () => ({ id: n, login: `u${n}`, pr: "o/r#1", signedAt: "t" }),
+      () => ({ id: n }),
+      () => ({ id: n, login: 123 }),
+      () => ({ id: String(n), login: `u${n}` }),
+      () => ({ id: null, login: "x" }),
+      () => ({ login: "no-id" }),
+      () => ({ id: NaN, login: "nan" }),
+      () => null,
+      () => undefined,
+      () => 42,
+      () => "oops",
+      () => [],
+    ])();
+  };
+  const store = () => ({
+    version: 1,
+    signatures: Array.from({ length: Math.floor(rnd() * 30) }, entry),
+  });
+  const authors = [
+    ...Array.from({ length: 45 }, (_, i) => ({ id: i, login: `a${i}` })),
+    ...Array.from({ length: 45 }, (_, i) => ({ id: String(i), login: "s" })),
+    { id: NaN, login: "nan" },
+    { login: "no-id" },
+    null,
+    undefined,
+    "alice",
+    42,
+    {},
+  ];
+
+  for (let trial = 0; trial < 1500; trial++) {
+    const data = store();
+    const index = new SignatureIndex(data.signatures);
+    for (const author of authors) {
+      const expected = legacyIsSigned(data, author);
+      assert.strictEqual(
+        isSigned(data, author),
+        expected,
+        `plain, trial ${trial}`,
+      );
+      assert.strictEqual(
+        isSigned(index, author),
+        expected,
+        `indexed, trial ${trial}`,
+      );
+    }
+    const known = rnd() < 0.15 ? null : store();
+    const fresh = store();
+    assert.deepStrictEqual(
+      mergeSignatures(known, fresh),
+      legacyMergeSignatures(known, fresh),
+      `merge, trial ${trial}`,
+    );
+  }
+});
+
+// A store whose entries count how often their `id` is read, so complexity can
+// be asserted exactly instead of timed.
+function countingStore(size) {
+  const counter = { reads: 0 };
+  const signatures = Array.from({ length: size }, (_, i) => ({
+    get id() {
+      counter.reads += 1;
+      return i + 1;
+    },
+    login: `user${i + 1}`,
+  }));
+  return { counter, signatures };
+}
+
+test("complexity: once indexed, isSigned reads NO stored entry - lookups are O(1) however big the store is", () => {
+  for (const size of [10, 10_000]) {
+    const { counter, signatures } = countingStore(size);
+    const index = new SignatureIndex(signatures);
+    assert.strictEqual(counter.reads, size, "building reads each entry once");
+    counter.reads = 0;
+    for (let i = 0; i < 1000; i++) {
+      assert.strictEqual(
+        isSigned(index, { id: (i % size) + 1, login: "x" }),
+        true,
+      );
+      assert.strictEqual(
+        isSigned(index, { id: size + 1 + i, login: "x" }),
+        false,
+      );
+    }
+    assert.strictEqual(
+      counter.reads,
+      0,
+      `2000 lookups against ${size} signatures read the store ${counter.reads} times`,
+    );
+  }
+});
+
+test("complexity: mergeSignatures reads each entry once (O(known + fresh)), not known x fresh", () => {
+  const size = 3000;
+  const known = countingStore(size);
+  const fresh = countingStore(size);
+  const merged = mergeSignatures(
+    { version: 1, signatures: known.signatures },
+    { version: 1, signatures: fresh.signatures },
+  );
+  assert.strictEqual(
+    merged.signatures.length,
+    size,
+    "all known ids are in fresh",
+  );
+  // The nested scan needed about size^2 / 2 reads here (millions).
+  assert.ok(
+    known.counter.reads + fresh.counter.reads <= 2 * 2 * size,
+    `merge read entries ${known.counter.reads + fresh.counter.reads} times for ${size}+${size} entries`,
+  );
 });
 
 // --- signerCompletedRequirement (checkPR) --------------------------------

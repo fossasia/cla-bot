@@ -1,56 +1,42 @@
 /**
  *
- * A self-contained GitHub Action that enforces CLA signing across every
- * FOSSASIA repository, backed by one central private signature store
- * (fossasia/cla-signatures). No npm dependencies - just Node's built-in
- * `fetch` and `crypto`.
+ * A GitHub Action that checks every pull request for a signed CLA. Signatures
+ * live in one shared private repo (fossasia/cla-signatures). There are no npm
+ * dependencies, only Node's built-in `fetch` and `crypto`.
  *
- * ── Security properties (read before changing anything below) ───────────
- * 1. Writes to the signatures repo use a short-lived GitHub App token,
- *    minted on demand and never persisted. It is re-minted before it
- *    expires (and once more on a 401), so a long run can't outlive it. No
- *    long-lived PAT is ever stored. See getSignaturesToken().
- * 2. Everything else (comments, statuses) uses the job's own `GITHUB_TOKEN`,
- *    which has no access to the signatures repo - a leaked token can't
- *    reach it.
- * 3. A PR only counts as "signed" once every one of its real commit authors
- *    (looked up via the API, not whoever left the sign comment) is in the
- *    signature store. Someone else can't sign on a contributor's behalf.
- * 4. The allowlist is a set of immutable numeric GitHub account ids - no
- *    logins, no wildcards - so nobody can dodge signing by naming themselves
- *    like a bot, and a released/renamed login can never inherit an
- *    exemption. See parseAllowlist()/isAllowlisted().
- * 5. Writes retry with a fresh read on HTTP 409, for when two repos' PRs
- *    write to the same file at once.
- * 6. Every request has a timeout, so a hung call can't stall the whole job.
- * 7. Signatures are keyed by the signer's numeric GitHub id, not their
- *    login. Logins can be renamed and reused by someone else later, so
- *    matching on login alone could hand an old signature to a new owner.
- *    See isSigned().
- * 8. A commit/co-author email that can't be resolved to an account never
- *    shows up in a comment or log - it can be personal data. Only the
- *    (already public) commit SHA is shown instead. See listPRCommitAuthors()
- *    and checkPR().
- * 9. GitHub matches a commit's author to an account by email, and that's
- *    spoofable: anyone can set their author email to
- *    id+victim@users.noreply.github.com, since both are public. GitHub also
- *    only ever verifies the committer, not the author, so a validly signed
- *    commit can still carry a forged author. REQUIRE_VERIFIED_COMMITS=true
- *    closes this by only trusting the author when that same account is also
- *    the verified committer - see listPRCommitAuthors().
- * 10. A Co-authored-by: trailer is free text - GitHub never authenticates
- *     it. What this bot does check is that the (id, login) pair it acts on
- *     really is one real account, resolved from GitHub itself rather than
- *     trusted from the trailer - otherwise someone could pair a real,
- *     already-signed id with a made-up login to sneak past the
- *     login-based allowlist check. It can't verify the named person
- *     actually agreed to be credited; nothing can, since GitHub doesn't
- *     ask.
- * 11. Same reasoning as 7, applied to the allowlist: it holds numeric
- *     account ids only, matched against the id GitHub itself reported for
- *     the author (never against anything a commit/trailer merely claims).
- *     A non-numeric entry (e.g. a username) fails validateConfig() loudly
- *     instead of being silently ignored.
+ * Security properties. Read these before changing anything:
+ *
+ *  1. Writes to the signatures repo use a short-lived GitHub App token. It is
+ *     minted on demand, never stored, refreshed shortly before it expires and
+ *     once more after a 401. See getSignaturesToken().
+ *  2. Comments and statuses use the job's own GITHUB_TOKEN, which cannot reach
+ *     the signatures repo.
+ *  3. A PR counts as signed only when every real commit author is in the
+ *     store. Authors come from the API, not from whoever left the sign
+ *     comment, so nobody can sign for someone else.
+ *  4. The allowlist holds numeric account ids only. No logins and no
+ *     wildcards, so a renamed or released login can never inherit an
+ *     exemption. See parseAllowlist() and isAllowlisted().
+ *  5. Signature writes retry with a fresh read on HTTP 409, and on the
+ *     first-write 422, for when several repos write the same file at once.
+ *  6. Every request has a timeout.
+ *  7. Signatures are keyed by numeric id, not login, for the same reason as
+ *     point 4. See isSigned(). Lookups go through SignatureIndex, a hash set
+ *     of ids built in the same pass that parses the file, so each check is
+ *     O(1) instead of a scan of the whole store.
+ *  8. An email that cannot be resolved to an account is never shown in a
+ *     comment or a log because it may be personal data. Only the commit SHA
+ *     is shown. See listPRCommitAuthors() and checkPR().
+ *  9. GitHub picks a commit's author from its email, which anyone can forge,
+ *     and it verifies only the committer. REQUIRE_VERIFIED_COMMITS=true trusts
+ *     the author only when the same account is the verified committer. See
+ *     listPRCommitAuthors().
+ * 10. A Co-authored-by trailer is free text. The bot reads the id from it but
+ *     looks up the real login on GitHub, so every (id, login) pair belongs to
+ *     one real account. It cannot check that the person agreed to be credited.
+ * 11. Allowlist ids are matched against the id GitHub reports for the author,
+ *     never against what a commit or trailer claims. A non-numeric entry fails
+ *     validateConfig().
  */
 
 "use strict";
@@ -58,10 +44,8 @@
 const fs = require("fs");
 const crypto = require("crypto");
 
-// ---------------------------------------------------------------------------
-// Node 18/20 are past End-of-Life, so we require 22+. Fail loudly here
-// instead of hitting a confusing "fetch is not defined" later.
-// ---------------------------------------------------------------------------
+// Node 18 and 20 are past end of life. Fail here with a clear message instead
+// of a confusing "fetch is not defined" later.
 const [NODE_MAJOR] = process.versions.node.split(".").map(Number);
 if (NODE_MAJOR < 22 || typeof fetch !== "function") {
   console.error(
@@ -71,7 +55,7 @@ if (NODE_MAJOR < 22 || typeof fetch !== "function") {
 }
 
 // ---------------------------------------------------------------------------
-// Config - all of this comes from env vars set by action.yml.
+// Config (all values come from env vars set by action.yml)
 // ---------------------------------------------------------------------------
 const GITHUB_API = process.env.GITHUB_API_URL || "https://api.github.com";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
@@ -79,23 +63,18 @@ const SIG_APP_ID = process.env.SIG_APP_ID || "";
 const SIG_APP_PRIVATE_KEY = process.env.SIG_APP_PRIVATE_KEY || "";
 const SIG_OWNER = process.env.SIG_OWNER;
 const SIG_REPO = process.env.SIG_REPO;
-// Normalized once, here, so every consumer (validation, URL building, log
-// messages) sees the same value. See normalizeSigPath() for exactly what is
-// (and deliberately is not) tolerated.
+// Normalized once so validation, URL building and log messages all see the
+// same value. See normalizeSigPath().
 const SIG_PATH_RAW = process.env.SIG_PATH;
 const SIG_PATH = normalizeSigPath(SIG_PATH_RAW);
 const CLA_DOCUMENT_URL = process.env.CLA_DOCUMENT_URL;
-// The allowlist is a list of immutable numeric GitHub account ids (the same
-// identity the signature store is keyed on), separated by commas and/or any
-// whitespace (so a multi-line YAML value works). Logins are deliberately NOT
-// supported: a login can be renamed and later claimed by a different account,
-// which would then inherit the exemption.
-//
-// Anything that isn't a plain positive integer (a username, "id:5", "0",
-// "1e3", "012", a value beyond Number.MAX_SAFE_INTEGER) is collected in
-// `invalid` rather than dropped or coerced - validateConfig() fails the run on
-// it, because a silently ignored entry would demand a signature from the very
-// account the maintainer meant to exempt.
+
+// The allowlist is numeric GitHub account ids separated by commas and/or
+// whitespace, so a multi-line YAML value works. Anything that is not a plain
+// positive integer ("id:5", "0", "1e3", "012", a username, a value past
+// Number.MAX_SAFE_INTEGER) goes into `invalid` and validateConfig() fails the
+// run. Ignoring a bad entry would ask for a signature from the account the
+// maintainer meant to exempt.
 const ALLOWLIST_ID_RE = /^[1-9][0-9]*$/;
 function parseAllowlist(raw) {
   const ids = new Set();
@@ -115,106 +94,48 @@ function parseAllowlist(raw) {
 const ALLOWLIST = parseAllowlist(process.env.ALLOWLIST);
 const SIGN_PHRASE = "I have read the CLA Document and I hereby sign the CLA";
 const STATUS_CONTEXT = "cla/fossasia";
+
+// Every comment the bot posts starts with BOT_MARKER. The other markers and
+// fragments below let classifyBotComment() tell a comment that blocked a PR
+// from one that announced success, so checkPR() can stay quiet when nothing
+// has changed.
 const BOT_MARKER = "<!-- fossasia-cla-bot:v1 -->";
-// Embedded (in addition to BOT_MARKER) in the comment checkPR posts when a
-// PR genuinely needs action - someone still needs to sign, or a commit
-// needs manual review. Together with the two legacy text fragments below,
-// this is how a later, automatically triggered checkPR call recognizes
-// "this PR was actually blocked at some point" - see classifyBotComment()
-// and quietIfNeverFlagged.
 const PENDING_MARKER = "<!-- fossasia-cla-bot:pending -->";
-// The exact fragments that appear in the "please sign" and "needs manual
-// review" comment templates below (see the `lines` array in checkPR).
-// Defined once and referenced from both the template text and
-// classifyBotComment() so the two can never silently drift apart - and,
-// importantly, so a PR blocked by an OLDER deployment of this bot (from
-// before PENDING_MARKER existed, which only ever wrote this same wording)
-// is still correctly recognized as having been blocked. PENDING_MARKER
-// alone would miss those pre-existing comments entirely on the very first
-// run of the upgraded code.
+// Wording shared by the "please sign" and "needs manual review" comments and
+// by classifyBotComment(), so the two cannot drift apart. They also match
+// comments from older versions of the bot that had no PENDING_MARKER.
 const NEEDS_SIGN_FRAGMENT = "need to sign our";
 const NEEDS_REVIEW_FRAGMENT = "could not be automatically attributed";
-// The exact legacy success wording, kept as its own constant so
-// classifyBotComment() can still recognize a plain-text success comment
-// posted by an OLDER deployment of this bot, from before SUCCESS_MARKER
-// existed (same reasoning as the two NEEDS_*_FRAGMENT constants above for
-// the "pending" case) - see the fallback check in classifyBotComment.
+// Exact text of the success comment from older versions of the bot. It is
+// matched by equality, not substring, so an unrelated comment that quotes the
+// phrase is not mistaken for it.
 const LEGACY_SUCCESS_TEXT = "All contributors have signed the CLA. ✅";
-// The full body of a "success" comment as posted by a version of this bot
-// from before SUCCESS_MARKER existed: back then, a success comment's
-// entire content beyond BOT_MARKER was always nothing more than this one
-// fixed string, with nothing else ever appended - unlike NEEDS_SIGN_FRAGMENT/
-// NEEDS_REVIEW_FRAGMENT above, which are genuinely partial fragments of a
-// longer, variable comment (one that also lists specific missing
-// contributors or unresolved commit SHAs, so no fixed whole-body string
-// exists to match against). Since the full legacy body IS fixed and known,
-// classifyBotComment checks it with an exact equality match rather than a
-// substring search - substring matching here would risk a false positive on
-// some unrelated future bot comment that merely happens to quote or mention
-// this exact phrase.
 const LEGACY_SUCCESS_COMMENT = `${BOT_MARKER}\n${LEGACY_SUCCESS_TEXT}`;
-// Embedded (in addition to BOT_MARKER) in EVERY comment this bot posts that
-// announces a PR as fully signed. classifyBotComment() looks for this
-// marker first, falling back to LEGACY_SUCCESS_COMMENT only for comments
-// predating it, so that checkPR's quietIfNeverFlagged history check keeps
-// recognizing "this PR's completion was already announced" even though the
-// visible wording now varies per signer instead of always being the one
-// fixed string it used to be. SUCCESS_MESSAGE below is built FROM this
-// marker (rather than the marker being appended separately at each call
-// site) specifically so that guarantee can never be broken by editing the
-// generic wording without also remembering to touch classifyBotComment.
-// Unlike LEGACY_SUCCESS_COMMENT above, this marker is matched with a
-// substring search rather than exact equality - it's a purpose-built,
-// distinctive HTML-comment sentinel (not a plain English phrase that could
-// plausibly appear elsewhere), and the personalized variant it also appears
-// in (personalSuccessMessage()) has a variable "@login" suffix that an
-// exact whole-body match couldn't account for anyway.
+// Every success comment carries this marker. SUCCESS_MESSAGE and
+// personalSuccessMessage() both build on it, so changing their wording cannot
+// break classifyBotComment().
 const SUCCESS_MARKER = "<!-- fossasia-cla-bot:success -->";
-// Only ever used when checkPR() has no specific signer to credit (an
-// automatic pull_request_target check, or the human-triggered `recheck`
-// command) - see personalSuccessMessage() below for the normal, per-signer
-// case.
+// Used when there is no specific signer to thank: automatic checks and the
+// `recheck` command.
 const SUCCESS_MESSAGE = `${SUCCESS_MARKER}\n${LEGACY_SUCCESS_TEXT}`;
-// The per-signer announcement checkPR() posts when the person who *just*
-// signed (via the sign-phrase comment) is themselves one of the PR's
-// required (non-allowlisted) commit authors AND their signing is what
-// makes the PR fully signed. Replaces the one-size-fits-all SUCCESS_MESSAGE
-// for that specific case, so the contributor who unblocked the PR is
-// thanked by name instead of an anonymous "All contributors..."
-// announcement. See checkPR()'s `signer` option and the
-// `signerCompletedRequirement` check there for why this is NOT used
-// whenever `signer` is merely present - crediting a completely unrelated
-// commenter (someone who isn't even a commit author on this PR) with
-// "completing" a PR they had no bearing on would be actively misleading.
+// Used when the person who just signed is the one who completed the PR. See
+// signerCompletedRequirement().
 function personalSuccessMessage(login) {
   return `${SUCCESS_MARKER}\n@${login} Thank you for signing the CLA! We look forward to your contributions.`;
 }
-// Optional hardening, off by default so normal unsigned-commit workflows
-// keep working. GitHub attributes a commit's author to an account purely by
-// matching the commit's git email - for the noreply format that's
-// `ID+USERNAME@users.noreply.github.com`, and both parts are public. So
-// anyone can set their author email to an already-signed account's noreply
-// address and have GitHub display that commit as authored by the victim.
-// Commit signature verification doesn't fix this either: GitHub only ever
-// verifies the committer, never the author, so a forged commit (author =
-// victim, committer = attacker's own verified account) still shows as fully
-// verified. When this flag is on, we only trust `c.author` if that same
-// account is also the verified committer - see listPRCommitAuthors().
+
+// Optional hardening, off by default so unsigned-commit workflows keep
+// working. See security property 9 and listPRCommitAuthors().
 const REQUIRE_VERIFIED_COMMITS =
   (process.env.REQUIRE_VERIFIED_COMMITS || "false").toLowerCase() === "true";
-// Comments posted via the default GITHUB_TOKEN always show this exact login
-// - this is the correct, documented value for the intended/standard use of
-// this action. If a consumer passes a different kind of token (a PAT, or a
-// separate GitHub App token) instead, the actual authenticated identity
-// could differ; resolveBotLogin() below tries to detect that at runtime and
-// falls back to this constant when it can't.
+// The login GITHUB_TOKEN comments appear under. resolveBotLogin() tries to
+// detect the real identity (a consumer may pass a PAT or an App token) and
+// falls back to this.
 const DEFAULT_BOT_LOGIN = "github-actions[bot]";
 const REQUEST_TIMEOUT_MS = 15_000;
 const MAX_RETRIES = 3;
-// Caps how many Co-authored-by trailers we'll resolve per commit - each one
-// costs an API call, so a commit padded with thousands of fake trailers
-// could otherwise burn through the run's time and rate limit. Anything past
-// the cap gets flagged for manual review instead of silently dropped; see
+// Each Co-authored-by trailer costs an API call, so cap them per commit.
+// Trailers past the cap flag the commit for manual review. See
 // extractCoAuthors().
 const MAX_COAUTHOR_TRAILERS_PER_COMMIT = 20;
 
@@ -229,37 +150,23 @@ function fail(msg) {
   process.exit(1);
 }
 
-// GitHub login/org names: letters, digits, single hyphens, can't start or
-// end with one, max 39 chars.
+// GitHub user/org names: letters, digits and single hyphens, no leading or
+// trailing hyphen, at most 39 characters.
 const GITHUB_LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
-// Repo names are looser: letters, digits, '.', '-', '_', up to 100 chars.
+// Repo names: letters, digits, ".", "-", "_", up to 100 characters.
 const GITHUB_REPO_NAME_RE = /^[A-Za-z0-9._-]{1,100}$/;
 
 // ---------------------------------------------------------------------------
-// Webhook-payload sanitizers.
+// Payload validators
 //
-// EVENT_PATH (see main()) is a JSON file GitHub itself writes before the job
-// starts, but it's still external, file-provided data - a PR/issue number or
-// commit SHA read out of it flows straight into the path of every gh()/fetch
-// call below (postComment, checkPR, lockPR, setStatus, ...). These two
-// checks are called right where that data is first pulled out of the parsed
-// payload (handleIssueComment, handlePullRequestTarget), so nothing
-// unvalidated from the file ever reaches a request URL - a malformed or
-// unexpected event file fails loudly here instead of being interpolated
-// into an outbound API call.
+// The event file is written by GitHub, but it is still external data. PR
+// numbers, user ids and SHAs from it end up in request URLs and in the
+// signature store, so they are checked where they are first read.
 //
-// Number.isSafeInteger(), not Number.isInteger(): every double beyond
-// 2^53 is still "an integer" with no fractional part, so Number.isInteger
-// happily accepts values like 1e100 or Number.MAX_SAFE_INTEGER + 1 - which
-// then serialize into a URL as garbage (e.g. "1e+100") instead of a real
-// PR number. Worse, JSON.parse() itself silently rounds an out-of-range
-// integer literal in the source JSON to the nearest representable double
-// (JSON.parse("9007199254740993") === 9007199254740992) - by the time
-// this function sees the value, that corruption has already happened, so
-// isSafeInteger is the only check that reliably tells us we're not one of
-// those rounded, no-longer-faithful values. No real GitHub PR/issue number
-// is ever remotely close to this boundary, so this is strictly tighter
-// with zero risk to legitimate input.
+// Number.isSafeInteger is used instead of Number.isInteger because JSON.parse
+// silently rounds integer literals beyond 2^53, and isInteger accepts values
+// like 1e100 that turn into garbage in a URL.
+// ---------------------------------------------------------------------------
 function assertValidPRNumber(value, context) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(
@@ -269,16 +176,8 @@ function assertValidPRNumber(value, context) {
   return value;
 }
 
-// Same trust boundary and same bar as assertValidPRNumber() above (an
-// externally-sourced number interpolated directly into a request path) -
-// a real GitHub App installation id is always a positive integer. Pulled
-// out as its own named function specifically so NaN/Infinity/-Infinity can
-// be unit-tested directly: those three values can never actually survive
-// a real HTTP round-trip (JSON has no token for any of them - JSON.parse
-// can't produce them from response text, and JSON.stringify silently
-// turns all three into `null` before they'd ever be sent), so the only
-// honest way to verify this function rejects them is to call it directly,
-// not through a JSON-serialized fetch mock.
+// Its own function so NaN and Infinity can be tested directly. They cannot
+// survive a JSON round trip, so a mocked fetch could never produce them.
 function assertValidInstallationId(value, context) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(
@@ -288,24 +187,10 @@ function assertValidInstallationId(value, context) {
   return value;
 }
 
-// A GitHub account id (user.id in every webhook/REST user object) is always a
-// positive integer. Same trust boundary and same bar as the two validators
-// above, but with a different consequence for getting it wrong: this value
-// is PERSISTED into the signature store, and isSigned() only matches on id
-// when both sides are numbers (typeof === "number"). An entry written with
-// a missing/null/string/zero/negative/fractional id is therefore not
-// rejected anywhere later - it just silently degrades, forever, to the
-// login-only comparison that the id-keying exists to avoid (a released
-// login claimed by a different person would inherit the old signature; see
-// security property 7 at the top of this file). JSON.stringify makes the
-// missing case invisible, too: `{ id: undefined }` simply drops the key, so
-// the stored entry looks like a perfectly ordinary legacy record.
-//
-// Fail loudly BEFORE anything is written instead - exactly what the
-// existing comment.user.login guard does for the login. Real GitHub
-// payloads never trip this (user.id is a required integer in GitHub's own
-// schema, for bots and the "ghost" placeholder user alike), so it only ever
-// fires on a corrupted event file or a non-GitHub caller.
+// This id is written to the signature store, and isSigned() matches by id
+// only when both sides are numbers. A bad id would not be rejected later, it
+// would just never match, and JSON.stringify drops an undefined id without
+// any sign. So fail before anything is written.
 function assertValidUserId(value, context) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new Error(
@@ -315,14 +200,10 @@ function assertValidUserId(value, context) {
   return value;
 }
 
-// Real git commit SHAs are lowercase hex (40 chars for sha1, 64 for
-// sha256), but test/tooling code sometimes uses opaque placeholder strings
-// in their place, so this deliberately doesn't require hex - it only
-// rejects what would actually be dangerous as a URL path segment: slashes,
-// "..", "?"/"#" (which would truncate or redirect the request path/query),
-// whitespace/control characters, and "%" (blocks a percent-encoded
-// bypass of the checks above, e.g. "%2e%2e" or "%2f" - a real SHA never
-// contains one either way, so this costs nothing).
+// Real SHAs are lowercase hex, but tests use placeholder strings, so this does
+// not require hex. It rejects what is dangerous in a URL path segment:
+// slashes, "..", "?", "#", whitespace, control characters and "%" (which
+// would allow a percent-encoded bypass).
 const UNSAFE_URL_SEGMENT_RE = /[/\\?#%\s\x00-\x1f]|\.\./;
 function assertValidSha(value, context) {
   if (
@@ -339,96 +220,49 @@ function assertValidSha(value, context) {
 }
 
 // ---------------------------------------------------------------------------
-// SIG_PATH / SIG_OWNER / SIG_REPO -> request-URL safety.
+// SIG_PATH, SIG_OWNER and SIG_REPO in request URLs
 //
-// These three values are interpolated straight into the path of every
-// signature-store request (readSignatures, writeSignatures, the App
-// installation lookup). They're maintainer-supplied config rather than
-// attacker-controlled PR content, but a mistake here is NOT harmless - and
-// it's not loud either. Node's fetch() parses the request URL with the
-// WHATWG URL algorithm, which means (verified empirically, see
-// test/sig-path.test.js):
+// These values go straight into the path of every signature-store request.
+// They are maintainer config, but a mistake is quiet: fetch() parses the URL
+// with the WHATWG algorithm, so
+//   - "#" and "?" silently cut the path short,
+//   - "%2e%2e" becomes ".." and can climb out of /contents/,
+//   - tabs, newlines and a trailing space are stripped,
+//   - "." and ".." as a repo name are dot-segments.
+// readSignatures() treats a 404 as "no signatures yet", so a truncated path
+// looks like an empty store and the bot would use the wrong file.
 //
-//   - "#" starts a fragment and everything after it is silently dropped
-//     from the request ("sig#path.json" is fetched as ".../contents/sig").
-//   - "?" starts a query string, truncating the path the same way.
-//   - "%2e"/"%2E" are treated as ".", so "a/%2e%2e/b" is normalized to a
-//     real ".." traversal AFTER the literal-".." check in validateConfig
-//     already passed - and it can climb right out of /contents/ into other
-//     API endpoints (".../%2e%2e/%2e%2e/orgs/x" -> "/repos/o/orgs/x").
-//   - tab/CR/LF anywhere in the URL, and a trailing space, are stripped
-//     without any error.
-//   - A bare "." or ".." SIG_REPO passes GITHUB_REPO_NAME_RE's character
-//     class but is itself a dot-segment ("/repos/o/../contents/..").
+// Three layers, all needed:
+//   1. normalizeSigPath() keeps the two slips that always worked (trailing
+//      whitespace and a leading "./") and touches nothing else.
+//   2. findSigPathProblem() rejects anything ambiguous or unsafe, with a
+//      message that names the problem.
+//   3. encodeRepoPath() percent-encodes each segment.
+// Encoding alone is not enough, since encodeURIComponent("..") is still "..".
+// The URL builders therefore validate again, because readSignatures() and
+// writeSignatures() are exported and can run without validateConfig().
 //
-// The worst part is what happens next: readSignatures() treats a 404 as
-// "no signatures yet", so a silently-truncated path looks exactly like an
-// empty store, and the bot then reads/writes the WRONG file.
-//
-// Three layers, deliberately all kept (none is enough alone):
-//   1. normalizeSigPath() reproduces - explicitly, instead of by accident -
-//      the two formatting slips the old, un-normalized code happened to
-//      tolerate: trailing whitespace/control characters (e.g. the newline a
-//      YAML `|` block adds) and a leading "./". Nothing else is touched.
-//   2. findSigPathProblem() rejects what is ambiguous or unsafe, with a
-//      message that names the actual problem (called by validateConfig).
-//   3. encodeRepoPath() percent-encodes every "/"-separated segment, so
-//      whatever DOES pass validation (interior spaces, non-ASCII names, ...)
-//      reaches the wire unambiguously - the same treatment PR numbers and
-//      SHAs already get via encodeURIComponent at their call sites.
-//
-// Backward compatibility is deliberate: whitespace (including leading
-// whitespace and non-ASCII whitespace) is ALLOWED as part of the file name,
-// because fetch() already sent it as %20 / UTF-8 percent-escapes, so the
-// request URL for any such path is byte-for-byte what it was before. Only
-// inputs that were silently mangled, or whose meaning would silently change
-// once encoding is applied ("%", see below), are rejected.
-//
-// Encoding alone is NOT sufficient: encodeURIComponent("..") is still "..",
-// which the URL parser collapses. That is why the URL builders re-run the
-// validator themselves: readSignatures()/writeSignatures() are exported, so
-// they can be reached without validateConfig() ever having run.
+// Spaces and non-ASCII characters are allowed in the file name and are sent
+// as percent-escapes, exactly as before. "%" is rejected: encoding it again
+// would silently address a different file ("my%20file.json" would become a
+// file literally named that), and decoding it would reopen double-decode bugs.
 // ---------------------------------------------------------------------------
-// Characters never acceptable anywhere in SIG_PATH: backslash, "?" and "#"
-// (URL delimiters), "%", and C0/DEL/C1 control characters (the URL parser
-// silently strips some of them, and they can forge GitHub Actions log
-// commands since this value is echoed into "::error::" lines). Ordinary
-// whitespace is NOT in this set - see the compatibility note above.
-//
-// Why "%" is rejected rather than simply encoded as "%25": once every
-// segment is encoded, a "%" is no longer a traversal vector. The problem is
-// that its MEANING would change. The old code passed "%XX" through verbatim,
-// so "my%20file.json" addressed "my file.json"; encoding it again would
-// silently address a file literally named "my%20file.json" instead - a
-// 404, which readSignatures() reads as "no signatures yet". Decoding
-// instead would reopen the double-decode class of bugs ("%252e%252e").
-// Failing fast, with a message that says what to write instead, is the only
-// choice that is neither silent nor risky.
+// Never allowed in SIG_PATH: backslash, "?", "#", "%" and control characters.
+// Control characters are blocked because the URL parser strips some of them
+// and because the value is echoed into "::error::" log lines.
 const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
 
-// Normalizes SIG_PATH to EXACTLY the file the pre-validation code addressed,
-// no more and no less. That code interpolated the raw value at the very end
-// of the request URL and handed it to fetch(), whose WHATWG URL parser:
-//   - strips trailing C0-control-or-space characters (U+0000..U+0020) from
-//     the whole URL - which is the end of SIG_PATH. So a trailing space, or
-//     the newline a YAML `|` block scalar adds, never reached the server and
-//     configs carrying one worked.
-//   - collapsed a leading "./" segment.
-// and did NOT touch anything else: leading whitespace stayed part of the file
-// name (as %20), and Unicode whitespace such as NBSP at either end was
-// percent-encoded as part of it. This function reproduces precisely that, so
-// an upgrade can never silently redirect an existing config to a different
-// file - which would be dangerous here, since a read that lands on a missing
-// file looks like "no signatures yet". A blanket String#trim() is NOT
-// equivalent (it also removes leading and Unicode whitespace), and neither is
-// removing normalization altogether (a trailing space would then address
-// "cla.json%20" instead of "cla.json"). validateConfig() reports when
-// normalization changed the value, so it is never invisible.
+// Reproduces exactly what the file name used to be when the raw value went
+// straight into fetch(): trailing characters U+0000..U+0020 (a trailing space,
+// or the newline a YAML `|` block adds) never reached the server, and a
+// leading "./" was collapsed. Leading whitespace stays part of the name. A
+// plain trim() would also strip leading and Unicode whitespace, and no
+// normalization at all would turn a trailing space into "cla.json%20".
+// validateConfig() warns when the value changed.
 //
-// An unset/empty value falls back to the default; a value that is nothing but
-// whitespace normalizes to "" and is then rejected by findSigPathProblem().
-// (A char-code loop, not a /[\x00-\x20]+$/ regex, to stay linear-time on
-// pathological input.)
+// An empty value falls back to the default. A whitespace-only value becomes ""
+// and findSigPathProblem() rejects it. A char-code loop is used instead of a
+// regex to stay linear-time on odd input.
 function normalizeSigPath(raw) {
   let p = raw || "signatures/cla.json";
   let end = p.length;
@@ -438,8 +272,8 @@ function normalizeSigPath(raw) {
   return p;
 }
 
-// Returns a short human-readable reason SIG_PATH-style input is unusable,
-// or null when it's fine. Pure function: no I/O, never throws.
+// Returns a short reason why a path is unusable, or null when it is fine.
+// Pure: no I/O and it never throws.
 function findSigPathProblem(path) {
   if (typeof path !== "string" || path.trim().length === 0) {
     return "it must not be empty";
@@ -464,8 +298,8 @@ function findSigPathProblem(path) {
     if (segment === "." || segment === "..") {
       return `it contains the "${segment}" path segment`;
     }
-    // Git itself refuses a ".git" path component, so GitHub's Contents API
-    // can never address one.
+    // Git refuses a ".git" path component, so the Contents API cannot
+    // address one.
     if (segment.toLowerCase() === ".git") {
       return 'it contains a ".git" path segment, which git does not allow';
     }
@@ -473,17 +307,16 @@ function findSigPathProblem(path) {
   try {
     encodeURIComponent(path);
   } catch {
-    // Lone UTF-16 surrogate: encodeURIComponent throws URIError on it.
-    // Catching it here turns a mid-run crash into a clear config error.
+    // A lone UTF-16 surrogate makes encodeURIComponent throw. Report it as a
+    // config problem instead of crashing mid-run.
     return "it is not valid Unicode text";
   }
   return null;
 }
 
-// Percent-encodes each "/"-separated segment, keeping the "/" separators
-// literal - the shape GitHub's /contents/{path} endpoint expects. Throws on
-// input findSigPathProblem() rejects, so a bad value can never be turned
-// into a request URL by accident (see the layering note above).
+// Percent-encodes each "/"-separated segment and keeps the "/" literal, which
+// is the shape /contents/{path} expects. Throws on anything
+// findSigPathProblem() rejects.
 function encodeRepoPath(path) {
   const problem = findSigPathProblem(path);
   if (problem) {
@@ -494,28 +327,16 @@ function encodeRepoPath(path) {
   return path.split("/").map(encodeURIComponent).join("/");
 }
 
-// "/repos/{owner}/{repo}" for the SIGNATURES repo, with owner and repo
-// encoded like every other interpolated path value. For values that passed
-// validateConfig() (letters, digits, ".", "-", "_") encoding is a no-op; it
-// matters only for direct, unvalidated callers. A "." / ".." name is refused
-// outright - encoding can't save it, see above.
-//
-// Deliberately NOT exported and deliberately takes no suffix: callers must go
-// through one of the two purpose-built functions below, each of which fixes
-// its own (static or separately-encoded) tail. A general
-// "base + arbitrary suffix" helper would look like a safe URL builder while
-// encoding only half of what it returns.
+// "/repos/{owner}/{repo}" for the signatures repo. Not exported and takes no
+// suffix on purpose: callers use one of the two functions below, each of which
+// encodes its own tail. Only an empty value and a dot-segment are checked
+// here. Whether the name is a real GitHub name is validateConfig()'s job, and
+// repeating those regexes here would make the encoding unreachable.
 function sigRepoBasePath() {
   for (const [name, value] of [
     ["SIG_OWNER", SIG_OWNER],
     ["SIG_REPO", SIG_REPO],
   ]) {
-    // Not stricter than the URL-safety contract on purpose: once encoded,
-    // the only things that can still misdirect a request are an absent value
-    // (encodeURIComponent(undefined) would silently yield "undefined") and a
-    // dot-segment. Whether a name is a REAL GitHub name is validateConfig()'s
-    // job (GITHUB_LOGIN_RE / GITHUB_REPO_NAME_RE); re-applying those regexes
-    // here would make the encoding below unreachable dead code.
     if (typeof value !== "string" || value.length === 0) {
       throw new Error(
         `Refusing to build a request URL: ${name} is missing or empty.`,
@@ -535,7 +356,7 @@ function sigInstallationApiPath() {
   return `${sigRepoBasePath()}/installation`;
 }
 
-// The Contents API path of the signature file itself.
+// Contents API path of the signature file.
 function sigContentsApiPath() {
   return `${sigRepoBasePath()}/contents/${encodeRepoPath(SIG_PATH)}`;
 }
@@ -550,19 +371,14 @@ function validateConfig() {
     if (!val) fail(`Missing required input/env: ${name}`);
   }
 
-  // These checks are just fail-fast convenience for maintainer-supplied
-  // config (not attacker-controlled PR content). Without them a typo would
-  // still surface eventually, just as a vague API error several steps
-  // later - this catches it immediately with a message that says exactly
-  // what's wrong.
+  // Fail fast on config typos instead of a vague API error later.
   if (!GITHUB_LOGIN_RE.test(SIG_OWNER)) {
     fail(
       `SIG_OWNER ${JSON.stringify(SIG_OWNER)} doesn't look like a valid GitHub user/org name.`,
     );
   }
-  // "." and ".." satisfy GITHUB_REPO_NAME_RE's character class but are
-  // URL dot-segments (".../repos/o/../contents" collapses to
-  // "/repos/contents") - GitHub itself never allows either as a repo name.
+  // "." and ".." pass the repo-name regex but are URL dot-segments, and GitHub
+  // never allows them as repo names.
   if (
     !GITHUB_REPO_NAME_RE.test(SIG_REPO) ||
     SIG_REPO === "." ||
@@ -572,8 +388,7 @@ function validateConfig() {
       `SIG_REPO ${JSON.stringify(SIG_REPO)} doesn't look like a valid GitHub repository name.`,
     );
   }
-  // JSON.stringify (not a bare "${SIG_PATH}") so a value containing control
-  // characters can't inject extra lines/commands into the Actions log.
+  // JSON.stringify keeps control characters from injecting log lines.
   const sigPathProblem = findSigPathProblem(SIG_PATH);
   if (sigPathProblem) {
     fail(
@@ -587,31 +402,25 @@ function validateConfig() {
         `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} must be an http(s) URL.`,
       );
     }
-  } catch (e) {
+  } catch {
     fail(
       `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} is not a valid URL.`,
     );
   }
-  // Normalization (see normalizeSigPath) reproduces what the old code did
-  // implicitly; say so, rather than leaving a config that differs from what
-  // is actually used invisible.
+  // Say so when normalization changed the value.
   if (SIG_PATH_RAW && SIG_PATH_RAW !== SIG_PATH) {
     console.warn(
       `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing whitespace/control characters and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
     );
   }
-  // A bad entry would otherwise silently exempt nobody (and demand a
-  // signature from the very account the maintainer meant to allowlist), so
-  // fail loudly like every other bad input. JSON.stringify keeps control
-  // characters from injecting extra lines into the Actions log.
   if (ALLOWLIST.invalid.length) {
     fail(
       `ALLOWLIST entries must be numeric GitHub account ids (usernames are not supported - they can be renamed and reclaimed by someone else); invalid: ${ALLOWLIST.invalid.map((e) => JSON.stringify(e)).join(", ")}. Look an id up with: gh api users/NAME --jq .id`,
     );
   }
-  // App auth is optional (getSignaturesToken falls back to GITHUB_TOKEN when
-  // either half is missing), but if a key WAS supplied, check its shape here
-  // so a mis-pasted secret fails clearly instead of deep inside crypto.sign().
+  // App auth is optional (getSignaturesToken falls back to GITHUB_TOKEN), but
+  // a key that is set must look like a PEM, so a mis-pasted secret fails
+  // clearly instead of deep inside crypto.sign().
   if (SIG_APP_PRIVATE_KEY && !SIG_APP_PRIVATE_KEY.includes("-----BEGIN")) {
     fail(
       'SIG_APP_PRIVATE_KEY is set but does not look like a PEM-encoded private key (missing a "-----BEGIN" header).',
@@ -620,9 +429,9 @@ function validateConfig() {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP helper: timeout, JSON handling, and a retry for transient failures
-// (rate limits, brief 5xx). 409 conflicts on writes are handled separately
-// in writeSignatures() since those need a re-fetch, not a blind retry.
+// HTTP helper: timeout, JSON handling and a retry for transient failures
+// (rate limits, brief 5xx). 409 conflicts on writes are handled in
+// writeSignatures(), since they need a re-read, not a blind retry.
 // ---------------------------------------------------------------------------
 async function ghRaw(path, token, options = {}) {
   const controller = new AbortController();
@@ -636,22 +445,21 @@ async function ghRaw(path, token, options = {}) {
         Accept: "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
         "User-Agent": "fossasia-cla-bot",
-        // fetch() doesn't set this for a plain string body on its own.
+        // fetch() does not set this for a plain string body.
         ...(options.body ? { "Content-Type": "application/json" } : {}),
         ...(options.headers || {}),
       },
     });
     const text = await res.text();
     if (!res.ok) {
-      // GitHub's API returns JSON errors, but a proxy/gateway can return an
-      // HTML error page on a 502/503/504 instead. Parse defensively so that
-      // doesn't mask the real status with a "Unexpected token <" crash.
+      // A proxy can return an HTML error page on a 502/503/504. Parse
+      // defensively so that does not hide the real status.
       let body = null;
       if (text) {
         try {
           body = JSON.parse(text);
         } catch {
-          body = null; // non-JSON body - raw text is still in the Error message below
+          body = null; // The raw text is still in the Error message below.
         }
       }
       const err = new Error(
@@ -662,8 +470,7 @@ async function ghRaw(path, token, options = {}) {
       err.retryAfter = Number(res.headers.get("retry-after")) || null;
       throw err;
     }
-    // Raw-media-type requests (see readSignatures, for files too big for
-    // the base64+JSON envelope) return plain text, not JSON.
+    // Raw media-type requests (see readSignatures) return plain text.
     if (options.raw) return text;
     return text ? JSON.parse(text) : null;
   } finally {
@@ -675,12 +482,11 @@ async function gh(path, token, options = {}, attempt = 1) {
   try {
     return await ghRaw(path, token, options);
   } catch (e) {
-    // Only retry what's safe to repeat: GETs, PUTs (protected by GitHub's
-    // sha compare-and-swap, so a retry either no-ops via 409 or applies
-    // exactly once), and DELETEs (repeating one just 404s). POSTs that
-    // create something (comments, tokens) are excluded by default since a
-    // blind retry could create a duplicate - callers that know a POST is
-    // safe to retry can pass `idempotent: true`.
+    // Retry only what is safe to repeat. GET is. PUT is, because GitHub's sha
+    // check makes a repeat either apply once or fail with 409. DELETE is,
+    // because repeating it just gives 404. Creating POSTs (comments, tokens)
+    // are not, since a retry could duplicate them, unless the caller passes
+    // `idempotent: true`.
     const method = (options.method || "GET").toUpperCase();
     const safeToRetry =
       options.idempotent === true ||
@@ -690,7 +496,7 @@ async function gh(path, token, options = {}, attempt = 1) {
     const transient =
       safeToRetry &&
       (e.status === 429 ||
-        (e.status === 403 && e.retryAfter) || // GitHub secondary rate limit
+        (e.status === 403 && e.retryAfter) || // secondary rate limit
         (e.status >= 500 && e.status <= 599) ||
         e.name === "AbortError");
     if (transient && attempt < MAX_RETRIES) {
@@ -703,7 +509,7 @@ async function gh(path, token, options = {}, attempt = 1) {
 }
 
 // ---------------------------------------------------------------------------
-// GitHub App: mint a short-lived installation token on demand.
+// GitHub App: mint a short-lived installation token
 // ---------------------------------------------------------------------------
 function base64url(buf) {
   return buf
@@ -716,8 +522,8 @@ function base64url(buf) {
 function createAppJWT(appId, privateKeyPem) {
   const now = Math.floor(Date.now() / 1000);
   const header = { alg: "RS256", typ: "JWT" };
-  // iat is set 60s in the past to tolerate clock drift with GitHub; exp
-  // must be <= 10 minutes per GitHub's own App JWT requirements.
+  // iat is 60s in the past to allow for clock drift. GitHub requires exp to
+  // be at most 10 minutes ahead.
   const payload = { iat: now - 60, exp: now + 9 * 60, iss: appId };
   const unsigned = `${base64url(Buffer.from(JSON.stringify(header)))}.${base64url(Buffer.from(JSON.stringify(payload)))}`;
   const signer = crypto.createSign("RSA-SHA256");
@@ -727,49 +533,38 @@ function createAppJWT(appId, privateKeyPem) {
 }
 
 // ---------------------------------------------------------------------------
-// Signatures-repo token lifecycle.
+// Signatures-repo token lifecycle
 //
-// A GitHub App installation token lives ~1 hour; the access_tokens response
-// carries the authoritative `expires_at`. In the normal case a run takes
-// seconds, so one mint per run is plenty - but the sign-phrase flow mints
-// FIRST (to write the signature) and only reads the store again at the very
-// end of checkPR(), after listPRCommitAuthors() has paged through every
-// commit and resolved every co-author trailer. On a huge PR, a slow or
-// rate-limited API, or a long-lived self-hosted runner, that gap can outlast
-// the token, and the final read would fail with a 401 AFTER the signature
-// was already persisted - leaving the PR's status/comment stale. So:
-//
-//  1. The cache remembers when the token expires and re-mints once it is
-//     within SIG_TOKEN_REFRESH_SKEW_MS of that (proactive refresh).
-//  2. withSignaturesToken() additionally recovers from a 401 on a
-//     signatures-repo request - a token revoked early, or a runner clock
-//     that disagrees with GitHub's - by minting a fresh token and retrying
-//     exactly once (reactive refresh).
-//  3. Concurrent callers share one in-flight mint instead of each minting.
+// An installation token lives about an hour, and the access_tokens response
+// carries its `expires_at`. The sign flow mints a token first, then reads the
+// store again at the end of checkPR(), after paging through every commit and
+// co-author. On a huge PR or a slow runner that gap can outlast the token and
+// the final read would fail with a 401 after the signature was already saved.
+// So:
+//   1. The cache remembers the expiry and re-mints within
+//      SIG_TOKEN_REFRESH_SKEW_MS of it.
+//   2. withSignaturesToken() also recovers from a 401 by minting a fresh token
+//      and retrying once.
+//   3. Concurrent callers share one in-flight mint.
 // ---------------------------------------------------------------------------
-// GitHub documents installation tokens as valid for one hour. Also the
-// ceiling for any `expires_at` we are told about: we never trust a token to
-// outlive the documented lifetime, whatever the response claims.
+// GitHub documents one hour. It is also the ceiling for any `expires_at` we
+// are told about.
 const SIG_TOKEN_LIFETIME_MS = 60 * 60 * 1000;
-// Refresh this long BEFORE the real expiry, so a token is never handed out
-// that dies mid-request, and so modest clock drift between this runner and
-// GitHub is absorbed.
+// Refresh this long before the real expiry, so a token never dies mid-request
+// and small clock drift is absorbed.
 const SIG_TOKEN_REFRESH_SKEW_MS = 5 * 60 * 1000;
 
 let _sigTokenCache = null; // { token, expiresAtMs, viaApp } | null
-let _sigTokenMint = null; // in-flight mint promise, shared by concurrent callers
+let _sigTokenMint = null; // in-flight mint promise shared by concurrent callers
 
 function usesAppAuth() {
   return Boolean(SIG_APP_ID && SIG_APP_PRIVATE_KEY);
 }
 
-// When should a freshly minted token be considered dead? Uses the response's
-// `expires_at` when it is a parseable date, never later than the documented
-// 1-hour lifetime counted from when the mint REQUEST started (the
-// conservative end - the token was necessarily created after that). A
-// missing/unparseable `expires_at` falls back to that same ceiling: caching
-// NaN here would make every later freshness check false and silently
-// re-mint on every single call.
+// When a fresh token should be considered dead: the response's `expires_at`,
+// but never later than one hour after the mint request started. A missing or
+// unparseable value falls back to that ceiling, because caching NaN would make
+// every freshness check false and re-mint on every call.
 function resolveSigTokenExpiry(expiresAt, mintStartedAtMs) {
   const ceiling = mintStartedAtMs + SIG_TOKEN_LIFETIME_MS;
   if (typeof expiresAt !== "string") return ceiling;
@@ -789,25 +584,18 @@ async function mintSignaturesToken() {
     console.warn(
       "::warning::SIG_APP_ID/SIG_APP_PRIVATE_KEY not set - falling back to GITHUB_TOKEN. Cross-repo writes will only work if the signatures repo equals the current repo.",
     );
-    // The job's own GITHUB_TOKEN is not ours to refresh - it lives for the
-    // whole job, so this entry never goes stale.
+    // GITHUB_TOKEN lives for the whole job, so this entry never goes stale.
     return { token: GITHUB_TOKEN, expiresAtMs: Infinity, viaApp: false };
   }
 
-  // Taken BEFORE any request, see resolveSigTokenExpiry().
+  // Taken before any request, see resolveSigTokenExpiry().
   const mintStartedAtMs = Date.now();
   const jwt = createAppJWT(SIG_APP_ID, SIG_APP_PRIVATE_KEY);
-  // Repo-scoped lookup, not /orgs/{org}/installation - the org endpoint
-  // 404s when signatures-owner is a user account rather than an org, and
-  // this one works for both without needing to branch on account type.
+  // The repo-scoped lookup works for user and org owners. The
+  // /orgs/{org}/installation endpoint 404s for a user account.
   const installation = await gh(sigInstallationApiPath(), jwt);
-  // Same reasoning as the tokenResp check below: a 200 OK here doesn't
-  // guarantee a usable installation id. Without this check, a malformed
-  // response could flow straight into the URL below as "undefined" (or
-  // any other non-safe value), and the failure would only surface as a
-  // misleading 404 from the *next* request - naming the wrong problem
-  // (a bad access_tokens response) instead of the actual one (a bad
-  // installation lookup response).
+  // A 200 does not guarantee a usable id. Check it here so a bad lookup
+  // response is reported as that, not as a misleading 404 on the next request.
   assertValidInstallationId(
     installation?.id,
     `GitHub App installation lookup for /repos/${SIG_OWNER}/${SIG_REPO}/installation`,
@@ -815,24 +603,12 @@ async function mintSignaturesToken() {
   const tokenResp = await gh(
     `/app/installations/${installation.id}/access_tokens`,
     jwt,
-    // A retried mint just produces an extra unused, short-lived token -
-    // no user-visible side effect, so it's fine to let gh() retry here.
+    // A retried mint only produces an extra unused short-lived token.
     { method: "POST", idempotent: true },
   );
-  // A 200 OK response here doesn't guarantee a usable token - a malformed
-  // or unexpected body (e.g. a proxy/gateway that mangles the response, an
-  // empty 200 body which ghRaw() turns into `null`, or a future GitHub API
-  // change) must fail loudly right here, not silently flow through as
-  // a cached `undefined`/`null` token and only surface later as a
-  // confusing "Bad credentials" 401 on some unrelated request that happens
-  // to use it. `tokenResp?.token` (rather than `tokenResp.token`) matters:
-  // ghRaw() returns a bare `null` (not `{}`) for a 200 response with an
-  // empty body, and dereferencing `.token` directly on that would throw an
-  // unrelated, confusing TypeError instead of this clear, actionable one.
-  // `.trim().length === 0` (rather than just `.length === 0`) also catches
-  // a whitespace-only token (e.g. `"   "`) - a non-empty string that would
-  // otherwise pass the plain length check but is just as unusable as an
-  // empty one.
+  // Same for the token: an empty 200 body (ghRaw() returns null) or a
+  // whitespace-only token must fail here, not later as a confusing "Bad
+  // credentials" on an unrelated request.
   if (
     !tokenResp ||
     typeof tokenResp.token !== "string" ||
@@ -851,7 +627,7 @@ async function mintSignaturesToken() {
 
 async function getSignaturesToken() {
   if (isSigTokenFresh(_sigTokenCache)) return _sigTokenCache.token;
-  // A mint is already running - join it instead of minting a second token.
+  // Join a mint that is already running instead of starting a second one.
   if (_sigTokenMint) return _sigTokenMint;
 
   const mint = mintSignaturesToken()
@@ -860,16 +636,16 @@ async function getSignaturesToken() {
       return entry.token;
     })
     .finally(() => {
-      // Cleared on success AND failure, so a failed mint never poisons later
-      // calls (they simply try again). Only clear our own promise.
+      // Cleared on success and failure, so a failed mint never blocks later
+      // calls. Only clear our own promise.
       if (_sigTokenMint === mint) _sigTokenMint = null;
     });
   _sigTokenMint = mint;
   return mint;
 }
 
-// Forget `rejectedToken`, but only if it is still the cached one - if
-// something else already refreshed the cache, that newer token must survive.
+// Forget `rejectedToken`, but only if it is still the cached one. A newer
+// token from another refresh must survive.
 function invalidateSignaturesToken(rejectedToken) {
   if (
     _sigTokenCache &&
@@ -880,17 +656,12 @@ function invalidateSignaturesToken(rejectedToken) {
   }
 }
 
-// Runs `fn(token)` with a signatures-repo token and, if GitHub answers 401
-// (token expired/revoked early, or clock skew defeated the proactive check),
-// mints a fresh one and runs `fn` once more. At most ONE retry, so bad
-// credentials can never loop. Only for App-minted tokens: the GITHUB_TOKEN
-// fallback cannot be re-minted, so its 401 is surfaced as-is. Failures while
-// minting happen outside `fn` and propagate untouched.
-//
-// Re-running `fn` is safe because a 401 means the request was rejected
-// before it could do anything, and every `fn` used here (a read, or
-// writeSignatures with its idempotent check-and-append mutate) tolerates
-// being re-run - the 409 retry loop already relies on exactly that.
+// Runs `fn(token)` and, on a 401, mints a fresh token and runs `fn` once more.
+// Only one retry, so bad credentials never loop. Only for App tokens, since
+// the GITHUB_TOKEN fallback cannot be re-minted. Mint failures happen outside
+// `fn` and propagate unchanged. Re-running `fn` is safe: a 401 means the
+// request was rejected before doing anything, and every `fn` used here
+// tolerates a re-run.
 async function withSignaturesToken(fn) {
   const token = await getSignaturesToken();
   try {
@@ -908,19 +679,63 @@ async function withSignaturesToken(fn) {
 }
 
 // ---------------------------------------------------------------------------
-// Signature store (JSON file in the central private repo).
+// Signature index: O(1) "has this account id signed?" lookups
+//
+// The store is a JSON array, and scanning it per question made every check
+// O(n): checkPR() asked once per commit author (O(authors x signatures)), and
+// mergeSignatures() compared every known entry with every fresh entry
+// (O(known x fresh), which is O(n^2) because the sign flow hands it the whole
+// file). Parsing the file is O(n) and unavoidable, so the index is built in
+// that same single pass (see readSignatures()) and every lookup after it is a
+// hash probe.
+//
+// The index holds numeric ids only, under exactly the rule isSigned() always
+// had: an entry counts only if it is an object whose `id` is a number. A
+// missing, string, null or NaN id is never indexed, so such an entry fails
+// closed, and Set.has() uses SameValueZero, so a string "555" never matches
+// the number 555. Logins are not stored, so they can never be matched.
+//
+// An index is a snapshot. It is built from one array and does not follow later
+// changes to it, so build a new one for new data instead of reusing it.
+// ---------------------------------------------------------------------------
+function signatureEntryId(entry) {
+  if (entry === null || typeof entry !== "object") return null;
+  const id = entry.id;
+  return typeof id === "number" && !Number.isNaN(id) ? id : null;
+}
+
+class SignatureIndex {
+  #ids = new Set();
+
+  // `signatures` must be an array. A non-array throws a TypeError, as the
+  // linear scan it replaces did.
+  constructor(signatures) {
+    for (const entry of signatures) this.add(entry);
+  }
+
+  // Takes a stored entry, not an id. Entries without a usable id are skipped.
+  add(entry) {
+    const id = signatureEntryId(entry);
+    if (id !== null) this.#ids.add(id);
+  }
+
+  has(id) {
+    return this.#ids.has(id);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Signature store (a JSON file in the central private repo)
 // ---------------------------------------------------------------------------
 async function readSignatures(token) {
-  // Built (and validated) once, OUTSIDE the try below on purpose: an invalid
-  // SIG_PATH is a configuration error and must surface as one - never be
-  // mistaken for the "file doesn't exist yet" 404 case handled in the catch.
+  // Built and validated outside the try on purpose, so an invalid SIG_PATH
+  // surfaces as a config error and is never mistaken for the 404 below.
   const contentsPath = sigContentsApiPath();
   try {
-    // The 'object' media type works up to 100 MB (the default response
-    // format is only reliable under 1 MB) and still gives us the sha we
-    // need for compare-and-swap writes. Files at or under 1 MB come back
-    // with content included; bigger files come back empty and we fetch the
-    // actual bytes below via the 'raw' media type.
+    // The 'object' media type works up to 100 MB (the default format is only
+    // reliable under 1 MB) and still returns the sha needed for
+    // compare-and-swap writes. Files up to 1 MB come with their content.
+    // Larger ones come back empty and are fetched with the 'raw' media type.
     const meta = await gh(contentsPath, token, {
       headers: { Accept: "application/vnd.github.object+json" },
     });
@@ -941,42 +756,49 @@ async function readSignatures(token) {
         'signatures file is malformed: "signatures" is not an array',
       );
 
-    // A malformed entry (e.g. missing "login") must never crash isSigned()
-    // or isAllowlisted() - but it also can't just be dropped here, because
-    // this data gets re-serialized straight back to the file on the next
-    // write. Silently dropping it would permanently delete what might be a
-    // real signature that just predates a schema change. So: warn, but
-    // leave it in place; isSigned() handles matching against it safely.
-    //
-    // The warning deliberately omits the entry's own content - it prints
-    // into the Actions log of every consuming repo (which can be public),
-    // and entries can contain personal data. An index is enough for a
-    // maintainer to go look it up directly in the signatures repo.
-    data.signatures.forEach((entry, index) => {
+    // One pass over the entries does two jobs, so the index costs nothing
+    // extra on top of the O(n) parse. It warns about a malformed entry but
+    // keeps it: the data is written straight back on the next write, and
+    // dropping an entry could delete a real signature from before a schema
+    // change. isSigned() handles such entries safely. The warning prints only
+    // the position, because the Actions log can be public and entries can
+    // contain personal data. It also indexes every entry by numeric id (see
+    // SignatureIndex), whether or not its login is valid, as isSigned()
+    // always matched on the id alone.
+    const index = new SignatureIndex([]);
+    data.signatures.forEach((entry, position) => {
       if (
         !entry ||
         typeof entry.login !== "string" ||
         entry.login.length === 0
       ) {
         console.warn(
-          `::warning::Signature entry at index ${index} is missing/has an invalid "login" field (kept as-is, not treated as a match) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
+          `::warning::Signature entry at index ${position} is missing/has an invalid "login" field (kept as-is, not treated as a match) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
         );
       }
+      index.add(entry);
     });
-    return { sha: meta.sha, data };
+    // `index` describes this `data` snapshot only.
+    return { sha: meta.sha, data, index };
   } catch (e) {
     if (e.status === 404)
-      return { sha: null, data: { version: 1, signatures: [] } };
+      return {
+        sha: null,
+        data: { version: 1, signatures: [] },
+        index: new SignatureIndex([]),
+      };
     throw e;
   }
 }
 
 async function writeSignatures(token, mutate, message, attempt = 1) {
-  // Always re-read right before writing so the sha we PUT with is fresh -
-  // that's what makes the retry loop below correct instead of racing itself.
-  const { sha, data } = await readSignatures(token);
-  const updated = mutate(data);
-  if (updated === null) return data; // mutate() decided nothing changed (e.g. already signed)
+  // Re-read right before writing so the sha we PUT with is fresh. That is
+  // what makes the retry loop below correct.
+  // `mutate` also gets the SignatureIndex of `data`, for O(1) "already
+  // there?" checks. The index describes `data`, not what mutate() returns.
+  const { sha, data, index } = await readSignatures(token);
+  const updated = mutate(data, index);
+  if (updated === null) return data; // nothing to change, e.g. already signed
   const content = Buffer.from(JSON.stringify(updated, null, 2)).toString(
     "base64",
   );
@@ -987,18 +809,11 @@ async function writeSignatures(token, mutate, message, attempt = 1) {
     });
     return updated;
   } catch (e) {
-    // Two different races land here, both meaning "the file changed under
-    // us - re-read and reapply our change":
-    //
-    // 1. A normal 409 Conflict: someone else updated the existing file
-    //    between our read and our write.
-    //
-    // 2. A first-write race: our read saw the file didn't exist yet (sha
-    //    null), but another writer's create won in the meantime. GitHub
-    //    doesn't return 409 for that - it returns 422 saying a sha is
-    //    required, since from its side we just tried to blindly overwrite
-    //    a file that now exists. Several repos can easily race to create
-    //    the signature file for the very first time, so this case matters.
+    // Two races mean "the file changed under us, re-read and reapply":
+    //  1. A 409: someone updated the existing file between our read and write.
+    //  2. A first-write race: we saw no file (sha null) but another writer
+    //     created it first. GitHub answers 422 asking for a sha, not 409.
+    //     Several repos can race to create the file for the first time.
     const isExistingFileConflict = e.status === 409;
     const isFirstWriteRace =
       sha === null &&
@@ -1012,72 +827,62 @@ async function writeSignatures(token, mutate, message, attempt = 1) {
   }
 }
 
-// `author` is a { id, login } pair. Matching is on the immutable numeric id
-// ONLY - logins are mutable, and a released login can be claimed by someone
-// else later, so a login comparison could hand that person an earlier
-// signature that isn't theirs. An author without a numeric id (a bare login
-// string, or a malformed shape) is never "signed", and neither is a stored
-// entry without a numeric id: both fail closed rather than degrade to login
-// matching. (handleIssueComment refuses to record an id-less signature in the
-// first place - see assertValidUserId().)
+// `author` is an { id, login } pair. Matching is on the numeric id only. A
+// login can be released and claimed by someone else, who would then inherit
+// the old signature. An author or stored entry without a numeric id never
+// matches, so it fails closed. Tests call this directly and readSignatures()
+// keeps malformed entries, so garbage entries return false instead of
+// throwing.
 //
-// This is also an exported helper (used by tests), so it tolerates garbage
-// entries - readSignatures() keeps malformed entries in place instead of
-// dropping them - and returns false instead of throwing.
-function isSigned(data, author) {
+// `source` is a SignatureIndex (O(1), what the bot's own code passes) or a
+// plain `{ signatures: [...] }` object. The plain form builds a throwaway
+// index, which costs O(n) per call, so use an index when asking more than
+// once about the same data.
+function isSigned(source, author) {
   if (author == null || typeof author !== "object") return false;
   const id = author.id;
   if (typeof id !== "number") return false;
-  return data.signatures.some((s) => s && typeof s === "object" && s.id === id);
+  const index =
+    source instanceof SignatureIndex
+      ? source
+      : new SignatureIndex(source.signatures);
+  return index.has(id);
 }
 
-// `author` is the same { id, login } pair the rest of the code passes around.
-// Only the numeric id is consulted - the login is mutable and reusable. A
-// missing, non-numeric, fractional or otherwise malformed id (including a bare
-// login string) fails closed: not allowlisted.
+// Same rule for the allowlist: only the numeric id counts, and a missing or
+// malformed id is not allowlisted.
 function isAllowlisted(author) {
   if (author == null || typeof author !== "object") return false;
   return typeof author.id === "number" && ALLOWLIST.ids.has(author.id);
 }
 
-// Same id-only identity rule as isSigned() above (kept as its own small
-// function rather than shared code, so a future change to either doesn't have
-// to reason about the other) - applied here to answer a different question:
-// not "has this identity signed anywhere", but "is this identity one of THIS
-// PR's own commit authors". Used by checkPR to tell a genuine required
-// signer apart from a bystander whose sign-phrase comment didn't actually
-// unblock this particular PR (see the `signerCompletedRequirement` check
-// there, and personalSuccessMessage()'s doc comment for why that
-// distinction matters).
+// Id-only identity check, like isSigned(), but answering a different
+// question: is this identity one of this PR's own commit authors? checkPR()
+// uses it to tell a real required signer from a bystander.
 function isSameContributor(a, b) {
   if (!a || !b) return false;
   return typeof a.id === "number" && typeof b.id === "number" && a.id === b.id;
 }
 
-// Combines a caller's already-known signature snapshot (e.g. the object
-// writeSignatures() just returned) with a freshly-read one, so that neither
-// side's staleness can hide a real signature from checkPR:
+// Combines a snapshot the caller already knows (what writeSignatures() just
+// returned) with a fresh read, so neither side's staleness hides a signature:
+//  - The fresh read may still show the old file, because GitHub's Contents API
+//    does not guarantee read-after-write. `known` covers that.
+//  - `known` was taken before listPRCommitAuthors() ran and cannot contain a
+//    signature that another run wrote in the meantime. `fresh` covers that.
+// When both have the same identity, the fresh entry wins. `known` is null for
+// every caller except handleIssueComment(), and then `fresh` is returned as is.
 //
-//  - `fresh` might still be serving the pre-write snapshot due to GitHub's
-//    Contents API read-after-write staleness window (see checkPR's doc
-//    comment) - `known`'s entries (the exact data the caller's own write
-//    just produced) cover that gap.
-//  - `known` was captured at some point BEFORE listPRCommitAuthors() ran,
-//    and can't reflect a signature written by a completely different
-//    workflow run (e.g. someone signing via a different PR/repo) that lands
-//    in the shared store while that call is in flight - `fresh`'s entries
-//    cover that gap instead.
-//
-// Where the same identity (per isSameContributor's id-first, login-fallback
-// rule) appears in both, the fresh entry wins, since it's the more recently
-// observed state of the shared store; entries only `known` has are kept
-// as-is. `known` may be null/undefined (every checkPR() caller except
-// handleIssueComment's has no such snapshot to hand over), in which case
-// `fresh` is returned unchanged.
+// Linear in known + fresh: the fresh ids are indexed once, and each known entry
+// is one probe. (The nested scan this replaced was O(known x fresh), and since
+// `known` is the whole file that was O(n^2).) The rule is the same as
+// isSameContributor(): numeric ids only, so a known entry without a usable id
+// has nothing to match and is kept.
 function mergeSignatures(known, fresh) {
   if (!known) return fresh;
+  const freshIds = new SignatureIndex(fresh.signatures);
   const keptFromKnown = known.signatures.filter(
-    (k) => !fresh.signatures.some((f) => isSameContributor(k, f)),
+    (k) => !freshIds.has(signatureEntryId(k)),
   );
   return {
     version: fresh.version,
@@ -1085,26 +890,12 @@ function mergeSignatures(known, fresh) {
   };
 }
 
-// Was `signer` actually a required (non-allowlisted) commit author among
-// `authors` (a PR's own commit authors, as returned by
-// listPRCommitAuthors())? Extracted as its own top-level function - rather
-// than an expression inlined into checkPR - specifically so it has ONE
-// definition that's directly unit-testable on its own (see
-// test/logic.test.js), instead of being duplicated between production code
-// and a re-typed copy of the same expression in its tests, which could
-// silently drift out of sync with each other over time.
-//
-// checkPR calls this only after confirming `missing.length === 0 &&
-// unresolved.length === 0` (the PR IS now fully signed), and only ever
-// passes a `signer` who just recorded a BRAND NEW signature (handleIssueComment
-// only passes `signer` after confirming they weren't already signed - see
-// there). So if `signer` really is a required author here, they were
-// necessarily among `missing` a moment ago and are not anymore: their
-// comment is genuinely what moved this PR's own requirement forward. If
-// not - an allowlisted account, or someone who never authored a commit on
-// this PR at all - their signing had zero effect on this PR's `missing`
-// list either way, so they get no credit for "completing" it (see
-// personalSuccessMessage()'s doc comment for why that distinction matters).
+// Was `signer` one of the required (non-allowlisted) commit authors in
+// `authors`? checkPR() calls this only when the PR is now fully signed, and
+// handleIssueComment() passes a `signer` only after recording a new signature.
+// So if the signer is a required author here, their signature is what moved
+// the PR forward. An allowlisted account or someone with no commit on the PR
+// gets no credit.
 function signerCompletedRequirement(authors, signer) {
   return (
     !!signer &&
@@ -1113,15 +904,10 @@ function signerCompletedRequirement(authors, signer) {
   );
 }
 
-// Classifies one of the bot's own comments (see getExistingBotComments -
-// only ever called on comments already confirmed to be from the bot) as
-// either "pending" (a real "you still need to sign" / "needs manual
-// review" comment - the PR was genuinely blocked when this was posted),
-// "success" (the "All contributors have signed" announcement), or neither
-// (e.g. the personal, non-blocking "you already signed the CLA, nothing
-// more to do here" reply someone gets for redundantly re-submitting the
-// sign phrase). Used by checkPR's quietIfNeverFlagged logic to tell a real
-// block apart from unrelated bot chatter on the same thread.
+// Classifies one of the bot's own comments as "pending" (it blocked the PR:
+// someone must sign or a commit needs review), "success" (the all-signed
+// announcement) or "other" (for example the "you already signed" reply).
+// checkPR() uses this to tell a real block from unrelated bot chatter.
 function classifyBotComment(body) {
   if (
     body.includes(PENDING_MARKER) ||
@@ -1130,17 +916,8 @@ function classifyBotComment(body) {
   ) {
     return "pending";
   }
-  // SUCCESS_MARKER covers both the generic SUCCESS_MESSAGE and the
-  // personalized per-signer thank-you (personalSuccessMessage()), since
-  // SUCCESS_MESSAGE is built directly from this marker (see its doc
-  // comment) - so this ALSO catches any future change to the generic
-  // wording, as long as it keeps going through SUCCESS_MESSAGE. The
-  // LEGACY_SUCCESS_COMMENT check is a separate, deliberately EXACT
-  // (not substring) fallback: it's the only thing that still recognizes a
-  // genuinely pre-marker comment (one posted by an older deployment of
-  // this bot, whose entire body was always just that one fixed string with
-  // nothing else appended - see LEGACY_SUCCESS_COMMENT's doc comment for
-  // why exact equality is correct, and safer, here specifically).
+  // SUCCESS_MARKER covers the generic and the per-signer messages. The exact
+  // match is only for comments from before the marker existed.
   if (body.includes(SUCCESS_MARKER) || body === LEGACY_SUCCESS_COMMENT) {
     return "success";
   }
@@ -1148,44 +925,30 @@ function classifyBotComment(body) {
 }
 
 // ---------------------------------------------------------------------------
-// Repo-local helpers (comments / status / lock) - always use GITHUB_TOKEN,
+// Repo-local helpers (comments, status, lock). These always use GITHUB_TOKEN,
 // never the signatures token.
 // ---------------------------------------------------------------------------
 // GitHub has two noreply email formats:
-//   - ID+USERNAME@users.noreply.github.com (accounts from after 18 Jul 2017)
-//     the id is right there, no lookup needed.
-//   - USERNAME@users.noreply.github.com (older accounts) - needs one lookup
-//     to resolve to an id.
+//   - ID+USERNAME@users.noreply.github.com (accounts created after 18 Jul
+//     2017): the id is in the address.
+//   - USERNAME@users.noreply.github.com (older accounts): needs one lookup.
 const NEW_NOREPLY = /^(\d+)\+([^@]+)@users\.noreply\.github\.com$/i;
 const OLD_NOREPLY = /^([^@+]+)@users\.noreply\.github\.com$/i;
 
 // ---------------------------------------------------------------------------
-// Identity lookups (login -> id, id -> login, and the bot's own login).
+// Identity lookups (login to id, id to login, and the bot's own login)
 //
-// All three used to be "check the cache -> await a GitHub API call -> store
-// the result". Because the cache held the finished VALUE, there was an await
-// between the check and the store: two callers asking for the same key at the
-// same time both missed the cache and each sent their own request (a
-// check-then-act race - the same shape getSignaturesToken() already guards
-// against for the token mint).
+// The caches hold the promise, not the finished value, and it is stored
+// synchronously before the request is awaited. A caller that asks while a
+// lookup is running gets the same promise, so each key costs exactly one
+// request per run. Nothing calls these concurrently today, but this keeps it
+// safe if listPRCommitAuthors() is ever parallelized.
 //
-// So the cache now holds the PROMISE, stored synchronously (no await between
-// the lookup and the set) before the request is even awaited. Every caller -
-// the first, a concurrent one, or a much later one - receives that same
-// promise, so exactly ONE request is made per key for the life of the run.
-//
-// Why a rejected promise can never get stuck in these caches: each fetcher
-// below catches every failure itself and resolves to a fallback value (null,
-// or the default bot login), so the promises never reject. Failed lookups are
-// cached on purpose, exactly as before (an unresolvable co-author costs one
-// request per run, not one per commit, and an unresolved id is flagged for
-// manual review - it fails closed, never open). If a fetcher is ever changed
-// so that it can reject, it must also evict its own entry, or one failure
-// would be replayed to every later caller.
-//
-// In practice nothing calls these concurrently today (listPRCommitAuthors()
-// walks commits one at a time); this keeps that from silently becoming a bug
-// the day someone parallelizes it for speed.
+// The fetchers never reject. They catch every failure and resolve to a
+// fallback (null, or the default bot login). Failed lookups are cached on
+// purpose: an unresolvable co-author costs one request per run, and an
+// unresolved id is flagged for manual review, so it fails closed. A fetcher
+// that can reject must also evict its own cache entry.
 // ---------------------------------------------------------------------------
 const _userIdLookups = new Map(); // login (lowercased) -> Promise<id | null>
 async function resolveUserIdByLogin(login) {
@@ -1198,23 +961,19 @@ async function resolveUserIdByLogin(login) {
   return lookup;
 }
 
-// Never rejects - see the block comment above.
 async function fetchUserIdByLogin(login) {
   try {
     const user = await gh(`/users/${encodeURIComponent(login)}`, GITHUB_TOKEN);
     if (user && typeof user.id === "number") return user.id;
-  } catch (e) {
-    // 404 or a transient failure - either way this falls through to
-    // "unresolved" at the call site rather than being silently dropped.
+  } catch {
+    // 404 or a transient failure: the caller treats it as unresolved.
   }
   return null;
 }
 
 const _loginByIdLookups = new Map(); // id -> Promise<login | null>
-// GET /user/{account_id} gives us the current, GitHub-verified login for an
-// id, instead of trusting whatever login string sits next to that id in a
-// commit trailer (see extractCoAuthors - the trailer is free text, so an
-// "id+login" pair in it doesn't prove they belong to the same account).
+// GET /user/{account_id} returns the current, GitHub-verified login for an
+// id. A trailer is free text, so the login next to an id in it proves nothing.
 async function resolveLoginById(id) {
   let lookup = _loginByIdLookups.get(id);
   if (lookup === undefined) {
@@ -1224,32 +983,25 @@ async function resolveLoginById(id) {
   return lookup;
 }
 
-// Never rejects - see the block comment above.
 async function fetchLoginById(id) {
   try {
     const user = await gh(`/user/${encodeURIComponent(id)}`, GITHUB_TOKEN);
     if (user && typeof user.login === "string" && user.login.length > 0) {
       return user.login;
     }
-  } catch (e) {
-    // 404 (deleted account, or no such id) or transient failure - falls
-    // through to unresolved.
+  } catch {
+    // 404 (deleted account or unknown id) or a transient failure: unresolved.
   }
   return null;
 }
 
-// A Co-authored-by: trailer in a commit message is free text - GitHub never
-// authenticates it. For the noreply formats we can at least confirm the
-// (id, login) pair refers to one real account: for the new format the login
-// is looked up independently by id rather than trusted from the trailer
-// (see resolveLoginById), so nobody can pair a real, already-signed id with
-// a fabricated login to slip past the login-based allowlist check. What we
-// can't verify is that the account actually agreed to be credited on this
-// commit - nothing can, since GitHub doesn't track that. Any other email
-// format can't be reliably resolved to an account, so it's flagged for
-// manual review just like an unresolved primary author. The raw email is
-// never part of the return value, since it can be personal data and this
-// eventually reaches PR comments and Actions logs (see checkPR).
+// Reads the Co-authored-by trailers of a commit message. A trailer is free
+// text that GitHub never authenticates, so for the new noreply format the
+// login is looked up by id instead of trusted (see security property 10).
+// Other email formats cannot be resolved reliably and are flagged for manual
+// review, like an unresolved primary author. The raw email is never returned,
+// because it can be personal data and the result ends up in PR comments and
+// logs.
 async function extractCoAuthors(commitMessage) {
   const authors = [];
   let hasUnresolved = false;
@@ -1259,11 +1011,9 @@ async function extractCoAuthors(commitMessage) {
   while ((match = trailerRegex.exec(commitMessage || "")) !== null) {
     const email = match[1].trim();
     const key = email.toLowerCase();
-    if (seen.has(key)) continue; // don't double-count/double-lookup a repeated trailer
+    if (seen.has(key)) continue; // repeated trailer, skip the second lookup
     if (seen.size >= MAX_COAUTHOR_TRAILERS_PER_COMMIT) {
-      // Stop minting more lookups for this commit once we're past the cap,
-      // and flag it for a human rather than silently ignoring the overflow
-      // - see MAX_COAUTHOR_TRAILERS_PER_COMMIT above for why.
+      // Past the cap: stop looking up and flag the commit for a human.
       hasUnresolved = true;
       break;
     }
@@ -1272,16 +1022,13 @@ async function extractCoAuthors(commitMessage) {
     const newStyle = email.match(NEW_NOREPLY);
     if (newStyle) {
       const claimedId = Number(newStyle[1]);
-      // Deliberately ignore newStyle[2] (the trailer's own login text) and
-      // resolve the account's real, current login from GitHub itself, keyed
-      // off the id - the one part of this trailer that isn't just a string
-      // an attacker gets to pick to match an arbitrary account.
+      // Ignore the login text in the trailer and ask GitHub for the real one.
       const authoritativeLogin = await resolveLoginById(claimedId);
       if (authoritativeLogin !== null) {
         authors.push({ id: claimedId, login: authoritativeLogin });
         continue;
       }
-      // id doesn't resolve to any real/current account - fall through.
+      // The id matches no current account, so fall through.
     }
 
     const oldStyle = email.match(OLD_NOREPLY);
@@ -1292,7 +1039,7 @@ async function extractCoAuthors(commitMessage) {
         authors.push({ id, login });
         continue;
       }
-      // lookup failed (e.g. account since deleted) - fall through to unresolved
+      // The lookup failed (for example a deleted account), so fall through.
     }
 
     hasUnresolved = true;
@@ -1301,12 +1048,11 @@ async function extractCoAuthors(commitMessage) {
 }
 
 async function listPRCommitAuthors(prNumber) {
-  // Keyed by numeric id (see isSigned) so the same person showing up as
-  // author on one commit and co-author on another collapses to one entry.
+  // Keyed by numeric id, so someone who is author on one commit and co-author
+  // on another counts once.
   const authors = new Map();
-  // Commits flagged for manual review, identified by SHA only - the SHA is
-  // already public on the PR's Commits tab and carries no personal data,
-  // unlike a raw author/co-author email.
+  // Commits flagged for manual review, by SHA only. A SHA is already public on
+  // the PR's Commits tab and holds no personal data, unlike an email.
   const unresolvedShas = new Set();
   let page = 1;
   for (;;) {
@@ -1316,8 +1062,7 @@ async function listPRCommitAuthors(prNumber) {
     );
     if (!commits.length) break;
     for (const c of commits) {
-      // Skip merge commits - whoever merged didn't author the change, so
-      // they shouldn't be asked to sign just for that.
+      // Skip merge commits. Whoever merged did not write the change.
       if (Array.isArray(c.parents) && c.parents.length > 1) continue;
 
       if (c.author && c.author.login && typeof c.author.id === "number") {
@@ -1326,10 +1071,9 @@ async function listPRCommitAuthors(prNumber) {
           c.commit.verification &&
           c.commit.verification.verified
         );
-        // verified === true alone proves nothing about c.author, since
-        // GitHub never verifies the author, only the committer (see
-        // REQUIRE_VERIFIED_COMMITS above). Only trust the author when the
-        // same account is also the verified committer.
+        // `verified` says nothing about the author, because GitHub verifies
+        // only the committer (see security property 9). Trust the author only
+        // when the same account is also the verified committer.
         const committerIsSameAccount =
           c.committer &&
           typeof c.committer.id === "number" &&
@@ -1342,13 +1086,11 @@ async function listPRCommitAuthors(prNumber) {
           authors.set(c.author.id, { id: c.author.id, login: c.author.login });
         }
       } else {
-        // The commit's email isn't linked to any GitHub account (privacy
-        // setting, or local git misconfiguration) - flag for manual review.
+        // The commit email is not linked to a GitHub account. Flag it.
         unresolvedShas.add(c.sha);
       }
 
-      // Co-authors need to sign too - their contribution counts just as
-      // much as the primary author's.
+      // Co-authors have to sign too.
       const { authors: coAuthors, hasUnresolved } = await extractCoAuthors(
         c.commit?.message,
       );
@@ -1361,28 +1103,24 @@ async function listPRCommitAuthors(prNumber) {
   return { authors: [...authors.values()], unresolved: [...unresolvedShas] };
 }
 
-// One lookup per run, shared by every caller - same idea as the identity
-// lookups above (see the block comment there for why the PROMISE is what is
-// stored, and why it can never reject), minus a key: an identity never goes
-// stale, so unlike the signatures token there is no expiry either.
+// One lookup per run, shared by every caller. Same promise caching as the
+// identity lookups above, and it never rejects.
 let _botLoginLookup = null; // Promise<string> | null
 async function resolveBotLogin() {
   if (_botLoginLookup === null) _botLoginLookup = fetchBotLogin();
   return _botLoginLookup;
 }
 
-// Never rejects: any failure resolves to DEFAULT_BOT_LOGIN.
+// Any failure resolves to DEFAULT_BOT_LOGIN.
 async function fetchBotLogin() {
   try {
-    // Works for a PAT or user-scoped token. The standard GITHUB_TOKEN isn't
-    // one of those, so this is expected to fail in the normal setup - we
-    // just fall back to the default below. This only matters for a
-    // consumer using a different kind of token, so dedupe still compares
-    // against the right identity instead of a hardcoded guess.
+    // Works for a PAT or a user-scoped token. The standard GITHUB_TOKEN is
+    // neither, so this normally fails and the default is used. It matters
+    // only when a consumer passes another kind of token.
     const me = await gh("/user", GITHUB_TOKEN);
     if (me && me.login) return me.login;
-  } catch (e) {
-    // Expected for the standard GITHUB_TOKEN - fall through to the default.
+  } catch {
+    // Expected for the standard GITHUB_TOKEN.
   }
   return DEFAULT_BOT_LOGIN;
 }
@@ -1404,40 +1142,18 @@ async function getExistingBotComments(
       ...comments.filter((c) => {
         if (!c.user || !c.body || !c.body.includes(BOT_MARKER)) return false;
         if (c.user.login === botLogin) return true;
-        // Broader match, opt-in via `anyBotIdentity` - used ONLY for the
-        // block/recovery history check in checkPR's quietIfNeverFlagged
-        // logic, never for postComment()'s own dedupe (which intentionally
-        // stays strict to the currently resolved identity - see
-        // bot-identity-success.test.js, which relies on a differently-
-        // identified past comment NOT counting as an already-said
-        // duplicate).
+        // `anyBotIdentity` is a broader match, used only for checkPR()'s
+        // history check and never for postComment()'s dedupe, which stays
+        // strict to the current identity. Without it, switching GITHUB_TOKEN
+        // to a PAT or another App token would hide comments posted under the
+        // old identity, and a PR that was blocked before the switch would look
+        // as if it never was.
         //
-        // Without this, a consumer that switches GITHUB_TOKEN from the
-        // default Actions token to a PAT or a separate GitHub App
-        // installation token (or back) mid-flight would have every comment
-        // posted under the OLD identity silently excluded here, since
-        // resolveBotLogin() only ever reports the CURRENT run's identity.
-        // A PR genuinely blocked before the switch would then look like it
-        // was never flagged, and its recovery announcement would be
-        // wrongly suppressed once it becomes fully signed.
-        //
-        // `type === "Bot"` is a field GitHub itself sets on the comment
-        // author and cannot be spoofed by an ordinary contributor's own
-        // account (see the spoofed-comment test below, whose fake commenter
-        // has no such type and so still fails this check) - it covers the
-        // default GITHUB_TOKEN identity and any GitHub-App-based custom
-        // token, regardless of which exact bot login was in use at the
-        // time. DEFAULT_BOT_LOGIN is checked too, as a defense-in-depth
-        // fallback for the single most common case (plain GITHUB_TOKEN) in
-        // case `type` is ever missing from a response - GitHub reserves
-        // the `[bot]`-suffixed login namespace for bot accounts, so an
-        // ordinary user can't take that exact login either. The one gap
-        // neither check can close is a PAT identity rotating to a
-        // DIFFERENT PAT-owned account: both report as an ordinary `type:
-        // "User"` account with an unreserved login, indistinguishable from
-        // any other GitHub user, so that specific switch still can't
-        // recover cross-identity history - a narrow, documented
-        // limitation (see CHANGELOG.md).
+        // `type === "Bot"` is set by GitHub and an ordinary account cannot
+        // fake it. The DEFAULT_BOT_LOGIN check is a fallback for the common
+        // plain GITHUB_TOKEN case in case `type` is missing. Neither covers a
+        // switch from one PAT-owned account to another, since both look like
+        // ordinary users. That limit is documented in CHANGELOG.md.
         return (
           anyBotIdentity &&
           (c.user.type === "Bot" || c.user.login === DEFAULT_BOT_LOGIN)
@@ -1451,32 +1167,20 @@ async function getExistingBotComments(
 }
 
 async function postComment(prNumber, body, dedupe = true) {
-  // Defense-in-depth: postComment is exported and callable directly (not
-  // only via the validated handleIssueComment/handlePullRequestTarget entry
-  // points), so it re-checks its own input rather than trusting every
-  // caller to have validated it first.
+  // postComment() is exported, so it checks its own input.
   assertValidPRNumber(prNumber, "postComment(prNumber)");
   const full = `${BOT_MARKER}\n${body}`;
   if (dedupe) {
     const existing = await getExistingBotComments(prNumber);
-    // Compare against the most recent bot comment of the SAME category
-    // (per classifyBotComment: "pending", "success", or "other"), not
-    // merely the literal last bot comment overall. checkPR can post two
-    // comments back to back within a single call - a personal per-signer
-    // thank-you ("other") followed by the pending-list comment
-    // ("pending") - so a LATER call's own pending comment would otherwise
-    // be compared against an unrelated, DIFFERENT signer's thank-you that
-    // landed in between (e.g. two different unrelated contributors each
-    // signing while the same required contributor is still missing),
-    // rather than against the earlier, byte-identical pending comment it
-    // should actually be deduped against. Comparing within the same
-    // category finds the right prior comment to compare against
-    // regardless of what other comment category was posted in between.
+    // Compare with the latest bot comment of the same category, not just the
+    // latest bot comment. checkPR() can post a personal thank-you ("other")
+    // and then the pending list ("pending") back to back, so a later pending
+    // comment would otherwise be compared with someone else's thank-you.
     const category = classifyBotComment(full);
     const lastOfCategory = existing.findLast(
       (c) => classifyBotComment(c.body) === category,
     );
-    if (lastOfCategory && lastOfCategory.body === full) return; // nothing changed, don't spam the thread
+    if (lastOfCategory && lastOfCategory.body === full) return; // unchanged
   }
   await gh(
     `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments`,
@@ -1488,11 +1192,8 @@ async function postComment(prNumber, body, dedupe = true) {
   );
 
   if (dedupe) {
-    // This cleanup is a best-effort mitigation for a race that's already
-    // been described above - by the time we get here, the important work
-    // (the comment itself) has already succeeded. A failure in the cleanup
-    // step (e.g. the existence-check GET running out of retries) must not
-    // fail the whole run and mask that the real work already completed.
+    // Best-effort. The comment is already posted, so a cleanup failure must
+    // not fail the run.
     try {
       await dedupeIdenticalTrailingComments(prNumber, full);
     } catch (e) {
@@ -1503,20 +1204,13 @@ async function postComment(prNumber, body, dedupe = true) {
   }
 }
 
-// The "no matching comment yet, so POST" check above is two separate HTTP
-// calls with no atomicity between them. Two concurrent runs (a duplicate
-// webhook delivery, or overlapping jobs not queued by the workflow's
-// `concurrency:` group) can both pass the check before either POST lands,
-// producing two identical comments. This can't prevent that - nothing
-// running as two separate REST calls without a compare-and-swap can - but
-// it self-heals right after: find any other bot comment with the same
-// body and delete all but the newest one. Keeping the newest matters,
-// since postComment() calls this right after creating a new comment, so
-// that new one is the highest id. Whichever concurrent run's cleanup runs
-// last still converges to the same result; deleting an already-deleted
-// comment just 404s, which is caught and ignored. The workflow-level
-// `concurrency:` group is what actually closes this race - this is just a
-// backstop for when that's missing or a race slips through anyway.
+// The "no matching comment yet, so post" check in postComment() is two HTTP
+// calls with nothing atomic between them, so two concurrent runs can both
+// post. This cannot prevent that, but it cleans up right after: it finds the
+// bot comments with the same body and deletes all but the newest. Running it
+// twice, or deleting an already deleted comment (404), is harmless. The
+// `concurrency:` group in the consumer workflow is what really closes the
+// race. This is the backstop for when it is missing.
 async function dedupeIdenticalTrailingComments(prNumber, body) {
   const comments = await getExistingBotComments(prNumber);
   const matching = comments
@@ -1525,17 +1219,9 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
   // Keep the newest (highest id), delete the rest.
   const duplicates = matching.slice(0, -1);
   if (duplicates.length > 0) {
-    // Observability only - nothing below depends on it. Reaching this point
-    // means two runs posted the identical comment before either one saw the
-    // other's, which is exactly what the workflow-level `concurrency:` group
-    // exists to prevent. Surfacing it in the Actions log lets a maintainer
-    // notice a consuming workflow that is missing (or has misconfigured)
-    // that group, instead of the cleanup silently masking it. Worded as
-    // "likely" and "check" rather than a diagnosis: a group that IS set can
-    // still be bypassed (e.g. two different workflows commenting on the same
-    // PR). Logged BEFORE the deletes, so it also appears when a delete then
-    // fails; says "found", not "deleted", for the same reason. Only the
-    // count and PR number are included - no comment content.
+    // Only for visibility, so a workflow without a proper `concurrency:` group
+    // does not go unnoticed. Logged before the deletes so it also shows when a
+    // delete fails. Contains the count and PR number only.
     console.warn(
       `::warning::Found ${duplicates.length} duplicate bot comment(s) on PR #${prNumber} and removing them - two runs likely posted the same comment at the same time. If this keeps happening, check that the consuming workflow sets the \`concurrency:\` group shown in examples/consumer-workflow.yml (see SECURITY.md).`,
     );
@@ -1548,9 +1234,8 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
         { method: "DELETE" },
       );
     } catch (e) {
-      // Could already be gone (another cleanup pass got there first) or we
-      // lack permission in some edge deployment - either way this is
-      // best-effort cosmetic cleanup, not worth failing the run over.
+      // It may already be gone, or the token may lack permission. This is
+      // cosmetic cleanup, so do not fail the run.
       console.warn(
         `::warning::Could not delete duplicate comment ${dup.id}: ${e.message}`,
       );
@@ -1564,9 +1249,8 @@ async function setStatus(sha, state, description) {
     GITHUB_TOKEN,
     {
       method: "POST",
-      // Posting the same status twice has no visible effect - GitHub only
-      // shows the latest status per context - so it's fine to let gh() retry
-      // a transient failure here.
+      // GitHub shows only the latest status per context, so a repeat is
+      // harmless and gh() may retry.
       idempotent: true,
       body: JSON.stringify({
         state,
@@ -1579,11 +1263,8 @@ async function setStatus(sha, state, description) {
 
 async function lockPR(prNumber) {
   try {
-    // Defense-in-depth, same reasoning as postComment(): lockPR is exported
-    // and callable directly. Validating inside the try means a bad
-    // prNumber is handled exactly like any other lock failure - logged and
-    // swallowed, never thrown - keeping lockPR's "never fails the run"
-    // contract intact.
+    // lockPR() is exported too. Validating inside the try treats a bad number
+    // like any other lock failure: logged, never thrown.
     assertValidPRNumber(prNumber, "lockPR(prNumber)");
     await gh(
       `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/lock`,
@@ -1594,134 +1275,51 @@ async function lockPR(prNumber) {
       },
     );
   } catch (e) {
-    // Nice-to-have hardening, not core to CLA correctness - log and move on.
+    // Nice to have, not part of CLA correctness. Log and move on.
     console.warn(`::warning::Could not lock PR #${prNumber}: ${e.message}`);
   }
 }
 
 // ---------------------------------------------------------------------------
-// Core: evaluate one PR and bring its status/comment up to date.
+// Core: evaluate one PR and bring its status and comment up to date
 //
-// `quietIfNeverFlagged` (only ever passed `true` by the automatic
-// pull_request_target handler - see handlePullRequestTarget) controls
-// whether a clean result gets announced with a comment:
+// Options:
 //
-// - A brand new PR whose commit authors had ALL already signed the CLA
-//   before this PR ever existed needs no comment at all - nothing was
-//   ever required of anyone here, so saying "All contributors have signed
-//   the CLA ✅" on a PR the bot has never spoken on before is pure noise.
-//   The commit status is still set to "success" either way, since that's
-//   what merge protection actually reads.
-// - The moment this PR ever *did* need a signer or manual review (a
-//   comment classifyBotComment() recognizes as "pending" was posted for
-//   it, at any point in its history) and it later becomes fully signed,
-//   that transition is worth announcing - people watched this PR go from
-//   blocked to unblocked. A personal, non-blocking reply (e.g. "you
-//   already signed, nothing more to do here" from someone re-submitting
-//   the sign phrase) doesn't count as ever having been blocked - it says
-//   nothing about the PR's own state.
-// - Once that transition has already been announced, later fully-signed
-//   checks stay quiet again even if some unrelated comment (like that same
-//   personal reply) lands afterward - re-announcing "all signed" every
-//   time something unrelated gets posted would just reintroduce the same
-//   noise this whole feature exists to remove. Concretely: this compares
-//   the position of the *most recent* "pending" comment against the most
-//   recent "success" one - success is only (re-)announced when a pending
-//   comment is the more recent of the two, i.e. a real block happened
-//   since the last time success was announced (or it's never been
-//   announced at all).
-// - An explicit human trigger (the sign-phrase comment, or the `recheck`
-//   command handled in handleIssueComment) always gets an answer, quiet
-//   or not: the caller took an action and asked a direct question, so
-//   `checkPR` is invoked there without this flag and always comments,
-//   regardless of what's already been said on the thread (aside from the
-//   ordinary same-category dedupe every postComment() call already does -
-//   see its own doc comment).
+// quietIfNeverFlagged (passed as true only by the automatic
+// pull_request_target handler). When the PR is fully signed, post a comment
+// only if the PR was blocked at some point:
+//   - A new PR whose authors had all signed already gets no comment. The
+//     status is still set to success, because merge protection reads that.
+//   - If a "pending" comment was ever posted, the move to fully signed is
+//     announced. This compares the latest "pending" comment with the latest
+//     "success" one, so a second block and resolve cycle is announced again
+//     and an unchanged result stays quiet.
+//   - A personal reply such as "you already signed" does not count as a block.
+// A human trigger (the sign phrase or `recheck`) always gets an answer, so
+// those callers leave this off. The usual same-category dedupe in
+// postComment() still applies.
 //
-// This is what makes "new committers joining an already-compliant PR"
-// behave as silently as the very first check: as long as this PR has never
-// actually needed asking (or that need was already fully announced as
-// resolved), a still-fully-signed result just stays quiet.
+// signer ({ id, login }, passed only by handleIssueComment right after it
+// recorded a new signature). It changes who the bot addresses, not the
+// pass/fail logic:
+//   - PR still not clear: a separate "@signer Thank you for signing" comment
+//     comes first, then the pending list.
+//   - PR now fully signed and the signer is one of its required authors: the
+//     signer is thanked by name instead of the generic success message.
+//   - PR fully signed but the signer is allowlisted or has no commit on the
+//     PR: the generic success message. Crediting them would be misleading.
 //
-// `signer` (only ever passed by handleIssueComment, right after recording a
-// BRAND NEW signature - never by the automatic pull_request_target trigger
-// or the `recheck` command, neither of which has any one specific person to
-// address) is the `{ id, login }` of whoever just signed. When present, it
-// changes how checkPR names the person(s) it addresses, without changing
-// the underlying pass/fail logic at all:
-//   - Still missing other signers/reviews: the pending comment leads with a
-//     personal "@signer Thank you for signing..." line, in addition to
-//     (not instead of) the usual list of who else still needs to sign - so
-//     the contributor who just acted gets acknowledged even though the PR
-//     as a whole isn't clear yet. This is always accurate regardless of
-//     who `signer` turns out to be, since reaching checkPR with a `signer`
-//     at all already means that exact identity just recorded a brand new
-//     signature (see handleIssueComment) - it says nothing about whether
-//     they were required here, just that they did in fact sign.
-//   - Now fully signed AND `signer` is one of THIS PR's own required
-//     (non-allowlisted) commit authors: that person is thanked by name
-//     (personalSuccessMessage()) INSTEAD OF the generic, anonymous
-//     SUCCESS_MESSAGE - see personalSuccessMessage()'s doc comment. This is
-//     the fix for a PR with several contributors: each one signing via a
-//     comment gets their own "@username Thank you for signing the CLA! We
-//     look forward to your contributions." rather than everyone just seeing
-//     one generic "All contributors have signed the CLA. ✅" once the last
-//     person signs.
-//   - Now fully signed but `signer` is NOT one of this PR's required
-//     authors (an allowlisted account, or - just as easily - someone with
-//     no connection to this PR at all who happened to comment the sign
-//     phrase on it): falls back to the generic SUCCESS_MESSAGE. Crediting
-//     that person with "completing" a PR their signature had no bearing on
-//     would be actively misleading, especially since the PR may well have
-//     already been fully signed before they ever commented - see
-//     `signerCompletedRequirement` below.
+// statusOnly (passed only for the "already signed" reply). Update the status
+// check and return without any comment. That person's other PR may have a
+// stale status from before they signed, but a full check would also post a
+// new pending or success comment each time they resend the phrase.
 //
-// `statusOnly` (only ever passed by handleIssueComment's `alreadySigned`
-// branch below) recomputes and updates the merge-blocking status check as
-// usual, but returns immediately after - without posting ANY comment,
-// pending or success. This exists specifically for a redundant sign-phrase
-// comment from someone who'd already signed (typically via a different
-// PR): that person gets their own "you already signed, nothing more to do"
-// reply regardless (see handleIssueComment), but this PR's own status may
-// well have gone stale in the meantime - it was last set when THIS PR was
-// still missing them, and nothing had re-run checkPR for THIS PR since. A
-// normal (non-statusOnly) checkPR call would fix the status too, but would
-// ALSO post a fresh pending-list or success comment alongside the
-// "already signed" one - and would do so AGAIN every time the same person
-// harmlessly re-sends the same redundant comment, since none of those
-// extra comments would be byte-identical to the one immediately before
-// them (the "already signed" reply always comes first) for postComment's
-// own dedupe to catch. `statusOnly` avoids that: the status is corrected
-// silently, with no risk of ever piling up duplicate announcements no
-// matter how many times someone redundantly re-signs.
-// `knownSignatures` (only ever passed by handleIssueComment, right after a
-// writeSignatures() call in the SAME request) is the exact signatures
-// object writeSignatures() just returned - the freshest possible state for
-// the caller's own write, known for certain without another round trip.
-// When given, checkPR merges it (via mergeSignatures()) with its own fresh
-// GET instead of trusting either one alone:
-//
-//  - The fresh GET alone isn't enough: GitHub's Contents API does NOT
-//    guarantee that a GET immediately following a PUT reflects that write -
-//    a super-brief read-after-write staleness window is a documented
-//    characteristic of that API, not something application code can
-//    reliably wait out. Without `knownSignatures` filling that gap, a
-//    contributor could sign the CLA and, purely because the GET raced
-//    against that same brief window, see the very message thanking them
-//    for signing ALSO still list them as needing to sign.
-//  - `knownSignatures` alone isn't enough either: it's a snapshot from
-//    before listPRCommitAuthors() ran (which can be slow on a big PR), so
-//    it can't see a DIFFERENT required contributor's signature that lands
-//    in the shared store - written by a completely different workflow run,
-//    e.g. them signing via another PR/repo - while that call is in flight.
-//    Skipping the GET entirely in that window would let checkPR post a
-//    false pending-signer comment / failure status for someone who has, in
-//    fact, already signed.
-//
-// Every other caller of checkPR (the automatic pull_request_target
-// trigger, and the `recheck` command) has no such freshly-known snapshot to
-// hand over, so mergeSignatures() just returns the fresh GET unchanged for
-// them - same behavior as always.
+// knownSignatures (passed only by handleIssueComment, with what
+// writeSignatures() just returned). It is merged with checkPR()'s own fresh
+// read, see mergeSignatures(). The fresh read alone can miss the write that
+// just happened, and the snapshot alone can miss a signature written by
+// another run meanwhile.
+// ---------------------------------------------------------------------------
 async function checkPR(
   prNumber,
   headSha,
@@ -1746,24 +1344,23 @@ async function checkPR(
     assertValidSha(headSha, "checkPR(headSha)");
   }
 
-  // listPRCommitAuthors() can be slow on a big PR; reading the signature
-  // store right after it (rather than before) is what's most likely to
-  // change under us, e.g. someone signing in another run. This narrows the
-  // race window but doesn't remove it - two overlapping runs can still each
-  // post a stale result if they're not serialized. That's what the
-  // consumer workflow's `concurrency:` group is for; it also covers the
-  // comment-duplication race handled in postComment().
-  //
-  // Always read here, even when `knownSignatures` was given - see
-  // mergeSignatures() and this function's doc comment above for why a
-  // caller's own known-fresh write still isn't a substitute for this GET.
+  // listPRCommitAuthors() can be slow on a big PR, so the store is read after
+  // it, when it is most likely to have changed. This narrows the race with
+  // other runs but does not close it. The consumer workflow's `concurrency:`
+  // group does. The read is needed even with `knownSignatures`, see
+  // mergeSignatures().
   const { authors, unresolved } = await listPRCommitAuthors(prNumber);
-  const freshData = (
-    await withSignaturesToken((sigToken) => readSignatures(sigToken))
-  ).data;
+  const { data: freshData, index: freshIndex } = await withSignaturesToken(
+    (sigToken) => readSignatures(sigToken),
+  );
   const data = mergeSignatures(knownSignatures, freshData);
+  // Index once, then one O(1) probe per author. mergeSignatures() returns
+  // `freshData` itself when there was nothing to merge (the usual automatic
+  // path), and then readSignatures() has already built the index.
+  const signed =
+    data === freshData ? freshIndex : new SignatureIndex(data.signatures);
   const missing = authors.filter(
-    (a) => !isAllowlisted(a) && !isSigned(data, a),
+    (a) => !isAllowlisted(a) && !isSigned(signed, a),
   );
 
   if (missing.length === 0 && unresolved.length === 0) {
@@ -1774,15 +1371,9 @@ async function checkPR(
     );
     if (statusOnly) return;
     if (quietIfNeverFlagged) {
-      // GET comments come back in creation order (oldest first), so the
-      // *last* match in the array for each category is the most recent
-      // one of that kind - findLastIndex() (Node 22+, per the version
-      // guard at the top of this file) gets us that directly. Comparing
-      // those two positions (rather than just "does a pending comment
-      // exist anywhere") is what correctly re-announces success after a
-      // genuine second block-and-resolve cycle, while staying quiet when
-      // nothing has changed since the last announcement - see the
-      // function-level comment above.
+      // Comments come back oldest first, so the last match per category is
+      // the latest one. Success is announced only when a pending comment is
+      // newer than the last success comment (or there is none yet).
       const existing = await getExistingBotComments(prNumber, {
         anyBotIdentity: true,
       });
@@ -1794,10 +1385,8 @@ async function checkPR(
       );
       if (lastPendingIdx <= lastSuccessIdx) return;
     }
-    // See checkPR's doc comment above and signerCompletedRequirement(): only
-    // address the signer by name when their own signature is what actually
-    // completed this PR's requirement, never merely because a `signer` was
-    // passed at all.
+    // Name the signer only when their signature completed this PR, never just
+    // because a `signer` was passed. See signerCompletedRequirement().
     await postComment(
       prNumber,
       signerCompletedRequirement(authors, signer)
@@ -1824,10 +1413,9 @@ async function checkPR(
     );
   }
   if (unresolved.length) {
-    // No commit-author/co-author email here on purpose - it can be personal
-    // data, and this comment is public. The commit SHA is already visible
-    // on the PR's own Commits tab, which is enough for a maintainer to find
-    // and inspect the commit themselves.
+    // No email here, since it can be personal data and this comment is
+    // public. The SHA is on the PR's Commits tab, which is enough for a
+    // maintainer to find the commit.
     const shaList = unresolved.map((sha) => sha.slice(0, 7)).join(", ");
     const n = unresolved.length;
     lines.push(
@@ -1845,13 +1433,9 @@ async function checkPR(
   );
   if (statusOnly) return;
   if (signer) {
-    // The PR isn't fully clear yet (someone else still needs to sign, or a
-    // commit needs manual review), but this specific person DID just sign
-    // successfully - acknowledge that as its OWN comment, separate from the
-    // list of what's still outstanding below (rather than one comment
-    // combining both), so each comment has one clear, single purpose: this
-    // one says "your action was recorded", the next one says "here's where
-    // the PR stands overall".
+    // The PR is not clear yet, but this person did just sign. Acknowledge it
+    // in its own comment, so one comment says "your signature was recorded"
+    // and the next says where the PR stands.
     await postComment(
       prNumber,
       `@${signer.login} Thank you for signing the CLA! We look forward to your contributions.`,
@@ -1864,9 +1448,9 @@ async function checkPR(
 // Event handlers
 // ---------------------------------------------------------------------------
 function isPrivileged(payload, commenter) {
-  // The PR's own author can always recheck their own PR. Beyond that,
-  // GitHub already tells us the commenter's relationship to the repo via
-  // author_association - no extra API call needed.
+  // The PR author can always recheck their own PR. Otherwise GitHub's
+  // author_association already tells us the commenter's role, no API call
+  // needed.
   const prAuthor =
     payload.issue && payload.issue.user && payload.issue.user.login;
   if (prAuthor && prAuthor.toLowerCase() === commenter.toLowerCase())
@@ -1877,20 +1461,17 @@ function isPrivileged(payload, commenter) {
 }
 
 async function handleIssueComment(payload) {
-  if (!payload.issue || !payload.issue.pull_request) return; // comment on a plain issue, not a PR
+  if (!payload.issue || !payload.issue.pull_request) return; // plain issue, not a PR
   if (
     !payload.comment ||
     !payload.comment.user ||
     typeof payload.comment.user.login !== "string" ||
     payload.comment.user.login.length === 0
   ) {
-    // A real issue_comment webhook always carries comment.user. Getting
-    // here means a malformed event file or an unexpected caller - fail
-    // loudly instead of a raw TypeError. An EMPTY login is rejected too,
-    // not just a non-string one: isSigned() refuses to match an empty
-    // login (it returns false before it ever compares ids), so signing as
-    // "" would append a brand-new, never-matchable entry on every single
-    // attempt instead of being idempotent.
+    // A real issue_comment event always has comment.user. Fail with a clear
+    // message instead of a TypeError. An empty login is rejected as well,
+    // since isSigned() never matches it and every attempt would append a new
+    // entry.
     throw new Error(
       "issue_comment payload is missing comment.user.login (or it is empty) - malformed or unexpected webhook delivery.",
     );
@@ -1903,32 +1484,26 @@ async function handleIssueComment(payload) {
   const commenter = payload.comment.user.login;
 
   if (body.toLowerCase() === SIGN_PHRASE.toLowerCase()) {
-    // The webhook already carries the commenter's numeric id - recording
-    // that, not just the login, is what lets the signature survive a later
-    // username change (see isSigned). Validated here, before any network
-    // call (including minting the signatures token) and only on this
-    // branch - `recheck` never reads the id, so a malformed id must not
-    // start failing a command that doesn't depend on it. See
-    // assertValidUserId() for why a bad id must never reach the store.
+    // Record the numeric id, not just the login, so the signature survives a
+    // username change. Validated here, before any network call and only on
+    // this branch, so a bad id cannot break `recheck`, which never uses it.
     const commenterId = assertValidUserId(
       payload.comment.user.id,
       "issue_comment payload comment.user.id",
     );
     const commenterIdentity = { id: commenterId, login: commenter };
 
-    // The check-and-append happens inside one mutate() call working on data
-    // that writeSignatures() re-reads fresh right before writing. That's
-    // what keeps signing idempotent under a race (a duplicate webhook, or
-    // the 409 retry loop re-running this closure) - each attempt checks the
-    // just-fetched state, not a stale snapshot.
+    // The check and the append run inside one mutate() on data that
+    // writeSignatures() has just re-read. That keeps signing idempotent when a
+    // webhook is delivered twice or the 409 retry re-runs this closure.
     let alreadySigned = false;
     const writtenSignatures = await withSignaturesToken((sigToken) =>
       writeSignatures(
         sigToken,
-        (data) => {
-          if (isSigned(data, commenterIdentity)) {
+        (data, index) => {
+          if (isSigned(index, commenterIdentity)) {
             alreadySigned = true;
-            return null; // tells writeSignatures: no write needed
+            return null; // no write needed
           }
           return {
             ...data,
@@ -1949,22 +1524,14 @@ async function handleIssueComment(payload) {
     );
 
     if (alreadySigned) {
-      // Dedupe is on by default - someone commenting the sign phrase again
-      // after already signing shouldn't get a fresh reply every time.
+      // Deduped by default, so repeating the phrase does not get a new reply
+      // each time.
       await postComment(
         prNumber,
         `@${commenter} you have already signed the CLA. Nothing more to do here.`,
       );
-      // This PR's own merge-blocking status may be stale: it was last set
-      // while THIS PR still considered them unsigned, and they may well
-      // have signed via a DIFFERENT PR since - nothing would have re-run
-      // checkPR for THIS PR in the meantime. Silently bring the status up
-      // to date (statusOnly: true posts no additional comment - see
-      // checkPR's doc comment for why that matters here specifically).
-      // knownSignatures ensures checkPR's own fresh GET can't shadow the
-      // write that just happened even if it races that write's
-      // read-after-write staleness window (see checkPR's and
-      // mergeSignatures()'s doc comments).
+      // This PR's status may be stale, since they may have signed through a
+      // different PR after it was last set. Fix it without another comment.
       await checkPR(prNumber, undefined, {
         statusOnly: true,
         knownSignatures: writtenSignatures,
@@ -1972,17 +1539,10 @@ async function handleIssueComment(payload) {
       return;
     }
 
-    // Re-evaluate the PR now that one more person has signed. Passing
-    // `signer` is what makes checkPR() address THIS specific person by name
-    // (either in a personal thank-you leading the pending list, or - if
-    // they're the one who just completed the requirement - in place of the
-    // generic "All contributors have signed" announcement). knownSignatures
-    // is the exact data writeSignatures() just wrote, so checkPR's own
-    // fresh GET can't shadow it even if that GET races the write's own
-    // read-after-write staleness window (see checkPR's and
-    // mergeSignatures()'s doc comments) - the very bug that would let the
-    // person who just signed still show up in their own "still needs to
-    // sign" list.
+    // Re-evaluate now that one more person has signed. `signer` makes
+    // checkPR() thank this person by name, and `knownSignatures` stops its own
+    // read from hiding the write that just happened, which would list them as
+    // still needing to sign.
     await checkPR(prNumber, undefined, {
       signer: commenterIdentity,
       knownSignatures: writtenSignatures,
@@ -1991,12 +1551,9 @@ async function handleIssueComment(payload) {
   }
 
   if (body.toLowerCase() === "recheck") {
-    // recheck does real work for no visible benefit to a random passer-by,
-    // so it's restricted to the PR's own author or someone with actual
-    // standing in the repo - otherwise it could be used to churn Actions
-    // minutes on PRs the commenter has nothing to do with. Signing itself
-    // stays open to anyone, since first-time contributors need to be able
-    // to sign too.
+    // recheck costs Actions minutes, so it is limited to the PR author and
+    // people with a role in the repo. Signing stays open to everyone, because
+    // first-time contributors must be able to sign.
     if (!isPrivileged(payload, commenter)) return;
     await checkPR(prNumber);
   }
@@ -2004,8 +1561,7 @@ async function handleIssueComment(payload) {
 
 async function handlePullRequestTarget(payload) {
   if (!payload.pull_request) {
-    // Same reasoning as the guard in handleIssueComment - a real
-    // pull_request_target webhook always carries this.
+    // A real pull_request_target event always has this.
     throw new Error(
       "pull_request_target payload is missing pull_request - malformed or unexpected webhook delivery.",
     );
@@ -2023,10 +1579,8 @@ async function handlePullRequestTarget(payload) {
       payload.pull_request.head && payload.pull_request.head.sha,
       "pull_request_target payload pull_request.head.sha",
     );
-    // Automatic trigger (PR opened/pushed to/reopened), not a human asking
-    // a direct question - stay quiet on an already-compliant result unless
-    // this PR previously needed action. See checkPR's quietIfNeverFlagged
-    // doc comment above for the full reasoning.
+    // Automatic trigger, not a direct question, so stay quiet on a clean
+    // result unless the PR was blocked before. See checkPR().
     await checkPR(prNumber, headSha, { quietIfNeverFlagged: true });
   }
 }
@@ -2054,27 +1608,18 @@ async function main() {
   }
 }
 
-// Only auto-run when executed directly (`node cla-bot.js`), not when
-// required by the tests - otherwise importing this file would immediately
-// try to run as a live Action and exit.
+// Run only when executed directly, not when the tests require this file.
 if (require.main === module) {
   main().catch((e) => fail(e.stack || e.message));
 }
 
-// Exported for tests only - not part of the action's public contract.
+// Exported for tests only, not part of the action's public contract.
 module.exports = {
   isSigned,
+  SignatureIndex,
   isAllowlisted,
-  // Exported for tests only: the allowlist is parsed once at load, so tests
-  // exercise its grammar directly.
   parseAllowlist,
   createAppJWT,
-  // Exported for tests only, same reasoning as the others below: ghRaw()'s
-  // own success-path body parsing (`text ? JSON.parse(text) : null`) is
-  // otherwise only exercised indirectly, through whichever higher-level
-  // caller happens to trigger it - a direct test pins down its null-body
-  // behavior against ghRaw() itself, not just one specific caller's
-  // reaction to it.
   ghRaw,
   base64url,
   readSignatures,
@@ -2084,9 +1629,6 @@ module.exports = {
   handlePullRequestTarget,
   checkPR,
   getSignaturesToken,
-  // Exported for tests only: the token lifecycle's tunables and its two
-  // pure/near-pure helpers, so tests assert against the real constants
-  // instead of re-typing 60/5 minutes and drifting out of sync.
   withSignaturesToken,
   resolveSigTokenExpiry,
   SIG_TOKEN_LIFETIME_MS,
@@ -2094,83 +1636,23 @@ module.exports = {
   postComment,
   validateConfig,
   lockPR,
-  // Exported for tests only (test/sig-path.test.js): the SIG_PATH validator
-  // and URL builders are the single source of truth for what may reach a
-  // signature-store request URL, so they're tested directly instead of only
-  // being inferred through readSignatures()/writeSignatures().
   findSigPathProblem,
   encodeRepoPath,
   sigInstallationApiPath,
   sigContentsApiPath,
-  // Exported for tests only, same as everything above - not part of the
-  // action's public contract. Covered directly in test/logic.test.js so a
-  // future change to either validator's character rules (e.g. UNSAFE_URL_
-  // SEGMENT_RE) fails immediately and specifically, rather than only being
-  // caught indirectly through the webhook-handler integration tests.
   assertValidPRNumber,
   assertValidInstallationId,
   assertValidUserId,
   assertValidSha,
-  // Exported for tests only, same reasoning: classifyBotComment() is the
-  // exact piece that tells a genuine block apart from unrelated bot
-  // chatter for checkPR's quietIfNeverFlagged logic, so it gets direct
-  // unit coverage in test/logic.test.js in addition to the end-to-end
-  // integration tests exercising it indirectly.
   classifyBotComment,
-  // Exported for tests only, same reasoning: the exact per-signer wording
-  // is a single source of truth used both when posting and when asserting
-  // in tests, so a future wording tweak can't silently drift between them.
   personalSuccessMessage,
-  // Exported for tests only, same reasoning as isSigned/isAllowlisted
-  // above: this is the exact piece checkPR relies on to decide whether a
-  // signer was actually one of a PR's own commit authors (as opposed to an
-  // unrelated bystander), so it gets direct unit coverage of its id-first,
-  // login-fallback matching rule in test/logic.test.js.
   isSameContributor,
-  // Exported for tests only, same reasoning as isSameContributor above:
-  // this is checkPR's single-source-of-truth definition of how a caller's
-  // known-fresh write and a subsequent GET are reconciled, so it gets
-  // direct unit coverage of its "fresh wins on a match, known-only entries
-  // are kept" merge rule in test/logic.test.js.
   mergeSignatures,
-  // Exported for tests only, same reasoning: this is checkPR's actual,
-  // single-source-of-truth definition of "did this signer's own signature
-  // complete the PR's requirement" - tests call this function directly
-  // instead of re-typing the same expression themselves, so the two can
-  // never drift out of sync with each other.
   signerCompletedRequirement,
-  // Exported for tests only, same reasoning as above: extractCoAuthors()
-  // is the exact piece that has to stay safe against a missing/null/non-
-  // string commit message (e.g. a malformed API response) without ever
-  // throwing or making a network call it doesn't need to - direct unit
-  // coverage in test/logic.test.js pins that down independently of the
-  // full listPRCommitAuthors() integration path.
   extractCoAuthors,
-  // Exported for tests only, same reasoning: fail() is the single place
-  // that formats an error for the Actions log and terminates the run, so
-  // its exact "::error::"-prefixed output and process.exit(1) behavior get
-  // one direct, isolated test instead of being inferred only through the
-  // handful of call sites that happen to trigger it.
   fail,
-  // Exported for tests only, same reasoning: this is the exact filter
-  // checkPR's quietIfNeverFlagged history check and postComment's dedupe
-  // both rely on, so its full truth table (missing user/body/marker,
-  // current-identity match, and each anyBotIdentity fallback) gets direct
-  // unit coverage instead of being inferred only through those two
-  // higher-level call sites.
   getExistingBotComments,
-  // Exported for tests only, same reasoning: these are the two identity-
-  // resolution caches extractCoAuthors() relies on - direct coverage here
-  // pins down the negative-caching contract (an unresolved lookup is
-  // cached too, so a repeat lookup costs zero additional API calls)
-  // independently of the higher-level commit/co-author integration tests.
   resolveUserIdByLogin,
   resolveLoginById,
-  // Exported for tests only, same reasoning: setStatus()'s own 140-char
-  // description truncation has no reachable production call site that
-  // actually produces a description that long (every real caller passes a
-  // short, fixed-shape string) - direct coverage here is the only honest
-  // way to test defensive code that exists for a case the codebase itself
-  // never currently triggers.
   setStatus,
 };

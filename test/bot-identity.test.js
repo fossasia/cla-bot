@@ -41,7 +41,6 @@ function res(status, jsonBody) {
 
 (async () => {
   await test("when GET /user fails (the expected case for the standard GITHUB_TOKEN), dedupe falls back to github-actions[bot]", async () => {
-    let filterLoginSeen = null;
     global.fetch = async (url, opts = {}) => {
       if (url.endsWith("/user"))
         return res(401, { message: "Bad credentials" }); // GITHUB_TOKEN really does fail this
