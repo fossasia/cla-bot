@@ -51,7 +51,7 @@ jobs:
       # `enable-cache: false`: nothing here benefits from a uv cache, and
       # restoring one would let a poisoned cache entry influence a security check.
       - name: Install uv (pinned and checksum-verified)
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.12.17"
           checksum: "fa82fd8dde8e8eefdecada6aa0889666556cfceb690d06e0c3bca49eb3070a63"
