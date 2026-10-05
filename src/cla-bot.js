@@ -21,7 +21,9 @@
  *     first-write 422, for when several repos write the same file at once.
  *  6. Every request has a timeout.
  *  7. Signatures are keyed by numeric id, not login, for the same reason as
- *     point 4. See isSigned().
+ *     point 4. See isSigned(). Lookups go through SignatureIndex, a hash set
+ *     of ids built in the same pass that parses the file, so each check is
+ *     O(1) instead of a scan of the whole store.
  *  8. An email that cannot be resolved to an account is never shown in a
  *     comment or a log because it may be personal data. Only the commit SHA
  *     is shown. See listPRCommitAuthors() and checkPR().
@@ -677,6 +679,52 @@ async function withSignaturesToken(fn) {
 }
 
 // ---------------------------------------------------------------------------
+// Signature index: O(1) "has this account id signed?" lookups
+//
+// The store is a JSON array, and scanning it per question made every check
+// O(n): checkPR() asked once per commit author (O(authors x signatures)), and
+// mergeSignatures() compared every known entry with every fresh entry
+// (O(known x fresh), which is O(n^2) because the sign flow hands it the whole
+// file). Parsing the file is O(n) and unavoidable, so the index is built in
+// that same single pass (see readSignatures()) and every lookup after it is a
+// hash probe.
+//
+// The index holds numeric ids only, under exactly the rule isSigned() always
+// had: an entry counts only if it is an object whose `id` is a number. A
+// missing, string, null or NaN id is never indexed, so such an entry fails
+// closed, and Set.has() uses SameValueZero, so a string "555" never matches
+// the number 555. Logins are not stored, so they can never be matched.
+//
+// An index is a snapshot. It is built from one array and does not follow later
+// changes to it, so build a new one for new data instead of reusing it.
+// ---------------------------------------------------------------------------
+function signatureEntryId(entry) {
+  if (entry === null || typeof entry !== "object") return null;
+  const id = entry.id;
+  return typeof id === "number" && !Number.isNaN(id) ? id : null;
+}
+
+class SignatureIndex {
+  #ids = new Set();
+
+  // `signatures` must be an array. A non-array throws a TypeError, as the
+  // linear scan it replaces did.
+  constructor(signatures) {
+    for (const entry of signatures) this.add(entry);
+  }
+
+  // Takes a stored entry, not an id. Entries without a usable id are skipped.
+  add(entry) {
+    const id = signatureEntryId(entry);
+    if (id !== null) this.#ids.add(id);
+  }
+
+  has(id) {
+    return this.#ids.has(id);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Signature store (a JSON file in the central private repo)
 // ---------------------------------------------------------------------------
 async function readSignatures(token) {
@@ -708,26 +756,37 @@ async function readSignatures(token) {
         'signatures file is malformed: "signatures" is not an array',
       );
 
-    // Warn about a malformed entry but keep it. The data is written straight
-    // back on the next write, and dropping an entry could delete a real
-    // signature from before a schema change. isSigned() handles such entries
-    // safely. The warning prints only the index, because the Actions log can
-    // be public and entries can contain personal data.
-    data.signatures.forEach((entry, index) => {
+    // One pass over the entries does two jobs, so the index costs nothing
+    // extra on top of the O(n) parse. It warns about a malformed entry but
+    // keeps it: the data is written straight back on the next write, and
+    // dropping an entry could delete a real signature from before a schema
+    // change. isSigned() handles such entries safely. The warning prints only
+    // the position, because the Actions log can be public and entries can
+    // contain personal data. It also indexes every entry by numeric id (see
+    // SignatureIndex), whether or not its login is valid, as isSigned()
+    // always matched on the id alone.
+    const index = new SignatureIndex([]);
+    data.signatures.forEach((entry, position) => {
       if (
         !entry ||
         typeof entry.login !== "string" ||
         entry.login.length === 0
       ) {
         console.warn(
-          `::warning::Signature entry at index ${index} is missing/has an invalid "login" field (kept as-is, not treated as a match) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
+          `::warning::Signature entry at index ${position} is missing/has an invalid "login" field (kept as-is, not treated as a match) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
         );
       }
+      index.add(entry);
     });
-    return { sha: meta.sha, data };
+    // `index` describes this `data` snapshot only.
+    return { sha: meta.sha, data, index };
   } catch (e) {
     if (e.status === 404)
-      return { sha: null, data: { version: 1, signatures: [] } };
+      return {
+        sha: null,
+        data: { version: 1, signatures: [] },
+        index: new SignatureIndex([]),
+      };
     throw e;
   }
 }
@@ -735,8 +794,10 @@ async function readSignatures(token) {
 async function writeSignatures(token, mutate, message, attempt = 1) {
   // Re-read right before writing so the sha we PUT with is fresh. That is
   // what makes the retry loop below correct.
-  const { sha, data } = await readSignatures(token);
-  const updated = mutate(data);
+  // `mutate` also gets the SignatureIndex of `data`, for O(1) "already
+  // there?" checks. The index describes `data`, not what mutate() returns.
+  const { sha, data, index } = await readSignatures(token);
+  const updated = mutate(data, index);
   if (updated === null) return data; // nothing to change, e.g. already signed
   const content = Buffer.from(JSON.stringify(updated, null, 2)).toString(
     "base64",
@@ -772,11 +833,20 @@ async function writeSignatures(token, mutate, message, attempt = 1) {
 // matches, so it fails closed. Tests call this directly and readSignatures()
 // keeps malformed entries, so garbage entries return false instead of
 // throwing.
-function isSigned(data, author) {
+//
+// `source` is a SignatureIndex (O(1), what the bot's own code passes) or a
+// plain `{ signatures: [...] }` object. The plain form builds a throwaway
+// index, which costs O(n) per call, so use an index when asking more than
+// once about the same data.
+function isSigned(source, author) {
   if (author == null || typeof author !== "object") return false;
   const id = author.id;
   if (typeof id !== "number") return false;
-  return data.signatures.some((s) => s && typeof s === "object" && s.id === id);
+  const index =
+    source instanceof SignatureIndex
+      ? source
+      : new SignatureIndex(source.signatures);
+  return index.has(id);
 }
 
 // Same rule for the allowlist: only the numeric id counts, and a missing or
@@ -802,10 +872,17 @@ function isSameContributor(a, b) {
 //    signature that another run wrote in the meantime. `fresh` covers that.
 // When both have the same identity, the fresh entry wins. `known` is null for
 // every caller except handleIssueComment(), and then `fresh` is returned as is.
+//
+// Linear in known + fresh: the fresh ids are indexed once, and each known entry
+// is one probe. (The nested scan this replaced was O(known x fresh), and since
+// `known` is the whole file that was O(n^2).) The rule is the same as
+// isSameContributor(): numeric ids only, so a known entry without a usable id
+// has nothing to match and is kept.
 function mergeSignatures(known, fresh) {
   if (!known) return fresh;
+  const freshIds = new SignatureIndex(fresh.signatures);
   const keptFromKnown = known.signatures.filter(
-    (k) => !fresh.signatures.some((f) => isSameContributor(k, f)),
+    (k) => !freshIds.has(signatureEntryId(k)),
   );
   return {
     version: fresh.version,
@@ -1273,12 +1350,17 @@ async function checkPR(
   // group does. The read is needed even with `knownSignatures`, see
   // mergeSignatures().
   const { authors, unresolved } = await listPRCommitAuthors(prNumber);
-  const freshData = (
-    await withSignaturesToken((sigToken) => readSignatures(sigToken))
-  ).data;
+  const { data: freshData, index: freshIndex } = await withSignaturesToken(
+    (sigToken) => readSignatures(sigToken),
+  );
   const data = mergeSignatures(knownSignatures, freshData);
+  // Index once, then one O(1) probe per author. mergeSignatures() returns
+  // `freshData` itself when there was nothing to merge (the usual automatic
+  // path), and then readSignatures() has already built the index.
+  const signed =
+    data === freshData ? freshIndex : new SignatureIndex(data.signatures);
   const missing = authors.filter(
-    (a) => !isAllowlisted(a) && !isSigned(data, a),
+    (a) => !isAllowlisted(a) && !isSigned(signed, a),
   );
 
   if (missing.length === 0 && unresolved.length === 0) {
@@ -1418,8 +1500,8 @@ async function handleIssueComment(payload) {
     const writtenSignatures = await withSignaturesToken((sigToken) =>
       writeSignatures(
         sigToken,
-        (data) => {
-          if (isSigned(data, commenterIdentity)) {
+        (data, index) => {
+          if (isSigned(index, commenterIdentity)) {
             alreadySigned = true;
             return null; // no write needed
           }
@@ -1534,6 +1616,7 @@ if (require.main === module) {
 // Exported for tests only, not part of the action's public contract.
 module.exports = {
   isSigned,
+  SignatureIndex,
   isAllowlisted,
   parseAllowlist,
   createAppJWT,
