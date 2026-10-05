@@ -136,6 +136,10 @@ const MAX_RETRIES = 3;
 // Trailers past the cap flag the commit for manual review. See
 // extractCoAuthors().
 const MAX_COAUTHOR_TRAILERS_PER_COMMIT = 20;
+// Roles that may run `recheck`, and PR actions that trigger a re-check. Sets,
+// so membership is O(1) like the rest of the lookups.
+const PRIVILEGED_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+const RECHECK_PR_ACTIONS = new Set(["opened", "synchronize", "reopened"]);
 
 const [REPO_OWNER, REPO_NAME] = (process.env.GITHUB_REPOSITORY || "/").split(
   "/",
@@ -766,24 +770,69 @@ async function writeSignatures(token, mutate, message, attempt = 1) {
   }
 }
 
-// `author` is an { id, login } pair. Matching is on the numeric id only. A
-// login can be released and claimed by someone else, who would then inherit
-// the old signature. An author or stored entry without a numeric id never
-// matches, so it fails closed. Tests call this directly and readSignatures()
-// keeps malformed entries, so garbage entries return false instead of
-// throwing.
+// Signature lookups are O(1).
+//
+// The store is a JSON array, which is the on-disk format and must stay one
+// (it is shared by every repo that uses the bot). Scanning that array once per
+// commit author made a PR check O(authors x signatures). Instead the ids are
+// loaded into a Set once per snapshot, O(signatures), and every lookup after
+// that is O(1).
+//
+// The index is deliberately NOT cached behind the scenes (no WeakMap keyed on
+// the array). A hidden cache can go stale when an array is changed in place,
+// and for a "has this person signed?" check a stale "yes" would be a security
+// bug. Callers that need many lookups build the index explicitly and know
+// exactly which snapshot it describes. The index is a plain Set of ids and is
+// never written into the data, so JSON.stringify() of the store is unchanged.
+
+// The numeric id of an { id, login } pair, or null when there is none. Only a
+// real number counts: a string id, a missing id and NaN all give null, so every
+// caller fails closed. NaN is excluded explicitly because `Set.has(NaN)` is
+// true while `NaN === NaN` is false, and the old linear scan never matched it.
+function numericIdOf(identity) {
+  if (identity == null || typeof identity !== "object") return null;
+  const id = identity.id;
+  if (typeof id !== "number" || Number.isNaN(id)) return null;
+  return id;
+}
+
+// Set of the numeric ids in `data.signatures`, one pass. Malformed entries
+// (null, non-objects, no numeric id) are skipped, never dropped from the data
+// itself. Logins are not indexed: identity is the id only.
+function buildSignatureIndex(data) {
+  const ids = new Set();
+  for (const entry of data.signatures) {
+    const id = numericIdOf(entry);
+    if (id !== null) ids.add(id);
+  }
+  return ids;
+}
+
+// O(1). `author` is an { id, login } pair. Matching is on the numeric id only.
+// A login can be released and claimed by someone else, who would then inherit
+// the old signature. An author without a numeric id never matches, so it fails
+// closed.
+function hasSigned(signedIds, author) {
+  const id = numericIdOf(author);
+  return id !== null && signedIds.has(id);
+}
+
+// Convenience for a single question about a snapshot. It costs one O(n) index
+// build, the same as the old scan, so use buildSignatureIndex() + hasSigned()
+// when asking about several authors. Tests call this directly and
+// readSignatures() keeps malformed entries, so garbage returns false instead of
+// throwing. The author is checked before the data is touched, so a bad author
+// is false without reading the store.
 function isSigned(data, author) {
-  if (author == null || typeof author !== "object") return false;
-  const id = author.id;
-  if (typeof id !== "number") return false;
-  return data.signatures.some((s) => s && typeof s === "object" && s.id === id);
+  if (numericIdOf(author) === null) return false;
+  return hasSigned(buildSignatureIndex(data), author);
 }
 
 // Same rule for the allowlist: only the numeric id counts, and a missing or
 // malformed id is not allowlisted.
 function isAllowlisted(author) {
-  if (author == null || typeof author !== "object") return false;
-  return typeof author.id === "number" && ALLOWLIST.ids.has(author.id);
+  const id = numericIdOf(author);
+  return id !== null && ALLOWLIST.ids.has(id);
 }
 
 // Id-only identity check, like isSigned(), but answering a different
@@ -804,9 +853,14 @@ function isSameContributor(a, b) {
 // every caller except handleIssueComment(), and then `fresh` is returned as is.
 function mergeSignatures(known, fresh) {
   if (!known) return fresh;
-  const keptFromKnown = known.signatures.filter(
-    (k) => !fresh.signatures.some((f) => isSameContributor(k, f)),
-  );
+  // One Set of the fresh ids instead of scanning `fresh` for every known entry:
+  // O(known + fresh), not O(known x fresh). An entry without a numeric id never
+  // matches, so it is always kept, the same as isSameContributor().
+  const freshIds = buildSignatureIndex(fresh);
+  const keptFromKnown = known.signatures.filter((k) => {
+    const id = numericIdOf(k);
+    return id === null || !freshIds.has(id);
+  });
   return {
     version: fresh.version,
     signatures: [...keptFromKnown, ...fresh.signatures],
@@ -1277,8 +1331,10 @@ async function checkPR(
     await withSignaturesToken((sigToken) => readSignatures(sigToken))
   ).data;
   const data = mergeSignatures(knownSignatures, freshData);
+  // Index the store once, then each author is one O(1) lookup.
+  const signedIds = buildSignatureIndex(data);
   const missing = authors.filter(
-    (a) => !isAllowlisted(a) && !isSigned(data, a),
+    (a) => !isAllowlisted(a) && !hasSigned(signedIds, a),
   );
 
   if (missing.length === 0 && unresolved.length === 0) {
@@ -1375,7 +1431,7 @@ function isPrivileged(payload, commenter) {
     return true;
 
   const association = payload.comment && payload.comment.author_association;
-  return ["OWNER", "MEMBER", "COLLABORATOR"].includes(association);
+  return PRIVILEGED_ASSOCIATIONS.has(association);
 }
 
 async function handleIssueComment(payload) {
@@ -1492,7 +1548,7 @@ async function handlePullRequestTarget(payload) {
     await lockPR(prNumber);
     return;
   }
-  if (["opened", "synchronize", "reopened"].includes(payload.action)) {
+  if (RECHECK_PR_ACTIONS.has(payload.action)) {
     const headSha = assertValidSha(
       payload.pull_request.head && payload.pull_request.head.sha,
       "pull_request_target payload pull_request.head.sha",
@@ -1534,6 +1590,8 @@ if (require.main === module) {
 // Exported for tests only, not part of the action's public contract.
 module.exports = {
   isSigned,
+  buildSignatureIndex,
+  hasSigned,
   isAllowlisted,
   parseAllowlist,
   createAppJWT,
