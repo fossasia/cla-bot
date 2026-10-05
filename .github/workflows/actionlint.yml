@@ -1,25 +1,26 @@
 name: "Lint GitHub Actions workflows"
 
+# Reusable workflow, called from ci.yml (that is what makes it part of the
+# single "Required checks pass" gate). It deliberately has NO push /
+# pull_request / schedule triggers of its own - they would run this check
+# twice per push/PR. `workflow_dispatch` is kept only to re-run it by hand.
+#
+# No `concurrency:` here on purpose: inside a reusable workflow
+# `github.workflow` resolves to the CALLER's name ("CI"), so a same-looking
+# group here would collide with ci.yml's and GitHub would cancel the run.
+# ci.yml owns concurrency for the whole gate.
 on:
-  push:
-    branches: ["main"]
-  pull_request:
-    branches: ["main"]
-  schedule:
-    - cron: "58 5 * * 1"
+  workflow_call: {}
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
-concurrency:
-  group: actionlint-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
-
 jobs:
   actionlint:
     name: actionlint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read # only needed to check out the repo
     steps:

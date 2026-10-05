@@ -58,7 +58,16 @@ jobs:
           signatures-repo: cla-signatures
           signatures-path: signatures/cla.json
           cla-document-url: https://github.com/fossasia/cla-signatures/blob/main/CLA.md
-          allowlist: dependabot[bot],renovate[bot],github-actions[bot]
+          # Numeric GitHub account ids, NOT usernames (usernames can be
+          # renamed and reclaimed by someone else). Look one up with
+          # `gh api 'users/NAME[bot]' --jq .id`.
+          allowlist: |
+            41898282
+            49699333
+            29139614
+          # 41898282 = github-actions[bot]
+          # 49699333 = dependabot[bot]
+          # 29139614 = renovate[bot]
           # Short-lived GitHub App token for writing to the signatures repo.
           # These are org secrets scoped to "Selected repositories" only -
           # see "SETUP_GUIDE.md" for how to create the App and set these up.

@@ -27,14 +27,31 @@ inputs:
     description: "Name of the private central signatures repo, e.g. cla-signatures"
     required: true
   signatures-path:
-    description: "Path to the JSON file inside the signatures repo"
+    description: >-
+      Path to the JSON file inside the signatures repo. Must be a relative
+      path to a file: no leading or trailing "/", no empty, "." or ".."
+      segments, and no ".git" segment. Trailing whitespace/control characters
+      (such as the newline a YAML "|" block adds) and a leading "./" are
+      ignored; any other whitespace, including leading whitespace, is part of
+      the file name. These characters are rejected: "#", "?", backslash,
+      control characters, and "%" (write the literal character instead - a
+      space, not "%20" - because encoding it again would silently address a
+      different file). Spaces and non-ASCII characters are fine and are
+      percent-encoded automatically.
     required: false
     default: "signatures/cla.json"
   cla-document-url:
     description: "Full URL to the CLA text contributors must read before signing"
     required: true
   allowlist:
-    description: "Comma-separated EXACT usernames/bot names exempt from signing. No wildcard support by design."
+    description: >-
+      Accounts exempt from signing, as numeric GitHub account ids separated
+      by commas and/or whitespace/newlines, e.g. "12345678,87654321". Ids are
+      immutable and never reassigned, unlike usernames (which can be renamed
+      and then claimed by a different account, who would inherit the
+      exemption) - so usernames are NOT accepted, and any non-numeric entry
+      fails the run. Look an id up with `gh api users/NAME --jq .id` (bots:
+      `gh api 'users/dependabot[bot]' --jq .id`). No wildcard support by design.
     required: false
     default: ""
   app-id:

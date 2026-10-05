@@ -24,6 +24,7 @@ const SIG_APP_ID_FOR_TESTS = process.env.SIG_APP_ID;
 const {
   readSignatures,
   writeSignatures,
+  SignatureIndex,
   getSignaturesToken,
   postComment,
   ghRaw,
@@ -73,6 +74,129 @@ function fakeResponse(status, jsonBody, headers = {}) {
     const { sha, data } = await readSignatures("tok");
     assert.strictEqual(sha, "abc123");
     assert.deepStrictEqual(data, stored);
+  });
+
+  // ===========================================================================
+  // The SignatureIndex that readSignatures() builds in its validation pass and
+  // that writeSignatures() hands to mutate(). It is what makes "has this id
+  // signed?" an O(1) probe instead of a scan of the whole file.
+  // ===========================================================================
+  await test("readSignatures returns an empty SignatureIndex for a store that does not exist yet (404)", async () => {
+    global.fetch = async () => fakeResponse(404, { message: "Not Found" });
+    const { index } = await readSignatures("tok");
+    assert.ok(index instanceof SignatureIndex);
+    for (const id of [0, 1, 42]) assert.strictEqual(index.has(id), false);
+  });
+
+  await test("readSignatures indexes every stored entry by numeric id, including entries it warns about, and nothing else", async () => {
+    const stored = {
+      version: 1,
+      signatures: [
+        { id: 1, login: "alice" },
+        { id: 2, login: "" }, // warned about, but isSigned() always matched on id alone
+        { id: 3 }, // warned about, same
+        { id: "4", login: "string-id" }, // not a numeric id: never matches
+        { login: "no-id" },
+        null,
+      ],
+    };
+    global.fetch = async () =>
+      fakeResponse(200, { sha: "s", content: b64(stored), encoding: "base64" });
+    const originalWarn = console.warn;
+    const warnings = [];
+    console.warn = (msg) => warnings.push(msg);
+    try {
+      const { index, data } = await readSignatures("tok");
+      assert.strictEqual(
+        data.signatures.length,
+        6,
+        "data is returned untouched",
+      );
+      for (const id of [1, 2, 3])
+        assert.strictEqual(index.has(id), true, `${id}`);
+      for (const id of [4, "4", 5, 0]) {
+        assert.strictEqual(index.has(id), false, `${String(id)}`);
+      }
+      // Same three as before indexing existed: login "", no login, and null.
+      // The string-id and no-id entries have a valid login, so they stay quiet.
+      assert.strictEqual(
+        warnings.length,
+        3,
+        "indexing must not change which entries warn",
+      );
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  await test("readSignatures builds the index on the raw-media fallback path too (file over 1 MB)", async () => {
+    const stored = { version: 1, signatures: [{ id: 11, login: "big" }] };
+    global.fetch = async (url, opts) => {
+      const accept = (opts.headers || {}).Accept;
+      if (accept === "application/vnd.github.object+json") {
+        return fakeResponse(200, { sha: "big", content: "", encoding: "none" });
+      }
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify(stored),
+        headers: { get: () => null },
+      };
+    };
+    const { index } = await readSignatures("tok");
+    assert.strictEqual(index.has(11), true);
+    assert.strictEqual(index.has(12), false);
+  });
+
+  await test("writeSignatures hands mutate() the index of the data it just read, and a 409 retry gets the index of the NEW read, not a stale one", async () => {
+    const reads = [
+      { version: 1, signatures: [{ id: 1, login: "alice" }] },
+      {
+        version: 1,
+        signatures: [
+          { id: 1, login: "alice" },
+          { id: 2, login: "bob" }, // another run signed bob between our two reads
+        ],
+      },
+    ];
+    let readCount = 0;
+    let putCount = 0;
+    global.fetch = async (url, opts) => {
+      if (opts.method === "PUT") {
+        putCount += 1;
+        return putCount === 1
+          ? fakeResponse(409, { message: "Conflict" })
+          : fakeResponse(200, {});
+      }
+      const stored = reads[Math.min(readCount, reads.length - 1)];
+      readCount += 1;
+      return fakeResponse(200, {
+        sha: `sha-${readCount}`,
+        content: b64(stored),
+        encoding: "base64",
+      });
+    };
+    const seen = [];
+    await writeSignatures(
+      "tok",
+      (data, index) => {
+        assert.ok(index instanceof SignatureIndex);
+        seen.push({
+          bob: index.has(2),
+          alice: index.has(1),
+          n: data.signatures.length,
+        });
+        return {
+          ...data,
+          signatures: [...data.signatures, { id: 3, login: "carol" }],
+        };
+      },
+      "carol signs",
+    );
+    assert.deepStrictEqual(seen, [
+      { bob: false, alice: true, n: 1 },
+      { bob: true, alice: true, n: 2 },
+    ]);
   });
 
   await test("every request carries Content-Type: application/json when it has a body", async () => {
@@ -1367,9 +1491,15 @@ function fakeResponse(status, jsonBody, headers = {}) {
         "expected the 503 to be retried once and succeed on the 2nd DELETE attempt",
       );
       assert.strictEqual(
-        warnings.length,
+        warnings.filter((w) => w.includes("Could not delete duplicate comment"))
+          .length,
         0,
         "a DELETE that eventually succeeds via gh()'s own retry loop must never reach the outer 'could not delete' warning",
+      );
+      assert.strictEqual(
+        warnings.filter((w) => w.includes("duplicate bot comment(s)")).length,
+        1,
+        "the cleanup found a duplicate, so it must have logged its one summary warning",
       );
     } finally {
       global.setTimeout = originalSetTimeout;
@@ -1440,9 +1570,15 @@ function fakeResponse(status, jsonBody, headers = {}) {
         "expected 1 timed-out DELETE attempt followed by 1 successful retry",
       );
       assert.strictEqual(
-        warnings.length,
+        warnings.filter((w) => w.includes("Could not delete duplicate comment"))
+          .length,
         0,
         "a DELETE that recovers via retry must never reach the outer per-comment warning",
+      );
+      assert.strictEqual(
+        warnings.filter((w) => w.includes("duplicate bot comment(s)")).length,
+        1,
+        "the cleanup found a duplicate, so it must have logged its one summary warning",
       );
     } finally {
       global.setTimeout = originalSetTimeout;
