@@ -6,14 +6,20 @@
   "license": "Apache-2.0",
   "main": "src/cla-bot.js",
   "scripts": {
-    "test": "node test/logic.test.js && node test/http.test.js && node test/integration.test.js && node test/bot-identity.test.js && node test/bot-identity-success.test.js && node test/bot-identity-recovery.test.js && node test/allowlist-signer-credit.test.js && node test/e2e.test.js"
+    "test": "node test/logic.test.js && node test/sig-path.test.js && node test/http.test.js && node test/integration.test.js && node test/bot-identity.test.js && node test/bot-identity-success.test.js && node test/bot-identity-recovery.test.js && node test/cache-race.test.js && node test/duplicate-warning.test.js && node test/allowlist-signer-credit.test.js && node test/allowlist-id.test.js && node test/token-expiry.test.js && node test/e2e.test.js && node test/coverage-report.test.js && node test/post-coverage-comment.test.js && node test/verify-coverage.test.js && node test/ci-gate.test.js",
+    "coverage": "c8 npm test && node .github/scripts/verify-coverage.js",
+    "test:coverage-nocheck": "c8 --check-coverage=false npm test",
+    "coverage:check": "c8 check-coverage && node .github/scripts/verify-coverage.js",
+    "coverage:report": "node .github/scripts/coverage-report.js",
+    "coverage:scripts": "c8 --check-coverage --all --include='.github/scripts/**/*.js' --exclude='test/**' --exclude='coverage/**' --exclude='coverage-scripts/**' --lines=100 --statements=100 --functions=100 --branches=100 --temp-directory=coverage-scripts/tmp --report-dir=coverage-scripts --reporter=text npm test"
   },
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   },
   "dependencies": {},
   "devDependencies": {
-    "js-yaml": "5.4.1"
+    "c8": "12.0.0",
+    "js-yaml": "5.4.2"
   },
   "repository": {
     "type": "git",

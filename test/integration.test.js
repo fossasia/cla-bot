@@ -259,6 +259,118 @@ function makeFakeGitHub({
     );
   });
 
+  // The signature lookups are index-backed (see SignatureIndex), so this runs
+  // the real flows against a store of realistic size. It checks the verdict,
+  // not speed: who is listed as missing, who is thanked, and that signers at
+  // the start, middle and end of the file are all found.
+  await test("at scale: a 20,000-signature store and a 61-author PR give exactly the right verdict on both the sign path and the recheck path", async () => {
+    const STORE = 20_000;
+    const storeEntry = (i) => ({ id: 100_000 + i, login: `signed${i}` });
+    const signatures = Array.from({ length: STORE }, (_, i) => storeEntry(i));
+    const commit = (n, id, login) => ({
+      sha: `c${n}`,
+      author: { id, login },
+      parents: [{ sha: "p" }],
+      commit: { author: { email: `${login}@example.com` } },
+    });
+
+    // 30 PR authors who are already in the store: first, middle, last and a
+    // spread in between.
+    const signedIdx = [
+      ...new Set([
+        0,
+        10_000,
+        STORE - 1,
+        ...Array.from({ length: 27 }, (_, k) => ((k + 1) * 617) % STORE),
+      ]),
+    ];
+    assert.strictEqual(signedIdx.length, 30);
+    const unsignedLogins = Array.from({ length: 30 }, (_, k) => `unsigned${k}`);
+    const commits = [
+      ...signedIdx.map((i, n) =>
+        commit(n, storeEntry(i).id, storeEntry(i).login),
+      ),
+      ...unsignedLogins.map((login, k) => commit(100 + k, 500_000 + k, login)),
+      commit(999, 777_777, "newcomer"), // signs below
+    ];
+
+    const gh = makeFakeGitHub({
+      commits,
+      initialSignatures: { version: 1, signatures },
+    });
+    global.fetch = gh.fetch;
+
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "newcomer" } },
+      comment: {
+        user: { id: 777_777, login: "newcomer" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "https://github.com/fossasia/testrepo/pull/1#issuecomment-1",
+        author_association: "NONE",
+      },
+    });
+
+    assert.strictEqual(gh.signatures.signatures.length, STORE + 1);
+    assert.strictEqual(
+      gh.signatures.signatures.filter((e) => e.id === 777_777).length,
+      1,
+      "recorded exactly once",
+    );
+    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
+    const pending = gh.comments[gh.comments.length - 1].body;
+    for (const login of unsignedLogins) {
+      assert.ok(
+        pending.includes(`- @${login}\n`) || pending.includes(`- @${login}`),
+        login,
+      );
+    }
+    for (const i of signedIdx) {
+      assert.ok(
+        !pending.includes(`@${storeEntry(i).login}\n`),
+        `${storeEntry(i).login} wrongly listed`,
+      );
+    }
+    assert.ok(
+      !pending.includes("@newcomer"),
+      "the signer just signed and is not missing",
+    );
+    assert.ok(
+      gh.comments.some((c) =>
+        c.body.includes("@newcomer Thank you for signing the CLA!"),
+      ),
+    );
+
+    // Same PR, everyone now in the store, checked through `recheck` (no
+    // known snapshot, so the index built while reading is reused directly).
+    const everyone = [
+      ...signatures,
+      ...unsignedLogins.map((login, k) => ({ id: 500_000 + k, login })),
+      { id: 777_777, login: "newcomer" },
+    ];
+    const gh2 = makeFakeGitHub({
+      commits,
+      initialSignatures: { version: 1, signatures: everyone },
+    });
+    global.fetch = gh2.fetch;
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "newcomer" } },
+      comment: {
+        user: { id: 777_777, login: "newcomer" },
+        body: "recheck",
+        html_url: "https://github.com/fossasia/testrepo/pull/1#issuecomment-2",
+        author_association: "NONE",
+      },
+    });
+    assert.strictEqual(gh2.statuses[gh2.statuses.length - 1].state, "success");
+    assert.strictEqual(
+      gh2.signatures.signatures.length,
+      everyone.length,
+      "recheck writes nothing",
+    );
+  });
+
   await test("a random third party commenting the sign phrase does NOT clear a PR authored by someone else", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -4376,7 +4488,7 @@ function makeFakeGitHub({
   // body that carries no usable login - the third branch beyond "succeeds
   // with a real login" (bot-identity-success.test.js) and "the request
   // itself fails" (bot-identity.test.js). Needs its own fresh module
-  // instance, same reasoning as those two files: _cachedBotLogin is a
+  // instance, same reasoning as those two files: _botLoginLookup is a
   // module-scope cache.
   // ===========================================================================
   await test("resolveBotLogin falls back to DEFAULT_BOT_LOGIN when GET /user succeeds but the body has no usable login (empty object)", async () => {
@@ -4611,10 +4723,33 @@ function makeFakeGitHub({
   // ===========================================================================
   // Item M: handleIssueComment() malformed comment-field shapes not yet
   // covered (missing comment.user.login and missing comment.user entirely
-  // are already tested elsewhere - these fill in the remaining fields).
+  // are already tested elsewhere - these fill in the remaining fields;
+  // comment.user.id is now REJECTED on the sign path, see the block below).
   // ===========================================================================
-  await test("handleIssueComment signs successfully when comment.user.id is entirely missing - the stored entry falls back to a login-only match, no crash", async () => {
-    const gh = makeFakeGitHub({
+  // ---------------------------------------------------------------------------
+  // comment.user.id validation. The id is the one payload value that is
+  // PERSISTED into the signature store, and isSigned() only matches on it when
+  // both sides are numbers - so a missing/malformed id used to be accepted and
+  // silently degrade that signature to login-only matching forever (a released
+  // login claimed by someone else would inherit it). These tests pin the
+  // fail-closed behavior: reject loudly, BEFORE any network call or write.
+  // ---------------------------------------------------------------------------
+  const SIGN_BODY = "I have read the CLA Document and I hereby sign the CLA";
+  function signPayload(user, extra = {}) {
+    return {
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "mona" } },
+      comment: {
+        user,
+        body: SIGN_BODY,
+        html_url: "https://github.com/fossasia/testrepo/pull/1#issuecomment-1",
+        author_association: "NONE",
+        ...extra,
+      },
+    };
+  }
+  function monaPR(initialSignatures = { version: 1, signatures: [] }) {
+    return makeFakeGitHub({
       commits: [
         {
           sha: "c1",
@@ -4623,60 +4758,200 @@ function makeFakeGitHub({
           commit: { author: { email: "mona@example.com" } },
         },
       ],
-      initialSignatures: { version: 1, signatures: [] },
+      initialSignatures,
+    });
+  }
+  // Wraps a fake GitHub's fetch so every request is recorded.
+  function recordCalls(gh) {
+    const calls = [];
+    global.fetch = (url, opts = {}) => {
+      calls.push(`${(opts.method || "GET").toUpperCase()} ${url}`);
+      return gh.fetch(url, opts);
+    };
+    return calls;
+  }
+
+  await test("handleIssueComment REJECTS a sign comment whose comment.user.id is missing entirely - no network call, nothing stored (no more silent login-only signature)", async () => {
+    global.fetch = fetchThatMustNotBeCalled;
+    await assert.rejects(
+      () => handleIssueComment(signPayload({ login: "mona" })), // no id at all
+      (err) => {
+        assert.ok(
+          /comment\.user\.id/.test(err.message),
+          `expected an error naming the missing field, got: ${err.message}`,
+        );
+        assert.ok(
+          /got undefined/.test(err.message),
+          "the error must say what it actually received",
+        );
+        return true;
+      },
+    );
+  });
+
+  for (const { label, value } of [
+    { label: "null", value: null },
+    { label: "a numeric string", value: "9101" },
+    { label: "a non-numeric string", value: "not-a-number" },
+    { label: "an empty string", value: "" },
+    { label: "zero", value: 0 },
+    { label: "a negative integer", value: -5 },
+    { label: "a non-integer float", value: 1.5 },
+    { label: "NaN", value: NaN },
+    { label: "Infinity", value: Infinity },
+    {
+      label: "Number.MAX_SAFE_INTEGER + 1",
+      value: Number.MAX_SAFE_INTEGER + 1,
+    },
+    { label: "a boolean", value: true },
+    { label: "an array", value: [9101] },
+    { label: "a plain object", value: { id: 9101 } },
+  ]) {
+    await test(`handleIssueComment REJECTS a sign comment whose comment.user.id is ${label}: no request of any kind is made and the store/status/comments are untouched`, async () => {
+      const gh = monaPR();
+      const calls = recordCalls(gh);
+      await assert.rejects(
+        () => handleIssueComment(signPayload({ id: value, login: "mona" })),
+        /comment\.user\.id: expected a positive integer GitHub user id/,
+      );
+      assert.deepStrictEqual(
+        calls,
+        [],
+        "validation must throw before ANY API request (not even a read)",
+      );
+      assert.deepStrictEqual(
+        gh.signatures.signatures,
+        [],
+        "nothing may be written to the signature store",
+      );
+      assert.strictEqual(gh.statuses.length, 0, "no status may be set");
+      assert.strictEqual(gh.comments.length, 0, "no comment may be posted");
+    });
+  }
+
+  await test("handleIssueComment still signs normally at both boundaries of a valid id (1 and Number.MAX_SAFE_INTEGER) and stores the id as a real number", async () => {
+    for (const id of [1, Number.MAX_SAFE_INTEGER]) {
+      const gh = monaPR();
+      global.fetch = gh.fetch;
+      await handleIssueComment(signPayload({ id, login: "mona" }));
+      assert.strictEqual(gh.signatures.signatures.length, 1);
+      assert.strictEqual(gh.signatures.signatures[0].id, id);
+      assert.strictEqual(typeof gh.signatures.signatures[0].id, "number");
+    }
+  });
+
+  await test("a recorded signature always carries a numeric id, which makes it match the author by id (not login) on the follow-up checkPR", async () => {
+    // mona's commit author id (9101) differs from the commenter id below, so
+    // if the stored entry were matched by login this would flip to success;
+    // by id it must NOT - proving the id was recorded and is what's compared.
+    const gh = monaPR();
+    global.fetch = gh.fetch;
+    await handleIssueComment(signPayload({ id: 777, login: "mona" }));
+    assert.strictEqual(gh.signatures.signatures[0].id, 777);
+    assert.strictEqual(
+      gh.statuses[gh.statuses.length - 1].state,
+      "failure",
+      "an entry with id 777 must not satisfy the commit author with id 9101, even though the login is identical",
+    );
+  });
+
+  await test("a DIFFERENT account that reclaimed a released login gets its OWN signature recorded - it does not inherit the previous owner's id-keyed one", async () => {
+    const gh = monaPR({
+      version: 1,
+      signatures: [
+        { id: 111, login: "mona", signedAt: "2020-01-01T00:00:00.000Z" },
+      ],
     });
     global.fetch = gh.fetch;
+    await handleIssueComment(signPayload({ id: 999, login: "mona" }));
+    assert.deepStrictEqual(
+      gh.signatures.signatures.map((e) => e.id),
+      [111, 999],
+      "the new owner must be recorded as a second, separate signature - not treated as 'already signed'",
+    );
+    assert.ok(
+      !gh.comments.some((c) => /already signed/.test(c.body)),
+      "must not tell the new owner they have already signed",
+    );
+  });
+
+  await test("signing twice with a valid id is still idempotent - exactly one entry, and the second attempt gets the 'already signed' reply", async () => {
+    const gh = monaPR();
+    global.fetch = gh.fetch;
+    await handleIssueComment(signPayload({ id: 9101, login: "mona" }));
+    await handleIssueComment(signPayload({ id: 9101, login: "mona" }));
+    assert.strictEqual(gh.signatures.signatures.length, 1);
+    assert.ok(gh.comments.some((c) => /already signed/.test(c.body)));
+  });
+
+  await test("`recheck` does NOT depend on comment.user.id: a malformed/missing id must not start failing a command that never reads it", async () => {
+    for (const user of [
+      { login: "mona" },
+      { id: "oops", login: "mona" },
+      { id: null, login: "mona" },
+    ]) {
+      const gh = monaPR({
+        version: 1,
+        signatures: [{ id: 9101, login: "mona" }],
+      });
+      global.fetch = gh.fetch;
+      await handleIssueComment({
+        action: "created",
+        issue: { number: 1, pull_request: {}, user: { login: "mona" } },
+        comment: {
+          user,
+          body: "recheck",
+          html_url: "x",
+          author_association: "NONE",
+        },
+      });
+      assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
+    }
+  });
+
+  await test("an unrelated comment with a missing comment.user.id stays a silent no-op (the id is only validated when a signature is about to be recorded)", async () => {
+    global.fetch = fetchThatMustNotBeCalled;
     await handleIssueComment({
       action: "created",
       issue: { number: 1, pull_request: {}, user: { login: "mona" } },
       comment: {
-        user: { login: "mona" }, // no id at all
-        body: "I have read the CLA Document and I hereby sign the CLA",
+        user: { login: "someone" },
+        body: "looks good to me",
         html_url: "x",
         author_association: "NONE",
       },
     });
-    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
-    const lastEntry =
-      gh.signatures.signatures[gh.signatures.signatures.length - 1];
-    assert.ok(
-      !("id" in lastEntry),
-      "with no id in the webhook payload, the stored entry must simply omit the key (JSON.stringify drops `id: undefined`), not store a literal 'undefined'",
-    );
-    assert.strictEqual(lastEntry.login, "mona");
   });
 
-  await test("handleIssueComment signs successfully when comment.user.id is a non-numeric value (malformed webhook) - stored as-is, falls back to login matching, no crash", async () => {
-    const gh = makeFakeGitHub({
-      commits: [
-        {
-          sha: "c1",
-          author: { id: 9102, login: "nate" },
-          parents: [{ sha: "p1" }],
-          commit: { author: { email: "nate@example.com" } },
-        },
-      ],
-      initialSignatures: { version: 1, signatures: [] },
-    });
-    global.fetch = gh.fetch;
-    await handleIssueComment({
-      action: "created",
-      issue: { number: 1, pull_request: {}, user: { login: "nate" } },
-      comment: {
-        user: { id: "not-a-number", login: "nate" },
-        body: "I have read the CLA Document and I hereby sign the CLA",
-        html_url: "x",
-        author_association: "NONE",
-      },
-    });
-    assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
-    const lastEntry =
-      gh.signatures.signatures[gh.signatures.signatures.length - 1];
-    assert.strictEqual(
-      lastEntry.id,
-      "not-a-number",
-      "the malformed id is stored as-is (not validated/coerced) - isSigned()'s typeof-number guard is what keeps matching safe despite this",
-    );
+  await test("handleIssueComment REJECTS an EMPTY comment.user.login (sign phrase or not): isSigned() can never match it, so a signature would be re-appended on every attempt", async () => {
+    for (const body of [SIGN_BODY, "recheck", "hello"]) {
+      global.fetch = fetchThatMustNotBeCalled;
+      await assert.rejects(
+        () =>
+          handleIssueComment({
+            action: "created",
+            issue: { number: 1, pull_request: {}, user: { login: "mona" } },
+            comment: {
+              user: { id: 5, login: "" },
+              body,
+              html_url: "x",
+              author_association: "OWNER",
+            },
+          }),
+        /comment\.user\.login/,
+        `empty login must be rejected for body ${JSON.stringify(body)}`,
+      );
+    }
+  });
+
+  await test("handleIssueComment still rejects a non-string comment.user.login (existing guard unchanged)", async () => {
+    for (const login of [undefined, null, 123, {}, ["mona"]]) {
+      global.fetch = fetchThatMustNotBeCalled;
+      await assert.rejects(
+        () => handleIssueComment(signPayload({ id: 5, login })),
+        /comment\.user\.login/,
+      );
+    }
   });
 
   await test("handleIssueComment signs successfully when comment.html_url is absent - the stored entry's commentUrl is simply omitted, no crash", async () => {
