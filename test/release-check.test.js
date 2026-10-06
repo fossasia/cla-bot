@@ -21,6 +21,8 @@ const SCRIPT = path.join(
 );
 const {
   parseTag,
+  declaresDependencies,
+  inspectTag,
   extractChangelogSection,
   findReleaseProblems,
   verifyTagSignature,
@@ -182,6 +184,28 @@ test("extractChangelogSection is exact: no prefix/regex confusion, missing -> nu
   );
 });
 
+test("extractChangelogSection handles Windows line endings and never compiles the version into a pattern", () => {
+  const crlf = CHANGELOG.replace(/\n/g, "\r\n");
+  assert.strictEqual(
+    extractChangelogSection(crlf, "1.2.3"),
+    "### Added\r\n\r\n- the thing",
+  );
+  // Only the literal heading counts: not indented, not a deeper heading,
+  // not a different bracket text.
+  assert.strictEqual(
+    extractChangelogSection(" ## [1.2.3]\n- x\n", "1.2.3"),
+    null,
+  );
+  assert.strictEqual(
+    extractChangelogSection("### [1.2.3]\n- x\n", "1.2.3"),
+    null,
+  );
+  assert.strictEqual(
+    extractChangelogSection("## [1.2.3] extra\n- x\n", "1.2.3"),
+    null,
+  );
+});
+
 // --- findReleaseProblems ----------------------------------------------------
 
 test("findReleaseProblems is empty for a consistent release", () => {
@@ -218,21 +242,58 @@ test("findReleaseProblems reports a package.json version mismatch", () => {
   );
 });
 
-test("findReleaseProblems refuses npm runtime dependencies (the SBOM would be incomplete) but tolerates an absent field", () => {
-  const withDeps = findReleaseProblems({
+test("declaresDependencies: empty means empty, anything else counts (fail closed)", () => {
+  for (const empty of [undefined, null, false, {}, []]) {
+    assert.strictEqual(
+      declaresDependencies(empty),
+      false,
+      JSON.stringify(empty),
+    );
+  }
+  for (const declared of [{ left: "1.0.0" }, ["left"], true, "left", 1]) {
+    assert.strictEqual(
+      declaresDependencies(declared),
+      true,
+      JSON.stringify(declared),
+    );
+  }
+});
+
+test("findReleaseProblems refuses npm dependencies in EVERY field that can pull code in, but tolerates absent fields", () => {
+  for (const [field, value] of [
+    ["dependencies", { left: "1.0.0" }],
+    ["optionalDependencies", { left: "1.0.0" }],
+    ["peerDependencies", { left: "1.0.0" }],
+    ["bundleDependencies", ["left"]],
+    ["bundleDependencies", true],
+    ["bundledDependencies", ["left"]],
+  ]) {
+    const problems = findReleaseProblems({
+      tag: "v1.2.3",
+      packageJson: { ...PACKAGE, [field]: value },
+      changelog: CHANGELOG,
+    });
+    assert.strictEqual(problems.length, 1, field);
+    assert.match(problems[0], new RegExp(`npm dependencies \\(${field}\\)`));
+  }
+  const several = findReleaseProblems({
     tag: "v1.2.3",
-    packageJson: { ...PACKAGE, dependencies: { left: "1.0.0" } },
+    packageJson: {
+      ...PACKAGE,
+      dependencies: { a: "1" },
+      peerDependencies: { b: "1" },
+    },
     changelog: CHANGELOG,
   });
-  assert.strictEqual(withDeps.length, 1);
-  assert.match(withDeps[0], /runtime "dependencies"/);
+  assert.match(several[0], /\(dependencies, peerDependencies\)/);
 
-  const { dependencies, ...noField } = PACKAGE;
+  // devDependencies are not shipped and stay allowed; absent fields are fine.
+  const { dependencies, ...bare } = PACKAGE;
   assert.ok(dependencies);
   assert.deepStrictEqual(
     findReleaseProblems({
       tag: "v1.2.3",
-      packageJson: noField,
+      packageJson: { ...bare, devDependencies: { c8: "1" } },
       changelog: CHANGELOG,
     }),
     [],
@@ -427,6 +488,29 @@ test("verifyTagSignature uses the global fetch by default (no injected implement
   assert.strictEqual(calls, 1);
 });
 
+test("inspectTag returns the inspected tag object's SHA (what the publish job later pins) and none for a lightweight tag", async () => {
+  const ok = await inspectTag({
+    repository: "fossasia/cla-bot",
+    tag: "v1.2.3",
+    commit: COMMIT,
+    token: "t",
+    fetchImpl: fakeFetch(annotatedRoutes()),
+  });
+  assert.deepStrictEqual(ok, { problems: [], tagObjectSha: TAG_OBJECT });
+
+  const light = await inspectTag({
+    repository: "fossasia/cla-bot",
+    tag: "v1.2.3",
+    commit: COMMIT,
+    token: "t",
+    fetchImpl: fakeFetch({
+      "git/ref/tags/v1.2.3": { object: { type: "commit", sha: COMMIT } },
+    }),
+  });
+  assert.strictEqual(light.problems.length, 1);
+  assert.strictEqual(light.tagObjectSha, undefined);
+});
+
 // --- SBOM -------------------------------------------------------------------
 
 test("listActionDependencies finds pinned third-party actions, skips local ones and comments", () => {
@@ -446,8 +530,7 @@ test("listActionDependencies fails closed on anything that is not a full-SHA pin
     "actions/checkout@main",
     `actions/checkout@${SHA_A.slice(0, 7)}`,
     "actions/checkout",
-    `@${SHA_A}`,
-    `"actions/checkout@${SHA_A}"`,
+    `"@${SHA_A}"`,
     "docker://alpine:3",
   ]) {
     assert.throws(
@@ -456,6 +539,60 @@ test("listActionDependencies fails closed on anything that is not a full-SHA pin
       target,
     );
   }
+});
+
+test("listActionDependencies parses YAML: no layout can hide a dependency (flow style, next-line value, nesting, quoting)", () => {
+  const unpinned = "evil/thing@main";
+  for (const [label, yml] of [
+    ["flow-style mapping", `steps: [{uses: ${unpinned}}]\n`],
+    [
+      "flow-style on one line",
+      `{runs: {steps: [{name: x, uses: ${unpinned}}]}}\n`,
+    ],
+    ["value on the next line", `steps:\n  - uses:\n      ${unpinned}\n`],
+    ["quoted value", `steps:\n  - uses: "${unpinned}"\n`],
+    ["single-quoted value", `steps:\n  - uses: '${unpinned}'\n`],
+    ["deeply nested", `a:\n  b:\n    - c:\n        uses: ${unpinned}\n`],
+    ["anchor and alias", `x: &s {uses: ${unpinned}}\ny: *s\n`],
+  ]) {
+    assert.throws(() => listActionDependencies(yml), /evil\/thing@main/, label);
+  }
+  // Valid YAML quoting of a PINNED action is understood, not rejected.
+  assert.deepStrictEqual(
+    listActionDependencies(
+      `steps:\n  - uses: "actions/checkout@${SHA_A}" # v7.0.1\n`,
+    ),
+    [{ name: "actions/checkout", ref: SHA_A, comment: "v7.0.1" }],
+  );
+  assert.deepStrictEqual(
+    listActionDependencies(
+      `steps:\n  - uses:\n      actions/checkout@${SHA_A}\n`,
+    ),
+    [{ name: "actions/checkout", ref: SHA_A, comment: undefined }],
+  );
+});
+
+test("listActionDependencies de-duplicates, rejects non-string `uses`, and rejects invalid YAML", () => {
+  const twice = `steps:\n  - uses: a/b@${SHA_A}\n  - uses: a/b@${SHA_A} # v1\n  - uses: a/b@${SHA_B}\n`;
+  assert.deepStrictEqual(listActionDependencies(twice), [
+    { name: "a/b", ref: SHA_A, comment: "v1" },
+    { name: "a/b", ref: SHA_B, comment: undefined },
+  ]);
+  // The same mapping reached twice through an alias is visited once.
+  assert.deepStrictEqual(
+    listActionDependencies(`x: &s {uses: a/b@${SHA_A}}\ny: *s\n`),
+    [{ name: "a/b", ref: SHA_A, comment: undefined }],
+  );
+  assert.throws(
+    () => listActionDependencies("steps:\n  - uses: {nested: thing}\n"),
+    /not a string/,
+  );
+  assert.throws(
+    () => listActionDependencies("steps: [unclosed\n"),
+    /YAMLException|end of the stream|unexpected/i,
+  );
+  // An empty document is an error too (js-yaml throws), never "no dependencies".
+  assert.throws(() => listActionDependencies(""), /empty/i);
 });
 
 test("listActionDependencies cannot be dodged by an odd trailing comment or an unpinned line after a pinned one", () => {
@@ -552,6 +689,52 @@ test("main verify: success writes the notes (changelog section + verification fo
     );
     assert.ok(!text.includes("## [1.2.2]"), "must not leak other versions");
     assert.match(io.out.join("\n"), /v1\.2\.3: tag, version, changelog/);
+  });
+});
+
+test("main verify writes tag-object-sha to GITHUB_OUTPUT when set, and only then", async () => {
+  await withTmpDir(async (dir) => {
+    writeProject(dir);
+    const output = path.join(dir, "gh-output");
+    fs.writeFileSync(output, "existing=1\n");
+    const code = await main(
+      ["verify", "--notes", path.join(dir, "n.md")],
+      baseEnv({ GITHUB_OUTPUT: output }),
+      { ...capture(), cwd: dir, fetchImpl: fakeFetch(annotatedRoutes()) },
+    );
+    assert.strictEqual(code, 0);
+    assert.strictEqual(
+      fs.readFileSync(output, "utf8"),
+      `existing=1\ntag-object-sha=${TAG_OBJECT}\n`,
+      "appended, never truncated",
+    );
+  });
+});
+
+test("main verify refuses to emit a malformed tag object id as a step output", async () => {
+  await withTmpDir(async (dir) => {
+    writeProject(dir);
+    const output = path.join(dir, "gh-output");
+    const io = capture();
+    const code = await main(
+      ["verify", "--notes", path.join(dir, "n.md")],
+      baseEnv({ GITHUB_OUTPUT: output }),
+      {
+        ...io,
+        cwd: dir,
+        fetchImpl: fakeFetch({
+          "git/ref/tags/v1.2.3": { object: { type: "tag", sha: "x\nevil=1" } },
+          "git/tags/x\nevil=1": {
+            object: { type: "commit", sha: COMMIT },
+            verification: { verified: true, reason: "valid" },
+          },
+        }),
+      },
+    );
+    assert.strictEqual(code, 1);
+    assert.match(io.err.join("\n"), /unexpected tag object id/);
+    assert.ok(!fs.existsSync(output), "nothing is written to GITHUB_OUTPUT");
+    assert.ok(!fs.existsSync(path.join(dir, "n.md")));
   });
 });
 

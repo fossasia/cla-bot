@@ -9,29 +9,39 @@
  *       Refuses to continue (exit 1) unless ALL of these hold:
  *         1. RELEASE_TAG is a strict stable semver tag: vMAJOR.MINOR.PATCH.
  *         2. package.json's "version" equals the tag without its "v".
- *         3. package.json has no runtime "dependencies". The SBOM below only
+ *         3. package.json declares no runtime dependencies of ANY kind
+ *            (dependencies, optionalDependencies, peerDependencies,
+ *            bundleDependencies / bundledDependencies). The SBOM below only
  *            describes the action's own `uses:` dependencies, so an npm
- *            runtime dependency would make it silently incomplete. Teach
- *            buildSbom about it before adding one (and see CONTRIBUTING.md).
+ *            dependency would make it silently incomplete. Teach buildSbom
+ *            about it before adding one (and see CONTRIBUTING.md).
  *         4. CHANGELOG.md has a non-empty "## [X.Y.Z]" section. It becomes
  *            the release notes, written to --notes.
  *         5. The tag is ANNOTATED, points at GITHUB_SHA (the commit being
  *            built), and GitHub reports its signature as verified.
  *       Check 5 ties a release to an identifiable person: anyone who can push
  *       a tag can start this workflow, but only the holder of a signing key
- *       registered on their GitHub account can push a *verified* one.
+ *       registered on their GitHub account can push a *verified* one. The
+ *       SHA of the verified tag OBJECT is written to $GITHUB_OUTPUT as
+ *       `tag-object-sha`: a tag object is content-addressed (commit,
+ *       signature and message), so the publish job re-checks that the tag
+ *       still resolves to exactly that object right before it releases. That
+ *       closes the gap between "verified at build time" and "released later".
  *
  *   node release-check.js sbom --out <file>
  *       Writes a CycloneDX 1.6 SBOM listing what the action actually
  *       depends on at runtime: the third-party actions in action.yml, each
- *       pinned to a full commit SHA. An unpinned `uses:` fails the command,
- *       so a release can never ship a mutable dependency.
+ *       pinned to a full commit SHA. action.yml is PARSED as YAML and every
+ *       `uses` key anywhere in it is collected, so no layout (flow style,
+ *       value on the next line, quoting) can hide one. An unpinned `uses:`
+ *       fails the command, so a release can never ship a mutable dependency.
  *
  * Environment (set by the workflow, never interpolated into shell text):
  *   RELEASE_TAG        e.g. v1.2.3 (github.ref_name)
  *   GITHUB_SHA         commit the tag points at
  *   GITHUB_REPOSITORY  owner/name
  *   GH_TOKEN           read-only token, `verify` only
+ *   GITHUB_OUTPUT      optional, file `verify` appends tag-object-sha to
  *   SOURCE_DATE_ISO    optional, commit time for the SBOM (reproducible)
  *
  * Exit codes: 0 ok, 1 a check failed, 2 bad usage.
@@ -45,6 +55,16 @@ const path = require("path");
 const TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const REPOSITORY_PATTERN = /^[\w.-]+\/[\w.-]+$/;
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
+// Every package.json field through which npm can pull code in at install or
+// pack time. All must be empty for the SBOM to be complete.
+const NPM_DEPENDENCY_FIELDS = [
+  "dependencies",
+  "optionalDependencies",
+  "peerDependencies",
+  "bundleDependencies",
+  "bundledDependencies",
+];
+const HEADING_SUFFIX = /^(?: - \d{4}-\d{2}-\d{2})?[ \t\r]*$/;
 const API_ROOT = "https://api.github.com";
 const API_TIMEOUT_MS = 30_000;
 
@@ -58,19 +78,29 @@ function parseTag(tag) {
 }
 
 // Body of the "## [X.Y.Z]" (optionally "- YYYY-MM-DD") section, or null if
-// there is no such heading. `version` comes from parseTag, so it only holds
-// digits and dots and is safe to put in a pattern.
+// there is no such heading. The version is compared as a literal string, never
+// compiled into a pattern, so there is nothing to escape.
 function extractChangelogSection(changelog, version) {
-  const escaped = version.replace(/\./g, "\\.");
-  const heading = new RegExp(
-    `^## \\[${escaped}\\](?: - \\d{4}-\\d{2}-\\d{2})?[ \\t]*$`,
-    "m",
+  const lines = changelog.split("\n");
+  const prefix = `## [${version}]`;
+  const start = lines.findIndex(
+    (line) =>
+      line.startsWith(prefix) && HEADING_SUFFIX.test(line.slice(prefix.length)),
   );
-  const match = heading.exec(changelog);
-  if (!match) return null;
-  const rest = changelog.slice(match.index + match[0].length);
-  const next = /^## /m.exec(rest);
-  return (next ? rest.slice(0, next.index) : rest).trim();
+  if (start === -1) return null;
+  const rest = lines.slice(start + 1);
+  const next = rest.findIndex((line) => line.startsWith("## "));
+  return (next === -1 ? rest : rest.slice(0, next)).join("\n").trim();
+}
+
+// true when an npm dependency field names anything at all. Anything that is
+// not clearly empty counts (fail closed): a non-empty object or array, `true`
+// (bundleDependencies: true bundles everything), or an unexpected scalar.
+function declaresDependencies(value) {
+  if (value === undefined || value === null || value === false) return false;
+  if (Array.isArray(value)) return value.length > 0;
+  if (typeof value === "object") return Object.keys(value).length > 0;
+  return true;
 }
 
 // Static consistency checks between the tag and the files it releases.
@@ -87,9 +117,12 @@ function findReleaseProblems({ tag, packageJson, changelog }) {
       `package.json version is "${packageJson.version}" but the tag is ${tag}; bump package.json before tagging.`,
     );
   }
-  if (Object.keys(packageJson.dependencies ?? {}).length > 0) {
+  const declared = NPM_DEPENDENCY_FIELDS.filter((field) =>
+    declaresDependencies(packageJson[field]),
+  );
+  if (declared.length > 0) {
     problems.push(
-      'package.json declares runtime "dependencies", which the release SBOM does not describe; extend buildSbom first.',
+      `package.json declares npm dependencies (${declared.join(", ")}), which the release SBOM does not describe; extend buildSbom first.`,
     );
   }
   const section = extractChangelogSection(changelog, version);
@@ -102,8 +135,10 @@ function findReleaseProblems({ tag, packageJson, changelog }) {
 }
 
 // Asks GitHub (not git) about the tag, because GitHub is the one that checks
-// the signature against the keys registered on the tagger's account.
-async function verifyTagSignature({
+// the signature against the keys registered on the tagger's account. Returns
+// the problems found plus the SHA of the tag object that was inspected (absent
+// for a lightweight tag), which the publish job later pins the tag to.
+async function inspectTag({
   repository,
   tag,
   commit,
@@ -128,9 +163,11 @@ async function verifyTagSignature({
 
   const ref = await api(`git/ref/tags/${tag}`);
   if (ref.object.type !== "tag") {
-    return [
-      `${tag} is a lightweight tag. Releases need a signed, annotated tag: git tag -s ${tag} -m "${tag}".`,
-    ];
+    return {
+      problems: [
+        `${tag} is a lightweight tag. Releases need a signed, annotated tag: git tag -s ${tag} -m "${tag}".`,
+      ],
+    };
   }
   const annotated = await api(`git/tags/${ref.object.sha}`);
   const problems = [];
@@ -145,20 +182,53 @@ async function verifyTagSignature({
       `GitHub does not report ${tag} as verified (reason: ${verification.reason ?? "unknown"}). Sign it with a key registered on your GitHub account.`,
     );
   }
-  return problems;
+  return { problems, tagObjectSha: ref.object.sha };
 }
 
-// Third-party actions that action.yml runs, each as { name, ref, comment }.
-// Throws if any is not pinned to a full commit SHA.
+async function verifyTagSignature(options) {
+  return (await inspectTag(options)).problems;
+}
+
+// Every value of a `uses` key anywhere in a parsed YAML document. Walking the
+// whole tree (not just runs.steps) means no layout can hide a dependency.
+function collectUses(node, found = [], seen = new WeakSet()) {
+  if (node === null || typeof node !== "object" || seen.has(node)) return found;
+  seen.add(node);
+  for (const [key, value] of Object.entries(node)) {
+    if (key === "uses") found.push(value);
+    else collectUses(value, found, seen);
+  }
+  return found;
+}
+
+// "owner/repo@<sha>" -> its trailing "# v1.2.3" comment. YAML parsing drops
+// comments, so they are read from the text; they only label the SBOM entry and
+// are never needed for completeness.
+function versionComments(actionYml) {
+  const comments = new Map();
+  for (const [, target, comment] of actionYml.matchAll(
+    /([\w./-]+@[0-9a-f]{40})["']?[ \t]*#[ \t]*(\S+)/g,
+  )) {
+    if (!comments.has(target)) comments.set(target, comment);
+  }
+  return comments;
+}
+
+// Third-party actions that action.yml runs, each as { name, ref, comment },
+// de-duplicated. Throws if any is not pinned to a full commit SHA, or if the
+// file is not valid YAML.
 function listActionDependencies(actionYml) {
-  const dependencies = [];
-  // Matches the WHOLE line (`.*` swallows whatever follows the comment's
-  // first word), so no `uses:` line can be skipped by an odd trailing
-  // comment; a quoted or otherwise odd target then fails the pin check below
-  // instead of being ignored.
-  const usesLine =
-    /^[ \t]*(?:-[ \t]+)?uses:[ \t]*(\S+)[ \t]*(?:#[ \t]*(\S+))?.*$/gm;
-  for (const [, target, comment] of actionYml.matchAll(usesLine)) {
+  // Loaded here, not at the top: `verify` runs before `npm ci` and must work
+  // with Node built-ins alone. js-yaml is a pinned devDependency.
+  const yaml = require("js-yaml");
+  const comments = versionComments(actionYml);
+  const dependencies = new Map();
+  for (const target of collectUses(yaml.load(actionYml))) {
+    if (typeof target !== "string") {
+      throw new Error(
+        `action.yml has a "uses" value that is not a string (${JSON.stringify(target)}); refusing to describe it.`,
+      );
+    }
     if (target.startsWith("./")) continue; // local to this repo, not a dependency
     const [name, ref] = target.split("@");
     if (!name || !FULL_SHA_PATTERN.test(ref ?? "")) {
@@ -166,9 +236,10 @@ function listActionDependencies(actionYml) {
         `action.yml uses "${target}", which is not pinned to a full commit SHA; refusing to describe a mutable dependency.`,
       );
     }
-    dependencies.push({ name, ref, comment });
+    // Keyed by the full target, so a repeated action collapses to one entry.
+    dependencies.set(target, { name, ref, comment: comments.get(target) });
   }
-  return dependencies;
+  return [...dependencies.values()];
 }
 
 // package URL for a GitHub Action: pkg:githubactions/owner/repo@sha#subpath
@@ -266,7 +337,7 @@ async function runVerify({ argv, env, cwd, stdout, stderr, fetchImpl }) {
   });
   if (problems.length > 0) return failures(problems, stderr);
 
-  const signatureProblems = await verifyTagSignature({
+  const { problems: signatureProblems, tagObjectSha } = await inspectTag({
     repository: env.GITHUB_REPOSITORY,
     tag,
     commit: env.GITHUB_SHA,
@@ -274,10 +345,19 @@ async function runVerify({ argv, env, cwd, stdout, stderr, fetchImpl }) {
     fetchImpl,
   });
   if (signatureProblems.length > 0) return failures(signatureProblems, stderr);
+  if (!FULL_SHA_PATTERN.test(tagObjectSha)) {
+    return failures(
+      [`GitHub returned an unexpected tag object id "${tagObjectSha}".`],
+      stderr,
+    );
+  }
 
   const section = extractChangelogSection(changelog, parseTag(tag));
   const notes = `${section}\n\n---\n\nEvery asset is signed. Verify before use: https://github.com/${env.GITHUB_REPOSITORY}/blob/${tag}/SECURITY.md#verifying-a-release\n`;
   fs.writeFileSync(notesFile, notes);
+  if (env.GITHUB_OUTPUT) {
+    fs.appendFileSync(env.GITHUB_OUTPUT, `tag-object-sha=${tagObjectSha}\n`);
+  }
   stdout(`${tag}: tag, version, changelog and tag signature all check out.`);
   return 0;
 }
@@ -355,6 +435,8 @@ module.exports = {
   parseTag,
   extractChangelogSection,
   findReleaseProblems,
+  declaresDependencies,
+  inspectTag,
   verifyTagSignature,
   listActionDependencies,
   actionPurl,

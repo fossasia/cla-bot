@@ -289,6 +289,10 @@ a mistake on the real repository burns a version number.
   (`git push --delete origin vX.Y.Z` and `git tag -d vX.Y.Z`), fix the cause
   and tag again, as long as nobody has pinned that tag in the meantime. Only a
   _published_ release is locked, and only if "Immutable releases" is on.
+- **A "no longer resolves to the signed tag object" error** means the tag was
+  moved, deleted and re-created, or re-signed after the build job verified it.
+  Nothing was published. Do not re-run: investigate who changed the tag, then
+  release the next patch version from a fresh tag.
 - **The `publish` job failed** (Sigstore or GitHub outage, approval
   timed out, upload error): use "Re-run failed jobs". It is safe to repeat; a
   leftover **draft** is replaced, and a release that is already **published**

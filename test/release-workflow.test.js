@@ -24,7 +24,9 @@
  */
 const assert = require("assert");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
+const { spawnSync } = require("child_process");
 const yaml = require("js-yaml");
 
 const ROOT = path.join(__dirname, "..");
@@ -34,6 +36,40 @@ const readJson = (...p) => JSON.parse(read(...p));
 const cases = [];
 function test(name, fn) {
   cases.push({ name, fn });
+}
+
+// Escapes EVERY regular-expression metacharacter, backslash included.
+const escapeRegExp = (text) => text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
+
+// Turns a GitHub tag filter into a RegExp. Supports exactly the syntax
+// release.yml uses (literal characters, `[0-9]`-style classes, `+`) and throws
+// on anything else, so the matcher can never silently disagree with GitHub.
+// Nothing is concatenated unescaped.
+function filterToRegExp(pattern) {
+  let source = "";
+  for (let i = 0; i < pattern.length; i += 1) {
+    const char = pattern[i];
+    if (char === "[") {
+      const end = pattern.indexOf("]", i);
+      const body = end === -1 ? "" : pattern.slice(i + 1, end);
+      assert.match(
+        body,
+        /^[0-9a-zA-Z-]+$/,
+        `unsupported character class in ${pattern}`,
+      );
+      source += `[${body}]`;
+      i = end;
+    } else if (char === "+") {
+      source += "+";
+    } else {
+      assert.ok(
+        !"*?!\\]".includes(char),
+        `unsupported filter syntax "${char}" in ${pattern}`,
+      );
+      source += escapeRegExp(char);
+    }
+  }
+  return new RegExp(`^${source}$`);
 }
 
 const raw = read(".github", "workflows", "release.yml");
@@ -76,7 +112,7 @@ test("the only trigger is a push of stable-semver tags: no PR, no branch, no man
   assert.deepStrictEqual(Object.keys(triggers.push), ["tags"]);
   assert.strictEqual(triggers.push.tags.length, 1);
   // GitHub's filter syntax: "+" repeats the previous character class, "." is literal.
-  const filter = new RegExp(`^${triggers.push.tags[0].replace(/\./g, "\\.")}$`);
+  const filter = filterToRegExp(triggers.push.tags[0]);
   const { TAG_PATTERN } = require(
     path.join(ROOT, ".github", "scripts", "release-check.js"),
   );
@@ -85,6 +121,27 @@ test("the only trigger is a push of stable-semver tags: no PR, no branch, no man
   }
   for (const tag of ["1.0.0", "v1.0", "v1.0.0-rc.1", "latest", "main"]) {
     assert.ok(!filter.test(tag), `${tag} must not start a release`);
+  }
+});
+
+test("the tag-filter matcher escapes everything and rejects syntax it does not model", () => {
+  assert.strictEqual(escapeRegExp("a\\b.c+d"), "a\\\\b\\.c\\+d");
+  const f = filterToRegExp("v[0-9]+.[0-9]+");
+  assert.ok(f.test("v1.2") && f.test("v10.20"));
+  assert.ok(!f.test("v1x2"), "'.' is literal");
+  assert.ok(!f.test("v1.2\n"), "anchored");
+  // A backslash is GitHub's escape character, which this matcher does not model.
+  for (const unsupported of [
+    "v*",
+    "v?",
+    "!v1",
+    "v[0-9",
+    "v[]",
+    "v]",
+    "v[^a]",
+    "a\\b",
+  ]) {
+    assert.throws(() => filterToRegExp(unsupported), undefined, unsupported);
   }
 });
 
@@ -334,6 +391,177 @@ test("verification pins WHO may have signed: this exact workflow file, on this t
   assert.ok(
     !/--certificate-identity-regexp|--cert-identity-regex/.test(text),
     "identity must be matched exactly, never by regex",
+  );
+});
+
+// --- tag movement between verification and release (TOCTOU) ----------------------------
+
+const SHA_VERIFIED = "a".repeat(40);
+const SHA_MOVED = "b".repeat(40);
+const recheckSteps = publish.steps.filter((s) =>
+  /^Re-check the tag/.test(s.name ?? ""),
+);
+
+test("build hands the verified tag object's SHA to publish through a job output (not the artifact store)", () => {
+  const verify = indexOfStep(
+    build.steps,
+    (s) => s.id === "verify",
+    "verify step",
+  );
+  assert.match(build.steps[verify].run, /release-check\.js verify/);
+  assert.strictEqual(
+    build.outputs["tag-object-sha"],
+    "${{ steps.verify.outputs.tag-object-sha }}",
+  );
+  assert.strictEqual(
+    publish.env.EXPECTED_TAG_OBJECT,
+    "${{ needs.build.outputs.tag-object-sha }}",
+  );
+});
+
+test("the tag is re-checked right before the release is created AND right before it is published", () => {
+  assert.strictEqual(recheckSteps.length, 2);
+  const create = runsMatching(publish.steps, /gh release create/);
+  const edit = runsMatching(publish.steps, /gh release edit/);
+  const [first, second] = recheckSteps.map((s) => publish.steps.indexOf(s));
+  assert.ok(first < create, "re-check must precede creating the release");
+  assert.ok(
+    create < second && second < edit,
+    "re-check must sit between creating and publishing",
+  );
+  assert.strictEqual(
+    first,
+    create - 1,
+    "no step may sit between the check and the create",
+  );
+  assert.strictEqual(
+    second,
+    edit - 1,
+    "no step may sit between the check and the publish",
+  );
+});
+
+test("after publishing, the tag is checked once more and the release is called compromised if it moved", () => {
+  const finalStep =
+    publish.steps[runsMatching(publish.steps, /gh release download/)].run;
+  assert.match(finalStep, /git\/ref\/tags\/\$\{RELEASE_TAG\}/);
+  assert.match(finalStep, /"tag \$\{EXPECTED_TAG_OBJECT\}"/);
+  assert.match(finalStep, /compromised/);
+});
+
+// Runs the REAL shell of a re-check step, with a fake `gh` that returns
+// whatever the tag "currently" resolves to.
+function runRecheck(step, { current, expected, ghFails = false }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-gh-"));
+  try {
+    const log = path.join(dir, "args.log");
+    fs.writeFileSync(
+      path.join(dir, "gh"),
+      ghFails
+        ? "#!/bin/sh\nexit 1\n"
+        : `#!/bin/sh\necho "$@" >> "${log}"\nprintf '%s\\n' "$FAKE_GH_OUTPUT"\n`,
+      { mode: 0o755 },
+    );
+    const result = spawnSync("bash", ["-c", step.run], {
+      env: {
+        PATH: `${dir}:${process.env.PATH}`,
+        GITHUB_REPOSITORY: "fossasia/cla-bot",
+        RELEASE_TAG: "v1.2.3",
+        EXPECTED_TAG_OBJECT: expected,
+        FAKE_GH_OUTPUT: current ?? "",
+      },
+      encoding: "utf8",
+    });
+    const args = fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "";
+    return {
+      status: result.status,
+      output: result.stdout + result.stderr,
+      args,
+    };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("re-check (real shell, fake gh): passes only while the tag still resolves to the verified tag object", () => {
+  for (const step of recheckSteps) {
+    const same = runRecheck(step, {
+      current: `tag ${SHA_VERIFIED}`,
+      expected: SHA_VERIFIED,
+    });
+    assert.strictEqual(same.status, 0, same.output);
+    assert.match(
+      same.args,
+      /api repos\/fossasia\/cla-bot\/git\/ref\/tags\/v1\.2\.3 --jq /,
+    );
+  }
+});
+
+test("re-check (real shell, fake gh): a MOVED, re-created-as-lightweight, or unexpected tag stops the release", () => {
+  for (const step of recheckSteps) {
+    for (const [label, current] of [
+      ["tag moved to another tag object", `tag ${SHA_MOVED}`],
+      [
+        "tag replaced by a lightweight tag at the same commit",
+        `commit ${SHA_VERIFIED}`,
+      ],
+      ["tag replaced by a lightweight tag elsewhere", `commit ${SHA_MOVED}`],
+      ["empty answer", ""],
+    ]) {
+      const r = runRecheck(step, { current, expected: SHA_VERIFIED });
+      assert.notStrictEqual(r.status, 0, label);
+      assert.match(
+        r.output,
+        /no longer resolves to the signed tag object/,
+        label,
+      );
+    }
+  }
+});
+
+test("re-check (real shell, fake gh): an empty expected value or a failing gh can never pass", () => {
+  for (const step of recheckSteps) {
+    const noExpected = runRecheck(step, { current: "tag ", expected: "" });
+    assert.notStrictEqual(
+      noExpected.status,
+      0,
+      "empty EXPECTED_TAG_OBJECT must fail",
+    );
+    const ghDown = runRecheck(step, {
+      current: `tag ${SHA_VERIFIED}`,
+      expected: SHA_VERIFIED,
+      ghFails: true,
+    });
+    assert.notStrictEqual(
+      ghDown.status,
+      0,
+      "an API failure must fail the step",
+    );
+  }
+});
+
+test("every `gh attestation verify` pins repo, signer workflow, tag ref AND commit digest (before and after publishing)", () => {
+  const commands = [
+    ...raw.matchAll(/gh attestation verify(?:[^\n]*\\\n)*[^\n]*/g),
+  ].map((m) => m[0]);
+  assert.strictEqual(
+    commands.length,
+    4,
+    "pre-publish: provenance + SBOM; post-publish: provenance + SBOM",
+  );
+  for (const command of commands) {
+    for (const flag of [
+      "--repo",
+      "--signer-workflow",
+      "--source-ref",
+      "--source-digest",
+    ]) {
+      assert.ok(command.includes(flag), `missing ${flag} in:\n${command}`);
+    }
+  }
+  assert.strictEqual(
+    commands.filter((c) => c.includes("https://cyclonedx.org/bom")).length,
+    2,
   );
 });
 

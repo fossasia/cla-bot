@@ -63,7 +63,11 @@ Out of scope:
    signed, annotated `vMAJOR.MINOR.PATCH` tag that GitHub reports as
    verified, on a commit that is already on `main`, after the full test
    suite and the 100% coverage gate pass on that exact commit. Nobody
-   uploads release assets by hand.
+   uploads release assets by hand. The signed tag object the build verified
+   is pinned: the publish job re-checks, right before it creates the release
+   and again right before it publishes, that the tag still resolves to that
+   exact object, so a tag moved or re-signed during the approval pause cannot
+   be released.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The
@@ -161,6 +165,13 @@ What the signatures do **not** protect against, and what does:
   not its contents. If you need more than that, add a required review (see the
   ruleset README) and check the diff of `release.yml` between the releases you
   adopt.
+- **A tag moved between verification and release.** Not possible through this
+  workflow: the publish job refuses to continue unless the tag still resolves
+  to the exact signed tag object that was verified (`gh release create
+--verify-tag` alone would not catch this; it only checks that the tag
+  exists). What remains is a window of a few milliseconds between the last
+  check and GitHub's publish call, and a final check after publishing that
+  fails the run loudly if the tag moved anyway.
 - **A tag moved or deleted after you pinned it.** Pinning the commit SHA makes
   this irrelevant for you; "Immutable releases" additionally makes it
   impossible for everyone else once a release is published. A tag that has no

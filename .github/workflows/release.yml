@@ -58,6 +58,10 @@ jobs:
       contents: read # checkout, and read the tag object through the REST API
     outputs:
       dist-digest: ${{ steps.build.outputs.dist-digest }}
+      # SHA of the verified, signed tag OBJECT. A tag object is content-
+      # addressed (commit + signature + message), so the publish job can prove
+      # the tag was not moved or re-signed after verification.
+      tag-object-sha: ${{ steps.verify.outputs.tag-object-sha }}
     steps:
       - name: Check out the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -92,6 +96,7 @@ jobs:
       # Tag is vX.Y.Z, matches package.json and CHANGELOG.md, and is an
       # annotated tag GitHub reports as cryptographically verified.
       - name: Verify tag, version, changelog and tag signature
+        id: verify
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           GH_TOKEN: ${{ github.token }}
@@ -162,6 +167,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       # There is no checkout in this job, so tell gh which repository to use.
       GH_REPO: ${{ github.repository }}
+      # What the build job verified; see "Re-check the tag" below.
+      EXPECTED_TAG_OBJECT: ${{ needs.build.outputs.tag-object-sha }}
     steps:
       - name: Download build output
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -248,7 +255,25 @@ jobs:
             --bundle "dist/${name}.sbom.intoto.jsonl" \
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$workflow" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
             --predicate-type "https://cyclonedx.org/bom"
+
+      # `gh release create --verify-tag` only checks that the tag EXISTS. The
+      # build job verified a specific signed tag object; between that check
+      # and now there can be a long pause (environment approval, signing), so
+      # prove the tag still resolves to exactly that object right before the
+      # release is created, again right before it is published, and once more
+      # after, as an alarm if it moved in the last instant.
+      - name: Re-check the tag before creating the release
+        run: |
+          set -euo pipefail
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
+          expected="tag ${EXPECTED_TAG_OBJECT}"
+          if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
+            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
+            exit 1
+          fi
 
       # Draft first, publish last. A leftover DRAFT from a failed earlier run
       # of this same tag is replaced; a PUBLISHED release is never touched
@@ -278,13 +303,29 @@ jobs:
             dist/SHA256SUMS \
             dist/SHA256SUMS.sigstore.json
 
+      - name: Re-check the tag before publishing the release
+        run: |
+          set -euo pipefail
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
+          expected="tag ${EXPECTED_TAG_OBJECT}"
+          if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
+            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
+            exit 1
+          fi
+
       - name: Publish the release
         run: gh release edit "$RELEASE_TAG" --draft=false --latest
 
-      # Download what users will download and verify it the way users will.
+      # Download what users will download and verify it the way users will,
+      # with the SAME constraints as before publishing (workflow, tag, commit).
       - name: Verify the published release end to end
         run: |
           set -euo pipefail
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
+          if [ "$current" != "tag ${EXPECTED_TAG_OBJECT}" ]; then
+            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the verified tag object after publishing ('${current}'). Treat this release as compromised."
+            exit 1
+          fi
           name="cla-bot-${RELEASE_TAG}"
           workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
           mkdir published
@@ -300,7 +341,15 @@ jobs:
           gh attestation verify "published/${name}.tar.gz" \
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$workflow" \
-            --source-ref "$GITHUB_REF"
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA"
+          gh attestation verify "published/${name}.tar.gz" \
+            --bundle "published/${name}.sbom.intoto.jsonl" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$workflow" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --predicate-type "https://cyclonedx.org/bom"
           # Only succeeds when "Immutable releases" is enabled for the
           # repository; otherwise it is a nudge, not a failure.
           gh release verify "$RELEASE_TAG" \
