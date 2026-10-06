@@ -3,10 +3,11 @@
 ## Architecture
 
 - `fossasia/cla-bot` - this action itself (zero npm dependencies). Every
-  repo references it with `uses: fossasia/cla-bot@vX.Y.Z`. Replace `vX.Y.Z`
-  with whatever tag actually exists - see Step 1.4 below. Don't hardcode a
-  version number anywhere else in your own notes; it goes stale the moment
-  a new version ships.
+  repo references a signed release of it, pinned by the release's **full
+  commit SHA** with the version in a trailing comment:
+  `uses: fossasia/cla-bot@<full commit SHA> # vX.Y.Z`. Which release and which
+  SHA - see Step 1.4 below. Don't hardcode a version number anywhere else in
+  your own notes; it goes stale the moment a new version ships.
 - `fossasia/cla-signatures` - a private repo holding the signature record,
   `signatures/cla.json`.
 - Each project repo gets a workflow file at `.github/workflows/cla.yml`,
@@ -27,23 +28,37 @@ App token - no long-lived personal access token is stored anywhere.
 3. Run `npm test` and confirm every test passes. The count grows as the bot
    gets more features, so don't assume a specific number - just check for
    `ALL TESTS PASSED.`
-4. **Create a release tag - don't skip this, everything after this step
-   depends on it existing:**
+4. **Cut a signed release - don't skip this, everything after this step
+   depends on it existing.** Releases are built, signed and published by CI
+   from a signed tag; nobody creates one by hand. The one-time repository
+   settings (immutable releases, the `release` environment, a
+   registered signing key) and the exact steps are in CONTRIBUTING.md's
+   "Releasing a new version" section. In short:
    ```bash
-   git tag v1.0.0   # or whatever version CHANGELOG.md currently says
+   git tag -s v1.0.0 -m "cla-bot v1.0.0"   # or whatever version CHANGELOG.md says
    git push origin v1.0.0
    ```
-   Then **verify the tag actually made it to GitHub** - open
-   `https://github.com/fossasia/cla-bot/tags` in a browser, or run:
+   Then approve the `publish` job of the **Release** workflow when asked, and
+   wait for it to finish.
+5. **Verify the release before anyone depends on it.** Open
+   `https://github.com/fossasia/cla-bot/releases` and confirm the release
+   carries the signature, SBOM, attestation and `SHA256SUMS` assets, then run
+   the commands in SECURITY.md's "Verifying a release" section. Until a
+   release exists **and verifies**, any workflow referencing it will fail to
+   resolve or should not be trusted.
+6. **Get the commit SHA to pin** (this is what goes into every consumer
+   workflow, not the tag):
    ```bash
-   git ls-remote --tags origin
+   git ls-remote --tags https://github.com/fossasia/cla-bot.git v1.0.0 "v1.0.0^{}"
    ```
-   Until that tag genuinely shows up there, any workflow referencing
-   `uses: fossasia/cla-bot@v1.0.0` will fail to resolve. When you later
-   update the bot, tag a new version and update every reference to it.
-   Always pin to a specific, real tag - never a moving reference like `v1`
-   or `main` for anything other than testing. See CONTRIBUTING.md's
-   "Releasing a new version" section for the full checklist.
+   Use the 40-character SHA on the line ending in `^{}`. Write it as
+   `uses: fossasia/cla-bot@<that full commit SHA> # v1.0.0`. A full commit SHA
+   cannot be moved to different code later, while a tag, even a protected one,
+   is only a name for a commit. When you later release a new version, repeat
+   steps 4-6 and update every reference; Dependabot or Renovate can do the
+   update for you once the SHA-plus-comment form is in place. Never use a
+   moving reference like `v1` or `main` for anything other than testing.
+   CONTRIBUTING.md's "Releasing a new version" section has the full checklist.
 
 ## Step 2 - Create the central signatures repo
 

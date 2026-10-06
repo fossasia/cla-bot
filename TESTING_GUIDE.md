@@ -251,12 +251,14 @@ Only these values need to change for the real FOSSASIA deployment:
 - The GitHub App needs to be recreated from FOSSASIA's **org** settings
   instead of a personal account (a personal-account App won't work for
   org repos) - everything else about it stays the same.
-- `uses: <you>/cla-bot@main` → `uses: fossasia/cla-bot@vX.Y.Z`, where
-  `vX.Y.Z` is whatever real tag you've actually pushed to
-  `fossasia/cla-bot`. `@main` is fine for testing, but production should
-  always use a pinned tag. Before switching over, check
-  `https://github.com/fossasia/cla-bot/tags` to confirm that tag is
-  genuinely there.
+- `uses: <you>/cla-bot@main` → `uses: fossasia/cla-bot@<full commit SHA> # vX.Y.Z`,
+  where `vX.Y.Z` is a real, **signed** release of `fossasia/cla-bot`.
+  `@main` is fine for testing, but production should always pin the full
+  commit SHA of a release you have verified. Before switching over, check
+  `https://github.com/fossasia/cla-bot/releases` to confirm that release is
+  genuinely there, verify it ("Verifying a release" in SECURITY.md), and take
+  the SHA from `git ls-remote --tags https://github.com/fossasia/cla-bot.git vX.Y.Z "vX.Y.Z^{}"`
+  (the line ending in `^{}`).
 
 The code itself stays exactly the same - no logic changes needed.
 

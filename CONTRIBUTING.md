@@ -22,7 +22,9 @@ FOSSASIA's projects.
    orchestration (`handleIssueComment`, `checkPR`), and
    `test/bot-identity*.test.js` for anything about how the bot resolves its
    own identity, and `test/token-expiry.test.js` for anything about the
-   signatures-repo token's lifetime (caching, refresh, 401 recovery). Run `npm test` before opening a PR - CI runs it too, on
+   signatures-repo token's lifetime (caching, refresh, 401 recovery),
+   `test/release-check.test.js` for the release helper script and
+   `test/release-workflow.test.js` for the properties of `release.yml`. Run `npm test` before opening a PR - CI runs it too, on
    Node 22 and 24.
 3. **This repo requires 100% test coverage (lines, statements, functions
    and branches) on every PR**, enforced by `.github/workflows/coverage.yml`
@@ -43,6 +45,13 @@ FOSSASIA's projects.
 5. Changes to `action.yml` inputs should stay backward compatible where
    possible; if a breaking change is unavoidable, bump the major version
    tag and note it in `CHANGELOG.md`.
+6. **Don't weaken the release pipeline** (`.github/workflows/release.yml`,
+   `.github/scripts/release-check.js`)
+   without discussing it in an issue first: `test/release-workflow.test.js`
+   pins its least-privilege, pinning and ordering properties on purpose.
+   Every third-party action there is pinned to a full commit SHA, and
+   `action.yml` may only `uses:` actions pinned that way (the release SBOM
+   refuses anything else).
 
 ## How the coverage gate is enforced (maintainers)
 
@@ -164,10 +173,13 @@ infer from the name:
   `github.workflow` deadlocks, because inside a reusable workflow that is
   the _caller's_ name. `ci.yml` owns concurrency and cancels superseded
   pull-request runs only.
-- `scorecard.yml` and `coverage-comment.yml` are deliberately outside the
-  gate: Scorecard does not run on pull requests and reports a score rather
-  than pass/fail, and the comment workflow runs after CI (`workflow_run`,
-  listening to the workflow named `CI`) only to post the coverage report.
+- `scorecard.yml`, `coverage-comment.yml` and `release.yml` are deliberately
+  outside the gate: Scorecard does not run on pull requests and reports a
+  score rather than pass/fail, the comment workflow runs after CI
+  (`workflow_run`, listening to the workflow named `CI`) only to post the
+  coverage report, and the release workflow only ever runs for a pushed tag.
+  They are still linted by `actionlint` and `zizmor` like every other file in
+  `.github/workflows/`.
 - A green `codeql` job means the analysis ran, not that there are no
   alerts. It does not block on alerts by itself (opt-in in
   `.github/rulesets/README.md`, "Optional: block on CodeQL alerts").
@@ -180,30 +192,110 @@ infer from the name:
 
 ## Releasing a new version
 
-Every example and setup doc in this project (`examples/consumer-workflow.yml`,
-"SETUP_GUIDE.md", this file) references a specific tag like `@vX.Y.Z`.
-**That tag has to actually exist and be pushed before anything referencing
-it will work** - a workflow pointing at a tag that isn't there yet just
-fails to resolve. When cutting a release:
+Releases are **signed and published by CI, never by hand**. Someone pushes a
+signed, annotated tag; `.github/workflows/release.yml` then verifies
+it, re-runs the whole test suite and the 100% coverage gate, builds the
+assets, signs and attests them with Sigstore (keyless, so there is no signing
+key to guard), publishes the release, and verifies what it published. What a
+release contains and how consumers verify it: "Verifying a release" in
+`SECURITY.md`.
 
-1. Merge your changes to `main` first.
-2. Update `CHANGELOG.md` and `package.json`'s `version` field.
-3. Tag and push:
+Every example and setup doc in this project (`examples/consumer-workflow.yml`,
+"SETUP_GUIDE.md", this file) refers to a release as `@vX.Y.Z`. That release
+has to exist before anything referencing it works, which is why the last step
+below comes **after** the workflow has finished.
+
+### One-time setup (repository admin)
+
+The immutable-releases switch, the environment and your signing key are GitHub
+settings, not repository files. Do this once, and re-check it when something about releasing seems off:
+
+1. **Turn on "Immutable releases"** (Settings -> General -> Releases). Once a
+   release is published, its assets and its tag can never be changed or
+   removed, even by an admin. The workflow creates each release as a draft,
+   fills and verifies it, and only then publishes, precisely so this setting
+   is safe to use. Without it the workflow still works, but warns on every
+   release.
+2. **Create the `release` environment** (Settings -> Environments -> New
+   environment). Required reviewers are optional but recommended: add one or
+   more (enable "Prevent self-review" if there are enough people), and under
+   "Deployment branches and tags" allow only the selected tag pattern `v*`.
+   The `publish` job pauses on this environment, so every release becomes an
+   explicit second-person approval - a human control that does not depend on
+   `main`'s review settings (there are none, by design). With no reviewers
+   configured the job simply runs.
+3. **Register a signing key on your GitHub account**, as a _Signing Key_ (not
+   just an authentication key), and use the same address as a verified email:
    ```bash
-   git tag vX.Y.Z
+   # SSH signing (simplest); GPG works too
+   git config --global gpg.format ssh
+   git config --global user.signingkey ~/.ssh/id_ed25519.pub
+   ```
+   then add that public key at Settings -> SSH and GPG keys -> New SSH key ->
+   Key type **Signing Key**. The workflow refuses any tag GitHub does not
+   report as _verified_.
+4. If your organisation restricts which actions may run, allow
+   `actions/attest`, `actions/upload-artifact`, `actions/download-artifact`
+   and `sigstore/cosign-installer` (plus the ones the CI already uses).
+
+### Rehearse in a fork first
+
+`release.yml` only uses `github.repository`, never a hard-coded name, so it
+runs unchanged in a fork. Before the **first** real release (and after any
+change to the workflow), push a throwaway signed tag such as `v0.0.1` to a fork
+that has its own `release` environment and signing key, and watch the whole
+run, including the final "verify the published release" step. Everything here
+is tested offline (the helper script, the workflow's structure, the CLI flags),
+but signing and attesting need a real GitHub run, and with immutable releases
+a mistake on the real repository burns a version number.
+
+### Cutting a release
+
+1. Merge your changes to `main` and let CI go green. A tag on a commit that is
+   not on `main` is refused.
+2. In a pull request, rename `## [Unreleased]` in `CHANGELOG.md` to
+   `## [X.Y.Z] - YYYY-MM-DD` (leave a new, empty `## [Unreleased]` above it)
+   and bump the version:
+   ```bash
+   npm version X.Y.Z --no-git-tag-version   # updates package.json and package-lock.json
+   ```
+   The section's text becomes the release notes, and the workflow fails if
+   the tag, `package.json` and `CHANGELOG.md` disagree. Merge it.
+3. Tag the merge commit **with a signature**, check it, and push it:
+   ```bash
+   git switch main && git pull
+   git tag -s vX.Y.Z -m "cla-bot vX.Y.Z"
+   git tag -v vX.Y.Z          # must say the signature is good
    git push origin vX.Y.Z
    ```
-4. **Only after step 3 succeeds**, update any `@vX.Y.Z` references in
-   `examples/consumer-workflow.yml` and "SETUP_GUIDE.md" to match, and
-   double-check by opening
-   `https://github.com/fossasia/cla-bot/releases/tag/vX.Y.Z` in a browser
-   (or `git ls-remote --tags origin`) to confirm it's really there, not
-   just that the push command didn't error.
+   Only `vMAJOR.MINOR.PATCH` starts a release; no pre-release suffixes. A
+   lightweight tag (`git tag vX.Y.Z`) or an unverified one fails the run.
+4. Watch the **Release** workflow (Actions tab). Approve the `publish` job
+   when asked. It ends by downloading the published release and verifying it
+   the way a consumer would.
+5. **Only after it succeeded**, open
+   `https://github.com/fossasia/cla-bot/releases/tag/vX.Y.Z`, run the
+   verification in `SECURITY.md` once from a clean machine, and then update
+   the `@vX.Y.Z` references in `examples/consumer-workflow.yml` and
+   "SETUP_GUIDE.md". The commit SHA to pin is
+   `git ls-remote --tags origin vX.Y.Z "vX.Y.Z^{}"` (the `^{}` line).
 
-If you're reading this because an example pointed at a tag that 404s: that
-almost certainly means step 3 hasn't happened yet for the version the docs
-claim exists - go create it, or point the reference back at the last tag
-that actually does exist.
+### If a release run fails
+
+- **The `build` job failed** (tag not verified, version or changelog
+  mismatch, tests, not on `main`): nothing was published. The simplest fix is
+  to repair `main` and cut the **next patch version**; skipping a number costs
+  nothing. Since no release exists yet, you may instead delete the tag
+  (`git push --delete origin vX.Y.Z` and `git tag -d vX.Y.Z`), fix the cause
+  and tag again, as long as nobody has pinned that tag in the meantime. Only a
+  _published_ release is locked, and only if "Immutable releases" is on.
+- **The `publish` job failed** (Sigstore or GitHub outage, approval
+  timed out, upload error): use "Re-run failed jobs". It is safe to repeat; a
+  leftover **draft** is replaced, and a release that is already **published**
+  is never overwritten (the run stops instead).
+- **A published release turns out to be wrong:** never reuse its version, and
+  with immutable releases you could not. Fix `main`, release the next patch
+  version, and say in its changelog which version it supersedes.
 
 ## Local development
 

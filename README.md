@@ -46,8 +46,12 @@ The short version:
   list - not just whoever left a comment. Someone else can't clear a PR by
   signing on your behalf.
 - The list of accounts allowed to skip signing (bots like Dependabot) only
-  matches exact usernames - no wildcards that a person could exploit.
+  matches immutable numeric GitHub account ids - no usernames (which can be
+  renamed and re-claimed) and no wildcards that a person could exploit.
 - This action never checks out or runs any code from the pull request.
+- Releases are **signed and attested** (Sigstore, keyless) by CI from a signed
+  tag, with an SBOM and build provenance - see
+  [Releases and verification](#releases-and-verification).
 
 ## Using this in a repo
 
@@ -57,9 +61,39 @@ into `.github/workflows/cla.yml` in any repo that needs it, and fill in the
 configuration - this README won't duplicate it separately, so it can't
 drift out of date.
 
+Reference the action by the **full commit SHA** of a release you have
+verified, with the version in a trailing comment:
+
+```yaml
+uses: fossasia/cla-bot@<full commit SHA of the release> # vX.Y.Z
+```
+
+A tag is only a name for a commit, and names can be moved; a full commit SHA
+cannot. How to find the SHA and verify the release first is in
+[Releases and verification](#releases-and-verification). Dependabot and
+Renovate keep a SHA pin and its version comment up to date.
+
 For the full org-wide setup - creating the GitHub App, setting up the
 signatures repo, secrets, and rolling this out to every repo - see
 "SETUP_GUIDE.md".
+
+## Releases and verification
+
+Every release is built and published by
+[`release.yml`](./.github/workflows/release.yml) when a signed, annotated
+tag is pushed. It runs the full test suite, then attaches to the release:
+
+- the source archive, signed with [Sigstore](https://www.sigstore.dev/)
+  (keyless - there is no signing key to leak),
+- a CycloneDX SBOM,
+- SLSA build provenance and SBOM attestations,
+- `SHA256SUMS`, itself signed.
+
+Verify a release before you first use it (`sha256sum`, `cosign verify-blob`,
+`gh attestation verify`, `gh release verify`); the exact commands, what the
+signatures do and do not prove, and how to get the commit SHA to pin are in
+"Verifying a release" in [`SECURITY.md`](./SECURITY.md#verifying-a-release).
+How to cut a release is in `CONTRIBUTING.md`.
 
 ## Inputs
 

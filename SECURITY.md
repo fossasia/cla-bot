@@ -31,6 +31,11 @@ In scope:
 
 - `src/cla-bot.js` and `action.yml` in this repository.
 - The composite action's interaction with the GitHub REST API.
+- The release pipeline: `.github/workflows/release.yml`,
+  `.github/scripts/release-check.js`, and the signatures and attestations they produce. A
+  way to publish a release that is not built by that workflow, or a release
+  that passes the verification below without having come from it, is a
+  vulnerability.
 
 Out of scope:
 
@@ -54,6 +59,112 @@ Out of scope:
    GitHub itself reports, exactly like the signature store.
 5. This action never checks out or executes code from the pull request - it
    only reads PR/commit metadata via the API.
+6. A release can only be created by `.github/workflows/release.yml`, from a
+   signed, annotated `vMAJOR.MINOR.PATCH` tag that GitHub reports as
+   verified, on a commit that is already on `main`, after the full test
+   suite and the 100% coverage gate pass on that exact commit. Nobody
+   uploads release assets by hand.
+7. Release signing uses no long-lived key. Assets are signed with Sigstore
+   keyless signing, bound to the identity of that workflow run through
+   GitHub's OIDC token, and recorded in a public transparency log. The
+   `publish` job (the only one that can sign or write) executes no
+   repository code, and the `build` job (the only one that executes
+   repository code) can only read.
+
+## Verifying a release
+
+Every release of this action is built and signed by GitHub Actions
+(`.github/workflows/release.yml`), not on anyone's laptop. A release that does
+not carry **all** the assets below is not a release of this project; do not
+use it.
+
+| Asset                                   | What it is                                                         |
+| --------------------------------------- | ------------------------------------------------------------------ |
+| `cla-bot-<tag>.tar.gz`                  | Source archive of the tagged commit (deterministic `git archive`). |
+| `cla-bot-<tag>.tar.gz.sigstore.json`    | Sigstore (cosign) signature bundle for the archive.                |
+| `cla-bot-<tag>.sbom.cdx.json`           | CycloneDX SBOM: the pinned third-party actions this action runs.   |
+| `cla-bot-<tag>.provenance.intoto.jsonl` | SLSA build-provenance attestation (archive and SBOM).              |
+| `cla-bot-<tag>.sbom.intoto.jsonl`       | Attestation binding the SBOM to the archive.                       |
+| `SHA256SUMS`                            | Checksums of the archive and the SBOM.                             |
+| `SHA256SUMS.sigstore.json`              | Sigstore signature bundle for `SHA256SUMS`.                        |
+
+The signatures prove **where a release came from**: this repository's
+`release.yml`, running on that tag and commit. They do not prove the code is
+free of bugs, and they cannot prove anything about a release you never
+verified. Check before you first pin a version:
+
+```bash
+TAG=vX.Y.Z                      # the release you are about to adopt
+REPO=fossasia/cla-bot
+WORKFLOW="$REPO/.github/workflows/release.yml"
+
+gh release download "$TAG" --repo "$REPO" --dir cla-bot-release
+cd cla-bot-release
+
+# 1. The files are the ones that were signed.
+sha256sum --check --strict SHA256SUMS
+
+# 2. Sigstore signatures (cosign v3 or later). The identity is matched EXACTLY:
+#    this workflow file, on this tag, issued by GitHub's OIDC provider.
+for f in "cla-bot-$TAG.tar.gz" SHA256SUMS; do
+  cosign verify-blob \
+    --bundle "$f.sigstore.json" \
+    --certificate-identity "https://github.com/$WORKFLOW@refs/tags/$TAG" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "$f"
+done
+
+# 3. GitHub build-provenance and SBOM attestations.
+gh attestation verify "cla-bot-$TAG.tar.gz" \
+  --bundle "cla-bot-$TAG.provenance.intoto.jsonl" \
+  --repo "$REPO" --signer-workflow "$WORKFLOW" --source-ref "refs/tags/$TAG"
+gh attestation verify "cla-bot-$TAG.tar.gz" \
+  --bundle "cla-bot-$TAG.sbom.intoto.jsonl" \
+  --repo "$REPO" --signer-workflow "$WORKFLOW" \
+  --predicate-type https://cyclonedx.org/bom
+
+# 4. If "Immutable releases" is enabled (it should be), GitHub itself attests
+#    that the release and its tag were never changed after publishing.
+gh release verify "$TAG" --repo "$REPO"
+gh release verify-asset "$TAG" "cla-bot-$TAG.tar.gz" --repo "$REPO"
+```
+
+Then **pin the commit, not the tag**. The commit a release tag points at is
+the last line printed by:
+
+```bash
+git ls-remote --tags "https://github.com/$REPO.git" "$TAG" "$TAG^{}"
+```
+
+(the line ending in `^{}` is the commit; for an annotated tag the first line
+is the tag object, which is not what you want). Use it in your workflow as
+`uses: fossasia/cla-bot@<that full commit SHA> # vX.Y.Z`, as
+`examples/consumer-workflow.yml` shows. A tag, even a protected one, is a name
+that points at a commit; a full commit SHA is the commit itself, so nothing
+that happens to this repository later can change what your workflow runs.
+Dependabot and Renovate both keep a SHA pin plus a version comment up to
+date.
+
+What the signatures do **not** protect against, and what does:
+
+- **Anyone who can push a tag to this repository.** Nothing restricts who may
+  create a release tag, and "verified" only means the tag was signed by a
+  key registered on the tagger's own GitHub account, so any collaborator with
+  write access and a registered signing key can start a release. The checks
+  that still apply to every release are: the commit must already be on
+  `main`, the tests and the 100% coverage gate must pass on it, and the
+  tagger is identifiable from the signed tag. If the `release` environment has
+  required reviewers, a second person must also approve the publish. This
+  repository also deliberately has no required code review on `main` (see
+  `.github/rulesets/README.md`), so a pull request can in principle change
+  `release.yml` itself, and the identity above only names the workflow _file_,
+  not its contents. If you need more than that, add a required review (see the
+  ruleset README) and check the diff of `release.yml` between the releases you
+  adopt.
+- **A tag moved or deleted after you pinned it.** Pinning the commit SHA makes
+  this irrelevant for you; "Immutable releases" additionally makes it
+  impossible for everyone else once a release is published. A tag that has no
+  published release yet is not protected.
 
 ## Known limitations (not vulnerabilities, but worth knowing)
 
@@ -139,3 +250,15 @@ Out of scope:
   installed on the signatures repo) will only surface at runtime; the
   manual test-PR walkthrough in "TESTING_GUIDE.md" is what actually
   catches those.
+- "Immutable releases" is a repository setting that cannot be turned on from
+  code. Until it is enabled, a published release's assets can in principle
+  still be replaced by an administrator; the signatures would then no
+  longer match, so a verifying consumer notices, but a non-verifying one
+  would not. The release workflow prints a warning on every release for as
+  long as the setting is off.
+- Verification trusts Sigstore's public-good instance (Fulcio, Rekor) and
+  GitHub's OIDC provider and attestation service. An outage of either only
+  delays a release or a verification; it cannot make a bad release verify.
+- The `release` environment and "Immutable releases" are GitHub settings that
+  no file in this repository can apply; confirm they are set (steps in
+  `CONTRIBUTING.md`).

@@ -3,11 +3,19 @@
 # be copied as-is, only the `with:` values under "Run CLA bot" need filling
 # in for your setup.
 #
-# ⚠️ The `uses: fossasia/cla-bot@vX.Y.Z` line only works once that exact tag
-# has been pushed to github.com/fossasia/cla-bot - see CONTRIBUTING.md's
-# "Releasing a new version" section. Check
-# https://github.com/fossasia/cla-bot/tags before copying, and use whatever
-# tag is actually latest if it differs from what's written below.
+# ⚠️ The `uses: fossasia/cla-bot@... # vX.Y.Z` line only works once that
+# release exists - see CONTRIBUTING.md's "Releasing a new version" section.
+# Check https://github.com/fossasia/cla-bot/releases before copying, use the
+# latest release that is actually there, and VERIFY IT first ("Verifying a
+# release" in SECURITY.md): every release is signed, and unsigned or
+# partially-signed ones must not be used.
+#
+# Pin the action by its full commit SHA, with the version only in the trailing
+# comment. A tag is a name that can be moved to a different commit, while a
+# full commit SHA cannot be. Get the SHA of a release with:
+#   git ls-remote --tags https://github.com/fossasia/cla-bot.git vX.Y.Z "vX.Y.Z^{}"
+# (the line ending in ^{} is the commit). Dependabot / Renovate update a SHA
+# pin and its comment together.
 #
 # Full setup walkthrough (creating the GitHub App, the signatures repo,
 # secrets, etc.) is in "SETUP_GUIDE.md" in this repo.
@@ -45,13 +53,12 @@ jobs:
   cla-check:
     runs-on: ubuntu-latest
     steps:
-      # `uses: fossasia/cla-bot@vX.Y.Z` fetches the action from that repo
-      # automatically; no separate checkout step needed. Replace vX.Y.Z
-      # with whatever tag actually exists - check
-      # https://github.com/fossasia/cla-bot/tags. Don't leave the literal
-      # "vX.Y.Z" here; it's a placeholder.
+      # `uses: fossasia/cla-bot@<sha>` fetches the action from that repo
+      # automatically; no separate checkout step needed. Replace BOTH the
+      # placeholder SHA and "vX.Y.Z" with a real, verified release (see the
+      # header of this file). Don't leave the placeholders in.
       - name: Run CLA bot
-        uses: fossasia/cla-bot@vX.Y.Z # <-- replace with a real, existing tag
+        uses: fossasia/cla-bot@REPLACE_WITH_THE_FULL_COMMIT_SHA_OF_THE_RELEASE # vX.Y.Z
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           signatures-owner: fossasia
