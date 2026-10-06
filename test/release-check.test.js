@@ -22,6 +22,7 @@ const SCRIPT = path.join(
 const {
   parseTag,
   declaresDependencies,
+  npmDependencyFields,
   inspectTag,
   extractChangelogSection,
   findReleaseProblems,
@@ -513,13 +514,22 @@ test("inspectTag returns the inspected tag object's SHA (what the publish job la
 
 // --- SBOM -------------------------------------------------------------------
 
+// A minimal composite action.yml around some steps (given as already-indented
+// YAML lines), so each test states only what it is about.
+const composite = (stepsYaml) =>
+  `runs:\n  using: composite\n  steps:\n${stepsYaml}\n`;
+
 test("listActionDependencies finds pinned third-party actions, skips local ones and comments", () => {
   assert.deepStrictEqual(listActionDependencies(ACTION_YML), [
     { name: "actions/setup-node", ref: SHA_A, comment: "v7.0.0" },
     { name: "github/codeql-action/analyze", ref: SHA_B, comment: undefined },
   ]);
   assert.deepStrictEqual(
-    listActionDependencies("runs:\n  using: composite\n"),
+    listActionDependencies(composite("    - run: echo hi")),
+    [],
+  );
+  assert.deepStrictEqual(
+    listActionDependencies("runs:\n  using: composite\n  steps: []\n"),
     [],
   );
 });
@@ -534,72 +544,175 @@ test("listActionDependencies fails closed on anything that is not a full-SHA pin
     "docker://alpine:3",
   ]) {
     assert.throws(
-      () => listActionDependencies(`steps:\n  - uses: ${target}\n`),
+      () => listActionDependencies(composite(`    - uses: ${target}`)),
       /not pinned to a full commit SHA/,
       target,
     );
   }
 });
 
-test("listActionDependencies parses YAML: no layout can hide a dependency (flow style, next-line value, nesting, quoting)", () => {
+test("listActionDependencies parses YAML: no layout of a step can hide a dependency (flow style, next-line value, quoting, alias)", () => {
   const unpinned = "evil/thing@main";
   for (const [label, yml] of [
-    ["flow-style mapping", `steps: [{uses: ${unpinned}}]\n`],
     [
-      "flow-style on one line",
-      `{runs: {steps: [{name: x, uses: ${unpinned}}]}}\n`,
+      "flow-style steps",
+      `runs: {using: composite, steps: [{uses: ${unpinned}}]}\n`,
     ],
-    ["value on the next line", `steps:\n  - uses:\n      ${unpinned}\n`],
-    ["quoted value", `steps:\n  - uses: "${unpinned}"\n`],
-    ["single-quoted value", `steps:\n  - uses: '${unpinned}'\n`],
-    ["deeply nested", `a:\n  b:\n    - c:\n        uses: ${unpinned}\n`],
-    ["anchor and alias", `x: &s {uses: ${unpinned}}\ny: *s\n`],
+    ["flow-style step", composite(`    - {name: x, uses: ${unpinned}}`)],
+    ["value on the next line", composite(`    - uses:\n        ${unpinned}`)],
+    ["quoted value", composite(`    - uses: "${unpinned}"`)],
+    ["single-quoted value", composite(`    - uses: '${unpinned}'`)],
+    [
+      "step reused through an alias",
+      `x: &s {uses: ${unpinned}}\nruns:\n  using: composite\n  steps:\n    - *s\n`,
+    ],
   ]) {
     assert.throws(() => listActionDependencies(yml), /evil\/thing@main/, label);
   }
   // Valid YAML quoting of a PINNED action is understood, not rejected.
   assert.deepStrictEqual(
     listActionDependencies(
-      `steps:\n  - uses: "actions/checkout@${SHA_A}" # v7.0.1\n`,
+      composite(`    - uses: "actions/checkout@${SHA_A}" # v7.0.1`),
     ),
     [{ name: "actions/checkout", ref: SHA_A, comment: "v7.0.1" }],
   );
   assert.deepStrictEqual(
     listActionDependencies(
-      `steps:\n  - uses:\n      actions/checkout@${SHA_A}\n`,
+      composite(`    - uses:\n        actions/checkout@${SHA_A}`),
     ),
     [{ name: "actions/checkout", ref: SHA_A, comment: undefined }],
   );
 });
 
-test("listActionDependencies de-duplicates, rejects non-string `uses`, and rejects invalid YAML", () => {
-  const twice = `steps:\n  - uses: a/b@${SHA_A}\n  - uses: a/b@${SHA_A} # v1\n  - uses: a/b@${SHA_B}\n`;
+test("a `uses` key that is data, not a step, is NOT a dependency (inputs, with:, env)", () => {
+  const yml = [
+    "inputs:",
+    "  uses:",
+    "    description: an input that happens to be called uses",
+    "runs:",
+    "  using: composite",
+    "  steps:",
+    "    - run: echo hi",
+    "      env:",
+    "        uses: evil/thing@main",
+    `    - uses: actions/setup-node@${SHA_A}`,
+    "      with:",
+    "        uses: also-not-a-dependency@main",
+    "",
+  ].join("\n");
+  assert.deepStrictEqual(listActionDependencies(yml), [
+    { name: "actions/setup-node", ref: SHA_A, comment: undefined },
+  ]);
+});
+
+test("listActionDependencies only models composite actions and well-formed steps", () => {
+  for (const [label, yml, message] of [
+    [
+      "node action",
+      "runs:\n  using: node20\n  main: index.js\n",
+      /must be a composite action/,
+    ],
+    [
+      "docker action",
+      "runs:\n  using: docker\n  image: docker://alpine:3\n",
+      /must be a composite action/,
+    ],
+    ["no runs", "name: x\n", /must be a composite action/],
+    ["steps missing", "runs:\n  using: composite\n", /steps must be a list/],
+    [
+      "steps not a list",
+      "runs:\n  using: composite\n  steps: nope\n",
+      /steps must be a list/,
+    ],
+    ["step is a string", composite("    - just a string"), /not a mapping/],
+    ["step is null", composite("    - null"), /not a mapping/],
+    ["step is a list", composite("    - [a, b]"), /not a mapping/],
+  ]) {
+    assert.throws(() => listActionDependencies(yml), message, label);
+  }
+});
+
+test("listActionDependencies de-duplicates, rejects non-string `uses`, and rejects invalid or empty YAML", () => {
+  const twice = composite(
+    [
+      `    - uses: a/b@${SHA_A}`,
+      `    - uses: a/b@${SHA_A} # v1`,
+      `    - uses: a/b@${SHA_B}`,
+    ].join("\n"),
+  );
   assert.deepStrictEqual(listActionDependencies(twice), [
     { name: "a/b", ref: SHA_A, comment: "v1" },
     { name: "a/b", ref: SHA_B, comment: undefined },
   ]);
-  // The same mapping reached twice through an alias is visited once.
-  assert.deepStrictEqual(
-    listActionDependencies(`x: &s {uses: a/b@${SHA_A}}\ny: *s\n`),
-    [{ name: "a/b", ref: SHA_A, comment: undefined }],
-  );
   assert.throws(
-    () => listActionDependencies("steps:\n  - uses: {nested: thing}\n"),
+    () => listActionDependencies(composite("    - uses: {nested: thing}")),
     /not a string/,
   );
   assert.throws(
     () => listActionDependencies("steps: [unclosed\n"),
     /YAMLException|end of the stream|unexpected/i,
   );
-  // An empty document is an error too (js-yaml throws), never "no dependencies".
+  // An empty document is an error (js-yaml throws), never "no dependencies".
   assert.throws(() => listActionDependencies(""), /empty/i);
 });
 
+test("version labels come only from real `uses:` lines and are dropped when ambiguous", () => {
+  // A commented-out line must not label the real dependency.
+  assert.deepStrictEqual(
+    listActionDependencies(
+      `# uses: actions/foo@${SHA_A} # v9.9.9\n` +
+        composite(`    - uses: actions/foo@${SHA_A}`),
+    ),
+    [{ name: "actions/foo", ref: SHA_A, comment: undefined }],
+  );
+  // The same pin labelled differently on two lines: no label rather than a guess.
+  assert.deepStrictEqual(
+    listActionDependencies(
+      composite(
+        [
+          `    - uses: actions/foo@${SHA_A} # v1.0.0`,
+          `    - uses: actions/foo@${SHA_A} # v2.0.0`,
+        ].join("\n"),
+      ),
+    ),
+    [{ name: "actions/foo", ref: SHA_A, comment: undefined }],
+  );
+  // Disagreement stays disagreement even with a third, agreeing line.
+  assert.deepStrictEqual(
+    listActionDependencies(
+      composite(
+        [
+          `    - uses: actions/foo@${SHA_A} # v1.0.0`,
+          `    - uses: actions/foo@${SHA_A} # v2.0.0`,
+          `    - uses: actions/foo@${SHA_A} # v2.0.0`,
+        ].join("\n"),
+      ),
+    ),
+    [{ name: "actions/foo", ref: SHA_A, comment: undefined }],
+  );
+  // Agreeing labels, and labels for a quoted target, are kept.
+  assert.deepStrictEqual(
+    listActionDependencies(
+      composite(
+        [
+          `    - uses: actions/foo@${SHA_A} # v1.0.0`,
+          `    - uses: "actions/foo@${SHA_A}" # v1.0.0`,
+        ].join("\n"),
+      ),
+    ),
+    [{ name: "actions/foo", ref: SHA_A, comment: "v1.0.0" }],
+  );
+});
+
 test("listActionDependencies cannot be dodged by an odd trailing comment or an unpinned line after a pinned one", () => {
-  const yml = `- uses: actions/setup-node@${SHA_A} # v7.0.0 and some more words\n- uses: evil/thing@main # looks fine\n`;
+  const yml = composite(
+    `    - uses: actions/setup-node@${SHA_A} # v7.0.0 and some more words\n    - uses: evil/thing@main # looks fine`,
+  );
   assert.throws(() => listActionDependencies(yml), /evil\/thing@main/);
   assert.deepStrictEqual(
-    listActionDependencies(`- uses: a/b@${SHA_A} # v1 extra words here\n`),
+    listActionDependencies(
+      composite(`    - uses: a/b@${SHA_A} # v1 extra words here`),
+    ),
     [{ name: "a/b", ref: SHA_A, comment: "v1" }],
   );
 });
@@ -615,7 +728,7 @@ test("actionPurl lowercases and handles sub-path actions", () => {
   );
 });
 
-test("buildSbom describes the app and its pinned action dependencies as CycloneDX 1.6", () => {
+test("buildSbom describes the app and its pinned action dependencies as CycloneDX 1.6, versioned by pinned commit", () => {
   const sbom = buildSbom({
     packageJson: PACKAGE,
     tag: "v1.2.3",
@@ -633,13 +746,19 @@ test("buildSbom describes the app and its pinned action dependencies as CycloneD
   assert.deepStrictEqual(sbom.metadata.component.licenses, [
     { license: { id: "Apache-2.0" } },
   ]);
+  // version is the verifiable commit; the source comment is only an annotation
   assert.deepStrictEqual(
-    sbom.components.map((c) => [c.name, c.version]),
+    sbom.components.map((c) => [c.name, c.version, c.properties]),
     [
-      ["actions/setup-node", "v7.0.0"],
-      ["github/codeql-action/analyze", SHA_B],
+      [
+        "actions/setup-node",
+        SHA_A,
+        [{ name: "fossasia:cla-bot:ref-comment", value: "v7.0.0" }],
+      ],
+      ["github/codeql-action/analyze", SHA_B, undefined],
     ],
   );
+  assert.ok(sbom.components.every((c) => c.purl.includes(`@${c.version}`)));
   assert.deepStrictEqual(sbom.dependencies, [
     {
       ref: "pkg:github/fossasia/cla-bot@v1.2.3",
@@ -653,11 +772,42 @@ test("buildSbom omits the timestamp when none is given and tolerates zero depend
     packageJson: PACKAGE,
     tag: "v1.2.3",
     repository: "fossasia/cla-bot",
-    actionYml: "runs:\n  using: composite\n",
+    actionYml: "runs:\n  using: composite\n  steps: []\n",
   });
   assert.ok(!("timestamp" in sbom.metadata));
   assert.deepStrictEqual(sbom.components, []);
   assert.deepStrictEqual(sbom.dependencies[0].dependsOn, []);
+});
+
+test("buildSbom itself refuses npm dependencies in every field, independent of `verify` having run", () => {
+  assert.deepStrictEqual(npmDependencyFields(PACKAGE), []);
+  assert.deepStrictEqual(
+    npmDependencyFields({
+      ...PACKAGE,
+      optionalDependencies: { a: "1" },
+      bundleDependencies: true,
+    }),
+    ["optionalDependencies", "bundleDependencies"],
+  );
+  for (const [field, value] of [
+    ["dependencies", { left: "1.0.0" }],
+    ["optionalDependencies", { left: "1.0.0" }],
+    ["peerDependencies", { left: "1.0.0" }],
+    ["bundleDependencies", ["left"]],
+    ["bundledDependencies", true],
+  ]) {
+    assert.throws(
+      () =>
+        buildSbom({
+          packageJson: { ...PACKAGE, [field]: value },
+          tag: "v1.2.3",
+          repository: "fossasia/cla-bot",
+          actionYml: ACTION_YML,
+        }),
+      new RegExp(`npm dependencies \\(${field}\\)`),
+      field,
+    );
+  }
 });
 
 // --- main() (in process) ----------------------------------------------------
@@ -857,7 +1007,7 @@ test("main sbom: unpinned action.yml dependency, bad tag and usage errors", asyn
     writeProject(dir);
     fs.writeFileSync(
       path.join(dir, "action.yml"),
-      "steps:\n  - uses: a/b@v1\n",
+      composite("    - uses: a/b@v1"),
     );
     const env = {
       RELEASE_TAG: "v1.2.3",
@@ -913,6 +1063,27 @@ test("main sbom: unpinned action.yml dependency, bad tag and usage errors", asyn
   });
 });
 
+test("main sbom: refuses to write an SBOM when package.json declares npm dependencies (no reliance on `verify`)", async () => {
+  await withTmpDir(async (dir) => {
+    writeProject(dir, {
+      pkg: { ...PACKAGE, optionalDependencies: { left: "1.0.0" } },
+    });
+    const out = path.join(dir, "sbom.json");
+    const io = capture();
+    const code = await main(
+      ["sbom", "--out", out],
+      { RELEASE_TAG: "v1.2.3", GITHUB_REPOSITORY: "fossasia/cla-bot" },
+      { ...io, cwd: dir },
+    );
+    assert.strictEqual(code, 1);
+    assert.match(
+      io.err.join("\n"),
+      /::error::package\.json declares npm dependencies \(optionalDependencies\)/,
+    );
+    assert.ok(!fs.existsSync(out), "no SBOM may be written");
+  });
+});
+
 test("main uses process defaults for cwd/stdout/stderr/fetch when none are injected", async () => {
   const realLog = console.error;
   const lines = [];
@@ -960,6 +1131,71 @@ test("CLI: an unexpected error (missing CHANGELOG.md) becomes ::error:: and exit
     assert.strictEqual(result.status, 1);
     assert.match(result.stderr, /^::error::ENOENT/);
     assert.ok(!/\n\s+at /.test(result.stderr), "no stack trace");
+  });
+});
+
+// The release workflow runs `verify` on a fresh runner BEFORE `npm ci`, so
+// `verify` must work with Node built-ins alone. This runs the REAL command in a
+// directory with no node_modules (the script is copied out of the repo, so
+// nothing can resolve js-yaml), with `fetch` stubbed by a preloaded module.
+test("CLI bootstrap: `verify` runs to success with NO node_modules; only `sbom` needs js-yaml", async () => {
+  await withTmpDir(async (dir) => {
+    writeProject(dir);
+    fs.copyFileSync(SCRIPT, path.join(dir, "release-check.js"));
+    fs.writeFileSync(
+      path.join(dir, "stub-fetch.js"),
+      [
+        `const COMMIT = ${JSON.stringify(COMMIT)}, TAG = ${JSON.stringify(TAG_OBJECT)};`,
+        "global.fetch = async (url) => ({ ok: true, status: 200, json: async () =>",
+        '  url.includes("git/ref/tags")',
+        '    ? { object: { type: "tag", sha: TAG } }',
+        '    : { object: { type: "commit", sha: COMMIT }, verification: { verified: true, reason: "valid" } } });',
+        "",
+      ].join("\n"),
+    );
+    const env = { PATH: process.env.PATH };
+    const node = (args, extraEnv) =>
+      spawnSync(process.execPath, args, {
+        cwd: dir,
+        env: { ...env, ...extraEnv },
+        encoding: "utf8",
+      });
+
+    // Precondition: the test is only meaningful if js-yaml really is unresolvable here.
+    const probe = node(["-e", 'require("js-yaml")']);
+    assert.notStrictEqual(
+      probe.status,
+      0,
+      "js-yaml must not be resolvable in the scratch dir",
+    );
+    assert.match(probe.stderr, /MODULE_NOT_FOUND/);
+
+    const output = path.join(dir, "gh-output");
+    const verify = node(
+      [
+        "--require",
+        "./stub-fetch.js",
+        "release-check.js",
+        "verify",
+        "--notes",
+        "notes.md",
+      ],
+      baseEnv({ GITHUB_OUTPUT: output }),
+    );
+    assert.strictEqual(verify.status, 0, verify.stderr);
+    assert.strictEqual(
+      fs.readFileSync(output, "utf8"),
+      `tag-object-sha=${TAG_OBJECT}\n`,
+    );
+    assert.ok(fs.existsSync(path.join(dir, "notes.md")));
+
+    // `sbom` is the only command that needs js-yaml (the workflow runs it after `npm ci`).
+    const sbom = node(["release-check.js", "sbom", "--out", "sbom.json"], {
+      RELEASE_TAG: "v1.2.3",
+      GITHUB_REPOSITORY: "fossasia/cla-bot",
+    });
+    assert.strictEqual(sbom.status, 1);
+    assert.match(sbom.stderr, /Cannot find module 'js-yaml'/);
   });
 });
 

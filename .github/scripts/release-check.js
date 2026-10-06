@@ -31,10 +31,15 @@
  *   node release-check.js sbom --out <file>
  *       Writes a CycloneDX 1.6 SBOM listing what the action actually
  *       depends on at runtime: the third-party actions in action.yml, each
- *       pinned to a full commit SHA. action.yml is PARSED as YAML and every
- *       `uses` key anywhere in it is collected, so no layout (flow style,
- *       value on the next line, quoting) can hide one. An unpinned `uses:`
- *       fails the command, so a release can never ship a mutable dependency.
+ *       pinned to a full commit SHA. action.yml is PARSED as YAML and the
+ *       `uses` of every entry of `runs.steps` is read, so no layout (flow
+ *       style, value on the next line, quoting) can hide one, while a
+ *       `uses` key that is merely data (an input or `with:` value named
+ *       "uses") is correctly not a dependency. Only composite actions are
+ *       modelled; anything else is an error rather than an incomplete SBOM.
+ *       An unpinned `uses:` fails the command, so a release can never ship
+ *       a mutable dependency. `sbom` ALSO refuses npm dependencies itself,
+ *       so its completeness never relies on `verify` having run first.
  *
  * Environment (set by the workflow, never interpolated into shell text):
  *   RELEASE_TAG        e.g. v1.2.3 (github.ref_name)
@@ -103,6 +108,17 @@ function declaresDependencies(value) {
   return true;
 }
 
+// The package.json dependency fields that name anything (empty if none).
+function npmDependencyFields(packageJson) {
+  return NPM_DEPENDENCY_FIELDS.filter((field) =>
+    declaresDependencies(packageJson[field]),
+  );
+}
+
+function npmDependencyMessage(fields) {
+  return `package.json declares npm dependencies (${fields.join(", ")}), which the release SBOM does not describe; extend buildSbom first.`;
+}
+
 // Static consistency checks between the tag and the files it releases.
 function findReleaseProblems({ tag, packageJson, changelog }) {
   const version = parseTag(tag);
@@ -117,14 +133,8 @@ function findReleaseProblems({ tag, packageJson, changelog }) {
       `package.json version is "${packageJson.version}" but the tag is ${tag}; bump package.json before tagging.`,
     );
   }
-  const declared = NPM_DEPENDENCY_FIELDS.filter((field) =>
-    declaresDependencies(packageJson[field]),
-  );
-  if (declared.length > 0) {
-    problems.push(
-      `package.json declares npm dependencies (${declared.join(", ")}), which the release SBOM does not describe; extend buildSbom first.`,
-    );
-  }
+  const declared = npmDependencyFields(packageJson);
+  if (declared.length > 0) problems.push(npmDependencyMessage(declared));
   const section = extractChangelogSection(changelog, version);
   if (section === null) {
     problems.push(`CHANGELOG.md has no "## [${version}]" heading.`);
@@ -189,41 +199,60 @@ async function verifyTagSignature(options) {
   return (await inspectTag(options)).problems;
 }
 
-// Every value of a `uses` key anywhere in a parsed YAML document. Walking the
-// whole tree (not just runs.steps) means no layout can hide a dependency.
-function collectUses(node, found = [], seen = new WeakSet()) {
-  if (node === null || typeof node !== "object" || seen.has(node)) return found;
-  seen.add(node);
-  for (const [key, value] of Object.entries(node)) {
-    if (key === "uses") found.push(value);
-    else collectUses(value, found, seen);
+// The steps of a composite action, validated. Only `runs.steps[*].uses` can
+// make a composite action run someone else's code, so that is the whole
+// dependency surface; a `uses` anywhere else (an input, a `with:` value) is
+// data and must not be mistaken for a dependency.
+function compositeSteps(document) {
+  const runs = document?.runs;
+  if (runs?.using !== "composite") {
+    throw new Error(
+      'action.yml must be a composite action ("runs.using: composite"); the SBOM only models that.',
+    );
   }
-  return found;
+  if (!Array.isArray(runs.steps)) {
+    throw new Error("action.yml runs.steps must be a list of steps.");
+  }
+  return runs.steps;
 }
 
-// "owner/repo@<sha>" -> its trailing "# v1.2.3" comment. YAML parsing drops
-// comments, so they are read from the text; they only label the SBOM entry and
-// are never needed for completeness.
+// "owner/repo@<sha>" -> the trailing "# v1.2.3" comment of the `uses:` LINE
+// that names it, or null when its lines disagree. YAML parsing drops comments,
+// so they are read from the text. Only a line that itself starts with `uses:`
+// counts (a commented-out line starts with `#`), and the label is only ever
+// metadata: the pinned commit, not the label, is the dependency's identity.
 function versionComments(actionYml) {
+  const usesLine =
+    /^[ \t]*(?:-[ \t]+)?uses:[ \t]*["']?([\w./-]+@[0-9a-f]{40})["']?[ \t]*#[ \t]*(\S+)/;
   const comments = new Map();
-  for (const [, target, comment] of actionYml.matchAll(
-    /([\w./-]+@[0-9a-f]{40})["']?[ \t]*#[ \t]*(\S+)/g,
-  )) {
-    if (!comments.has(target)) comments.set(target, comment);
+  for (const line of actionYml.split("\n")) {
+    const match = usesLine.exec(line);
+    if (!match) continue;
+    const [, target, comment] = match;
+    comments.set(
+      target,
+      comments.has(target) && comments.get(target) !== comment ? null : comment,
+    );
   }
   return comments;
 }
 
 // Third-party actions that action.yml runs, each as { name, ref, comment },
-// de-duplicated. Throws if any is not pinned to a full commit SHA, or if the
-// file is not valid YAML.
+// de-duplicated. Throws if action.yml is not valid YAML or not a composite
+// action, or if any `uses` is not pinned to a full commit SHA.
 function listActionDependencies(actionYml) {
   // Loaded here, not at the top: `verify` runs before `npm ci` and must work
-  // with Node built-ins alone. js-yaml is a pinned devDependency.
+  // with Node built-ins alone. js-yaml is a pinned devDependency, available to
+  // `sbom`, which the workflow runs after `npm ci`.
   const yaml = require("js-yaml");
   const comments = versionComments(actionYml);
   const dependencies = new Map();
-  for (const target of collectUses(yaml.load(actionYml))) {
+  for (const step of compositeSteps(yaml.load(actionYml))) {
+    if (step === null || typeof step !== "object" || Array.isArray(step)) {
+      throw new Error("action.yml has a step that is not a mapping.");
+    }
+    if (!("uses" in step)) continue; // a `run:` step
+    const target = step.uses;
     if (typeof target !== "string") {
       throw new Error(
         `action.yml has a "uses" value that is not a string (${JSON.stringify(target)}); refusing to describe it.`,
@@ -237,7 +266,11 @@ function listActionDependencies(actionYml) {
       );
     }
     // Keyed by the full target, so a repeated action collapses to one entry.
-    dependencies.set(target, { name, ref, comment: comments.get(target) });
+    dependencies.set(target, {
+      name,
+      ref,
+      comment: comments.get(target) ?? undefined,
+    });
   }
   return [...dependencies.values()];
 }
@@ -250,16 +283,29 @@ function actionPurl({ name, ref }) {
 }
 
 function buildSbom({ packageJson, tag, repository, actionYml, timestamp }) {
+  // Enforced here, at the point the SBOM is produced, so its completeness
+  // never depends on `verify` having been run before it.
+  const npmFields = npmDependencyFields(packageJson);
+  if (npmFields.length > 0) throw new Error(npmDependencyMessage(npmFields));
+
   const rootRef = `pkg:github/${repository.toLowerCase()}@${tag}`;
   const components = listActionDependencies(actionYml).map((dep) => {
     const purl = actionPurl(dep);
-    return {
+    const component = {
       type: "library",
       "bom-ref": purl,
       name: dep.name,
-      version: dep.comment ?? dep.ref,
+      // The pinned commit is the verifiable version. The human label from the
+      // source comment is an unverified annotation, kept in a property.
+      version: dep.ref,
       purl,
     };
+    if (dep.comment) {
+      component.properties = [
+        { name: "fossasia:cla-bot:ref-comment", value: dep.comment },
+      ];
+    }
+    return component;
   });
   const metadata = {
     component: {
@@ -436,6 +482,7 @@ module.exports = {
   extractChangelogSection,
   findReleaseProblems,
   declaresDependencies,
+  npmDependencyFields,
   inspectTag,
   verifyTagSignature,
   listActionDependencies,

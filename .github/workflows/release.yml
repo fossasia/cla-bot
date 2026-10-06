@@ -31,7 +31,11 @@ name: Release
 #   cla-bot-<tag>.sbom.cdx.json             CycloneDX SBOM
 #   cla-bot-<tag>.provenance.intoto.jsonl   SLSA build provenance (GitHub attestation)
 #   cla-bot-<tag>.sbom.intoto.jsonl         SBOM attestation
-#   SHA256SUMS + SHA256SUMS.sigstore.json   checksums of the above, signed
+#   SHA256SUMS + SHA256SUMS.sigstore.json   checksums of the archive and the
+#                                           SBOM, signed. The signature bundles
+#                                           and attestations are created after
+#                                           it, so they are not listed in it;
+#                                           each verifies on its own.
 # The release is created as a DRAFT, filled, verified, and only then
 # published. That order matters: with "Immutable releases" enabled (see
 # CONTRIBUTING.md) a published release can never be edited, so a broken one
@@ -108,14 +112,13 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
-      # The same suite and the same 100% coverage gate as pull requests. A
-      # tag that does not pass them is never released.
-      - name: Syntax check, tests and 100% coverage
-        run: |
-          set -euo pipefail
-          node --check src/cla-bot.js
-          npm run coverage
-
+      # The assets are built and hashed BEFORE any repository test code runs.
+      # `git archive` reads the commit object, so a test cannot change what is
+      # archived, and if anything that the tests start later touched dist/ it
+      # would no longer match the digest recorded below, which the publish job
+      # re-checks. (They cannot be built before `npm ci`: the SBOM step reads
+      # action.yml with js-yaml.)
+      #
       # `git archive` of the exact commit (not the working tree) gives a
       # deterministic tar (mtime = commit time, fixed umask); `gzip -n`
       # strips the name/timestamp gzip would otherwise embed.
@@ -140,6 +143,15 @@ jobs:
           dist_digest="$(find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)"
           echo "dist-digest=${dist_digest}" >> "$GITHUB_OUTPUT"
           ls -l dist
+
+      # The same suite and the same 100% coverage gate as pull requests. A
+      # tag that does not pass them is never released: this step fails the
+      # job, so the artifact below is never uploaded and publish never runs.
+      - name: Syntax check, tests and 100% coverage
+        run: |
+          set -euo pipefail
+          node --check src/cla-bot.js
+          npm run coverage
 
       - name: Upload build output for the publish job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -302,6 +314,39 @@ jobs:
             "dist/${name}.sbom.intoto.jsonl" \
             dist/SHA256SUMS \
             dist/SHA256SUMS.sigstore.json
+
+      # What GitHub now holds in the DRAFT must be exactly the bytes that were
+      # signed and verified above: compared byte for byte and as a set (no
+      # missing and no extra asset), after the upload and right before the
+      # last tag check and the publish. This narrows, but cannot close, the
+      # window in which someone with write access could alter a draft.
+      - name: Verify the draft's assets are byte-identical to the verified files
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          assets=(
+            "${name}.tar.gz"
+            "${name}.tar.gz.sigstore.json"
+            "${name}.sbom.cdx.json"
+            "${name}.provenance.intoto.jsonl"
+            "${name}.sbom.intoto.jsonl"
+            SHA256SUMS
+            SHA256SUMS.sigstore.json
+          )
+          rm -rf draft
+          mkdir draft
+          gh release download "$RELEASE_TAG" --dir draft
+          count="$(find draft -type f | wc -l)"
+          if [ "$count" -ne "${#assets[@]}" ]; then
+            echo "::error::The draft holds ${count} assets, expected ${#assets[@]}. Refusing to publish."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if ! cmp -s -- "dist/${asset}" "draft/${asset}"; then
+              echo "::error::Draft asset ${asset} differs from the verified file (or is missing). Refusing to publish."
+              exit 1
+            fi
+          done
 
       - name: Re-check the tag before publishing the release
         run: |

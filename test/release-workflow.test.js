@@ -93,6 +93,14 @@ const runsMatching = (steps, re) =>
     (s) => typeof s.run === "string" && re.test(s.run),
     String(re),
   );
+const stepNamed = (steps, name) => {
+  const i = steps.findIndex((s) => s.name === name);
+  assert.ok(i >= 0, `missing step named: ${name}`);
+  return i;
+};
+const DRAFT_CHECK =
+  "Verify the draft's assets are byte-identical to the verified files";
+const PUBLISHED_CHECK = "Verify the published release end to end";
 const usesStartingWith = (steps, prefix) =>
   indexOfStep(
     steps,
@@ -221,16 +229,26 @@ test("publish re-checks the digest build reported through a job output, before s
   );
 });
 
-test("build verifies the tag first, on the default branch, from a read-only token", () => {
+test("build verifies the tag first (on the default branch, read-only token), builds and hashes BEFORE repo test code runs, uploads only after tests pass", () => {
   const onMain = runsMatching(build.steps, /merge-base --is-ancestor/);
   const verify = runsMatching(build.steps, /release-check\.js verify/);
-  const tests = runsMatching(build.steps, /npm run coverage/);
+  const install = runsMatching(build.steps, /npm ci --ignore-scripts/);
   const buildAssets = indexOfStep(
     build.steps,
     (s) => s.id === "build",
     "build step",
   );
-  assert.ok(onMain < verify && verify < tests && tests < buildAssets);
+  const tests = runsMatching(build.steps, /npm run coverage/);
+  const upload = usesStartingWith(build.steps, "actions/upload-artifact@");
+  // verify is dependency-free so it runs first; the SBOM needs js-yaml, so the
+  // install must precede the asset build; the digest is recorded before any
+  // test code runs; a failing test stops the job before anything is uploaded.
+  assert.ok(onMain < verify && verify < install && install < buildAssets);
+  assert.ok(
+    buildAssets < tests && tests < upload,
+    "tests must run after the digest is recorded and before the upload",
+  );
+  assert.match(build.steps[buildAssets].run, /release-check\.js sbom/);
   assert.strictEqual(
     build.steps[verify].env.RELEASE_TAG,
     "${{ github.ref_name }}",
@@ -318,8 +336,9 @@ test("publish signs, then verifies its own output, then drafts, then publishes, 
     runsMatching(steps, /cosign sign-blob/),
     runsMatching(steps, /cosign verify-blob[\s\S]*gh attestation verify/),
     runsMatching(steps, /gh release create/),
+    stepNamed(steps, DRAFT_CHECK),
     runsMatching(steps, /gh release edit/),
-    runsMatching(steps, /gh release download/),
+    stepNamed(steps, PUBLISHED_CHECK),
   ];
   assert.deepStrictEqual(
     [...order].sort((a, b) => a - b),
@@ -425,9 +444,10 @@ test("the tag is re-checked right before the release is created AND right before
   const edit = runsMatching(publish.steps, /gh release edit/);
   const [first, second] = recheckSteps.map((s) => publish.steps.indexOf(s));
   assert.ok(first < create, "re-check must precede creating the release");
+  const draft = stepNamed(publish.steps, DRAFT_CHECK);
   assert.ok(
-    create < second && second < edit,
-    "re-check must sit between creating and publishing",
+    create < draft && draft < second && second < edit,
+    "create, then the draft byte check, then the last tag check, then publish",
   );
   assert.strictEqual(
     first,
@@ -443,7 +463,7 @@ test("the tag is re-checked right before the release is created AND right before
 
 test("after publishing, the tag is checked once more and the release is called compromised if it moved", () => {
   const finalStep =
-    publish.steps[runsMatching(publish.steps, /gh release download/)].run;
+    publish.steps[stepNamed(publish.steps, PUBLISHED_CHECK)].run;
   assert.match(finalStep, /git\/ref\/tags\/\$\{RELEASE_TAG\}/);
   assert.match(finalStep, /"tag \$\{EXPECTED_TAG_OBJECT\}"/);
   assert.match(finalStep, /compromised/);
@@ -540,6 +560,129 @@ test("re-check (real shell, fake gh): an empty expected value or a failing gh ca
   }
 });
 
+// The draft check's shell, run for real in a scratch dir. The fake `gh` serves
+// whatever is in $FAKE_DRAFT_DIR as the draft's assets.
+const draftStep = publish.steps[stepNamed(publish.steps, DRAFT_CHECK)];
+function runDraftCheck(mutate) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "draft-check-"));
+  try {
+    const name = "cla-bot-v1.2.3";
+    const assets = [
+      `${name}.tar.gz`,
+      `${name}.tar.gz.sigstore.json`,
+      `${name}.sbom.cdx.json`,
+      `${name}.provenance.intoto.jsonl`,
+      `${name}.sbom.intoto.jsonl`,
+      "SHA256SUMS",
+      "SHA256SUMS.sigstore.json",
+    ];
+    fs.mkdirSync(path.join(dir, "dist"));
+    fs.mkdirSync(path.join(dir, "served"));
+    for (const asset of assets) {
+      fs.writeFileSync(path.join(dir, "dist", asset), `content of ${asset}\n`);
+      fs.writeFileSync(
+        path.join(dir, "served", asset),
+        `content of ${asset}\n`,
+      );
+    }
+    fs.writeFileSync(
+      path.join(dir, "dist", "RELEASE_NOTES.md"),
+      "notes, never uploaded\n",
+    );
+    mutate({ served: path.join(dir, "served"), name });
+    fs.mkdirSync(path.join(dir, "bin"));
+    fs.writeFileSync(
+      path.join(dir, "bin", "gh"),
+      [
+        "#!/bin/sh",
+        "# gh release download <tag> --dir <dir>",
+        '[ "$1 $2" = "release download" ] || exit 9',
+        'cp "$FAKE_DRAFT_DIR"/* "$5"/',
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const result = spawnSync("bash", ["-c", draftStep.run], {
+      cwd: dir,
+      env: {
+        PATH: `${path.join(dir, "bin")}:${process.env.PATH}`,
+        RELEASE_TAG: "v1.2.3",
+        FAKE_DRAFT_DIR: path.join(dir, "served"),
+      },
+      encoding: "utf8",
+    });
+    return { status: result.status, output: result.stdout + result.stderr };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("draft check (real shell, fake gh): passes only when the draft holds exactly the verified bytes", () => {
+  const ok = runDraftCheck(() => {});
+  assert.strictEqual(ok.status, 0, ok.output);
+});
+
+test("draft check (real shell, fake gh): a changed byte, a swapped, missing or extra asset all stop the release", () => {
+  const cases = [
+    [
+      "one byte appended to the archive",
+      ({ served, name }) =>
+        fs.appendFileSync(path.join(served, `${name}.tar.gz`), "x"),
+    ],
+    [
+      "signature bundle replaced",
+      ({ served, name }) =>
+        fs.writeFileSync(
+          path.join(served, `${name}.tar.gz.sigstore.json`),
+          "forged",
+        ),
+    ],
+    [
+      "SHA256SUMS replaced",
+      ({ served }) =>
+        fs.writeFileSync(path.join(served, "SHA256SUMS"), "forged"),
+    ],
+    [
+      "asset missing",
+      ({ served }) => fs.rmSync(path.join(served, "SHA256SUMS.sigstore.json")),
+    ],
+    [
+      "extra asset added",
+      ({ served }) =>
+        fs.writeFileSync(path.join(served, "backdoor.sh"), "#!/bin/sh"),
+    ],
+    [
+      "asset swapped for another name",
+      ({ served, name }) => {
+        fs.renameSync(
+          path.join(served, `${name}.sbom.cdx.json`),
+          path.join(served, "other.json"),
+        );
+      },
+    ],
+  ];
+  for (const [label, mutate] of cases) {
+    const result = runDraftCheck(mutate);
+    assert.notStrictEqual(result.status, 0, label);
+    assert.match(result.output, /Refusing to publish/, label);
+  }
+});
+
+test("the draft check compares the same asset set that is uploaded", () => {
+  const create =
+    publish.steps[runsMatching(publish.steps, /gh release create/)].run;
+  const uploaded = [
+    ...create.matchAll(/^\s+"?dist\/([^"\s\\]+)"?\s*\\?$/gm),
+  ].map((m) => m[1]);
+  const listed = [
+    ...draftStep.run.matchAll(
+      /^\s+"?(\$\{name\}[^"\s]*|SHA256SUMS[^"\s]*)"?$/gm,
+    ),
+  ].map((m) => m[1]);
+  assert.strictEqual(uploaded.length, 7);
+  assert.deepStrictEqual([...listed].sort(), [...uploaded].sort());
+});
+
 test("every `gh attestation verify` pins repo, signer workflow, tag ref AND commit digest (before and after publishing)", () => {
   const commands = [
     ...raw.matchAll(/gh attestation verify(?:[^\n]*\\\n)*[^\n]*/g),
@@ -559,10 +702,14 @@ test("every `gh attestation verify` pins repo, signer workflow, tag ref AND comm
       assert.ok(command.includes(flag), `missing ${flag} in:\n${command}`);
     }
   }
-  assert.strictEqual(
-    commands.filter((c) => c.includes("https://cyclonedx.org/bom")).length,
-    2,
-  );
+  // Compare the flag's whole value, never a substring of a URL.
+  const predicateTypes = commands
+    .map((c) => /--predicate-type "([^"]*)"/.exec(c)?.[1])
+    .filter((value) => value !== undefined);
+  assert.deepStrictEqual(predicateTypes, [
+    "https://cyclonedx.org/bom",
+    "https://cyclonedx.org/bom",
+  ]);
 });
 
 // --- assets, docs, Scorecard -----------------------------------------------------------

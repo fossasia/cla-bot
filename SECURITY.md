@@ -67,7 +67,9 @@ Out of scope:
    is pinned: the publish job re-checks, right before it creates the release
    and again right before it publishes, that the tag still resolves to that
    exact object, so a tag moved or re-signed during the approval pause cannot
-   be released.
+   be released. The draft release is also compared byte for byte, and as a
+   set of assets, with the files that were signed and verified, right before
+   it is published.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The
@@ -172,6 +174,12 @@ What the signatures do **not** protect against, and what does:
   exists). What remains is a window of a few milliseconds between the last
   check and GitHub's publish call, and a final check after publishing that
   fails the run loudly if the tag moved anyway.
+- **A draft release altered by someone with write access.** The byte-for-byte
+  comparison right before publishing narrows this to the instant between that
+  comparison and GitHub's publish call; it cannot be closed from inside a
+  workflow. The post-publish verification then re-checks what users download
+  and fails the run loudly, and consumers who verify (above) are protected
+  regardless.
 - **A tag moved or deleted after you pinned it.** Pinning the commit SHA makes
   this irrelevant for you; "Immutable releases" additionally makes it
   impossible for everyone else once a release is published. A tag that has no
