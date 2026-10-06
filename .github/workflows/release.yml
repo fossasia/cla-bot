@@ -1,0 +1,307 @@
+name: Release
+
+# Publishes a SIGNED release when a signed, annotated tag vMAJOR.MINOR.PATCH
+# is pushed. This is the only way a release is created; there is no
+# manual "Draft a new release" step. How to cut one, the one-time repository
+# settings it relies on, and how consumers verify the result: see
+# CONTRIBUTING.md ("Releasing a new version") and SECURITY.md ("Verifying a
+# release").
+#
+# Deliberately NOT part of the "Required checks pass" gate in ci.yml: it
+# never runs on pull requests, so it can't be a required status check (the
+# same reason scorecard.yml is outside the gate).
+#
+# Two jobs, so that nothing which runs repository code can sign or publish:
+#
+#   build    contents: read ONLY. Verifies the tag, runs the full test suite
+#            and builds the assets. Runs the repo's code, holds no token
+#            that can write anything.
+#   publish  Holds the powerful permissions (OIDC for signing, attestations,
+#            contents: write) but checks out and executes NO repository
+#            code: it only handles the files `build` produced, after
+#            re-checking their digest against a value `build` passed as a job
+#            output (not through the artifact store). It also waits for
+#            approval on the `release` environment when that environment has
+#            required reviewers (recommended).
+#
+# What every release carries (all signed by this workflow's identity via
+# Sigstore, keyless: there is no signing key to steal or rotate):
+#   cla-bot-<tag>.tar.gz                    source archive of the tagged commit
+#   cla-bot-<tag>.tar.gz.sigstore.json      cosign signature bundle
+#   cla-bot-<tag>.sbom.cdx.json             CycloneDX SBOM
+#   cla-bot-<tag>.provenance.intoto.jsonl   SLSA build provenance (GitHub attestation)
+#   cla-bot-<tag>.sbom.intoto.jsonl         SBOM attestation
+#   SHA256SUMS + SHA256SUMS.sigstore.json   checksums of the above, signed
+# The release is created as a DRAFT, filled, verified, and only then
+# published. That order matters: with "Immutable releases" enabled (see
+# CONTRIBUTING.md) a published release can never be edited, so a broken one
+# would burn its version number.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions: {}
+
+# Serialised, never cancelled: two releases racing each other (or a rerun
+# overlapping the original) must queue, not interrupt a half-published one.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Verify and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # checkout, and read the tag object through the REST API
+    outputs:
+      dist-digest: ${{ steps.build.outputs.dist-digest }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Full history: the next step needs origin/<default branch> to ask
+          # "is this commit on main?".
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Without this, anyone with write access could release code that was
+      # never reviewed or tested on main by tagging a side branch.
+      - name: Require the tagged commit to be on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/${DEFAULT_BRANCH}"; then
+            echo "::error::${GITHUB_SHA} is not on ${DEFAULT_BRANCH}. Releases may only be cut from commits that were merged through CI."
+            exit 1
+          fi
+
+      # Caching is switched off explicitly: a release job must not restore a
+      # cache that a pull-request run could have written (cache poisoning).
+      # setup-node v7 turns it on by default whenever package.json names npm
+      # as its package manager, so omitting `cache:` alone is not enough.
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Tag is vX.Y.Z, matches package.json and CHANGELOG.md, and is an
+      # annotated tag GitHub reports as cryptographically verified.
+      - name: Verify tag, version, changelog and tag signature
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          node .github/scripts/release-check.js verify --notes dist/RELEASE_NOTES.md
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # The same suite and the same 100% coverage gate as pull requests. A
+      # tag that does not pass them is never released.
+      - name: Syntax check, tests and 100% coverage
+        run: |
+          set -euo pipefail
+          node --check src/cla-bot.js
+          npm run coverage
+
+      # `git archive` of the exact commit (not the working tree) gives a
+      # deterministic tar (mtime = commit time, fixed umask); `gzip -n`
+      # strips the name/timestamp gzip would otherwise embed.
+      - name: Build release assets
+        id: build
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          SOURCE_DATE_ISO="$(TZ=UTC git show -s --format=%cd --date=format-local:'%Y-%m-%dT%H:%M:%SZ' "$GITHUB_SHA")"
+          export SOURCE_DATE_ISO
+
+          git -c tar.umask=0022 archive --format=tar --prefix="${name}/" "$GITHUB_SHA" \
+            | gzip -9 -n > "dist/${name}.tar.gz"
+          node .github/scripts/release-check.js sbom --out "dist/${name}.sbom.cdx.json"
+          (cd dist && sha256sum "${name}.tar.gz" "${name}.sbom.cdx.json" > SHA256SUMS)
+
+          # One digest over every file in dist/. The publish job recomputes
+          # it, so a swapped file between the jobs is caught even though the
+          # checksums file itself travels in the same artifact.
+          dist_digest="$(find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)"
+          echo "dist-digest=${dist_digest}" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Upload build output for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Sign and publish
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Add required reviewers (and restrict deployments to the v* tags) on this
+    # environment to turn every release into an explicit human approval.
+    environment:
+      name: release
+    permissions:
+      contents: write # create the release and upload assets
+      id-token: write # Sigstore keyless signing (OIDC)
+      attestations: write # store the GitHub attestations
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      # There is no checkout in this job, so tell gh which repository to use.
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download build output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-dist
+          path: dist
+
+      - name: Verify the files are exactly what the build job produced
+        env:
+          EXPECTED_DIGEST: ${{ needs.build.outputs.dist-digest }}
+        run: |
+          set -euo pipefail
+          actual="$(find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)"
+          if [ -z "$EXPECTED_DIGEST" ] || [ "$actual" != "$EXPECTED_DIGEST" ]; then
+            echo "::error::dist/ does not match the digest reported by the build job (expected '${EXPECTED_DIGEST}', got '${actual}'). Refusing to sign."
+            exit 1
+          fi
+          (cd dist && sha256sum --check --strict SHA256SUMS)
+
+      # cosign is pinned by version here; Dependabot bumps the installer
+      # action but not this value, so bump `cosign-release` alongside it.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
+
+      # Each attest step writes its bundle to a path of its own choosing, so
+      # it is copied to its final name right after the step that made it.
+      - name: Attest build provenance for the assets
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+          create-storage-record: false
+
+      - name: Keep the provenance bundle as a release asset
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: cp -- "$BUNDLE" "dist/cla-bot-${RELEASE_TAG}.provenance.intoto.jsonl"
+
+      - name: Attest the SBOM
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/cla-bot-${{ github.ref_name }}.tar.gz
+          sbom-path: dist/cla-bot-${{ github.ref_name }}.sbom.cdx.json
+          create-storage-record: false
+
+      - name: Keep the SBOM attestation bundle as a release asset
+        env:
+          BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: cp -- "$BUNDLE" "dist/cla-bot-${RELEASE_TAG}.sbom.intoto.jsonl"
+
+      # Signing SHA256SUMS covers the SBOM too; the archive is signed on its
+      # own so it verifies without the checksum file.
+      - name: Sign the archive and the checksums with cosign (keyless)
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          cosign sign-blob --yes --bundle "dist/${name}.tar.gz.sigstore.json" "dist/${name}.tar.gz"
+          cosign sign-blob --yes --bundle "dist/SHA256SUMS.sigstore.json" dist/SHA256SUMS
+
+      # Verify what was just produced, with the exact checks a consumer is
+      # told to run, BEFORE anything becomes public.
+      - name: Verify our own signatures and attestations before publishing
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+          for file in "${name}.tar.gz" SHA256SUMS; do
+            cosign verify-blob \
+              --bundle "dist/${file}.sigstore.json" \
+              --certificate-identity "https://github.com/${workflow}@${GITHUB_REF}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "dist/${file}"
+          done
+          gh attestation verify "dist/${name}.tar.gz" \
+            --bundle "dist/${name}.provenance.intoto.jsonl" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$workflow" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA"
+          gh attestation verify "dist/${name}.tar.gz" \
+            --bundle "dist/${name}.sbom.intoto.jsonl" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$workflow" \
+            --predicate-type "https://cyclonedx.org/bom"
+
+      # Draft first, publish last. A leftover DRAFT from a failed earlier run
+      # of this same tag is replaced; a PUBLISHED release is never touched
+      # (with immutable releases it could not be, and it must not be silently
+      # replaced either way).
+      - name: Create the draft release
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$state" != "true" ]; then
+              echo "::error::Release ${RELEASE_TAG} is already published and is never overwritten. Use a new version."
+              exit 1
+            fi
+            gh release delete "$RELEASE_TAG" --yes
+          fi
+          gh release create "$RELEASE_TAG" \
+            --draft \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --notes-file dist/RELEASE_NOTES.md \
+            "dist/${name}.tar.gz" \
+            "dist/${name}.tar.gz.sigstore.json" \
+            "dist/${name}.sbom.cdx.json" \
+            "dist/${name}.provenance.intoto.jsonl" \
+            "dist/${name}.sbom.intoto.jsonl" \
+            dist/SHA256SUMS \
+            dist/SHA256SUMS.sigstore.json
+
+      - name: Publish the release
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest
+
+      # Download what users will download and verify it the way users will.
+      - name: Verify the published release end to end
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+          mkdir published
+          gh release download "$RELEASE_TAG" --dir published
+          (cd published && sha256sum --check --strict SHA256SUMS)
+          for file in "${name}.tar.gz" SHA256SUMS; do
+            cosign verify-blob \
+              --bundle "published/${file}.sigstore.json" \
+              --certificate-identity "https://github.com/${workflow}@${GITHUB_REF}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "published/${file}"
+          done
+          gh attestation verify "published/${name}.tar.gz" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$workflow" \
+            --source-ref "$GITHUB_REF"
+          # Only succeeds when "Immutable releases" is enabled for the
+          # repository; otherwise it is a nudge, not a failure.
+          gh release verify "$RELEASE_TAG" \
+            || echo "::warning::${RELEASE_TAG} is not an immutable release. Enable \"Immutable releases\" in the repository settings (see CONTRIBUTING.md)."
