@@ -50,8 +50,9 @@ FOSSASIA's projects.
    without discussing it in an issue first: `test/release-workflow.test.js`
    pins its least-privilege, pinning and ordering properties on purpose.
    Every third-party action there is pinned to a full commit SHA, and
-   `action.yml` may only `uses:` actions pinned that way (the release SBOM
-   refuses anything else).
+   `action.yml` may only `uses:` actions pinned that way, and no local `./`
+   action (the release SBOM refuses anything else rather than describing it
+   incompletely).
 
 ## How the coverage gate is enforced (maintainers)
 
@@ -214,8 +215,11 @@ settings, not repository files. Do this once, and re-check it when something abo
    release is published, its assets and its tag can never be changed or
    removed, even by an admin. The workflow creates each release as a draft,
    fills and verifies it, and only then publishes, precisely so this setting
-   is safe to use. Without it the workflow still works, but warns on every
-   release.
+   is safe to use. The workflow ends by requiring the release to be
+   immutable and **fails the run** (after publishing; it cannot undo the
+   release) if it is not, so turn this on **before** the first release. A
+   rehearsal fork that cannot or does not want it sets the repository variable
+   `ALLOW_MUTABLE_RELEASES` to `true` to accept mutable releases explicitly.
 2. **Create the `release` environment** (Settings -> Environments -> New
    environment). Required reviewers are optional but recommended: add one or
    more (enable "Prevent self-review" if there are enough people), and under
@@ -291,8 +295,24 @@ a mistake on the real repository burns a version number.
   _published_ release is locked, and only if "Immutable releases" is on.
 - **A "no longer resolves to the signed tag object" error** means the tag was
   moved, deleted and re-created, or re-signed after the build job verified it.
-  Nothing was published. Do not re-run: investigate who changed the tag, then
-  release the next patch version from a fresh tag.
+  Two cases, told apart by the message:
+  - _Before publishing_ ("Refusing to release"): nothing is public. Do not
+    re-run; investigate who changed the tag, then release the next patch
+    version from a fresh tag.
+  - _After publishing_ ("Treat this release as compromised"): the release **is
+    public**. Do not re-run. If the release is still editable (no immutable
+    releases), mark it as a pre-release with a notice, or delete it; find out
+    who moved the tag; release the next patch version from a fresh, verified
+    tag and say in its changelog which version it supersedes. Consumers who
+    pinned a verified commit SHA are unaffected, but tell everyone else to
+    move to the new version.
+- **A draft check error** ("Refusing to publish": assets or release metadata
+  differ from what was prepared) means someone or something changed the draft
+  after it was created. Nothing is public. Delete the draft, find out why, and
+  re-run the failed jobs.
+- **"... is NOT an immutable release"** at the very end: the release is
+  published, signed and verified, but "Immutable releases" is off. Turn it on
+  before the next release (it cannot be applied to this one).
 - **The `publish` job failed** (Sigstore or GitHub outage, approval
   timed out, upload error): use "Re-run failed jobs". It is safe to repeat; a
   leftover **draft** is replaced, and a release that is already **published**

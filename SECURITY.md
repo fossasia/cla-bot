@@ -61,15 +61,20 @@ Out of scope:
    only reads PR/commit metadata via the API.
 6. A release can only be created by `.github/workflows/release.yml`, from a
    signed, annotated `vMAJOR.MINOR.PATCH` tag that GitHub reports as
-   verified, on a commit that is already on `main`, after the full test
-   suite and the 100% coverage gate pass on that exact commit. Nobody
+   verified and whose own signed name is that same version (so a valid
+   signed tag for another version cannot be replayed under a new name), on a
+   commit that is already on `main`, after the full test suite and the 100%
+   coverage gate pass on that exact commit. The workflow checks only that the
+   commit is an ancestor of `main`; that commits reach `main` through a pull
+   request and a passing "Required checks pass" is enforced by the `main`
+   ruleset (`.github/rulesets/main.json`), which must be applied. Nobody
    uploads release assets by hand. The signed tag object the build verified
    is pinned: the publish job re-checks, right before it creates the release
    and again right before it publishes, that the tag still resolves to that
    exact object, so a tag moved or re-signed during the approval pause cannot
-   be released. The draft release is also compared byte for byte, and as a
-   set of assets, with the files that were signed and verified, right before
-   it is published.
+   be released. The draft release is also compared with what was prepared
+   and verified, right before it is published: its assets byte for byte and as
+   a set, and its title, tag, notes, draft and pre-release flags.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The
@@ -167,17 +172,27 @@ What the signatures do **not** protect against, and what does:
   not its contents. If you need more than that, add a required review (see the
   ruleset README) and check the diff of `release.yml` between the releases you
   adopt.
-- **A tag moved between verification and release.** Not possible through this
-  workflow: the publish job refuses to continue unless the tag still resolves
-  to the exact signed tag object that was verified (`gh release create
---verify-tag` alone would not catch this; it only checks that the tag
-  exists). What remains is a window of a few milliseconds between the last
-  check and GitHub's publish call, and a final check after publishing that
-  fails the run loudly if the tag moved anyway.
-- **A draft release altered by someone with write access.** The byte-for-byte
-  comparison right before publishing narrows this to the instant between that
-  comparison and GitHub's publish call; it cannot be closed from inside a
-  workflow. The post-publish verification then re-checks what users download
+- **A tag moved between verification and release.** The publish job refuses
+  to continue unless the tag still resolves to the exact signed tag object
+  that was verified (`gh release create --verify-tag` alone would not catch
+  this; it only checks that the tag exists). Two different outcomes, which
+  call for different responses:
+  - _Caught before publishing_ (the normal case): the run fails with "no
+    longer resolves to the signed tag object", **nothing is public**, and
+    nothing needs undoing.
+  - _Caught only after publishing_ (the tag moved in the few milliseconds
+    between the last check and GitHub's publish call, or in the seconds
+    before an immutable release locks it): the run fails with "after
+    publishing ... Treat this release as compromised". **The release is
+    already public.** Do not re-run it; follow "If a release run fails" in
+    `CONTRIBUTING.md` (mark or remove the release if it is still editable,
+    find out who moved the tag, release the next patch version). Consumers who
+    pinned the commit of a release they verified are unaffected, because the
+    signed assets and attestations still describe the commit that was built.
+- **A draft release altered by someone with write access.** The comparison
+  of assets and metadata right before publishing narrows this to the instant
+  between that comparison and GitHub's publish call; it cannot be closed from
+  inside a workflow. The post-publish verification then re-checks what users download
   and fails the run loudly, and consumers who verify (above) are protected
   regardless.
 - **A tag moved or deleted after you pinned it.** Pinning the commit SHA makes
@@ -273,8 +288,18 @@ What the signatures do **not** protect against, and what does:
   code. Until it is enabled, a published release's assets can in principle
   still be replaced by an administrator; the signatures would then no
   longer match, so a verifying consumer notices, but a non-verifying one
-  would not. The release workflow prints a warning on every release for as
-  long as the setting is off.
+  would not. The release workflow therefore ends by requiring the release to
+  be immutable and FAILS the run (after publishing, so it cannot undo the
+  release) if it is not, unless the repository variable
+  `ALLOW_MUTABLE_RELEASES` is `true`, an explicit opt-out meant for rehearsal
+  forks.
+- The release SBOM lists the pinned third-party actions that `action.yml`
+  runs (`runs.steps[*].uses`). It deliberately models only a composite action
+  with no local `./` actions: anything else makes the release fail instead of
+  producing an incomplete SBOM. It does not describe anything a step
+  downloads at run time.
+- The workflow proves that the released commit is an ancestor of `main`, not
+  how it got there; that is the `main` ruleset's job (see above).
 - Verification trusts Sigstore's public-good instance (Fulcio, Rekor) and
   GitHub's OIDC provider and attestation service. An outage of either only
   delays a release or a verification; it cannot make a bad release verify.

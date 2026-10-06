@@ -69,7 +69,6 @@ const ACTION_YML = [
   `    - uses: actions/setup-node@${SHA_A} # v7.0.0`,
   "      with:",
   '        node-version: "22"',
-  "    - uses: ./local-step",
   `    - uses: github/codeql-action/analyze@${SHA_B}`,
   "    # uses: not/a-real-step@main",
   "",
@@ -114,6 +113,7 @@ function fakeFetch(routes, seen = []) {
 const annotatedRoutes = (overrides = {}) => ({
   "git/ref/tags/v1.2.3": { object: { type: "tag", sha: TAG_OBJECT } },
   [`git/tags/${TAG_OBJECT}`]: {
+    tag: "v1.2.3",
     object: { type: "commit", sha: COMMIT },
     verification: { verified: true, reason: "valid" },
     ...overrides,
@@ -204,6 +204,64 @@ test("extractChangelogSection handles Windows line endings and never compiles th
   assert.strictEqual(
     extractChangelogSection("## [1.2.3] extra\n- x\n", "1.2.3"),
     null,
+  );
+});
+
+test("extractChangelogSection ignores headings inside fenced code blocks (backtick and tilde fences)", () => {
+  const fenced = [
+    "## [Unreleased]",
+    "",
+    "## [1.2.3]",
+    "",
+    "```md",
+    "## [1.2.2]",
+    "## Not a boundary",
+    "```",
+    "",
+    "~~~~",
+    "## Also not a boundary",
+    "~~~",
+    "still inside the longer tilde fence",
+    "~~~~",
+    "",
+    "- real notes",
+    "",
+    "## [1.2.2]",
+    "",
+    "- older",
+    "",
+  ].join("\n");
+  const section = extractChangelogSection(fenced, "1.2.3");
+  assert.match(section, /## Not a boundary/);
+  assert.match(section, /## Also not a boundary/);
+  assert.match(section, /still inside the longer tilde fence/);
+  assert.match(section, /- real notes$/);
+  assert.ok(!section.includes("- older"));
+  assert.strictEqual(extractChangelogSection(fenced, "1.2.2"), "- older");
+  // A heading that only exists inside a fence is not a heading.
+  assert.strictEqual(
+    extractChangelogSection("```\n## [9.9.9]\n- x\n```\n", "9.9.9"),
+    null,
+  );
+  // A ~~~ line does not close a ``` fence (and the other way round), however long.
+  const wrongChar =
+    "## [1.2.3]\n```\n~~~\n## still code\n~~~~~~\n```\n- after\n## [1.2.2]\n- old\n";
+  assert.strictEqual(
+    extractChangelogSection(wrongChar, "1.2.3"),
+    "```\n~~~\n## still code\n~~~~~~\n```\n- after",
+  );
+  const wrongChar2 =
+    "## [1.2.3]\n~~~\n```\n## still code\n````\n~~~\n- after\n## [1.2.2]\n- old\n";
+  assert.strictEqual(
+    extractChangelogSection(wrongChar2, "1.2.3"),
+    "~~~\n```\n## still code\n````\n~~~\n- after",
+  );
+  // A closing fence needs the same character, enough length and nothing after it;
+  // an unclosed fence runs to the end of the file.
+  const notClosed = "## [1.2.3]\n```\n~~~\n``` js\n## [1.2.2]\n- hidden\n";
+  assert.strictEqual(
+    extractChangelogSection(notClosed, "1.2.3"),
+    "```\n~~~\n``` js\n## [1.2.2]\n- hidden",
   );
 });
 
@@ -416,6 +474,31 @@ test("verifyTagSignature requires verified === true exactly (truthy strings do n
   assert.strictEqual(problems.length, 1);
 });
 
+test("verifyTagSignature rejects a validly signed tag object that carries a DIFFERENT tag name (replayed under a new ref)", async () => {
+  for (const [label, overrides] of [
+    ["another version", { tag: "v1.2.2" }],
+    ["prefix of the name", { tag: "v1.2" }],
+    ["suffix-extended name", { tag: "v1.2.30" }],
+    ["different case", { tag: "V1.2.3" }],
+    ["missing name field", { tag: undefined }],
+  ]) {
+    const problems = await verifyTagSignature({
+      repository: "fossasia/cla-bot",
+      tag: "v1.2.3",
+      commit: COMMIT,
+      token: "t",
+      // signature valid, commit right: ONLY the name is wrong
+      fetchImpl: fakeFetch(annotatedRoutes(overrides)),
+    });
+    assert.strictEqual(problems.length, 1, label);
+    assert.match(
+      problems[0],
+      /signed tag object is named .* not "v1\.2\.3"/,
+      label,
+    );
+  }
+});
+
 test("verifyTagSignature rejects a tag pointing at another commit or at a non-commit", async () => {
   const wrongCommit = await verifyTagSignature({
     repository: "fossasia/cla-bot",
@@ -446,11 +529,12 @@ test("verifyTagSignature reports every problem together", async () => {
     token: "t",
     fetchImpl: fakeFetch(
       annotatedRoutes({
+        tag: "v9.9.9",
         verification: { verified: false, reason: "bad_cert" },
       }),
     ),
   });
-  assert.strictEqual(problems.length, 2);
+  assert.strictEqual(problems.length, 3);
 });
 
 test("verifyTagSignature throws on an API error instead of guessing", async () => {
@@ -519,7 +603,7 @@ test("inspectTag returns the inspected tag object's SHA (what the publish job la
 const composite = (stepsYaml) =>
   `runs:\n  using: composite\n  steps:\n${stepsYaml}\n`;
 
-test("listActionDependencies finds pinned third-party actions, skips local ones and comments", () => {
+test("listActionDependencies finds pinned third-party actions and ignores commented-out ones", () => {
   assert.deepStrictEqual(listActionDependencies(ACTION_YML), [
     { name: "actions/setup-node", ref: SHA_A, comment: "v7.0.0" },
     { name: "github/codeql-action/analyze", ref: SHA_B, comment: undefined },
@@ -581,6 +665,24 @@ test("listActionDependencies parses YAML: no layout of a step can hide a depende
       composite(`    - uses:\n        actions/checkout@${SHA_A}`),
     ),
     [{ name: "actions/checkout", ref: SHA_A, comment: undefined }],
+  );
+});
+
+test("a local `./` action is refused, not skipped (it resolves against the caller's workspace and could hide dependencies)", () => {
+  for (const target of ["./local-step", "./.github/actions/thing", "./"]) {
+    assert.throws(
+      () =>
+        listActionDependencies(
+          composite(`    - uses: ${target}\n    - uses: a/b@${SHA_A}`),
+        ),
+      /local path .* does not model/s,
+      target,
+    );
+  }
+  // ...but a path that merely contains "./" is just an unpinned reference.
+  assert.throws(
+    () => listActionDependencies(composite("    - uses: a/./b@main")),
+    /not pinned/,
   );
 });
 
@@ -875,6 +977,7 @@ test("main verify refuses to emit a malformed tag object id as a step output", a
         fetchImpl: fakeFetch({
           "git/ref/tags/v1.2.3": { object: { type: "tag", sha: "x\nevil=1" } },
           "git/tags/x\nevil=1": {
+            tag: "v1.2.3",
             object: { type: "commit", sha: COMMIT },
             verification: { verified: true, reason: "valid" },
           },
@@ -1149,7 +1252,7 @@ test("CLI bootstrap: `verify` runs to success with NO node_modules; only `sbom` 
         "global.fetch = async (url) => ({ ok: true, status: 200, json: async () =>",
         '  url.includes("git/ref/tags")',
         '    ? { object: { type: "tag", sha: TAG } }',
-        '    : { object: { type: "commit", sha: COMMIT }, verification: { verified: true, reason: "valid" } } });',
+        '    : { tag: "v1.2.3", object: { type: "commit", sha: COMMIT }, verification: { verified: true, reason: "valid" } } });',
         "",
       ].join("\n"),
     );

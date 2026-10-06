@@ -17,8 +17,9 @@
  *            about it before adding one (and see CONTRIBUTING.md).
  *         4. CHANGELOG.md has a non-empty "## [X.Y.Z]" section. It becomes
  *            the release notes, written to --notes.
- *         5. The tag is ANNOTATED, points at GITHUB_SHA (the commit being
- *            built), and GitHub reports its signature as verified.
+ *         5. The tag is ANNOTATED, the tag object's own name is the tag being
+ *            released, it points at GITHUB_SHA (the commit being built), and
+ *            GitHub reports its signature as verified.
  *       Check 5 ties a release to an identifiable person: anyone who can push
  *       a tag can start this workflow, but only the holder of a signing key
  *       registered on their GitHub account can push a *verified* one. The
@@ -36,7 +37,8 @@
  *       style, value on the next line, quoting) can hide one, while a
  *       `uses` key that is merely data (an input or `with:` value named
  *       "uses") is correctly not a dependency. Only composite actions are
- *       modelled; anything else is an error rather than an incomplete SBOM.
+ *       modelled; anything else (a node/docker action, a local `./` action) is
+ *       an error rather than an incomplete SBOM.
  *       An unpinned `uses:` fails the command, so a release can never ship
  *       a mutable dependency. `sbom` ALSO refuses npm dependencies itself,
  *       so its completeness never relies on `verify` having run first.
@@ -82,20 +84,53 @@ function parseTag(tag) {
   return match ? `${match[1]}.${match[2]}.${match[3]}` : null;
 }
 
+// For each line: is it OUTSIDE a fenced code block (``` or ~~~)? A "## ..."
+// line inside a fence is code, not a heading, and must neither start nor end a
+// section. Follows CommonMark: a fence closes on the same character with at
+// least the opening length and nothing after it.
+function linesOutsideFences(lines) {
+  let fence = null;
+  return lines.map((line) => {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (match && fence === null) {
+      fence = { char: match[1][0], length: match[1].length };
+      return false;
+    }
+    if (
+      match &&
+      match[1][0] === fence.char &&
+      match[1].length >= fence.length &&
+      match[2].trim() === ""
+    ) {
+      fence = null;
+      return false;
+    }
+    return fence === null;
+  });
+}
+
 // Body of the "## [X.Y.Z]" (optionally "- YYYY-MM-DD") section, or null if
 // there is no such heading. The version is compared as a literal string, never
-// compiled into a pattern, so there is nothing to escape.
+// compiled into a pattern, so there is nothing to escape. Headings inside code
+// fences are ignored.
 function extractChangelogSection(changelog, version) {
   const lines = changelog.split("\n");
+  const outside = linesOutsideFences(lines);
   const prefix = `## [${version}]`;
   const start = lines.findIndex(
-    (line) =>
-      line.startsWith(prefix) && HEADING_SUFFIX.test(line.slice(prefix.length)),
+    (line, i) =>
+      outside[i] &&
+      line.startsWith(prefix) &&
+      HEADING_SUFFIX.test(line.slice(prefix.length)),
   );
   if (start === -1) return null;
-  const rest = lines.slice(start + 1);
-  const next = rest.findIndex((line) => line.startsWith("## "));
-  return (next === -1 ? rest : rest.slice(0, next)).join("\n").trim();
+  const next = lines.findIndex(
+    (line, i) => i > start && outside[i] && line.startsWith("## "),
+  );
+  return lines
+    .slice(start + 1, next === -1 ? undefined : next)
+    .join("\n")
+    .trim();
 }
 
 // true when an npm dependency field names anything at all. Anything that is
@@ -181,6 +216,14 @@ async function inspectTag({
   }
   const annotated = await api(`git/tags/${ref.object.sha}`);
   const problems = [];
+  // The signature covers the tag object's OWN name. Without this check, a
+  // validly signed tag object for another version (v1.2.2) could be re-pointed
+  // by a new ref (refs/tags/v1.2.3) and be released under the wrong version.
+  if (annotated.tag !== tag) {
+    problems.push(
+      `The signed tag object is named "${annotated.tag}", not "${tag}". A signed tag for another version cannot be released under this name.`,
+    );
+  }
   if (annotated.object.type !== "commit" || annotated.object.sha !== commit) {
     problems.push(
       `${tag} does not point directly at the commit being released (${commit}).`,
@@ -258,7 +301,16 @@ function listActionDependencies(actionYml) {
         `action.yml has a "uses" value that is not a string (${JSON.stringify(target)}); refusing to describe it.`,
       );
     }
-    if (target.startsWith("./")) continue; // local to this repo, not a dependency
+    if (target.startsWith("./")) {
+      // In a composite action a `./` path is resolved against the CALLER's
+      // workspace, not this repository (the portable form is
+      // ${{ github.action_path }}), and a local action could hide further
+      // third-party `uses:` that this SBOM would not list. Refuse rather than
+      // skip; teach this function to recurse before ever allowing one.
+      throw new Error(
+        `action.yml uses the local path "${target}", which the SBOM does not model (and which resolves against the caller's workspace); refusing to produce an incomplete SBOM.`,
+      );
+    }
     const [name, ref] = target.split("@");
     if (!name || !FULL_SHA_PATTERN.test(ref ?? "")) {
       throw new Error(

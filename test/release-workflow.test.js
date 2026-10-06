@@ -99,7 +99,8 @@ const stepNamed = (steps, name) => {
   return i;
 };
 const DRAFT_CHECK =
-  "Verify the draft's assets are byte-identical to the verified files";
+  "Verify the draft's assets and metadata are exactly what was verified";
+const IMMUTABLE_CHECK = "Require the release to be immutable";
 const PUBLISHED_CHECK = "Verify the published release end to end";
 const usesStartingWith = (steps, prefix) =>
   indexOfStep(
@@ -563,7 +564,10 @@ test("re-check (real shell, fake gh): an empty expected value or a failing gh ca
 // The draft check's shell, run for real in a scratch dir. The fake `gh` serves
 // whatever is in $FAKE_DRAFT_DIR as the draft's assets.
 const draftStep = publish.steps[stepNamed(publish.steps, DRAFT_CHECK)];
-function runDraftCheck(mutate) {
+function runDraftCheck(
+  mutate,
+  { meta = "v1.2.3 v1.2.3 true false", body = "notes, never uploaded" } = {},
+) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "draft-check-"));
   try {
     const name = "cla-bot-v1.2.3";
@@ -595,9 +599,15 @@ function runDraftCheck(mutate) {
       path.join(dir, "bin", "gh"),
       [
         "#!/bin/sh",
-        "# gh release download <tag> --dir <dir>",
-        '[ "$1 $2" = "release download" ] || exit 9',
-        'cp "$FAKE_DRAFT_DIR"/* "$5"/',
+        'case "$1 $2" in',
+        '  "release download") cp "$FAKE_DRAFT_DIR"/* "$5"/ ;;  # gh release download <tag> --dir <dir>',
+        '  "release view")',
+        '    case "$*" in',
+        '      *"--json body"*) printf \'%s\\n\' "$FAKE_BODY" ;;',
+        "      *) printf '%s\\n' \"$FAKE_META\" ;;",
+        "    esac ;;",
+        "  *) exit 9 ;;",
+        "esac",
         "",
       ].join("\n"),
       { mode: 0o755 },
@@ -608,6 +618,8 @@ function runDraftCheck(mutate) {
         PATH: `${path.join(dir, "bin")}:${process.env.PATH}`,
         RELEASE_TAG: "v1.2.3",
         FAKE_DRAFT_DIR: path.join(dir, "served"),
+        FAKE_META: meta,
+        FAKE_BODY: body,
       },
       encoding: "utf8",
     });
@@ -668,6 +680,42 @@ test("draft check (real shell, fake gh): a changed byte, a swapped, missing or e
   }
 });
 
+test("draft check (real shell, fake gh): changed title, tag, draft/pre-release flags or notes stop the release", () => {
+  for (const [label, options] of [
+    ["title changed", { meta: "v9.9.9 v1.2.3 true false" }],
+    ["tag changed", { meta: "v1.2.3 v9.9.9 true false" }],
+    ["no longer a draft", { meta: "v1.2.3 v1.2.3 false false" }],
+    ["marked as a pre-release", { meta: "v1.2.3 v1.2.3 true true" }],
+    ["extra metadata field", { meta: "v1.2.3 v1.2.3 true false extra" }],
+    ["empty metadata", { meta: "" }],
+    ["notes replaced", { body: "totally different notes" }],
+    [
+      "notes with text appended",
+      { body: "notes, never uploaded\nplus a malicious link" },
+    ],
+    ["empty notes", { body: "" }],
+  ]) {
+    const result = runDraftCheck(() => {}, options);
+    assert.notStrictEqual(result.status, 0, label);
+    assert.match(result.output, /Refusing to publish/, label);
+  }
+});
+
+test("draft check (real shell, fake gh): harmless storage differences in the notes (CRLF, trailing newlines) do not cause false alarms", () => {
+  for (const body of [
+    "notes, never uploaded\r",
+    "notes, never uploaded\r\n\r\n",
+    "notes, never uploaded\n\n\n",
+  ]) {
+    const result = runDraftCheck(() => {}, { body });
+    assert.strictEqual(
+      result.status,
+      0,
+      JSON.stringify(body) + "\n" + result.output,
+    );
+  }
+});
+
 test("the draft check compares the same asset set that is uploaded", () => {
   const create =
     publish.steps[runsMatching(publish.steps, /gh release create/)].run;
@@ -681,6 +729,69 @@ test("the draft check compares the same asset set that is uploaded", () => {
   ].map((m) => m[1]);
   assert.strictEqual(uploaded.length, 7);
   assert.deepStrictEqual([...listed].sort(), [...uploaded].sort());
+});
+
+test("the immutability requirement is its own final step; the published-release check no longer swallows its failure", () => {
+  const published = stepNamed(publish.steps, PUBLISHED_CHECK);
+  const immutable = stepNamed(publish.steps, IMMUTABLE_CHECK);
+  assert.strictEqual(immutable, publish.steps.length - 1, "last step");
+  assert.ok(published < immutable);
+  assert.ok(!/gh release verify/.test(publish.steps[published].run));
+  assert.ok(
+    !/\|\|\s*echo/.test(runText(publish.steps)),
+    "no `|| echo` that turns a failure into a message",
+  );
+  assert.deepStrictEqual(publish.steps[immutable].env, {
+    ALLOW_MUTABLE_RELEASES: "${{ vars.ALLOW_MUTABLE_RELEASES }}",
+  });
+});
+
+function runImmutable({ verifyExit, allow }) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "immutable-"));
+  try {
+    fs.writeFileSync(
+      path.join(dir, "gh"),
+      '#!/bin/sh\n[ "$1 $2" = "release verify" ] || exit 9\nexit "$FAKE_VERIFY_EXIT"\n',
+      { mode: 0o755 },
+    );
+    const env = {
+      PATH: `${dir}:${process.env.PATH}`,
+      RELEASE_TAG: "v1.2.3",
+      FAKE_VERIFY_EXIT: String(verifyExit),
+    };
+    if (allow !== undefined) env.ALLOW_MUTABLE_RELEASES = allow;
+    const result = spawnSync(
+      "bash",
+      ["-c", publish.steps[stepNamed(publish.steps, IMMUTABLE_CHECK)].run],
+      {
+        env,
+        encoding: "utf8",
+      },
+    );
+    return { status: result.status, output: result.stdout + result.stderr };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("immutability (real shell, fake gh): an immutable release passes; a mutable one FAILS unless mutable releases are explicitly allowed", () => {
+  const immutable = runImmutable({ verifyExit: 0 });
+  assert.strictEqual(immutable.status, 0, immutable.output);
+  assert.match(immutable.output, /is an immutable release/);
+
+  for (const allow of [undefined, "", "false", "yes", "TRUE", "1"]) {
+    const mutable = runImmutable({ verifyExit: 1, allow });
+    assert.strictEqual(mutable.status, 1, `allow=${JSON.stringify(allow)}`);
+    assert.match(mutable.output, /NOT an immutable release/);
+    assert.match(mutable.output, /ALLOW_MUTABLE_RELEASES/);
+  }
+
+  const optedOut = runImmutable({ verifyExit: 1, allow: "true" });
+  assert.strictEqual(optedOut.status, 0, optedOut.output);
+  assert.match(optedOut.output, /::warning::.*NOT an immutable release/);
+
+  // An allowed-mutable setting must not mask a release that IS immutable.
+  assert.strictEqual(runImmutable({ verifyExit: 0, allow: "true" }).status, 0);
 });
 
 test("every `gh attestation verify` pins repo, signer workflow, tag ref AND commit digest (before and after publishing)", () => {

@@ -75,15 +75,18 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Without this, anyone with write access could release code that was
-      # never reviewed or tested on main by tagging a side branch.
+      # Without this, anyone with write access could release code that never
+      # reached the default branch by tagging a side branch. Ancestry alone does
+      # not prove HOW a commit got there: that is the job of the default
+      # branch's ruleset (.github/rulesets/main.json: pull request plus the
+      # "Required checks pass" status check, no bypass), which must be applied.
       - name: Require the tagged commit to be on the default branch
         env:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/${DEFAULT_BRANCH}"; then
-            echo "::error::${GITHUB_SHA} is not on ${DEFAULT_BRANCH}. Releases may only be cut from commits that were merged through CI."
+            echo "::error::${GITHUB_SHA} is not on ${DEFAULT_BRANCH}. Releases may only be cut from commits that are already on the default branch."
             exit 1
           fi
 
@@ -315,12 +318,13 @@ jobs:
             dist/SHA256SUMS \
             dist/SHA256SUMS.sigstore.json
 
-      # What GitHub now holds in the DRAFT must be exactly the bytes that were
-      # signed and verified above: compared byte for byte and as a set (no
-      # missing and no extra asset), after the upload and right before the
-      # last tag check and the publish. This narrows, but cannot close, the
+      # What GitHub now holds in the DRAFT must be exactly what was prepared
+      # and verified above: the assets byte for byte and as a set (no missing
+      # and no extra asset), and the release metadata (title, tag, notes,
+      # draft and pre-release flags). Checked after the upload and right before
+      # the last tag check and the publish. This narrows, but cannot close, the
       # window in which someone with write access could alter a draft.
-      - name: Verify the draft's assets are byte-identical to the verified files
+      - name: Verify the draft's assets and metadata are exactly what was verified
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
@@ -333,6 +337,19 @@ jobs:
             SHA256SUMS
             SHA256SUMS.sigstore.json
           )
+          meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease --jq '[.name, .tagName, .isDraft, .isPrerelease] | join(" ")')"
+          if [ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
+            echo "::error::Draft metadata is '${meta}', expected title and tag '${RELEASE_TAG}', draft, not a pre-release. Refusing to publish."
+            exit 1
+          fi
+          # $(...) drops trailing newlines on both sides; CRs are ignored in case
+          # GitHub stores the body with CRLF line endings.
+          body="$(gh release view "$RELEASE_TAG" --json body --jq .body | tr -d '\r')"
+          notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
+          if [ "$body" != "$notes" ]; then
+            echo "::error::The draft's release notes differ from the notes that were generated. Refusing to publish."
+            exit 1
+          fi
           rm -rf draft
           mkdir draft
           gh release download "$RELEASE_TAG" --dir draft
@@ -395,7 +412,23 @@ jobs:
             --source-ref "$GITHUB_REF" \
             --source-digest "$GITHUB_SHA" \
             --predicate-type "https://cyclonedx.org/bom"
-          # Only succeeds when "Immutable releases" is enabled for the
-          # repository; otherwise it is a nudge, not a failure.
-          gh release verify "$RELEASE_TAG" \
-            || echo "::warning::${RELEASE_TAG} is not an immutable release. Enable \"Immutable releases\" in the repository settings (see CONTRIBUTING.md)."
+
+      # The release is already public here, so this step cannot undo anything.
+      # It exists so that a repository without "Immutable releases" gets a red
+      # run, never a quiet downgrade of the guarantee SECURITY.md describes.
+      # `gh release verify` succeeds only for an immutable release. A repository
+      # that knowingly accepts mutable releases (a rehearsal fork, say) opts out
+      # explicitly with the repository variable ALLOW_MUTABLE_RELEASES=true.
+      - name: Require the release to be immutable
+        env:
+          ALLOW_MUTABLE_RELEASES: ${{ vars.ALLOW_MUTABLE_RELEASES }}
+        run: |
+          set -euo pipefail
+          if gh release verify "$RELEASE_TAG"; then
+            echo "${RELEASE_TAG} is an immutable release."
+          elif [ "${ALLOW_MUTABLE_RELEASES:-}" = "true" ]; then
+            echo "::warning::${RELEASE_TAG} is NOT an immutable release; accepted because ALLOW_MUTABLE_RELEASES is true."
+          else
+            echo "::error::${RELEASE_TAG} is published, signed and verified, but it is NOT an immutable release (or GitHub could not confirm it). Turn on \"Immutable releases\" in the repository settings before the next release; see CONTRIBUTING.md. To accept mutable releases on purpose, set the repository variable ALLOW_MUTABLE_RELEASES to true."
+            exit 1
+          fi
