@@ -1175,14 +1175,31 @@ async function fetchAllIssueComments(prNumber, { fresh = false, cache }) {
     return await fetchPromise;
   } catch (e) {
     // Don't leave a failed page load cached - the next caller should get a
-    // real retry, not the same error forever. Every call for one PR within a
-    // run is sequential (checkPR() never reads the same PR's comments twice
-    // in parallel), so the entry is always still this exact promise here.
-    cache.delete(prNumber);
+    // real retry, not the same error forever. Guarded by identity: `cache`
+    // is a plain exported parameter, not something only checkPR() ever
+    // touches, so a concurrent `fresh: true` call sharing this same cache
+    // may already have replaced this entry with a newer (and possibly
+    // already-succeeded) fetch by the time this older one rejects. Only
+    // remove the entry if it's still the one this call itself set.
+    if (cache.get(prNumber) === fetchPromise) cache.delete(prNumber);
     throw e;
   }
 }
 
+// A public PR can carry comments from untrusted contributors in unbounded
+// number and size, so this run's cache must never hold more than the bot's
+// own small, bounded set of comments - not every human comment's full
+// GitHub payload for the whole life of the run. Two things keep it small:
+//
+// - Only a comment whose body carries BOT_MARKER is ever kept at all. That
+//   check is the same one getExistingBotComments() already needs before it
+//   can trust ANY comment, under both `anyBotIdentity` values - it is a
+//   prerequisite either way, not specific to one identity mode - so running
+//   it here, once, is lossless for both and is exactly what the pre-cache
+//   code did (it filtered per page too, before this cache existed).
+// - Only the few fields the rest of this file ever reads from a comment
+//   (id, body, user.login, user.type) are kept, not the full GitHub object
+//   (timestamps, URLs, avatar, reactions, and so on).
 async function fetchAllIssueCommentsUncached(prNumber) {
   const all = [];
   let page = 1;
@@ -1192,7 +1209,15 @@ async function fetchAllIssueCommentsUncached(prNumber) {
       GITHUB_TOKEN,
     );
     if (!comments.length) break;
-    all.push(...comments);
+    all.push(
+      ...comments
+        .filter((c) => c.user && c.body && c.body.includes(BOT_MARKER))
+        .map((c) => ({
+          id: c.id,
+          body: c.body,
+          user: { login: c.user.login, type: c.user.type },
+        })),
+    );
     if (comments.length < 100) break;
     page += 1;
   }
@@ -1233,8 +1258,10 @@ async function getExistingBotComments(
     resolveBotLogin(),
     fetchAllIssueComments(prNumber, { fresh, cache }),
   ]);
+  // `all` already contains only comments carrying BOT_MARKER, with a user
+  // present (see fetchAllIssueCommentsUncached) - this just narrows by
+  // identity.
   return all.filter((c) => {
-    if (!c.user || !c.body || !c.body.includes(BOT_MARKER)) return false;
     if (c.user.login === botLogin) return true;
     // `anyBotIdentity` is a broader match, used only for checkPR()'s
     // history check and never for postComment()'s dedupe, which stays

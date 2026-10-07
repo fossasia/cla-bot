@@ -68,13 +68,72 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     const cache = new Map();
     const a = await getExistingBotComments(1, { cache });
     const b = await getExistingBotComments(1, { anyBotIdentity: true, cache });
-    assert.strictEqual(getCalls, 1, "the raw comment page must be fetched once, not twice");
-    assert.deepStrictEqual(a.map((c) => c.id), [1]);
+    assert.strictEqual(
+      getCalls,
+      1,
+      "the raw comment page must be fetched once, not twice",
+    );
+    assert.deepStrictEqual(
+      a.map((c) => c.id),
+      [1],
+    );
     assert.deepStrictEqual(
       b.map((c) => c.id),
       [1],
       "the second call's different `anyBotIdentity` filter must still see the same underlying data",
     );
+  });
+
+  await test("the cache never retains ordinary (non-bot-marked) comments, nor fields beyond id/body/user.login/user.type", async () => {
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      return res(200, [
+        {
+          // An ordinary human comment on a public PR - this must never sit
+          // in the cache, however many of these a PR has.
+          id: 1,
+          body: "just a normal human comment, no marker here",
+          user: { login: "some-contributor", type: "User", id: 999 },
+          created_at: "2024-01-01T00:00:00Z",
+          html_url:
+            "https://github.com/fossasia/testrepo/pull/1#issuecomment-1",
+          reactions: { "+1": 3 },
+        },
+        {
+          id: 2,
+          body: `${MARKER}\nbot comment`,
+          user: {
+            login: "github-actions[bot]",
+            type: "Bot",
+            id: 41898282,
+            avatar_url: "https://avatars.example/bot.png",
+          },
+          created_at: "2024-01-02T00:00:00Z",
+          html_url:
+            "https://github.com/fossasia/testrepo/pull/1#issuecomment-2",
+        },
+      ]);
+    };
+    const cache = new Map();
+    await getExistingBotComments(1, { cache, anyBotIdentity: true });
+    const raw = await cache.get(1);
+    assert.strictEqual(
+      raw.length,
+      1,
+      "the ordinary human comment must never enter the cache at all, not even trimmed",
+    );
+    assert.deepStrictEqual(
+      Object.keys(raw[0]).sort(),
+      ["body", "id", "user"],
+      "a cached comment must carry only id/body/user, not the full GitHub payload",
+    );
+    assert.deepStrictEqual(
+      Object.keys(raw[0].user).sort(),
+      ["login", "type"],
+      "a cached comment's user must carry only login/type, not id/avatar_url/etc",
+    );
+    assert.strictEqual(raw[0].id, 2);
+    assert.strictEqual(raw[0].user.login, "github-actions[bot]");
   });
 
   await test("a cache is scoped per PR number - a different PR is never served from another PR's entry", async () => {
@@ -90,9 +149,19 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     const cache = new Map();
     const one = await getExistingBotComments(1, { cache });
     const two = await getExistingBotComments(2, { cache });
-    assert.strictEqual(getCalls, 2, "two different PRs must each get their own fetch");
-    assert.deepStrictEqual(one.map((c) => c.id), [1]);
-    assert.deepStrictEqual(two.map((c) => c.id), [2]);
+    assert.strictEqual(
+      getCalls,
+      2,
+      "two different PRs must each get their own fetch",
+    );
+    assert.deepStrictEqual(
+      one.map((c) => c.id),
+      [1],
+    );
+    assert.deepStrictEqual(
+      two.map((c) => c.id),
+      [2],
+    );
   });
 
   await test("fresh: true always re-fetches, even with a warm cache, and the fresh result becomes the new cache entry", async () => {
@@ -113,15 +182,32 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     };
     const cache = new Map();
     const warm = await getExistingBotComments(1, { cache });
-    assert.deepStrictEqual(warm.map((c) => c.id), [1]);
+    assert.deepStrictEqual(
+      warm.map((c) => c.id),
+      [1],
+    );
     const fresh = await getExistingBotComments(1, { cache, fresh: true });
-    assert.strictEqual(getCalls, 2, "fresh: true must bypass the cache and hit GitHub again");
-    assert.deepStrictEqual(fresh.map((c) => c.id), [1, 2]);
+    assert.strictEqual(
+      getCalls,
+      2,
+      "fresh: true must bypass the cache and hit GitHub again",
+    );
+    assert.deepStrictEqual(
+      fresh.map((c) => c.id),
+      [1, 2],
+    );
     // A plain (non-fresh) read right after must reuse the FRESH result, not
     // re-fetch and not fall back to the stale first snapshot.
     const after = await getExistingBotComments(1, { cache });
-    assert.strictEqual(getCalls, 2, "the fresh result must now be what's cached");
-    assert.deepStrictEqual(after.map((c) => c.id), [1, 2]);
+    assert.strictEqual(
+      getCalls,
+      2,
+      "the fresh result must now be what's cached",
+    );
+    assert.deepStrictEqual(
+      after.map((c) => c.id),
+      [1, 2],
+    );
   });
 
   await test("a failed fetch is evicted from the cache - the next call for the same PR gets a real retry, not the same error forever", async () => {
@@ -129,7 +215,8 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     global.fetch = async (url) => {
       if (url.endsWith("/user")) return res(404, { message: "Not Found" });
       getCalls += 1;
-      if (getCalls === 1) return res(403, { message: "Resource not accessible" });
+      if (getCalls === 1)
+        return res(403, { message: "Resource not accessible" });
       return res(200, [{ id: 9, body: `${MARKER}\nok`, user: BOT }]);
     };
     const cache = new Map();
@@ -140,7 +227,58 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       2,
       "the 2nd call must make a real new request, proving the failed one was not left cached",
     );
-    assert.deepStrictEqual(recovered.map((c) => c.id), [9]);
+    assert.deepStrictEqual(
+      recovered.map((c) => c.id),
+      [9],
+    );
+  });
+
+  await test("a stale call's late failure must not evict a newer, concurrent fresh:true call's still-good cache entry (identity-guarded eviction)", async () => {
+    const cache = new Map();
+    let getCalls = 0;
+    let rejectSlowFirstCall;
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      getCalls += 1;
+      if (getCalls === 1) {
+        // The first (non-fresh) call's own request hangs - it only fails
+        // once the test tells it to, below, which is deliberately AFTER the
+        // second (fresh) call has already replaced the cache entry.
+        return new Promise((_resolve, reject) => {
+          rejectSlowFirstCall = () => reject(new Error("network blip"));
+        });
+      }
+      return res(200, [{ id: 1, body: `${MARKER}\nfresh`, user: BOT }]);
+    };
+    // Starts the slow fetch and (synchronously, within this call) caches its
+    // promise - see fetchAllIssueComments: cache.set() happens before any
+    // await, so this is already true by the time this line returns.
+    const first = getExistingBotComments(1, { cache });
+    // A concurrent fresh:true read for the same PR, sharing the same cache,
+    // completes first and overwrites the entry the slow call set.
+    const second = await getExistingBotComments(1, { cache, fresh: true });
+    assert.deepStrictEqual(
+      second.map((c) => c.id),
+      [1],
+    );
+    // Now let the first, now-superseded call fail. Its cleanup must not
+    // delete the second call's still-good, newer entry.
+    rejectSlowFirstCall();
+    await assert.rejects(() => first);
+    assert.ok(
+      cache.has(1),
+      "the newer entry must survive an older, already-superseded call's late failure",
+    );
+    const third = await getExistingBotComments(1, { cache });
+    assert.strictEqual(
+      getCalls,
+      2,
+      "the still-good entry must be reused, not re-fetched a 3rd time",
+    );
+    assert.deepStrictEqual(
+      third.map((c) => c.id),
+      [1],
+    );
   });
 
   await test("without a cache (the default), two calls for the same PR each do their own fetch - unchanged, always-fresh behavior", async () => {
@@ -152,7 +290,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     };
     await getExistingBotComments(1);
     await getExistingBotComments(1);
-    assert.strictEqual(getCalls, 2, "omitting `cache` must mean no caching at all");
+    assert.strictEqual(
+      getCalls,
+      2,
+      "omitting `cache` must mean no caching at all",
+    );
   });
 
   // =========================================================================
@@ -160,7 +302,12 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
   // =========================================================================
 
   function makeFakeGitHub({ commits, initialSignatures, comments = [] }) {
-    const state = { signatures: initialSignatures, sha: "sig-sha-0", comments, statuses: [] };
+    const state = {
+      signatures: initialSignatures,
+      sha: "sig-sha-0",
+      comments,
+      statuses: [],
+    };
     function b64(obj) {
       return Buffer.from(JSON.stringify(obj)).toString("base64");
     }
@@ -181,14 +328,24 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
         }
         if (method === "PUT") {
           const body = JSON.parse(opts.body);
-          if (body.sha !== state.sha) return res(409, { message: "sha mismatch" });
-          state.signatures = JSON.parse(Buffer.from(body.content, "base64").toString());
+          if (body.sha !== state.sha)
+            return res(409, { message: "sha mismatch" });
+          state.signatures = JSON.parse(
+            Buffer.from(body.content, "base64").toString(),
+          );
           state.sha = `sig-sha-${Number(state.sha.split("-")[2]) + 1}`;
           return res(200, { content: { sha: state.sha } });
         }
       }
       if (url.includes("/issues/1/comments")) {
-        if (method === "GET") return res(200, state.comments);
+        if (method === "GET") {
+          // Real GitHub pagination, so a flood of comments actually exercises
+          // multiple pages instead of looping forever (per_page=100 is fixed
+          // by the source, only `page` varies here).
+          const page = Number(new URL(url).searchParams.get("page")) || 1;
+          const start = (page - 1) * 100;
+          return res(200, state.comments.slice(start, start + 100));
+        }
         if (method === "POST") {
           const { body } = JSON.parse(opts.body);
           const comment = { id: state.comments.length + 1, body, user: BOT };
@@ -232,7 +389,10 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
           commit: { author: { email: "alice@example.com" } },
         },
       ],
-      initialSignatures: { version: 1, signatures: [{ id: 1, login: "alice" }] },
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "alice" }],
+      },
       // A prior "pending" comment exists, so success is newsworthy and
       // postComment() actually runs (quietIfNeverFlagged would otherwise
       // return before ever posting).
@@ -311,6 +471,58 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     );
   });
 
+  await test("a PR flooded with ordinary contributor comments still works correctly, and none of them ever reach the cache (checkPR path)", async () => {
+    const floodSize = 250; // spans more than one 100-per-page GitHub response
+    const flood = Array.from({ length: floodSize }, (_, i) => ({
+      id: 1000 + i,
+      body: `comment #${i} from an untrusted public contributor`,
+      user: { login: `rando-${i}`, type: "User" },
+    }));
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+      comments: flood,
+    });
+    const getCommentReads = countCommentReads(gh);
+
+    await handleIssueComment({
+      action: "created",
+      issue: { number: 1, pull_request: {}, user: { login: "alice" } },
+      comment: {
+        user: { id: 1, login: "alice" },
+        body: "I have read the CLA Document and I hereby sign the CLA",
+        html_url: "x",
+        author_association: "NONE",
+      },
+    });
+
+    // 250 flood comments page as 100 + 100 + 50 (3 raw GETs) for the shared
+    // pre-check, then 251 (+ the just-posted bot comment) page the same way
+    // for the forced-fresh cleanup re-fetch - 6 raw GETs total, still just
+    // the 2 logical reads from the single-postComment() case above.
+    assert.strictEqual(
+      getCommentReads(),
+      6,
+      "3 paginated GETs for the shared pre-check + 3 for the forced-fresh cleanup, despite the flood",
+    );
+    assert.ok(
+      gh.comments.some((c) => c.body.includes("Thank you for signing the CLA")),
+      "the real bot comment must still be posted correctly despite the flood",
+    );
+    assert.strictEqual(
+      gh.comments.filter((c) => c.user !== BOT).length,
+      floodSize,
+      "none of the flood of ordinary comments were touched or lost",
+    );
+  });
+
   await test("a genuine duplicate found by the forced-fresh cleanup is still deleted correctly when a cache is in play (checkPR path)", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -354,7 +566,9 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     // alice is the sole author, so she gets the personalized success message
     // rather than the generic one - either way, only one copy of it should
     // remain once the cleanup runs.
-    const matching = gh.comments.filter((c) => c.body.includes("Thank you for signing the CLA"));
+    const matching = gh.comments.filter((c) =>
+      c.body.includes("Thank you for signing the CLA"),
+    );
     assert.strictEqual(
       matching.length,
       1,
