@@ -17,6 +17,47 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `SHA256SUMS`. The release is created as a draft, verified, published, and
   verified again from the public copy. See "Verifying a release" in
   `SECURITY.md`.
+- The publish job pins the tag: it re-checks (before creating the release,
+  before publishing, and after) that the tag still resolves to the exact
+  signed tag object the build job verified, so a tag moved during the approval
+  pause cannot be released. Every `gh attestation verify`, before and after
+  publishing, pins the repository, signer workflow, tag ref and commit digest.
+- The release helper refuses npm dependencies in every field that can pull
+  code in (`dependencies`, `optionalDependencies`, `peerDependencies`,
+  `bundleDependencies`/`bundledDependencies`), and reads `action.yml` as YAML
+  instead of with a line regex.
+- Before publishing, the draft release's assets are downloaded and compared
+  byte for byte, and as a set, with the files that were signed and verified.
+  The build job now builds and hashes the assets before any repository test
+  code runs (the publish job re-checks that digest), and uploads only after the
+  tests pass.
+- The SBOM helper refuses npm dependencies itself (not only via `verify`),
+  reads only `runs.steps[*].uses` of a composite action (a `uses` that is an
+  input or a `with:` value is not a dependency), versions components by their
+  pinned commit, and keeps the human version label as an annotation that is
+  dropped when the source comments disagree.
+- The tag check also verifies the signed tag object's own name equals the tag
+  being released, so a validly signed tag for another version cannot be
+  replayed under a new ref. The draft check covers release metadata (title,
+  tag, notes, draft and pre-release flags) as well as the assets. The final
+  step now checks the release's own `isImmutable` flag plus GitHub's release
+  attestation, and FAILS the run when a release declared `required` is not
+  immutable, instead of warning.
+- The release helper refuses a local `./` action in `action.yml` (it resolves
+  against the caller's workspace and would hide dependencies from the SBOM), and
+  its changelog parser ignores `##` lines inside fenced code blocks.
+- Third-party code no longer shares a machine with the archive. The release is
+  now four jobs: `policy`, `build` (verifies the tag and builds the archive with
+  `git` and Node built-ins only, no npm), `checks` (installs dev dependencies,
+  generates the SBOM, runs the tests and the 100% coverage gate) and `publish`
+  (which needs both, re-checks both digests, and writes `SHA256SUMS` itself).
+- A release policy gate runs before anything is built: the repository
+  variable `RELEASE_IMMUTABILITY` must be declared (`required` or
+  `not-required`; GitHub's setting cannot be read from a workflow token), and
+  the `release` environment must have required reviewers, read through the API
+  (opt-out: `RELEASE_APPROVAL=not-required`).
+- The last tag check and the publish call are now one shell step, so nothing
+  but one API round trip sits between them.
 - Least-privilege release pipeline: the job that runs repository code can only
   read; the job that signs and publishes runs no repository code, re-checks
   the build's digest, and waits on the `release` environment.

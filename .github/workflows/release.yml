@@ -11,18 +11,30 @@ name: Release
 # never runs on pull requests, so it can't be a required status check (the
 # same reason scorecard.yml is outside the gate).
 #
-# Two jobs, so that nothing which runs repository code can sign or publish:
+# Four jobs. The point of the split is that no job which runs code that is NOT
+# the release itself shares a machine with the archive, and no job which runs
+# any repository code can sign or publish:
 #
-#   build    contents: read ONLY. Verifies the tag, runs the full test suite
-#            and builds the assets. Runs the repo's code, holds no token
-#            that can write anything.
+#   policy   actions: read ONLY. Fails fast, before anything is built, unless
+#            the release policy has been declared: the immutability policy
+#            (repository variable RELEASE_IMMUTABILITY) and that the `release`
+#            environment has required reviewers (checked through the API,
+#            opt-out: RELEASE_APPROVAL=not-required).
+#   build    contents: read ONLY. Verifies the tag and builds the source
+#            archive and release notes with `git` and Node built-ins. It
+#            installs and executes NO third-party code (no npm), so nothing
+#            outside the commit being released can influence the archive.
+#   checks   contents: read ONLY, on a different machine from `build`. Installs
+#            the dev dependencies, runs the test suite and the 100% coverage
+#            gate, and generates the SBOM. This is where third-party code
+#            (js-yaml, c8) and the repository's own test code run. At worst
+#            it can falsify the SBOM; it cannot reach the archive.
 #   publish  Holds the powerful permissions (OIDC for signing, attestations,
-#            contents: write) but checks out and executes NO repository
-#            code: it only handles the files `build` produced, after
-#            re-checking their digest against a value `build` passed as a job
-#            output (not through the artifact store). It also waits for
-#            approval on the `release` environment when that environment has
-#            required reviewers (recommended).
+#            contents: write) but checks out and executes NO repository code
+#            and no third-party code: it only handles the files the other jobs
+#            produced, after re-checking their digests against values those
+#            jobs passed as job outputs (not through the artifact store), and
+#            it needs BOTH `build` and `checks` to have succeeded.
 #
 # What every release carries (all signed by this workflow's identity via
 # Sigstore, keyless: there is no signing key to steal or rotate):
@@ -54,14 +66,92 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  policy:
+    name: Check the release policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read # read the `release` environment's protection rules
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_IMMUTABILITY: ${{ vars.RELEASE_IMMUTABILITY }}
+      RELEASE_APPROVAL: ${{ vars.RELEASE_APPROVAL }}
+    steps:
+      # GitHub's setting "Immutable releases" can only be read with the
+      # `administration` permission, which no workflow token can have, so it
+      # cannot be checked from here BEFORE publishing. What can be done before
+      # anything irreversible happens is to require an explicit declaration by
+      # whoever administers the repository; after publishing, the release
+      # itself is checked and the run fails if the declaration was wrong.
+      - name: Require the immutability policy to be declared
+        run: |
+          set -euo pipefail
+          case "${RELEASE_IMMUTABILITY:-}" in
+            required)
+              echo "Immutable releases are declared as enabled; this is verified on the published release."
+              ;;
+            not-required)
+              echo "::warning::Immutable releases are NOT required (RELEASE_IMMUTABILITY=not-required): a published release can still be edited."
+              ;;
+            *)
+              echo "::error::Declare the immutability policy first. Turn on \"Immutable releases\" in the repository settings and set the repository variable RELEASE_IMMUTABILITY to required, or set it to not-required to accept mutable releases on purpose (see CONTRIBUTING.md). Nothing has been built or published."
+              exit 1
+              ;;
+          esac
+
+      # The workflow file is repository-controlled, so a human approval is only
+      # meaningful if it is enforced by the `release` environment, whose
+      # protection rules are not part of the repository. Read them (any token
+      # with `actions: read` can) and refuse to release unless someone other
+      # than the workflow author's pipeline has to approve.
+      - name: Require reviewers on the release environment
+        run: |
+          set -euo pipefail
+          case "${RELEASE_APPROVAL:-}" in
+            "")
+              ;;
+            not-required)
+              echo "::warning::No reviewer approval is required for releases (RELEASE_APPROVAL=not-required)."
+              exit 0
+              ;;
+            *)
+              echo "::error::RELEASE_APPROVAL must be unset or not-required, not '${RELEASE_APPROVAL}'."
+              exit 1
+              ;;
+          esac
+          if ! summary="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release" --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | "\(map(.reviewers | length) | add // 0) \(map(.prevent_self_review) | any)"')"; then
+            echo "::error::Could not read the 'release' environment. Create it (Settings -> Environments) with required reviewers, or set the repository variable RELEASE_APPROVAL to not-required to release without approval."
+            exit 1
+          fi
+          read -r reviewers prevent_self_review <<< "$summary"
+          # `[ x -lt 1 ]` with a non-number is an ERROR (status 2), which `if`
+          # treats as "false". Reject anything that is not a plain number first,
+          # so an unexpected answer can never pass as "has reviewers".
+          case "${reviewers:-}" in
+            "" | *[!0-9]*)
+              echo "::error::Unexpected answer while reading the 'release' environment ('${summary}'). Refusing to release."
+              exit 1
+              ;;
+          esac
+          if [ "$reviewers" -lt 1 ]; then
+            echo "::error::The 'release' environment has no required reviewers, so nobody has to approve a release. Add reviewers, or set the repository variable RELEASE_APPROVAL to not-required to accept that on purpose."
+            exit 1
+          fi
+          if [ "${prevent_self_review:-false}" != "true" ]; then
+            echo "::notice::The 'release' environment allows self-review: whoever pushes the tag may also approve its release."
+          fi
+
   build:
-    name: Verify and build
+    name: Verify the tag and build the source archive
+    needs: policy
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read # checkout, and read the tag object through the REST API
     outputs:
-      dist-digest: ${{ steps.build.outputs.dist-digest }}
+      # Digest of the archive and the release notes, recorded the moment they
+      # exist; the publish job recomputes it.
+      source-digest: ${{ steps.archive.outputs.source-digest }}
       # SHA of the verified, signed tag OBJECT. A tag object is content-
       # addressed (commit + signature + message), so the publish job can prove
       # the tag was not moved or re-signed after verification.
@@ -101,7 +191,8 @@ jobs:
           package-manager-cache: false
 
       # Tag is vX.Y.Z, matches package.json and CHANGELOG.md, and is an
-      # annotated tag GitHub reports as cryptographically verified.
+      # annotated tag GitHub reports as cryptographically verified. Uses Node
+      # built-ins only: this job never runs `npm`.
       - name: Verify tag, version, changelog and tag signature
         id: verify
         env:
@@ -112,65 +203,100 @@ jobs:
           mkdir -p dist
           node .github/scripts/release-check.js verify --notes dist/RELEASE_NOTES.md
 
-      - name: Install dependencies
-        run: npm ci --ignore-scripts
-
-      # The assets are built and hashed BEFORE any repository test code runs.
-      # `git archive` reads the commit object, so a test cannot change what is
-      # archived, and if anything that the tests start later touched dist/ it
-      # would no longer match the digest recorded below, which the publish job
-      # re-checks. (They cannot be built before `npm ci`: the SBOM step reads
-      # action.yml with js-yaml.)
-      #
       # `git archive` of the exact commit (not the working tree) gives a
-      # deterministic tar (mtime = commit time, fixed umask); `gzip -n`
-      # strips the name/timestamp gzip would otherwise embed.
-      - name: Build release assets
-        id: build
+      # deterministic tar (mtime = commit time, fixed umask); `gzip -n` strips
+      # the name/timestamp gzip would otherwise embed. Nothing but git, gzip
+      # and coreutils touches the archive in this job, and no third-party code
+      # runs here at all (that is what the separate `checks` job is for).
+      - name: Build the source archive
+        id: archive
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
-          SOURCE_DATE_ISO="$(TZ=UTC git show -s --format=%cd --date=format-local:'%Y-%m-%dT%H:%M:%SZ' "$GITHUB_SHA")"
-          export SOURCE_DATE_ISO
-
           git -c tar.umask=0022 archive --format=tar --prefix="${name}/" "$GITHUB_SHA" \
             | gzip -9 -n > "dist/${name}.tar.gz"
-          node .github/scripts/release-check.js sbom --out "dist/${name}.sbom.cdx.json"
-          (cd dist && sha256sum "${name}.tar.gz" "${name}.sbom.cdx.json" > SHA256SUMS)
-
-          # One digest over every file in dist/. The publish job recomputes
-          # it, so a swapped file between the jobs is caught even though the
-          # checksums file itself travels in the same artifact.
-          dist_digest="$(find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)"
-          echo "dist-digest=${dist_digest}" >> "$GITHUB_OUTPUT"
+          # The publish job recomputes this over the same two files, in this order.
+          source_digest="$(sha256sum dist/RELEASE_NOTES.md "dist/${name}.tar.gz" | sha256sum | cut -d' ' -f1)"
+          echo "source-digest=${source_digest}" >> "$GITHUB_OUTPUT"
           ls -l dist
 
-      # The same suite and the same 100% coverage gate as pull requests. A
-      # tag that does not pass them is never released: this step fails the
-      # job, so the artifact below is never uploaded and publish never runs.
+      - name: Upload the archive and notes for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-source
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  checks:
+    name: Tests, coverage and SBOM
+    needs: policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      sbom-digest: ${{ steps.sbom.outputs.sbom-digest }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Installing runs no lifecycle scripts, but the packages are still third-
+      # party code that will be EXECUTED below (js-yaml by the SBOM step, c8 by
+      # the coverage step). That is why this job is a different machine from
+      # the one that builds the archive.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Generate the SBOM
+        id: sbom
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          mkdir -p dist
+          SOURCE_DATE_ISO="$(TZ=UTC git show -s --format=%cd --date=format-local:'%Y-%m-%dT%H:%M:%SZ' "$GITHUB_SHA")"
+          export SOURCE_DATE_ISO
+          node .github/scripts/release-check.js sbom --out "dist/${name}.sbom.cdx.json"
+          sbom_digest="$(sha256sum "dist/${name}.sbom.cdx.json" | cut -d' ' -f1)"
+          echo "sbom-digest=${sbom_digest}" >> "$GITHUB_OUTPUT"
+
+      # The same suite and the same 100% coverage gate as pull requests. A tag
+      # that does not pass them is never released: this step fails the job, so
+      # the artifact below is never uploaded and publish never runs.
       - name: Syntax check, tests and 100% coverage
         run: |
           set -euo pipefail
           node --check src/cla-bot.js
           npm run coverage
 
-      - name: Upload build output for the publish job
+      - name: Upload the SBOM for the publish job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-dist
+          name: release-sbom
           path: dist/
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: Sign and publish
-    needs: build
+    needs: [build, checks]
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # Add required reviewers (and restrict deployments to the v* tags) on this
-    # environment to turn every release into an explicit human approval.
+    # Required reviewers on this environment make every release an explicit
+    # approval; the `policy` job refuses to start a release unless they exist
+    # (or the repository has opted out). Also restrict deployments to v* tags.
     environment:
       name: release
     permissions:
@@ -185,23 +311,51 @@ jobs:
       # What the build job verified; see "Re-check the tag" below.
       EXPECTED_TAG_OBJECT: ${{ needs.build.outputs.tag-object-sha }}
     steps:
-      - name: Download build output
+      - name: Download the source archive and release notes
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-dist
+          name: release-source
           path: dist
 
-      - name: Verify the files are exactly what the build job produced
+      - name: Download the SBOM
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-sbom
+          path: dist
+
+      # Each job passed the digest of its own output as a job OUTPUT, which does
+      # not travel through the artifact store, so an altered file is caught
+      # here. SHA256SUMS is written only now, by this job (coreutils only), over
+      # files that have just been verified.
+      - name: Verify the files are exactly what build and checks produced, then write SHA256SUMS
         env:
-          EXPECTED_DIGEST: ${{ needs.build.outputs.dist-digest }}
+          EXPECTED_SOURCE_DIGEST: ${{ needs.build.outputs.source-digest }}
+          EXPECTED_SBOM_DIGEST: ${{ needs.checks.outputs.sbom-digest }}
         run: |
           set -euo pipefail
-          actual="$(find dist -type f | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -d' ' -f1)"
-          if [ -z "$EXPECTED_DIGEST" ] || [ "$actual" != "$EXPECTED_DIGEST" ]; then
-            echo "::error::dist/ does not match the digest reported by the build job (expected '${EXPECTED_DIGEST}', got '${actual}'). Refusing to sign."
+          name="cla-bot-${RELEASE_TAG}"
+          count="$(find dist -type f | wc -l)"
+          if [ "$count" -ne 3 ]; then
+            echo "::error::dist/ holds ${count} files, expected exactly 3 (archive, notes, SBOM). Refusing to sign."
             exit 1
           fi
-          (cd dist && sha256sum --check --strict SHA256SUMS)
+          for file in dist/RELEASE_NOTES.md "dist/${name}.tar.gz" "dist/${name}.sbom.cdx.json"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Expected file ${file} is missing from the downloaded artifacts. Refusing to sign."
+              exit 1
+            fi
+          done
+          source_digest="$(sha256sum dist/RELEASE_NOTES.md "dist/${name}.tar.gz" | sha256sum | cut -d' ' -f1)"
+          sbom_digest="$(sha256sum "dist/${name}.sbom.cdx.json" | cut -d' ' -f1)"
+          if [ -z "$EXPECTED_SOURCE_DIGEST" ] || [ "$source_digest" != "$EXPECTED_SOURCE_DIGEST" ]; then
+            echo "::error::The archive or notes do not match the digest reported by the build job (expected '${EXPECTED_SOURCE_DIGEST}', got '${source_digest}'). Refusing to sign."
+            exit 1
+          fi
+          if [ -z "$EXPECTED_SBOM_DIGEST" ] || [ "$sbom_digest" != "$EXPECTED_SBOM_DIGEST" ]; then
+            echo "::error::The SBOM does not match the digest reported by the checks job (expected '${EXPECTED_SBOM_DIGEST}', got '${sbom_digest}'). Refusing to sign."
+            exit 1
+          fi
+          (cd dist && sha256sum "${name}.tar.gz" "${name}.sbom.cdx.json" > SHA256SUMS)
 
       # cosign is pinned by version here; Dependabot bumps the installer
       # action but not this value, so bump `cosign-release` alongside it.
@@ -278,8 +432,9 @@ jobs:
       # build job verified a specific signed tag object; between that check
       # and now there can be a long pause (environment approval, signing), so
       # prove the tag still resolves to exactly that object right before the
-      # release is created, again right before it is published, and once more
-      # after, as an alarm if it moved in the last instant.
+      # draft is created, again immediately before it is published (in the
+      # same step as the publish call), and once more after, as an alarm if it
+      # moved in the last instant.
       - name: Re-check the tag before creating the release
         run: |
           set -euo pipefail
@@ -365,7 +520,11 @@ jobs:
             fi
           done
 
-      - name: Re-check the tag before publishing the release
+      # The tag check and the publish call are ONE shell step, back to back:
+      # nothing, not even a step boundary, sits between them. What remains is
+      # the round trip to GitHub's publish endpoint, which no workflow can
+      # close; the post-publication checks below exist for that instant.
+      - name: Re-check the tag and publish the release
         run: |
           set -euo pipefail
           current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
@@ -374,9 +533,7 @@ jobs:
             echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
             exit 1
           fi
-
-      - name: Publish the release
-        run: gh release edit "$RELEASE_TAG" --draft=false --latest
+          gh release edit "$RELEASE_TAG" --draft=false --latest
 
       # Download what users will download and verify it the way users will,
       # with the SAME constraints as before publishing (workflow, tag, commit).
@@ -414,21 +571,43 @@ jobs:
             --predicate-type "https://cyclonedx.org/bom"
 
       # The release is already public here, so this step cannot undo anything.
-      # It exists so that a repository without "Immutable releases" gets a red
-      # run, never a quiet downgrade of the guarantee SECURITY.md describes.
-      # `gh release verify` succeeds only for an immutable release. A repository
-      # that knowingly accepts mutable releases (a rehearsal fork, say) opts out
-      # explicitly with the repository variable ALLOW_MUTABLE_RELEASES=true.
+      # It exists so that a wrong RELEASE_IMMUTABILITY declaration (or a setting
+      # that was switched off later) is a red run, never a quiet downgrade of
+      # the guarantee SECURITY.md describes. The direct signal is the release's
+      # own `immutable` flag (gh: isImmutable). `gh release verify` additionally
+      # checks GitHub's own signed release attestation, which exists for
+      # immutable releases and can take a moment to appear, hence the retries.
       - name: Require the release to be immutable
         env:
-          ALLOW_MUTABLE_RELEASES: ${{ vars.ALLOW_MUTABLE_RELEASES }}
+          RELEASE_IMMUTABILITY: ${{ vars.RELEASE_IMMUTABILITY }}
         run: |
           set -euo pipefail
-          if gh release verify "$RELEASE_TAG"; then
-            echo "${RELEASE_TAG} is an immutable release."
-          elif [ "${ALLOW_MUTABLE_RELEASES:-}" = "true" ]; then
-            echo "::warning::${RELEASE_TAG} is NOT an immutable release; accepted because ALLOW_MUTABLE_RELEASES is true."
-          else
-            echo "::error::${RELEASE_TAG} is published, signed and verified, but it is NOT an immutable release (or GitHub could not confirm it). Turn on \"Immutable releases\" in the repository settings before the next release; see CONTRIBUTING.md. To accept mutable releases on purpose, set the repository variable ALLOW_MUTABLE_RELEASES to true."
+          case "${RELEASE_IMMUTABILITY:-}" in
+            required) ;;
+            not-required)
+              state="$(gh release view "$RELEASE_TAG" --json isImmutable --jq .isImmutable || echo unknown)"
+              echo "::notice::Immutable releases are not required here (RELEASE_IMMUTABILITY=not-required); ${RELEASE_TAG} isImmutable=${state}."
+              exit 0
+              ;;
+            *)
+              echo "::error::RELEASE_IMMUTABILITY must be required or not-required, not '${RELEASE_IMMUTABILITY:-}'."
+              exit 1
+              ;;
+          esac
+          immutable="$(gh release view "$RELEASE_TAG" --json isImmutable --jq .isImmutable)"
+          if [ "$immutable" != "true" ]; then
+            echo "::error::${RELEASE_TAG} is published, signed and verified, but GitHub reports it as NOT immutable (isImmutable=${immutable}). Turn on \"Immutable releases\" in the repository settings before the next release; see CONTRIBUTING.md. If that is deliberate, set the repository variable RELEASE_IMMUTABILITY to not-required."
             exit 1
           fi
+          attempts=6
+          for attempt in $(seq 1 "$attempts"); do
+            if gh release verify "$RELEASE_TAG"; then
+              echo "${RELEASE_TAG} is immutable and its GitHub release attestation verifies."
+              exit 0
+            fi
+            if [ "$attempt" -lt "$attempts" ]; then
+              sleep "${RETRY_DELAY:-10}"
+            fi
+          done
+          echo "::error::${RELEASE_TAG} is immutable, but GitHub's release attestation could not be verified after ${attempts} attempts."
+          exit 1

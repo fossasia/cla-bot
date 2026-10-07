@@ -215,20 +215,32 @@ settings, not repository files. Do this once, and re-check it when something abo
    release is published, its assets and its tag can never be changed or
    removed, even by an admin. The workflow creates each release as a draft,
    fills and verifies it, and only then publishes, precisely so this setting
-   is safe to use. The workflow ends by requiring the release to be
-   immutable and **fails the run** (after publishing; it cannot undo the
-   release) if it is not, so turn this on **before** the first release. A
-   rehearsal fork that cannot or does not want it sets the repository variable
-   `ALLOW_MUTABLE_RELEASES` to `true` to accept mutable releases explicitly.
-2. **Create the `release` environment** (Settings -> Environments -> New
-   environment). Required reviewers are optional but recommended: add one or
-   more (enable "Prevent self-review" if there are enough people), and under
+   is safe to use. Turn it on **before** the first release, then declare it
+   (step 2).
+2. **Declare the release policy** as repository variables (Settings -> Secrets
+   and variables -> Actions -> Variables). A release does not start, and
+   nothing is built, until this is done:
+   - `RELEASE_IMMUTABILITY` = `required` once "Immutable releases" is on. The
+     workflow cannot read that setting before publishing (it needs a permission
+     no workflow token has), so you confirm it; after publishing, the workflow
+     checks the release itself and **fails the run** if it is not immutable
+     (it cannot undo the release, so a wrong declaration shows up on the first
+     release). A rehearsal fork that does not want it sets `not-required`.
+   - `RELEASE_APPROVAL`: leave it unset. The workflow then requires the
+     `release` environment (step 3) to have required reviewers, and refuses to
+     start otherwise. Set it to `not-required` only to release without any
+     approval, on purpose.
+3. **Create the `release` environment** (Settings -> Environments -> New
+   environment). Add **required reviewers** (enable "Prevent self-review" if
+   there are enough people; the workflow notes it when it is off), and under
    "Deployment branches and tags" allow only the selected tag pattern `v*`.
    The `publish` job pauses on this environment, so every release becomes an
-   explicit second-person approval - a human control that does not depend on
-   `main`'s review settings (there are none, by design). With no reviewers
-   configured the job simply runs.
-3. **Register a signing key on your GitHub account**, as a _Signing Key_ (not
+   explicit second-person approval, a control that does not depend on `main`'s
+   review settings (there are none, by design). The `policy` job reads these
+   rules and refuses to start a release without reviewers. Note what this does
+   not do: a pull request could still edit `release.yml` (see "A change to
+   `release.yml` itself" in `SECURITY.md`).
+4. **Register a signing key on your GitHub account**, as a _Signing Key_ (not
    just an authentication key), and use the same address as a verified email:
    ```bash
    # SSH signing (simplest); GPG works too
@@ -238,7 +250,7 @@ settings, not repository files. Do this once, and re-check it when something abo
    then add that public key at Settings -> SSH and GPG keys -> New SSH key ->
    Key type **Signing Key**. The workflow refuses any tag GitHub does not
    report as _verified_.
-4. If your organisation restricts which actions may run, allow
+5. If your organisation restricts which actions may run, allow
    `actions/attest`, `actions/upload-artifact`, `actions/download-artifact`
    and `sigstore/cosign-installer` (plus the ones the CI already uses).
 
@@ -310,9 +322,15 @@ a mistake on the real repository burns a version number.
   differ from what was prepared) means someone or something changed the draft
   after it was created. Nothing is public. Delete the draft, find out why, and
   re-run the failed jobs.
-- **"... is NOT an immutable release"** at the very end: the release is
-  published, signed and verified, but "Immutable releases" is off. Turn it on
-  before the next release (it cannot be applied to this one).
+- **A "policy" job failure** ("Declare the immutability policy first", "The
+  'release' environment has no required reviewers", "Could not read the
+  'release' environment"): nothing was built or published. Do the one-time
+  setup it names, then re-run the failed jobs.
+- **"... NOT immutable (isImmutable=false)"** at the very end: the release is
+  published, signed and verified, but "Immutable releases" is off although
+  `RELEASE_IMMUTABILITY` says `required`. Turn it on before the next release
+  (it cannot be applied to this one), or correct the variable if opting out
+  was the intent.
 - **The `publish` job failed** (Sigstore or GitHub outage, approval
   timed out, upload error): use "Re-run failed jobs". It is safe to repeat; a
   leftover **draft** is replaced, and a release that is already **published**

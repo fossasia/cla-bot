@@ -7,10 +7,15 @@
  *
  *  - it only runs for pushed stable-semver tags (never a PR, branch or manual
  *    trigger), serialised and never cancelled;
- *  - least privilege: workflow permissions are empty; `build` can only READ;
- *    only `publish` can sign/attest/write, and `publish` runs no repository
- *    code (no checkout, no node/npm), waits on the `release` environment,
- *    and re-checks the digest `build` reported;
+ *  - least privilege: workflow permissions are empty; `policy`, `build` and
+ *    `checks` can only READ; only `publish` can sign/attest/write, and
+ *    `publish` runs no repository or third-party code (no checkout, no
+ *    node/npm), waits on the `release` environment, and re-checks the digests
+ *    `build` and `checks` reported;
+ *  - third-party code (npm packages) only ever runs in `checks`, never on the
+ *    machine that builds the archive;
+ *  - the release policy (immutability declared, reviewers on the environment)
+ *    is enforced before anything is built;
  *  - every action is pinned to a full commit SHA, cosign to an exact
  *    version, and no expression is interpolated into shell text;
  *  - caching is off (cache poisoning) and checkout keeps no credentials;
@@ -24,6 +29,7 @@
  */
 const assert = require("assert");
 const fs = require("fs");
+const crypto = require("crypto");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
@@ -74,9 +80,14 @@ function filterToRegExp(pattern) {
 
 const raw = read(".github", "workflows", "release.yml");
 const wf = yaml.load(raw);
-const { build, publish } = wf.jobs;
+const { policy, build, checks, publish } = wf.jobs;
 const triggers = wf.on ?? wf[true];
-const allSteps = [...build.steps, ...publish.steps];
+const allSteps = [
+  ...policy.steps,
+  ...build.steps,
+  ...checks.steps,
+  ...publish.steps,
+];
 const runText = (steps) =>
   steps
     .filter((s) => typeof s.run === "string")
@@ -100,6 +111,12 @@ const stepNamed = (steps, name) => {
 };
 const DRAFT_CHECK =
   "Verify the draft's assets and metadata are exactly what was verified";
+const DIGEST_STEP =
+  "Verify the files are exactly what build and checks produced, then write SHA256SUMS";
+const PUBLISH_STEP = "Re-check the tag and publish the release";
+const CREATE_RECHECK = "Re-check the tag before creating the release";
+const POLICY_IMMUTABILITY = "Require the immutability policy to be declared";
+const POLICY_REVIEWERS = "Require reviewers on the release environment";
 const IMMUTABLE_CHECK = "Require the release to be immutable";
 const PUBLISHED_CHECK = "Verify the published release end to end";
 const usesStartingWith = (steps, prefix) =>
@@ -109,10 +126,63 @@ const usesStartingWith = (steps, prefix) =>
     `uses ${prefix}`,
   );
 
+// Runs a step's REAL shell in a scratch directory with a fake `gh` first on the
+// PATH. `gh` is shell text for the fake; every call it receives is logged and
+// returned as `calls`. `setup(dir)` prepares files; `after(dir)` is read before
+// cleanup. Environment values that are undefined are simply not set.
+function runStep(
+  step,
+  { gh = "exit 0", env = {}, setup = () => {}, after = () => null } = {},
+) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "step-"));
+  try {
+    const bin = path.join(dir, "bin");
+    fs.mkdirSync(bin);
+    const log = path.join(dir, "gh-calls.log");
+    fs.writeFileSync(
+      path.join(bin, "gh"),
+      `#!/bin/sh\necho "$@" >> "${log}"\n${gh}\n`,
+      { mode: 0o755 },
+    );
+    setup(dir);
+    const environment = {
+      PATH: `${bin}:${process.env.PATH}`,
+      GITHUB_REPOSITORY: "fossasia/cla-bot",
+      RELEASE_TAG: "v1.2.3",
+    };
+    for (const [key, value] of Object.entries(env)) {
+      if (value !== undefined) environment[key] = value;
+    }
+    const result = spawnSync("bash", ["-c", step.run], {
+      cwd: dir,
+      env: environment,
+      encoding: "utf8",
+    });
+    return {
+      status: result.status,
+      output: result.stdout + result.stderr,
+      calls: fs.existsSync(log)
+        ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean)
+        : [],
+      extra: after(dir),
+    };
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+// A fake `gh` that answers every call with one line.
+const ghAnswers = (text) => `printf '%s\\n' '${text}'`;
+const HAS_SHA256SUM = spawnSync("sha256sum", ["--version"]).status === 0;
+
 // --- triggers and top-level hygiene -------------------------------------------
 
-test("release.yml has exactly two jobs, build and publish, and is not a reusable workflow", () => {
-  assert.deepStrictEqual(Object.keys(wf.jobs).sort(), ["build", "publish"]);
+test("release.yml has exactly four jobs: policy, build, checks, publish, and is not a reusable workflow", () => {
+  assert.deepStrictEqual(Object.keys(wf.jobs).sort(), [
+    "build",
+    "checks",
+    "policy",
+    "publish",
+  ]);
   assert.ok(!Object.keys(triggers).includes("workflow_call"));
 });
 
@@ -174,9 +244,16 @@ test("every job has a timeout", () => {
 
 // --- least privilege -------------------------------------------------------------
 
-test("build can only read; it holds no signing, attestation or write permission", () => {
+test("policy, build and checks can only read; none of them can sign, attest or write", () => {
+  assert.deepStrictEqual(policy.permissions, { actions: "read" });
   assert.deepStrictEqual(build.permissions, { contents: "read" });
-  assert.strictEqual(build.environment, undefined);
+  assert.deepStrictEqual(checks.permissions, { contents: "read" });
+  for (const job of [policy, build, checks]) {
+    assert.strictEqual(job.environment, undefined);
+    for (const [scope, level] of Object.entries(job.permissions)) {
+      assert.strictEqual(level, "read", scope);
+    }
+  }
 });
 
 test("publish holds exactly the three permissions signing and publishing need", () => {
@@ -187,12 +264,19 @@ test("publish holds exactly the three permissions signing and publishing need", 
   });
 });
 
-test("publish waits for build and runs in the `release` environment (where reviewers can be required)", () => {
-  assert.strictEqual(publish.needs, "build");
-  assert.strictEqual(publish.environment.name, "release");
+test("job graph: policy first; build and checks wait for it; publish needs BOTH build and checks", () => {
+  assert.strictEqual(policy.needs, undefined);
+  assert.strictEqual(build.needs, "policy");
+  assert.strictEqual(checks.needs, "policy");
+  assert.deepStrictEqual(publish.needs, ["build", "checks"]);
 });
 
-test("publish executes no repository code: no checkout, no node/npm, no scripts from the tagged tree", () => {
+test("publish runs in the `release` environment, and the policy job reads that same environment", () => {
+  assert.strictEqual(publish.environment.name, "release");
+  assert.match(runText(policy.steps), /environments\/release"/);
+});
+
+test("publish executes no repository or third-party code: no checkout, no node/npm, no scripts from the tagged tree", () => {
   assert.ok(
     !publish.steps.some((s) =>
       String(s.uses ?? "").startsWith("actions/checkout@"),
@@ -208,53 +292,128 @@ test("publish executes no repository code: no checkout, no node/npm, no scripts 
   assert.strictEqual(publish.env.GH_REPO, "${{ github.repository }}");
 });
 
-test("publish re-checks the digest build reported through a job output, before signing anything", () => {
-  assert.match(
-    build.outputs["dist-digest"],
-    /steps\.build\.outputs\.dist-digest/,
-  );
-  const check = indexOfStep(
-    publish.steps,
-    (s) =>
-      /needs\.build\.outputs\.dist-digest/.test(s.env?.EXPECTED_DIGEST ?? ""),
-    "digest re-check",
-  );
-  assert.ok(check < usesStartingWith(publish.steps, "actions/attest@"));
+test("build executes NO third-party code: no npm/npx/node_modules, only first-party actions, Node only for the repository's own verify script", () => {
+  const text = runText(build.steps);
   assert.ok(
-    check < usesStartingWith(publish.steps, "sigstore/cosign-installer@"),
+    !/\b(npm|npx|yarn|pnpm)\b/.test(text),
+    "no package manager in build",
   );
-  assert.match(
-    publish.steps[check].run,
-    /\[ -z "\$EXPECTED_DIGEST" \]/,
-    "an empty digest must fail",
-  );
+  assert.ok(!/node_modules/.test(text));
+  for (const step of build.steps) {
+    if (step.uses)
+      assert.match(
+        step.uses,
+        /^actions\/(checkout|setup-node|upload-artifact)@/,
+        step.uses,
+      );
+  }
+  assert.deepStrictEqual(text.match(/\bnode\b[^\n]*/g), [
+    "node .github/scripts/release-check.js verify --notes dist/RELEASE_NOTES.md",
+  ]);
 });
 
-test("build verifies the tag first (on the default branch, read-only token), builds and hashes BEFORE repo test code runs, uploads only after tests pass", () => {
+test("build verifies the tag first (default branch, read-only token), then builds the archive, then uploads it", () => {
   const onMain = runsMatching(build.steps, /merge-base --is-ancestor/);
   const verify = runsMatching(build.steps, /release-check\.js verify/);
-  const install = runsMatching(build.steps, /npm ci --ignore-scripts/);
-  const buildAssets = indexOfStep(
+  const archive = indexOfStep(
     build.steps,
-    (s) => s.id === "build",
-    "build step",
+    (s) => s.id === "archive",
+    "archive step",
   );
-  const tests = runsMatching(build.steps, /npm run coverage/);
   const upload = usesStartingWith(build.steps, "actions/upload-artifact@");
-  // verify is dependency-free so it runs first; the SBOM needs js-yaml, so the
-  // install must precede the asset build; the digest is recorded before any
-  // test code runs; a failing test stops the job before anything is uploaded.
-  assert.ok(onMain < verify && verify < install && install < buildAssets);
-  assert.ok(
-    buildAssets < tests && tests < upload,
-    "tests must run after the digest is recorded and before the upload",
-  );
-  assert.match(build.steps[buildAssets].run, /release-check\.js sbom/);
+  assert.ok(onMain < verify && verify < archive && archive < upload);
   assert.strictEqual(
     build.steps[verify].env.RELEASE_TAG,
     "${{ github.ref_name }}",
   );
   assert.strictEqual(build.steps[verify].env.GH_TOKEN, "${{ github.token }}");
+  assert.match(build.steps[archive].run, /git -c tar\.umask=0022 archive/);
+  assert.strictEqual(build.steps[upload].with.name, "release-source");
+});
+
+test("checks (where third-party code runs) installs from the lockfile without scripts, builds the SBOM, runs the coverage gate, and uploads only the SBOM", () => {
+  const install = runsMatching(checks.steps, /npm ci --ignore-scripts/);
+  const sbom = indexOfStep(checks.steps, (s) => s.id === "sbom", "sbom step");
+  const tests = runsMatching(checks.steps, /npm run coverage/);
+  const upload = usesStartingWith(checks.steps, "actions/upload-artifact@");
+  assert.ok(
+    install < sbom && sbom < tests && tests < upload,
+    "a failing test must stop the job before anything is uploaded",
+  );
+  assert.strictEqual(checks.steps[upload].with.name, "release-sbom");
+  assert.match(checks.steps[sbom].run, /release-check\.js sbom --out/);
+  assert.ok(
+    !/git archive|\.tar\.gz|SHA256SUMS/.test(runText(checks.steps)),
+    "checks never touches the archive or the checksums",
+  );
+  assert.deepStrictEqual(Object.keys(checks.outputs), ["sbom-digest"]);
+});
+
+test("publish verifies BOTH job-output digests and rejects stray files before signing, and is the only job that writes SHA256SUMS", () => {
+  assert.match(
+    build.outputs["source-digest"],
+    /steps\.archive\.outputs\.source-digest/,
+  );
+  assert.match(
+    checks.outputs["sbom-digest"],
+    /steps\.sbom\.outputs\.sbom-digest/,
+  );
+  const idx = stepNamed(publish.steps, DIGEST_STEP);
+  const step = publish.steps[idx];
+  assert.strictEqual(
+    step.env.EXPECTED_SOURCE_DIGEST,
+    "${{ needs.build.outputs.source-digest }}",
+  );
+  assert.strictEqual(
+    step.env.EXPECTED_SBOM_DIGEST,
+    "${{ needs.checks.outputs.sbom-digest }}",
+  );
+  const downloads = publish.steps
+    .map((s, i) =>
+      String(s.uses ?? "").startsWith("actions/download-artifact@") ? i : -1,
+    )
+    .filter((i) => i >= 0);
+  assert.strictEqual(downloads.length, 2);
+  assert.ok(Math.max(...downloads) < idx, "downloads precede the digest check");
+  assert.ok(idx < usesStartingWith(publish.steps, "actions/attest@"));
+  assert.ok(
+    idx < usesStartingWith(publish.steps, "sigstore/cosign-installer@"),
+  );
+  assert.match(
+    step.run,
+    /\[ -z "\$EXPECTED_SOURCE_DIGEST" \]/,
+    "an empty digest must fail",
+  );
+  assert.match(
+    step.run,
+    /\[ -z "\$EXPECTED_SBOM_DIGEST" \]/,
+    "an empty digest must fail",
+  );
+  // Producer and verifier must use the very same formulas.
+  const sourceFormula =
+    "sha256sum dist/RELEASE_NOTES.md \"dist/${name}.tar.gz\" | sha256sum | cut -d' ' -f1";
+  const sbomFormula =
+    "sha256sum \"dist/${name}.sbom.cdx.json\" | cut -d' ' -f1";
+  assert.ok(
+    build.steps[
+      indexOfStep(build.steps, (s) => s.id === "archive", "archive")
+    ].run.includes(sourceFormula),
+  );
+  assert.ok(step.run.includes(sourceFormula));
+  assert.ok(
+    checks.steps[
+      indexOfStep(checks.steps, (s) => s.id === "sbom", "sbom")
+    ].run.includes(sbomFormula),
+  );
+  assert.ok(step.run.includes(sbomFormula));
+  assert.ok(
+    !/SHA256SUMS/.test(runText(build.steps)) &&
+      !/SHA256SUMS/.test(runText(checks.steps)),
+  );
+  assert.match(
+    step.run,
+    /sha256sum "\$\{name\}\.tar\.gz" "\$\{name\}\.sbom\.cdx\.json" > SHA256SUMS/,
+  );
 });
 
 // --- supply-chain hygiene ----------------------------------------------------------
@@ -304,33 +463,38 @@ test("every shell step fails fast (set -euo pipefail), except one-liners with a 
   }
 });
 
-test("checkout keeps no credentials and fetches full history; setup-node has caching disabled", () => {
-  const checkout =
-    build.steps[usesStartingWith(build.steps, "actions/checkout@")];
-  assert.strictEqual(checkout.with["persist-credentials"], false);
-  assert.strictEqual(checkout.with["fetch-depth"], 0);
-  const node =
-    build.steps[usesStartingWith(build.steps, "actions/setup-node@")];
-  assert.strictEqual(node.with["package-manager-cache"], false);
-  assert.strictEqual(node.with.cache, undefined);
+test("checkouts keep no credentials (build needs full history); every setup-node has caching disabled", () => {
+  for (const job of [build, checks]) {
+    const checkout =
+      job.steps[usesStartingWith(job.steps, "actions/checkout@")];
+    assert.strictEqual(checkout.with["persist-credentials"], false);
+    const node = job.steps[usesStartingWith(job.steps, "actions/setup-node@")];
+    assert.strictEqual(node.with["package-manager-cache"], false);
+    assert.strictEqual(node.with.cache, undefined);
+  }
+  assert.strictEqual(
+    build.steps[usesStartingWith(build.steps, "actions/checkout@")].with[
+      "fetch-depth"
+    ],
+    0,
+  );
   assert.ok(!/actions\/cache@/.test(raw), "no cache in a release workflow");
 });
 
-test("dependencies are installed from the lockfile with scripts disabled", () => {
-  assert.match(runText(build.steps), /npm ci --ignore-scripts/);
+test("npm runs only in `checks`, from the lockfile, with lifecycle scripts disabled", () => {
+  assert.match(runText(checks.steps), /npm ci --ignore-scripts/);
+  for (const job of [policy, build, publish]) {
+    assert.ok(!/\bnpm\b/.test(runText(job.steps)));
+  }
 });
 
 // --- order of operations --------------------------------------------------------------
 
-test("publish signs, then verifies its own output, then drafts, then publishes, then verifies the public copy", () => {
+test("publish: downloads, verifies digests, signs, self-verifies, drafts, checks the draft, re-checks the tag AND publishes, verifies the public copy, then requires immutability", () => {
   const steps = publish.steps;
   const order = [
     usesStartingWith(steps, "actions/download-artifact@"),
-    indexOfStep(
-      steps,
-      (s) => s.env?.EXPECTED_DIGEST !== undefined,
-      "digest check",
-    ),
+    stepNamed(steps, DIGEST_STEP),
     usesStartingWith(steps, "sigstore/cosign-installer@"),
     indexOfStep(steps, (s) => s.id === "provenance", "provenance attestation"),
     indexOfStep(steps, (s) => s.id === "sbom", "SBOM attestation"),
@@ -338,8 +502,9 @@ test("publish signs, then verifies its own output, then drafts, then publishes, 
     runsMatching(steps, /cosign verify-blob[\s\S]*gh attestation verify/),
     runsMatching(steps, /gh release create/),
     stepNamed(steps, DRAFT_CHECK),
-    runsMatching(steps, /gh release edit/),
+    stepNamed(steps, PUBLISH_STEP),
     stepNamed(steps, PUBLISHED_CHECK),
+    stepNamed(steps, IMMUTABLE_CHECK),
   ];
   assert.deepStrictEqual(
     [...order].sort((a, b) => a - b),
@@ -347,6 +512,11 @@ test("publish signs, then verifies its own output, then drafts, then publishes, 
     "steps are out of order",
   );
   assert.strictEqual(new Set(order).size, order.length);
+  assert.strictEqual(
+    order[order.length - 1],
+    steps.length - 1,
+    "the immutability requirement is the last step",
+  );
 });
 
 test("the release is created as a DRAFT bound to the pushed tag, and only a later step publishes it", () => {
@@ -418,9 +588,6 @@ test("verification pins WHO may have signed: this exact workflow file, on this t
 
 const SHA_VERIFIED = "a".repeat(40);
 const SHA_MOVED = "b".repeat(40);
-const recheckSteps = publish.steps.filter((s) =>
-  /^Re-check the tag/.test(s.name ?? ""),
-);
 
 test("build hands the verified tag object's SHA to publish through a job output (not the artifact store)", () => {
   const verify = indexOfStep(
@@ -439,26 +606,36 @@ test("build hands the verified tag object's SHA to publish through a job output 
   );
 });
 
-test("the tag is re-checked right before the release is created AND right before it is published", () => {
-  assert.strictEqual(recheckSteps.length, 2);
+test("the tag is re-checked right before the draft is created, and in the SAME STEP as the publish call", () => {
   const create = runsMatching(publish.steps, /gh release create/);
-  const edit = runsMatching(publish.steps, /gh release edit/);
-  const [first, second] = recheckSteps.map((s) => publish.steps.indexOf(s));
-  assert.ok(first < create, "re-check must precede creating the release");
-  const draft = stepNamed(publish.steps, DRAFT_CHECK);
-  assert.ok(
-    create < draft && draft < second && second < edit,
-    "create, then the draft byte check, then the last tag check, then publish",
-  );
   assert.strictEqual(
-    first,
+    stepNamed(publish.steps, CREATE_RECHECK),
     create - 1,
-    "no step may sit between the check and the create",
+    "no step between that check and the create",
   );
-  assert.strictEqual(
-    second,
-    edit - 1,
-    "no step may sit between the check and the publish",
+  const draft = stepNamed(publish.steps, DRAFT_CHECK);
+  const pub = stepNamed(publish.steps, PUBLISH_STEP);
+  assert.ok(
+    create < draft && draft < pub,
+    "create, then the draft check, then the check-and-publish step",
+  );
+  const script = publish.steps[pub].run;
+  const checkAt = script.indexOf("git/ref/tags/");
+  const compareAt = script.indexOf('if [ -z "$EXPECTED_TAG_OBJECT"');
+  const editAt = script.indexOf("gh release edit");
+  assert.ok(
+    checkAt >= 0 && checkAt < compareAt && compareAt < editAt,
+    "look up, compare, then publish, in one script",
+  );
+  assert.strictEqual(script.match(/gh release edit/g).length, 1);
+  assert.match(
+    script,
+    /gh release edit "\$RELEASE_TAG" --draft=false --latest/,
+  );
+  const between = script.slice(compareAt, editAt);
+  assert.ok(
+    !/\b(gh|git|curl|sleep|npm|node)\b/.test(between),
+    "nothing else runs between the comparison and the publish call",
   );
 });
 
@@ -470,56 +647,31 @@ test("after publishing, the tag is checked once more and the release is called c
   assert.match(finalStep, /compromised/);
 });
 
-// Runs the REAL shell of a re-check step, with a fake `gh` that returns
-// whatever the tag "currently" resolves to.
-function runRecheck(step, { current, expected, ghFails = false }) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fake-gh-"));
-  try {
-    const log = path.join(dir, "args.log");
-    fs.writeFileSync(
-      path.join(dir, "gh"),
-      ghFails
-        ? "#!/bin/sh\nexit 1\n"
-        : `#!/bin/sh\necho "$@" >> "${log}"\nprintf '%s\\n' "$FAKE_GH_OUTPUT"\n`,
-      { mode: 0o755 },
-    );
-    const result = spawnSync("bash", ["-c", step.run], {
-      env: {
-        PATH: `${dir}:${process.env.PATH}`,
-        GITHUB_REPOSITORY: "fossasia/cla-bot",
-        RELEASE_TAG: "v1.2.3",
-        EXPECTED_TAG_OBJECT: expected,
-        FAKE_GH_OUTPUT: current ?? "",
-      },
-      encoding: "utf8",
+test("re-check (real shell, fake gh): passes only while the tag still resolves to the verified tag object, and only then does the publish call happen", () => {
+  for (const name of [CREATE_RECHECK, PUBLISH_STEP]) {
+    const step = publish.steps[stepNamed(publish.steps, name)];
+    const same = runStep(step, {
+      gh: ghAnswers(`tag ${SHA_VERIFIED}`),
+      env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
     });
-    const args = fs.existsSync(log) ? fs.readFileSync(log, "utf8") : "";
-    return {
-      status: result.status,
-      output: result.stdout + result.stderr,
-      args,
-    };
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
-}
-
-test("re-check (real shell, fake gh): passes only while the tag still resolves to the verified tag object", () => {
-  for (const step of recheckSteps) {
-    const same = runRecheck(step, {
-      current: `tag ${SHA_VERIFIED}`,
-      expected: SHA_VERIFIED,
-    });
-    assert.strictEqual(same.status, 0, same.output);
+    assert.strictEqual(same.status, 0, `${name}\n${same.output}`);
     assert.match(
-      same.args,
-      /api repos\/fossasia\/cla-bot\/git\/ref\/tags\/v1\.2\.3 --jq /,
+      same.calls[0],
+      /^api repos\/fossasia\/cla-bot\/git\/ref\/tags\/v1\.2\.3 --jq /,
+    );
+    assert.deepStrictEqual(
+      same.calls.filter((call) => call.startsWith("release edit")),
+      name === PUBLISH_STEP
+        ? ["release edit v1.2.3 --draft=false --latest"]
+        : [],
+      name,
     );
   }
 });
 
-test("re-check (real shell, fake gh): a MOVED, re-created-as-lightweight, or unexpected tag stops the release", () => {
-  for (const step of recheckSteps) {
+test("re-check (real shell, fake gh): a MOVED, re-created-as-lightweight, or unexpected tag stops the release and never reaches the publish call", () => {
+  for (const name of [CREATE_RECHECK, PUBLISH_STEP]) {
+    const step = publish.steps[stepNamed(publish.steps, name)];
     for (const [label, current] of [
       ["tag moved to another tag object", `tag ${SHA_MOVED}`],
       [
@@ -529,40 +681,54 @@ test("re-check (real shell, fake gh): a MOVED, re-created-as-lightweight, or une
       ["tag replaced by a lightweight tag elsewhere", `commit ${SHA_MOVED}`],
       ["empty answer", ""],
     ]) {
-      const r = runRecheck(step, { current, expected: SHA_VERIFIED });
-      assert.notStrictEqual(r.status, 0, label);
+      const r = runStep(step, {
+        gh: ghAnswers(current),
+        env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
+      });
+      assert.notStrictEqual(r.status, 0, `${name}: ${label}`);
       assert.match(
         r.output,
         /no longer resolves to the signed tag object/,
-        label,
+        `${name}: ${label}`,
+      );
+      assert.ok(
+        !r.calls.some((call) => call.startsWith("release edit")),
+        `${name}: ${label}: must not publish`,
       );
     }
   }
 });
 
-test("re-check (real shell, fake gh): an empty expected value or a failing gh can never pass", () => {
-  for (const step of recheckSteps) {
-    const noExpected = runRecheck(step, { current: "tag ", expected: "" });
+test("re-check (real shell, fake gh): an empty expected value or a failing gh can never pass, and never publishes", () => {
+  for (const name of [CREATE_RECHECK, PUBLISH_STEP]) {
+    const step = publish.steps[stepNamed(publish.steps, name)];
+    const noExpected = runStep(step, {
+      gh: ghAnswers("tag "),
+      env: { EXPECTED_TAG_OBJECT: "" },
+    });
     assert.notStrictEqual(
       noExpected.status,
       0,
-      "empty EXPECTED_TAG_OBJECT must fail",
+      `${name}: empty EXPECTED_TAG_OBJECT must fail`,
     );
-    const ghDown = runRecheck(step, {
-      current: `tag ${SHA_VERIFIED}`,
-      expected: SHA_VERIFIED,
-      ghFails: true,
+    const ghDown = runStep(step, {
+      gh: "exit 1",
+      env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
     });
     assert.notStrictEqual(
       ghDown.status,
       0,
-      "an API failure must fail the step",
+      `${name}: an API failure must fail the step`,
     );
+    for (const r of [noExpected, ghDown]) {
+      assert.ok(
+        !r.calls.some((call) => call.startsWith("release edit")),
+        `${name}: must not publish`,
+      );
+    }
   }
 });
 
-// The draft check's shell, run for real in a scratch dir. The fake `gh` serves
-// whatever is in $FAKE_DRAFT_DIR as the draft's assets.
 const draftStep = publish.steps[stepNamed(publish.steps, DRAFT_CHECK)];
 function runDraftCheck(
   mutate,
@@ -731,67 +897,159 @@ test("the draft check compares the same asset set that is uploaded", () => {
   assert.deepStrictEqual([...listed].sort(), [...uploaded].sort());
 });
 
-test("the immutability requirement is its own final step; the published-release check no longer swallows its failure", () => {
+test("the immutability requirement is its own final step; the published-release check no longer carries it", () => {
   const published = stepNamed(publish.steps, PUBLISHED_CHECK);
   const immutable = stepNamed(publish.steps, IMMUTABLE_CHECK);
   assert.strictEqual(immutable, publish.steps.length - 1, "last step");
   assert.ok(published < immutable);
   assert.ok(!/gh release verify/.test(publish.steps[published].run));
-  assert.ok(
-    !/\|\|\s*echo/.test(runText(publish.steps)),
-    "no `|| echo` that turns a failure into a message",
-  );
   assert.deepStrictEqual(publish.steps[immutable].env, {
-    ALLOW_MUTABLE_RELEASES: "${{ vars.ALLOW_MUTABLE_RELEASES }}",
+    RELEASE_IMMUTABILITY: "${{ vars.RELEASE_IMMUTABILITY }}",
   });
+  // The ONLY failure that is turned into a message is the informational lookup
+  // in the not-required branch; nothing in the release path swallows an error.
+  assert.strictEqual(
+    (runText(publish.steps).match(/\|\|\s*echo/g) ?? []).length,
+    1,
+  );
+  assert.match(
+    publish.steps[immutable].run,
+    /not-required\)\s+state="\$\(gh release view .*\|\| echo unknown\)"/,
+  );
 });
 
-function runImmutable({ verifyExit, allow }) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "immutable-"));
-  try {
-    fs.writeFileSync(
-      path.join(dir, "gh"),
-      '#!/bin/sh\n[ "$1 $2" = "release verify" ] || exit 9\nexit "$FAKE_VERIFY_EXIT"\n',
-      { mode: 0o755 },
-    );
-    const env = {
-      PATH: `${dir}:${process.env.PATH}`,
-      RELEASE_TAG: "v1.2.3",
-      FAKE_VERIFY_EXIT: String(verifyExit),
-    };
-    if (allow !== undefined) env.ALLOW_MUTABLE_RELEASES = allow;
-    const result = spawnSync(
-      "bash",
-      ["-c", publish.steps[stepNamed(publish.steps, IMMUTABLE_CHECK)].run],
-      {
-        env,
-        encoding: "utf8",
-      },
-    );
-    return { status: result.status, output: result.stdout + result.stderr };
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-  }
+test("the immutability check uses the release's own `isImmutable` flag AND GitHub's release attestation, with bounded retries", () => {
+  const script = publish.steps[stepNamed(publish.steps, IMMUTABLE_CHECK)].run;
+  assert.match(
+    script,
+    /gh release view "\$RELEASE_TAG" --json isImmutable --jq \.isImmutable/,
+  );
+  assert.match(
+    script,
+    /\[ "\$immutable" != "true" \]/,
+    "only the exact string true passes",
+  );
+  assert.match(script, /gh release verify "\$RELEASE_TAG"/);
+  assert.match(script, /attempts=6/);
+  assert.match(script, /sleep "\$\{RETRY_DELAY:-10\}"/);
+});
+
+// A fake `gh` for the immutability step. `view` answers FAKE_IMMUTABLE (or fails);
+// `verify` fails its first FAKE_VERIFY_FAILS calls, counting in ./counter.
+const IMMUTABLE_GH = [
+  'case "$1 $2" in',
+  '  "release view")',
+  '    [ -z "$FAKE_VIEW_FAIL" ] || exit 1',
+  `    printf '%s\\n' "$FAKE_IMMUTABLE" ;;`,
+  '  "release verify")',
+  '    n=$(cat counter 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > counter',
+  '    [ "$n" -gt "$FAKE_VERIFY_FAILS" ] ;;',
+  "  *) exit 9 ;;",
+  "esac",
+].join("\n");
+
+function runImmutable({
+  policy: declared,
+  immutable = "true",
+  verifyFails = 0,
+  viewFails = false,
+}) {
+  return runStep(publish.steps[stepNamed(publish.steps, IMMUTABLE_CHECK)], {
+    gh: IMMUTABLE_GH,
+    env: {
+      RELEASE_IMMUTABILITY: declared,
+      FAKE_IMMUTABLE: immutable,
+      FAKE_VERIFY_FAILS: String(verifyFails),
+      FAKE_VIEW_FAIL: viewFails ? "1" : "",
+      RETRY_DELAY: "0",
+    },
+  });
 }
+const verifyCalls = (r) =>
+  r.calls.filter((call) => call.startsWith("release verify")).length;
 
-test("immutability (real shell, fake gh): an immutable release passes; a mutable one FAILS unless mutable releases are explicitly allowed", () => {
-  const immutable = runImmutable({ verifyExit: 0 });
-  assert.strictEqual(immutable.status, 0, immutable.output);
-  assert.match(immutable.output, /is an immutable release/);
+test("immutability (real shell, fake gh): `required` passes only for a release that GitHub reports as immutable AND whose attestation verifies", () => {
+  const ok = runImmutable({ policy: "required" });
+  assert.strictEqual(ok.status, 0, ok.output);
+  assert.match(
+    ok.output,
+    /is immutable and its GitHub release attestation verifies/,
+  );
+  assert.deepStrictEqual(ok.calls, [
+    "release view v1.2.3 --json isImmutable --jq .isImmutable",
+    "release verify v1.2.3",
+  ]);
 
-  for (const allow of [undefined, "", "false", "yes", "TRUE", "1"]) {
-    const mutable = runImmutable({ verifyExit: 1, allow });
-    assert.strictEqual(mutable.status, 1, `allow=${JSON.stringify(allow)}`);
-    assert.match(mutable.output, /NOT an immutable release/);
-    assert.match(mutable.output, /ALLOW_MUTABLE_RELEASES/);
+  for (const [label, options] of [
+    ["isImmutable false", { immutable: "false" }],
+    ["isImmutable empty", { immutable: "" }],
+    ["isImmutable null", { immutable: "null" }],
+    ["isImmutable TRUE (wrong case)", { immutable: "TRUE" }],
+    ["the lookup itself fails", { viewFails: true }],
+  ]) {
+    const r = runImmutable({ policy: "required", ...options });
+    assert.notStrictEqual(r.status, 0, label);
+    assert.strictEqual(
+      verifyCalls(r),
+      0,
+      `${label}: the attestation is not even consulted`,
+    );
   }
+  const mutable = runImmutable({ policy: "required", immutable: "false" });
+  assert.match(
+    mutable.output,
+    /::error::.*NOT immutable \(isImmutable=false\)/,
+  );
+  assert.match(mutable.output, /RELEASE_IMMUTABILITY/);
+});
 
-  const optedOut = runImmutable({ verifyExit: 1, allow: "true" });
-  assert.strictEqual(optedOut.status, 0, optedOut.output);
-  assert.match(optedOut.output, /::warning::.*NOT an immutable release/);
+test("immutability (real shell, fake gh): the release attestation may take a moment (retried), but never passes without verifying", () => {
+  const eventually = runImmutable({ policy: "required", verifyFails: 2 });
+  assert.strictEqual(eventually.status, 0, eventually.output);
+  assert.strictEqual(verifyCalls(eventually), 3);
 
-  // An allowed-mutable setting must not mask a release that IS immutable.
-  assert.strictEqual(runImmutable({ verifyExit: 0, allow: "true" }).status, 0);
+  const lastChance = runImmutable({ policy: "required", verifyFails: 5 });
+  assert.strictEqual(lastChance.status, 0, "the sixth attempt still counts");
+  assert.strictEqual(verifyCalls(lastChance), 6);
+
+  const never = runImmutable({ policy: "required", verifyFails: 99 });
+  assert.strictEqual(never.status, 1);
+  assert.strictEqual(verifyCalls(never), 6, "bounded: exactly six attempts");
+  assert.match(
+    never.output,
+    /attestation could not be verified after 6 attempts/,
+  );
+});
+
+test("immutability (real shell, fake gh): `not-required` is an explicit, visible opt-out; an undeclared or invalid policy fails", () => {
+  const optOut = runImmutable({ policy: "not-required", immutable: "false" });
+  assert.strictEqual(optOut.status, 0, optOut.output);
+  assert.match(
+    optOut.output,
+    /::notice::.*not required here.*isImmutable=false/,
+  );
+  assert.strictEqual(verifyCalls(optOut), 0);
+  const lookupFails = runImmutable({ policy: "not-required", viewFails: true });
+  assert.strictEqual(
+    lookupFails.status,
+    0,
+    "an informational lookup never fails the opt-out",
+  );
+  assert.match(lookupFails.output, /isImmutable=unknown/);
+
+  for (const declared of [
+    undefined,
+    "",
+    "yes",
+    "Required",
+    "true",
+    "not required",
+  ]) {
+    const r = runImmutable({ policy: declared });
+    assert.strictEqual(r.status, 1, `policy=${JSON.stringify(declared)}`);
+    assert.match(r.output, /must be required or not-required/);
+    assert.deepStrictEqual(r.calls, [], "gh is never called");
+  }
 });
 
 test("every `gh attestation verify` pins repo, signer workflow, tag ref AND commit digest (before and after publishing)", () => {
@@ -821,6 +1079,376 @@ test("every `gh attestation verify` pins repo, signer workflow, tag ref AND comm
     "https://cyclonedx.org/bom",
     "https://cyclonedx.org/bom",
   ]);
+});
+
+// --- the release policy gate (runs before anything is built) -----------------------
+
+test("policy reads its declarations from repository variables, and only those", () => {
+  assert.deepStrictEqual(policy.env, {
+    GH_TOKEN: "${{ github.token }}",
+    RELEASE_IMMUTABILITY: "${{ vars.RELEASE_IMMUTABILITY }}",
+    RELEASE_APPROVAL: "${{ vars.RELEASE_APPROVAL }}",
+  });
+});
+
+test("policy (real shell): the immutability policy must be declared as `required` or `not-required`, otherwise nothing is built", () => {
+  const step = policy.steps[stepNamed(policy.steps, POLICY_IMMUTABILITY)];
+  const required = runStep(step, { env: { RELEASE_IMMUTABILITY: "required" } });
+  assert.strictEqual(required.status, 0, required.output);
+  assert.match(required.output, /declared as enabled/);
+  const optOut = runStep(step, {
+    env: { RELEASE_IMMUTABILITY: "not-required" },
+  });
+  assert.strictEqual(optOut.status, 0, optOut.output);
+  assert.match(optOut.output, /::warning::.*NOT required/);
+  for (const declared of [
+    undefined,
+    "",
+    "yes",
+    "Required",
+    "REQUIRED",
+    "true",
+    "not required",
+  ]) {
+    const r = runStep(step, { env: { RELEASE_IMMUTABILITY: declared } });
+    assert.strictEqual(r.status, 1, `policy=${JSON.stringify(declared)}`);
+    assert.match(r.output, /Nothing has been built or published/);
+  }
+});
+
+test("policy (real shell, fake gh): the `release` environment must have at least one required reviewer", () => {
+  const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
+  const ok = runStep(step, { gh: ghAnswers("1 true") });
+  assert.strictEqual(ok.status, 0, ok.output);
+  assert.match(
+    ok.calls[0],
+    /^api repos\/fossasia\/cla-bot\/environments\/release --jq /,
+  );
+  assert.ok(
+    !/::notice::/.test(ok.output),
+    "self-review is off, nothing to point out",
+  );
+
+  const selfReview = runStep(step, { gh: ghAnswers("3 false") });
+  assert.strictEqual(selfReview.status, 0, selfReview.output);
+  assert.match(selfReview.output, /::notice::.*allows self-review/);
+
+  for (const [label, answer] of [
+    ["no reviewers", "0 false"],
+    ["no reviewers, self-review off", "0 true"],
+    ["empty answer", ""],
+    ["a non-number", "garbage true"],
+    ["a negative number", "-1 true"],
+    ["a decimal", "1.5 true"],
+    ["only whitespace", "   "],
+  ]) {
+    const r = runStep(step, { gh: ghAnswers(answer) });
+    assert.notStrictEqual(r.status, 0, `${label} must NOT pass`);
+    assert.match(r.output, /::error::/, label);
+  }
+  const unreadable = runStep(step, { gh: "exit 1" });
+  assert.strictEqual(unreadable.status, 1);
+  assert.match(unreadable.output, /Could not read the 'release' environment/);
+});
+
+test("policy (real shell, fake gh): `RELEASE_APPROVAL=not-required` is the only way to skip the reviewer check, and it is visible", () => {
+  const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
+  const optOut = runStep(step, {
+    gh: ghAnswers("0 false"),
+    env: { RELEASE_APPROVAL: "not-required" },
+  });
+  assert.strictEqual(optOut.status, 0, optOut.output);
+  assert.match(optOut.output, /::warning::.*No reviewer approval is required/);
+  assert.deepStrictEqual(optOut.calls, [], "the environment is not even read");
+  for (const value of ["yes", "true", "Not-Required", "none", "required"]) {
+    const r = runStep(step, {
+      gh: ghAnswers("5 true"),
+      env: { RELEASE_APPROVAL: value },
+    });
+    assert.strictEqual(r.status, 1, value);
+    assert.match(r.output, /RELEASE_APPROVAL must be unset or not-required/);
+    assert.deepStrictEqual(
+      r.calls,
+      [],
+      "an invalid value never reaches the API",
+    );
+  }
+  // An EMPTY variable behaves as unset: the check is enforced.
+  const empty = runStep(step, {
+    gh: ghAnswers("0 false"),
+    env: { RELEASE_APPROVAL: "" },
+  });
+  assert.strictEqual(empty.status, 1);
+});
+
+// --- the jq programs that ship in the workflow ---------------------------------------
+//
+// The fake `gh` in the tests above never evaluates `--jq`, but the real one does.
+// These are the programs exactly as written in the workflow, run through a real
+// jq (or gojq, which is what `gh` embeds) on payloads shaped like GitHub's.
+
+const JQ = ["jq", "gojq"].find(
+  (bin) => spawnSync(bin, ["--version"]).status === 0,
+);
+function jqProgram(job, stepName, anchor) {
+  const step = job.steps[stepNamed(job.steps, stepName)];
+  const match = new RegExp(`${escapeRegExp(anchor)}[^\n]*--jq '([^']*)'`).exec(
+    step.run,
+  );
+  assert.ok(match, `no --jq program after ${anchor} in "${stepName}"`);
+  return match[1];
+}
+function evalJq(program, payload) {
+  const r = spawnSync(JQ, ["-r", program], {
+    input: JSON.stringify(payload),
+    encoding: "utf8",
+  });
+  assert.strictEqual(r.status, 0, r.stderr);
+  return r.stdout.replace(/\n$/, "");
+}
+
+test("the jq programs that ship in the workflow answer correctly on GitHub-shaped payloads (real jq/gojq, when installed)", () => {
+  if (!JQ)
+    return console.log(
+      "  (skipped: neither jq nor gojq is installed on this machine)",
+    );
+  const reviewers = jqProgram(
+    policy,
+    POLICY_REVIEWERS,
+    'environments/release"',
+  );
+  const user = { type: "User", reviewer: { login: "octo", id: 1 } };
+  for (const [label, payload, want] of [
+    [
+      "two reviewers, self-review blocked",
+      {
+        protection_rules: [
+          { type: "wait_timer" },
+          {
+            type: "required_reviewers",
+            prevent_self_review: true,
+            reviewers: [user, user],
+          },
+        ],
+      },
+      "2 true",
+    ],
+    [
+      "one reviewer, self-review allowed",
+      {
+        protection_rules: [
+          {
+            type: "required_reviewers",
+            prevent_self_review: false,
+            reviewers: [user],
+          },
+        ],
+      },
+      "1 false",
+    ],
+    [
+      "no protection rules",
+      { name: "release", protection_rules: [] },
+      "0 false",
+    ],
+    ["protection_rules absent", { name: "release" }, "0 false"],
+    [
+      "only a wait timer",
+      { protection_rules: [{ type: "wait_timer" }] },
+      "0 false",
+    ],
+    [
+      "required_reviewers with an empty list",
+      {
+        protection_rules: [
+          {
+            type: "required_reviewers",
+            prevent_self_review: true,
+            reviewers: [],
+          },
+        ],
+      },
+      "0 true",
+    ],
+    [
+      "required_reviewers without a reviewers key",
+      {
+        protection_rules: [
+          { type: "required_reviewers", prevent_self_review: true },
+        ],
+      },
+      "0 true",
+    ],
+  ]) {
+    assert.strictEqual(evalJq(reviewers, payload), want, label);
+  }
+
+  const tagRef = jqProgram(
+    publish,
+    PUBLISH_STEP,
+    'git/ref/tags/${RELEASE_TAG}"',
+  );
+  assert.strictEqual(
+    evalJq(tagRef, { object: { type: "tag", sha: SHA_VERIFIED } }),
+    `tag ${SHA_VERIFIED}`,
+  );
+  assert.strictEqual(
+    evalJq(tagRef, { object: { type: "commit", sha: SHA_VERIFIED } }),
+    `commit ${SHA_VERIFIED}`,
+  );
+
+  const meta = jqProgram(
+    publish,
+    DRAFT_CHECK,
+    "--json name,tagName,isDraft,isPrerelease",
+  );
+  assert.strictEqual(
+    evalJq(meta, {
+      name: "v1.2.3",
+      tagName: "v1.2.3",
+      isDraft: true,
+      isPrerelease: false,
+    }),
+    "v1.2.3 v1.2.3 true false",
+  );
+  assert.strictEqual(
+    evalJq(meta, {
+      name: "v1.2.3",
+      tagName: "v1.2.3",
+      isDraft: true,
+      isPrerelease: true,
+    }),
+    "v1.2.3 v1.2.3 true true",
+  );
+});
+
+// --- digests between jobs (real shell) ----------------------------------------------
+
+const sha256hex = (buffer) =>
+  crypto.createHash("sha256").update(buffer).digest("hex");
+const DIGEST_NAME = "cla-bot-v1.2.3";
+
+// Runs the publish job's digest step over a dist/ built to match the digests
+// the two jobs would have reported (computed here independently, in JS).
+function runDigestStep({ tamper = () => {}, expected = {} } = {}) {
+  const notes = Buffer.from("release notes\n");
+  const archive = Buffer.from("pretend tarball bytes");
+  const sbom = Buffer.from('{"bomFormat":"CycloneDX"}\n');
+  const sourceDigest = sha256hex(
+    Buffer.from(
+      `${sha256hex(notes)}  dist/RELEASE_NOTES.md\n${sha256hex(archive)}  dist/${DIGEST_NAME}.tar.gz\n`,
+    ),
+  );
+  const files = {
+    "RELEASE_NOTES.md": notes,
+    [`${DIGEST_NAME}.tar.gz`]: archive,
+    [`${DIGEST_NAME}.sbom.cdx.json`]: sbom,
+  };
+  const result = runStep(publish.steps[stepNamed(publish.steps, DIGEST_STEP)], {
+    env: {
+      EXPECTED_SOURCE_DIGEST: expected.source ?? sourceDigest,
+      EXPECTED_SBOM_DIGEST: expected.sbom ?? sha256hex(sbom),
+    },
+    setup: (dir) => {
+      const dist = path.join(dir, "dist");
+      fs.mkdirSync(dist);
+      for (const [file, content] of Object.entries(files))
+        fs.writeFileSync(path.join(dist, file), content);
+      tamper(dist);
+    },
+    after: (dir) => {
+      const sums = path.join(dir, "dist", "SHA256SUMS");
+      return fs.existsSync(sums) ? fs.readFileSync(sums, "utf8") : null;
+    },
+  });
+  return {
+    ...result,
+    expectedSums: `${sha256hex(archive)}  ${DIGEST_NAME}.tar.gz\n${sha256hex(sbom)}  ${DIGEST_NAME}.sbom.cdx.json\n`,
+  };
+}
+
+test("digest step (real shell): untouched files pass and SHA256SUMS is written over exactly the archive and the SBOM", () => {
+  if (!HAS_SHA256SUM)
+    return console.log("  (skipped: sha256sum not available on this machine)");
+  const r = runDigestStep();
+  assert.strictEqual(r.status, 0, r.output);
+  assert.strictEqual(r.extra, r.expectedSums);
+});
+
+test("digest step (real shell): any altered, missing, extra or mismatching file stops the release before SHA256SUMS exists", () => {
+  if (!HAS_SHA256SUM)
+    return console.log("  (skipped: sha256sum not available on this machine)");
+  const zeros = "0".repeat(64);
+  for (const [label, options] of [
+    [
+      "archive altered",
+      {
+        tamper: (dist) =>
+          fs.appendFileSync(path.join(dist, `${DIGEST_NAME}.tar.gz`), "x"),
+      },
+    ],
+    [
+      "notes altered",
+      {
+        tamper: (dist) =>
+          fs.appendFileSync(path.join(dist, "RELEASE_NOTES.md"), "evil link\n"),
+      },
+    ],
+    [
+      "SBOM altered",
+      {
+        tamper: (dist) =>
+          fs.writeFileSync(
+            path.join(dist, `${DIGEST_NAME}.sbom.cdx.json`),
+            "{}",
+          ),
+      },
+    ],
+    [
+      "archive missing",
+      { tamper: (dist) => fs.rmSync(path.join(dist, `${DIGEST_NAME}.tar.gz`)) },
+    ],
+    [
+      "SBOM missing",
+      {
+        tamper: (dist) =>
+          fs.rmSync(path.join(dist, `${DIGEST_NAME}.sbom.cdx.json`)),
+      },
+    ],
+    [
+      "extra file",
+      {
+        tamper: (dist) =>
+          fs.writeFileSync(path.join(dist, "backdoor.sh"), "#!/bin/sh"),
+      },
+    ],
+    [
+      "extra file replacing a real one",
+      {
+        tamper: (dist) =>
+          fs.renameSync(
+            path.join(dist, "RELEASE_NOTES.md"),
+            path.join(dist, "other.md"),
+          ),
+      },
+    ],
+    [
+      "source digest reported by build is wrong",
+      { expected: { source: zeros } },
+    ],
+    ["SBOM digest reported by checks is wrong", { expected: { sbom: zeros } }],
+    ["source digest missing", { expected: { source: "" } }],
+    ["SBOM digest missing", { expected: { sbom: "" } }],
+  ]) {
+    const r = runDigestStep(options);
+    assert.notStrictEqual(r.status, 0, label);
+    assert.match(r.output, /Refusing to sign/, label);
+    assert.strictEqual(
+      r.extra,
+      null,
+      `${label}: SHA256SUMS must not be written`,
+    );
+  }
 });
 
 // --- assets, docs, Scorecard -----------------------------------------------------------

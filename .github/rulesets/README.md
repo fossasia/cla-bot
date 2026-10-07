@@ -114,6 +114,29 @@ Either way, `required_approving_review_count` and
 `require_code_owner_review` are the only two fields that change; the status
 check and bypass list stay exactly as they are.
 
+**For the release pipeline specifically** ("A change to `release.yml` itself"
+in `SECURITY.md`): keep `required_approving_review_count` at `0`, set
+`require_code_owner_review: true`, and let `.github/CODEOWNERS` name owners
+for the release-critical paths only, so that every other change still merges
+without a review:
+
+```
+/.github/workflows/release.yml    @OWNER
+/.github/scripts/release-check.js @OWNER
+/.github/rulesets/                @OWNER
+/.github/CODEOWNERS               @OWNER
+/action.yml                       @OWNER
+/package.json                     @OWNER
+```
+
+`@OWNER` must be a user or team with write access to the repository: a path
+whose owner does not exist or cannot approve makes every pull request that
+touches it impossible to merge. Check it on a throwaway PR that edits
+`release.yml`. This repository ships no `CODEOWNERS` on purpose and
+`test/ci-gate.test.js` asserts that, so adopting this means changing that
+test and the "Branch protection has exactly one required condition, by
+design" text above.
+
 ## Optional: block on CodeQL alerts
 
 A green `codeql` job in `ci.yml` means the analysis ran, not that there are

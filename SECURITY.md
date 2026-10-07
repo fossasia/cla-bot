@@ -69,18 +69,32 @@ Out of scope:
    request and a passing "Required checks pass" is enforced by the `main`
    ruleset (`.github/rulesets/main.json`), which must be applied. Nobody
    uploads release assets by hand. The signed tag object the build verified
-   is pinned: the publish job re-checks, right before it creates the release
-   and again right before it publishes, that the tag still resolves to that
-   exact object, so a tag moved or re-signed during the approval pause cannot
-   be released. The draft release is also compared with what was prepared
-   and verified, right before it is published: its assets byte for byte and as
-   a set, and its title, tag, notes, draft and pre-release flags.
+   is pinned: the publish job re-checks that the tag still resolves to that
+   exact object right before it creates the draft, and again in the very same
+   shell step as the publish call, so a tag moved or re-signed during the
+   approval pause or the signing is refused. (A gap of one API round trip
+   remains; see "A tag moved between verification and release" below.) The
+   draft release is also compared with what was prepared and verified, right
+   before it is published: its assets byte for byte and as a set, and its
+   title, tag, notes, draft and pre-release flags.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
-   GitHub's OIDC token, and recorded in a public transparency log. The
-   `publish` job (the only one that can sign or write) executes no
-   repository code, and the `build` job (the only one that executes
-   repository code) can only read.
+   GitHub's OIDC token, and recorded in a public transparency log. The jobs
+   are split by what they run: `build` creates the archive with `git` and
+   Node built-ins and runs **no third-party code at all**; the `checks` job,
+   on a different machine, installs the dev dependencies and runs them (the
+   YAML parser for the SBOM, the coverage tool) and the test suite, and can
+   at worst falsify the SBOM, never the archive; `publish` (the only job that
+   can sign or write) runs neither repository nor third-party code and
+   re-checks the digests the other two reported through job outputs. `policy`,
+   `build` and `checks` can only read.
+8. A release does not start unless the release policy is declared, before
+   anything is built: the repository variable `RELEASE_IMMUTABILITY` must be
+   `required` (the administrator confirms "Immutable releases" is on; it is
+   verified on the published release) or `not-required`, and the `release`
+   environment must have required reviewers (read through the API) unless
+   `RELEASE_APPROVAL` is `not-required`. These are explicit, visible
+   decisions, never silent defaults.
 
 ## Verifying a release
 
@@ -164,19 +178,30 @@ What the signatures do **not** protect against, and what does:
   write access and a registered signing key can start a release. The checks
   that still apply to every release are: the commit must already be on
   `main`, the tests and the 100% coverage gate must pass on it, and the
-  tagger is identifiable from the signed tag. If the `release` environment has
-  required reviewers, a second person must also approve the publish. This
-  repository also deliberately has no required code review on `main` (see
-  `.github/rulesets/README.md`), so a pull request can in principle change
-  `release.yml` itself, and the identity above only names the workflow _file_,
-  not its contents. If you need more than that, add a required review (see the
-  ruleset README) and check the diff of `release.yml` between the releases you
-  adopt.
+  tagger is identifiable from the signed tag, and the `release` environment
+  must have required reviewers (verified before anything is built), so a
+  second person approves the publish.
+- **A change to `release.yml` itself.** This repository deliberately has no
+  required code review on `main` (see `.github/rulesets/README.md`), and the
+  signing identity above names the workflow _file_, not its contents. A pull
+  request that passes CI could therefore change `release.yml`, including
+  removing the policy checks or the `environment: release` line that makes
+  reviewers apply, and no check inside that same file can stop it. The
+  policy gate protects against misconfiguration and against someone who can
+  push tags but not change the workflow; it is **not** a defence against a
+  malicious change to the workflow. That needs a human review of changes to
+  the release pipeline files. The narrowest way to get it without slowing
+  down the rest of the repository is a path-scoped code-owner review for
+  those files only (see "Optional: add required review back" in
+  `.github/rulesets/README.md`, which lists the paths). Until you adopt it, check the diff of
+  `release.yml` and `release-check.js` between the releases you adopt.
 - **A tag moved between verification and release.** The publish job refuses
   to continue unless the tag still resolves to the exact signed tag object
   that was verified (`gh release create --verify-tag` alone would not catch
-  this; it only checks that the tag exists). Two different outcomes, which
-  call for different responses:
+  this; it only checks that the tag exists). The check and the publish call
+  are one shell step, back to back, so the gap is a single API round trip,
+  which no workflow can close entirely. Two different outcomes, which call for
+  different responses:
   - _Caught before publishing_ (the normal case): the run fails with "no
     longer resolves to the signed tag object", **nothing is public**, and
     nothing needs undoing.
@@ -288,16 +313,24 @@ What the signatures do **not** protect against, and what does:
   code. Until it is enabled, a published release's assets can in principle
   still be replaced by an administrator; the signatures would then no
   longer match, so a verifying consumer notices, but a non-verifying one
-  would not. The release workflow therefore ends by requiring the release to
-  be immutable and FAILS the run (after publishing, so it cannot undo the
-  release) if it is not, unless the repository variable
-  `ALLOW_MUTABLE_RELEASES` is `true`, an explicit opt-out meant for rehearsal
-  forks.
+  would not. The setting cannot be read from a workflow before publishing
+  (GitHub requires the `administration` permission, which no workflow token can
+  have), so the workflow does what is possible: before building anything it
+  requires the administrator to **declare** the policy (`RELEASE_IMMUTABILITY`
+  `required` or `not-required`), and after publishing it checks the release's
+  own `isImmutable` flag and GitHub's signed release attestation, FAILING the
+  run if a `required` release is not immutable. That last failure comes after
+  publishing, so it cannot undo the release: it catches a wrong declaration
+  (or a setting switched off since), the first time it happens.
 - The release SBOM lists the pinned third-party actions that `action.yml`
   runs (`runs.steps[*].uses`). It deliberately models only a composite action
   with no local `./` actions: anything else makes the release fail instead of
   producing an incomplete SBOM. It does not describe anything a step
-  downloads at run time.
+  downloads at run time. It is generated in the `checks` job by the pinned
+  `js-yaml` dev dependency, so a compromised copy of that package could
+  falsify the SBOM's contents (never the archive, which is built in a
+  different job on a different machine); the SBOM is evidence about the
+  dependencies, the pinned commit and signatures are the integrity guarantee.
 - The workflow proves that the released commit is an ancestor of `main`, not
   how it got there; that is the `main` ruleset's job (see above).
 - Verification trusts Sigstore's public-good instance (Fulcio, Rekor) and

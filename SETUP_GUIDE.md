@@ -31,8 +31,8 @@ App token - no long-lived personal access token is stored anywhere.
 4. **Cut a signed release - don't skip this, everything after this step
    depends on it existing.** Releases are built, signed and published by CI
    from a signed tag; nobody creates one by hand. The one-time repository
-   settings (immutable releases, the `release` environment, a
-   registered signing key) and the exact steps are in CONTRIBUTING.md's
+   settings (immutable releases and its `RELEASE_IMMUTABILITY` declaration, the
+   `release` environment with required reviewers, a registered signing key) and the exact steps are in CONTRIBUTING.md's
    "Releasing a new version" section. In short:
    ```bash
    git tag -s v1.0.0 -m "cla-bot v1.0.0"   # or whatever version CHANGELOG.md says
