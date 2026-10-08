@@ -240,12 +240,12 @@ const publishTagGh = (
     '  *"releases/123"*)',
     '    reads=0; [ ! -f release-read-count ] || reads=$(cat release-read-count); reads=$((reads + 1)); printf "%s\\n" "$reads" > release-read-count',
     `    if [ "$reads" -gt 1 ] && [ "\${FAKE_FINAL_RELEASE_FAILURE:-}" = true ]; then exit 1; fi`,
-    `    if [ "$reads" -gt 1 ] && [ -n "\${FAKE_FINAL_RELEASE_JSON:-}" ]; then printf '%s\\n' "$FAKE_FINAL_RELEASE_JSON"; else printf '%s\\n' '${releasePayload(meta, body, assets)}'; fi ;;`,
+    `    if [ "$reads" -gt 1 ] && [ -f tag-checked ] && [ -n "\${FAKE_RELEASE_AFTER_TAG:-}" ]; then printf '%s\\n' "$FAKE_RELEASE_AFTER_TAG"; elif [ "$reads" -gt 1 ] && [ -n "\${FAKE_FINAL_RELEASE_JSON:-}" ]; then printf '%s\\n' "$FAKE_FINAL_RELEASE_JSON"; else printf '%s\\n' '${releasePayload(meta, body, assets)}'; fi ;;`,
     '  *"release download"*) printf \'wrong release 999\' > "$5/wrong-release-999" ;;',
     ...assets.map((asset, index) =>
       `  *"releases/assets/${100 + index} "*) touch assets-downloaded; cat "$FAKE_DRAFT_DIR/${asset}" 2>/dev/null || : ;;`,
     ),
-    `  *"git/ref/tags/"*) if [ -f assets-downloaded ] && [ "\${FAKE_TAG_API_FAILURE_AFTER_ASSETS:-}" = true ]; then exit 1; elif [ -f assets-downloaded ] && [ -n "\${FAKE_TAG_AFTER_ASSETS:-}" ]; then printf '%s\\n' "$FAKE_TAG_AFTER_ASSETS"; else printf '%s\\n' '${answer}'; fi ;;`,
+    `  *"git/ref/tags/"*) touch tag-checked; if [ -f assets-downloaded ] && [ "\${FAKE_TAG_API_FAILURE_AFTER_ASSETS:-}" = true ]; then exit 1; elif [ -f assets-downloaded ] && [ -n "\${FAKE_TAG_AFTER_ASSETS:-}" ]; then printf '%s\\n' "$FAKE_TAG_AFTER_ASSETS"; else printf '%s\\n' '${answer}'; fi ;;`,
     '  *) exit 99 ;;',
     "esac",
   ].join("\n");
@@ -1095,10 +1095,12 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   const finalAssetsAt = script.indexOf('releases/assets/${asset_id}');
   const finalCompareAt = script.indexOf('cmp -s -- "dist/${asset}" "final-draft/${asset}"');
   const finalSnapshotAt = script.indexOf('final_release_json="$(gh api');
+  const finalSnapshotCompareAt = script.indexOf('if [ "$final_meta"');
   assert.ok(
-    finalCompareAt >= 0 && finalCompareAt < finalSnapshotAt &&
-      finalSnapshotAt < checkAt && checkAt < compareAt && compareAt < editAt,
-    "compare bytes, re-read release state, check the tag last, then publish in one script",
+    finalCompareAt >= 0 && finalCompareAt < checkAt &&
+      checkAt < finalSnapshotAt && finalSnapshotAt < finalSnapshotCompareAt &&
+      finalSnapshotCompareAt < editAt,
+    "compare bytes, check tag, re-read release state, then publish in one script",
   );
   assert.ok(
     finalAssetsAt >= 0 && finalAssetsAt < finalCompareAt &&
@@ -1107,12 +1109,12 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   );
   assert.strictEqual((script.match(/gh api --method PATCH/g) ?? []).length, 1);
   assert.match(script, /gh api --method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=false/);
-  const between = script.slice(compareAt, editAt);
+  const between = script.slice(finalSnapshotCompareAt, editAt);
   assert.ok(
     !/\b(gh|git|curl|sleep|npm|node)\b/.test(
       between.replace(/gh api --method PATCH[^\n]+/, ""),
     ),
-    "the tag comparison is followed directly by the publish call",
+    "the final release snapshot comparison is followed directly by the publish call",
   );
 });
 
@@ -1469,7 +1471,7 @@ test("publication rechecks the tag after asset and release verification, catchin
     (last, call, index) => call === "api repos/fossasia/cla-bot/releases/123" ? index : last,
     -1,
   );
-  assert.ok(lastReleaseRead < tagRead, "the final release snapshot precedes the final tag check");
+  assert.ok(lastReleaseRead < tagRead, "a moved tag fails before the final release snapshot");
   assert.ok(
     !result.calls.some((call) => call.startsWith("api --method PATCH")),
     "a tag move during final verification prevents publication",
@@ -1493,6 +1495,40 @@ test("a failed final tag lookup after asset verification cannot publish", () => 
   assert.ok(
     !result.calls.some((call) => call.startsWith("api --method PATCH")),
     "a failed final tag lookup fails closed",
+  );
+});
+
+test("asset replacement during the final tag lookup is caught by the post-tag release snapshot", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISH_STEP)];
+  const replacedIds = Object.fromEntries(
+    releaseAssets().map((asset, index) => [asset, index === 0 ? 999 : 100 + index]),
+  );
+  const replacement = releasePayload(
+    "123 v1.2.3 v1.2.3 true false",
+    "notes",
+    releaseAssets(),
+    replacedIds,
+  );
+  const result = runStep(step, {
+    gh: publishTagGh(`tag ${SHA_VERIFIED}`),
+    env: {
+      EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+      EXPECTED_RELEASE_ID: "123",
+      FAKE_DRAFT_DIR: "served",
+      FAKE_RELEASE_AFTER_TAG: replacement,
+    },
+    setup: setupPublishDraft,
+  });
+  assert.notStrictEqual(result.status, 0, result.output);
+  assert.match(result.output, /asset objects changed while verifying/);
+  const tagRead = result.calls.findIndex((call) => call.includes("git/ref/tags/"));
+  const finalReleaseRead = result.calls.findLastIndex(
+    (call) => call === "api repos/fossasia/cla-bot/releases/123",
+  );
+  assert.ok(tagRead >= 0 && tagRead < finalReleaseRead);
+  assert.ok(
+    !result.calls.some((call) => call.startsWith("api --method PATCH")),
+    "replacement detected after the tag lookup is never published",
   );
 });
 
@@ -1881,7 +1917,7 @@ test("consumer verification pins the resolved tag commit to both attestations an
 
 // --- the release policy gate (runs before anything is built) -----------------------
 
-test("immutability is pinned in reviewed workflow code; only the approval opt-out is a variable", () => {
+test("mutable releases are the reviewed policy in preflight, publish, Latest and the security docs", () => {
   assert.deepStrictEqual(policy.env, {
     GH_TOKEN: "${{ github.token }}",
     RELEASE_IMMUTABILITY: "not-required",
@@ -1889,6 +1925,9 @@ test("immutability is pinned in reviewed workflow code; only the approval opt-ou
   });
   assert.strictEqual(publish.steps[stepNamed(publish.steps, IMMUTABLE_CHECK)].env.RELEASE_IMMUTABILITY, "not-required");
   assert.strictEqual(verifyLatest.env.RELEASE_IMMUTABILITY, "not-required");
+  assert.match(read("CONTRIBUTING.md"), /Mutability is intentionally `not-required`/);
+  assert.match(read("SECURITY.md"), /reviewed `not-required` policy does not fail for mutable releases/);
+  assert.match(read("SECURITY.md"), /release notes and mutable metadata are not covered by/);
 });
 
 test("policy (real shell): the immutability policy must be declared as `required` or `not-required`, otherwise nothing is built", () => {

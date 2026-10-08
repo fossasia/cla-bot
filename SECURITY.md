@@ -71,15 +71,18 @@ Out of scope:
    uploads release assets by hand. The signed tag object the build verified
    is pinned: the publish job re-checks that the tag still resolves to that
    exact object right before it creates the draft, and again in the very same
-   shell step as the publish call. That final step also re-downloads and
-   compares the DRAFT's assets and metadata immediately before publication;
-   only the final GitHub API round-trip remains non-atomic. The release tag ruleset
-   (`.github/rulesets/release-tags.json`) prevents ordinary writers from
-   updating or deleting a `v*` tag once created; it must be imported in GitHub
-   settings. Without it, repeated checks only narrow the tag race. The
-   final check still has a one-API-round-trip window if an administrator
-   disables or bypasses the ruleset; see "A tag moved between verification
-   and release" below. The
+   shell step as the publish call. The final step downloads and compares the
+   DRAFT's assets, checks the tag, then reads the release again by ID before
+   publication. That last read detects asset replacement during the tag API
+   request. GitHub has no atomic verify-and-publish operation: a tag can move
+   during the final release read, and release contents can change after that
+   read. The release tag ruleset (`.github/rulesets/release-tags.json`)
+   prevents ordinary writers from updating or deleting a `v*` tag once
+   created; it must be imported in GitHub settings. Without it, repeated
+   checks only narrow the tag race. If an administrator disables or bypasses
+   the ruleset, the tag can move during the final release read; the release
+   itself can still be edited after that read. See "A tag moved between
+   verification and release" below. The
    draft release is also compared with what was prepared and verified, right
    before it is published: its assets byte for byte and as a set, and its
    title, tag, notes, draft and pre-release flags. Before publication the
@@ -259,8 +262,9 @@ What the signatures do **not** protect against, and what does:
   that was verified (`gh release create --verify-tag` alone would not catch
   this; it only checks that the tag exists). Importing the tag ruleset blocks
   updates/deletions by ordinary writers. If an administrator disables or
-  bypasses that ruleset, the final check and publish call remain separate
-  GitHub API operations, leaving one API round trip of residual race. Two
+  bypasses that ruleset, the tag check and final release read remain separate
+  API operations, so the tag can move during that read. The release can also
+  change after its final read and before publication. Two
   outcomes call for different responses:
   - _Caught before publishing_ (the normal case): the run fails with "no
     longer resolves to the signed tag object", **nothing is public**, and
@@ -273,12 +277,13 @@ What the signatures do **not** protect against, and what does:
     find out who moved the tag, release the next patch version). Consumers who
     pinned the commit of a release they verified are unaffected, because the
     signed assets and attestations still describe the commit that was built.
-- **A draft release altered by someone with write access.** The comparison
-  of assets and metadata right before publishing narrows this to the instant
-  between that comparison and GitHub's publish call; it cannot be closed from
-  inside a workflow. The post-publish verification then re-checks what users download
-  and fails the run loudly, and consumers who verify (above) are protected
-  regardless.
+- **A draft release altered by someone with write access.** The final
+  release-ID snapshot follows the tag lookup and catches an asset replacement
+  during that lookup. GitHub exposes no atomic release-read-and-publish call,
+  so a writer can still change the release after the final snapshot and before
+  publication. The post-publish verification re-checks what users download
+  and fails the run loudly; consumers must verify signatures and attestations
+  before using assets.
 - **A tag moved or deleted after you pinned it.** Pinning the commit SHA makes
   this irrelevant for you. Import `.github/rulesets/release-tags.json` to
   prevent updates and deletions of `v*` tags while still allowing authorized

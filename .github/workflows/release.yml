@@ -705,10 +705,11 @@ jobs:
             fi
           done
 
-      # Verify the release after downloading its assets, then make the tag
-      # check the final read before publication. A second release read detects
-      # replacement during downloads; GitHub has no atomic verify-and-publish
-      # operation, so small API races remain between checks and the PATCH.
+      # Verify the release after downloading its assets, check the tag, then
+      # read the release again as the final check before publication. This
+      # catches asset replacement during the tag lookup. GitHub has no atomic
+      # verify-and-publish operation: the tag can move during the last release
+      # read, and the release can change between that read and the publish call.
       - name: Re-check the tag and publish the release
         env:
           EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
@@ -720,9 +721,9 @@ jobs:
             exit 1
           fi
 
-          # Re-read and compare the DRAFT in this same shell step immediately
-          # before publication. Asset IDs identify immutable uploaded objects;
-          # a same-name removal/re-upload changes the snapshot and fails closed.
+          # Read the DRAFT in this same shell step before publication. Asset
+          # IDs identify immutable uploaded objects; same-name replacement
+          # changes the snapshot and fails closed.
           name="cla-bot-${RELEASE_TAG}"
           assets=(
             "${name}.tar.gz"
@@ -781,8 +782,15 @@ jobs:
             fi
           done
 
-          # Re-read the release after downloads and require the same metadata
-          # and asset identities before making the final tag check.
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
+          expected="tag ${EXPECTED_TAG_OBJECT}"
+          if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
+            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
+            exit 1
+          fi
+          # Re-read the release AFTER the tag lookup. This catches removal and
+          # same-name re-upload of an asset during that request: asset IDs are
+          # immutable, so the fresh list must match the bytes checked above.
           final_release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
           final_meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$final_release_json")"
           final_body="$(jq -r .body <<< "$final_release_json" | tr -d '\r')"
@@ -790,12 +798,6 @@ jobs:
           verified_asset_ids="$(jq -c '[.assets[] | {id, name, state, size, digest: (.digest // null)}] | sort_by(.id)' <<< "$release_json")"
           if [ "$final_meta" != "${release_id} ${RELEASE_TAG} ${RELEASE_TAG} true false" ] || [ "$final_body" != "$notes" ] || [ "$final_asset_ids" != "$verified_asset_ids" ]; then
             echo "::error::Draft metadata or asset objects changed while verifying immediately before publication. Refusing to publish."
-            exit 1
-          fi
-          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
-          expected="tag ${EXPECTED_TAG_OBJECT}"
-          if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
-            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
             exit 1
           fi
           # Keep this release from changing Latest during publication. A final
