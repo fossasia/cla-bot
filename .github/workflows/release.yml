@@ -17,9 +17,9 @@ name: Release
 #
 #   policy   actions: read ONLY. Fails fast, before anything is built, unless
 #            the release policy is explicit: mutability is a reviewed workflow
-#            setting; `RELEASE_APPROVAL` is the no-approval opt-out. The
-#            `release` environment is checked through the API when no opt-out
-#            is set.
+#            setting; `RELEASE_APPROVAL` declares whether the `release`
+#            environment must have reviewers or must have none. The actual
+#            environment is always checked through the API.
 #   build    contents: read ONLY. Verifies the tag and builds the source
 #            archive and release notes with `git` and Node built-ins. It
 #            installs and executes NO third-party code (no npm), so nothing
@@ -37,9 +37,9 @@ name: Release
 #            against the sign job output before publishing. No third-party
 #            action or repository code runs with release-write permission.
 #   latest   contents: write only. Reconciles GitHub's Latest marker after
-#            publication; globally serialized. A release published while a
-#            reconciliation is running may briefly leave the marker stale,
-#            until the queued reconciliation reads the newer release list.
+#            publication; globally serialized. It rechecks the public stable
+#            maximum and verified release fingerprint before writing, and
+#            fails closed if a newer stable release appeared after verification.
 #   verify-latest  contents: read only. Validates candidates' signed tags,
 #            branch ancestry, exact assets, signatures and workflow attestations.
 #            Runs after publication even if a post-publication check fails.
@@ -59,8 +59,9 @@ name: Release
 # The release is created as a DRAFT, filled, verified, and only then
 # published. It is published without changing the Latest marker; a final,
 # globally serialised job points Latest at the highest verified stable release.
-# This is eventually consistent: GitHub's concurrency queue can retain only a
-# pending run, and a release can become public after candidate verification.
+# Candidate assets and tag binding are rechecked immediately before the Latest
+# write. GitHub has no atomic verify-and-promote operation, so a final API race
+# remains possible; a later reconciliation repairs the marker.
 # That order matters: with "Immutable releases" enabled (see
 # CONTRIBUTING.md) a published release can never be edited, so a broken one
 # would burn its version number.
@@ -115,19 +116,18 @@ jobs:
           esac
 
       # The workflow file is repository-controlled, so a human approval is only
-      # meaningful if it is enforced by the `release` environment, whose
-      # protection rules are not part of the repository. Read them (any token
-      # with `actions: read` can) and refuse to release unless someone other
-      # than the workflow author's pipeline has to approve.
-      - name: Require reviewers on the release environment
+      # GitHub enforces environment protection independently of workflow
+      # variables. Always read the actual rules so the declared policy cannot
+      # disagree with a reviewer gate that would still block the publish job.
+      - name: Check the release environment approval policy
         run: |
           set -euo pipefail
           case "${RELEASE_APPROVAL:-}" in
             "")
+              expected="required"
               ;;
             not-required)
-              echo "::warning::No reviewer approval is required for releases (RELEASE_APPROVAL=not-required)."
-              exit 0
+              expected="not-required"
               ;;
             *)
               echo "::error::RELEASE_APPROVAL must be unset or not-required, not '${RELEASE_APPROVAL}'."
@@ -135,7 +135,7 @@ jobs:
               ;;
           esac
           if ! summary="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release" --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | "\(map(.reviewers | length) | add // 0) \(map(.prevent_self_review) | any)"')"; then
-            echo "::error::Could not read the 'release' environment. Create it (Settings -> Environments) with required reviewers, or set the repository variable RELEASE_APPROVAL to not-required to release without approval."
+            echo "::error::Could not read the 'release' environment approval rules. Configure the environment and grant this workflow actions:read access."
             exit 1
           fi
           read -r reviewers prevent_self_review <<< "$summary"
@@ -148,12 +148,20 @@ jobs:
               exit 1
               ;;
           esac
-          if [ "$reviewers" -lt 1 ]; then
-            echo "::error::The 'release' environment has no required reviewers, so nobody has to approve a release. Add reviewers, or set the repository variable RELEASE_APPROVAL to not-required to accept that on purpose."
-            exit 1
-          fi
-          if [ "${prevent_self_review:-false}" != "true" ]; then
-            echo "::notice::The 'release' environment allows self-review: whoever pushes the tag may also approve its release."
+          if [ "$expected" = "not-required" ]; then
+            if [ "$reviewers" -ne 0 ]; then
+              echo "::error::RELEASE_APPROVAL=not-required conflicts with the 'release' environment, which has ${reviewers} required reviewer(s). Remove those reviewers to allow authorized release writers to publish without a second-person approval."
+              exit 1
+            fi
+            echo "No required reviewers are configured on the 'release' environment; GitHub will not add an environment approval gate."
+          else
+            if [ "$reviewers" -lt 1 ]; then
+              echo "::error::RELEASE_APPROVAL is unset, so approval is required, but the 'release' environment has no required reviewers. Add reviewers or explicitly set RELEASE_APPROVAL=not-required."
+              exit 1
+            fi
+            if [ "${prevent_self_review:-false}" != "true" ]; then
+              echo "::notice::The 'release' environment allows self-review: whoever pushes the tag may also approve its release."
+            fi
           fi
 
   build:
@@ -558,21 +566,13 @@ jobs:
             exit 1
           fi
 
-      # Draft first, publish last. A leftover DRAFT from a failed earlier run
-      # of this same tag is replaced; a PUBLISHED release is never touched
-      # (with immutable releases it could not be, and it must not be silently
-      # replaced either way).
+      # Draft first, publish last. Never delete an existing release: GitHub
+      # cannot atomically check its draft state and delete it, so a concurrent
+      # publisher could otherwise turn a checked draft public before deletion.
       - name: Create the draft release
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
-          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
-            if [ "$state" != "true" ]; then
-              echo "::error::Release ${RELEASE_TAG} is already published and is never overwritten. Use a new version."
-              exit 1
-            fi
-            gh release delete "$RELEASE_TAG" --yes
-          fi
           gh release create "$RELEASE_TAG" \
             --draft \
             --verify-tag \
@@ -815,6 +815,9 @@ jobs:
     outputs:
       release-id: ${{ steps.select.outputs.release-id }}
       release-tag: ${{ steps.select.outputs.release-tag }}
+      asset-digest: ${{ steps.select.outputs.verified-asset-digest }}
+      tag-object: ${{ steps.select.outputs.verified-tag-object }}
+      commit: ${{ steps.select.outputs.verified-commit }}
     env:
       GH_TOKEN: ${{ github.token }}
       RELEASE_IMMUTABILITY: not-required
@@ -874,8 +877,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Global serialization prevents competing Latest writes. Candidate
-    # verification can still race with a newer publication; the newer run
-    # verifies the current release list and its serialized write converges.
+    # metadata, tag binding, ancestry and asset bytes are rechecked here before
+    # the write; a later reconciliation repairs any final API race.
     concurrency:
       group: release-latest-marker
       cancel-in-progress: false
@@ -885,14 +888,80 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       VERIFIED_RELEASE_ID: ${{ needs.verify-latest.outputs.release-id }}
       VERIFIED_RELEASE_TAG: ${{ needs.verify-latest.outputs.release-tag }}
+      VERIFIED_ASSET_DIGEST: ${{ needs.verify-latest.outputs.asset-digest }}
+      VERIFIED_TAG_OBJECT: ${{ needs.verify-latest.outputs.tag-object }}
+      VERIFIED_COMMIT: ${{ needs.verify-latest.outputs.commit }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       - name: Reconcile Latest to the highest verified stable SemVer
         run: |
           set -euo pipefail
           highest_tag="${VERIFIED_RELEASE_TAG:-}"
           highest_id="${VERIFIED_RELEASE_ID:-}"
-          if [[ ! "$highest_id" =~ ^[0-9]+$ || ! "$highest_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+          if [[ ! "$highest_id" =~ ^[0-9]+$ || ! "$highest_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ || ! "${VERIFIED_ASSET_DIGEST:-}" =~ ^[0-9a-f]{64}$ || ! "${VERIFIED_TAG_OBJECT:-}" =~ ^[0-9a-f]{40}$ || ! "${VERIFIED_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Could not resolve a verified stable release to promote."
+            exit 1
+          fi
+
+          # verify-latest is read-only and runs separately. Reconfirm that the
+          # same release, signed tag object, ancestry, and exact verified bytes
+          # are still public before using contents:write.
+          release_meta="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${highest_tag}" --jq '[.id, .tag_name, .draft, .prerelease] | join(" ")')"
+          if [ "$release_meta" != "${highest_id} ${highest_tag} false false" ]; then
+            echo "::error::Verified release metadata changed before Latest reconciliation ('${release_meta}')."
+            exit 1
+          fi
+          public_highest="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -r '
+            def stable_semver:
+              test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$");
+            def semver_key:
+              sub("^v"; "") | split(".") | map([length, .]);
+            [.[][] | select(.draft == false and .prerelease == false)
+              | select(.tag_name | stable_semver)]
+            | sort_by(.tag_name | semver_key) | last | .tag_name // empty
+          ')"
+          if [ "$public_highest" != "$highest_tag" ]; then
+            echo "::error::The highest public stable release changed after verification (now '${public_highest:-none}', verified '${highest_tag}'). Refusing to promote a stale candidate; rerun Latest reconciliation."
+            exit 1
+          fi
+          ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${highest_tag}" --jq '.object | "\(.type) \(.sha)"')"
+          if [ "$ref" != "tag ${VERIFIED_TAG_OBJECT}" ]; then
+            echo "::error::Verified tag object changed before Latest reconciliation ('${ref}')."
+            exit 1
+          fi
+          tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${VERIFIED_TAG_OBJECT}" --jq '.object | "\(.type) \(.sha)"')"
+          if [ "$tag_commit" != "commit ${VERIFIED_COMMIT}" ]; then
+            echo "::error::Verified tag no longer resolves to its verified commit ('${tag_commit}')."
+            exit 1
+          fi
+          default_sha="$(gh api "repos/${GITHUB_REPOSITORY}/branches/${DEFAULT_BRANCH}" --jq .commit.sha)"
+          ancestry="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${VERIFIED_COMMIT}...${default_sha}" --jq .status)"
+          if [ "$ancestry" != ahead ] && [ "$ancestry" != identical ]; then
+            echo "::error::Verified release commit is no longer an ancestor of ${DEFAULT_BRANCH} (${ancestry})."
+            exit 1
+          fi
+
+          name="cla-bot-${highest_tag}"
+          assets=(
+            "${name}.tar.gz"
+            "${name}.tar.gz.sigstore.json"
+            "${name}.sbom.cdx.json"
+            "${name}.provenance.intoto.jsonl"
+            "${name}.sbom.intoto.jsonl"
+            SHA256SUMS
+            SHA256SUMS.sigstore.json
+          )
+          mkdir latest-assets
+          gh release download "$highest_tag" --dir latest-assets
+          entry_count="$(find latest-assets -mindepth 1 -maxdepth 1 | wc -l)"
+          file_count="$(find latest-assets -mindepth 1 -maxdepth 1 -type f | wc -l)"
+          if [ "$entry_count" -ne "${#assets[@]}" ] || [ "$file_count" -ne "${#assets[@]}" ]; then
+            echo "::error::Verified release asset set changed before Latest reconciliation."
+            exit 1
+          fi
+          actual_asset_digest="$(cd latest-assets && sha256sum -- "${assets[@]}" | sha256sum | awk '{print $1}')"
+          if [ "$actual_asset_digest" != "$VERIFIED_ASSET_DIGEST" ]; then
+            echo "::error::Verified release assets changed before Latest reconciliation."
             exit 1
           fi
 

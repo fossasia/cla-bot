@@ -119,7 +119,7 @@ const DIGEST_STEP =
 const PUBLISH_STEP = "Re-check the tag and publish the release";
 const CREATE_RECHECK = "Re-check the tag before creating the release";
 const POLICY_IMMUTABILITY = "Require the immutability policy to be declared";
-const POLICY_REVIEWERS = "Require reviewers on the release environment";
+const POLICY_REVIEWERS = "Check the release environment approval policy";
 const IMMUTABLE_CHECK = "Check the release immutability policy";
 const PUBLISHED_CHECK = "Verify the published release end to end";
 const usesStartingWith = (steps, prefix) =>
@@ -386,6 +386,13 @@ test("candidate verification is read-only, checks published releases after a pub
   );
   assert.match(runText(verifyLatest.steps), /verify-release-candidate\.sh/);
   assert.match(runText(verifyLatest.steps), /sort_by\(.tag_name \| semver_key\) \| reverse/);
+  const verifier = read(".github", "scripts", "verify-release-candidate.sh");
+  assert.match(verifier, /verified-asset-digest=%s/);
+  assert.match(verifier, /verified-tag-object=%s/);
+  assert.match(verifier, /verified-commit=%s/);
+  assert.match(wf.jobs.latest.env.VERIFIED_ASSET_DIGEST, /verify-latest\.outputs\.asset-digest/);
+  assert.match(wf.jobs.latest.env.VERIFIED_TAG_OBJECT, /verify-latest\.outputs\.tag-object/);
+  assert.match(wf.jobs.latest.env.VERIFIED_COMMIT, /verify-latest\.outputs\.commit/);
   const checkout = verifyLatest.steps.find((step) =>
     String(step.uses ?? "").startsWith("actions/checkout@"),
   );
@@ -418,7 +425,7 @@ test("candidate selector tries releases in numeric SemVer order and skips an unv
       fs.mkdirSync(helper, { recursive: true });
       fs.writeFileSync(
         path.join(helper, "verify-release-candidate.sh"),
-        '#!/bin/bash\necho "$RELEASE_TAG" >> attempts.log\n[ "$RELEASE_TAG" != v999.0.0 ]\n',
+        '#!/bin/bash\necho "$RELEASE_TAG" >> attempts.log\n[ "$RELEASE_TAG" != v999.0.0 ] || exit 1\nprintf "verified-asset-digest=%064d\\nverified-tag-object=%040d\\nverified-commit=%040d\\n" 0 0 0 >> "$GITHUB_OUTPUT"\n',
         { mode: 0o755 },
       );
     },
@@ -432,24 +439,60 @@ test("candidate selector tries releases in numeric SemVer order and skips an unv
   assert.match(result.githubOutput, /release-tag=v10\.0\.0/);
 });
 
-test("Latest promotes only the verified candidate output and leaves an already-correct marker alone", () => {
+test("Latest revalidates the verified release fingerprint before promotion", () => {
   const step = wf.jobs.latest.steps[0];
   const gh = [
     'case "$*" in',
+    '  *"releases/tags/v10.0.0"*) printf "10 v10.0.0 false false\\n" ;;',
+    '  *"--paginate --slurp"*) cat public-releases.json ;;',
+    '  *"git/ref/tags/v10.0.0"*) printf "tag %s\\n" "$VERIFIED_TAG_OBJECT" ;;',
+    '  *"git/tags/"*) printf "commit %s\\n" "$VERIFIED_COMMIT" ;;',
+    '  *"branches/main"*) printf "%s\\n" "$DEFAULT_SHA" ;;',
+    '  *"compare/"*) printf "ahead\\n" ;;',
+    '  *"release download"*) cp fake-assets/* latest-assets/ ;;',
     '  *"releases/latest"*) if [ -s fake-latest.txt ]; then cat fake-latest.txt; else exit 1; fi ;;',
     '  *"--method PATCH"*) printf \'%s\\n\' "$VERIFIED_RELEASE_TAG" > fake-latest.txt ;;',
     '  *) exit 99 ;;',
     "esac",
   ].join("\n");
-  const run = (currentLatest) =>
+  const assets = [
+    "cla-bot-v10.0.0.tar.gz",
+    "cla-bot-v10.0.0.tar.gz.sigstore.json",
+    "cla-bot-v10.0.0.sbom.cdx.json",
+    "cla-bot-v10.0.0.provenance.intoto.jsonl",
+    "cla-bot-v10.0.0.sbom.intoto.jsonl",
+    "SHA256SUMS",
+    "SHA256SUMS.sigstore.json",
+  ];
+  const contents = Object.fromEntries(assets.map((name) => [name, `verified:${name}\n`]));
+  const fingerprint = assets
+    .map((name) => `${crypto.createHash("sha256").update(contents[name]).digest("hex")}  ${name}`)
+    .join("\n") + "\n";
+  const assetDigest = crypto.createHash("sha256").update(fingerprint).digest("hex");
+  const run = (currentLatest, highestPublicTag = "v10.0.0") =>
     runStep(step, {
       gh,
       env: {
         VERIFIED_RELEASE_ID: "10",
         VERIFIED_RELEASE_TAG: "v10.0.0",
+        VERIFIED_ASSET_DIGEST: assetDigest,
+        VERIFIED_TAG_OBJECT: "b".repeat(40),
+        VERIFIED_COMMIT: "c".repeat(40),
+        DEFAULT_BRANCH: "main",
+        DEFAULT_SHA: "d".repeat(40),
       },
-      setup: (dir) =>
-        fs.writeFileSync(path.join(dir, "fake-latest.txt"), `${currentLatest}\n`),
+      setup: (dir) => {
+        fs.mkdirSync(path.join(dir, "fake-assets"));
+        for (const [name, body] of Object.entries(contents)) {
+          fs.writeFileSync(path.join(dir, "fake-assets", name), body);
+        }
+        if (currentLatest) fs.writeFileSync(path.join(dir, "fake-latest.txt"), `${currentLatest}\n`);
+        fs.writeFileSync(
+          path.join(dir, "public-releases.json"),
+          JSON.stringify([[{ id: 10, tag_name: "v10.0.0", draft: false, prerelease: false },
+            ...(highestPublicTag === "v10.0.0" ? [] : [{ id: 11, tag_name: highestPublicTag, draft: false, prerelease: false }])]]),
+        );
+      },
       after: (dir) => fs.readFileSync(path.join(dir, "fake-latest.txt"), "utf8").trim(),
     });
 
@@ -469,44 +512,35 @@ test("Latest promotes only the verified candidate output and leaves an already-c
   assert.strictEqual(firstRelease.status, 0, firstRelease.output);
   assert.strictEqual(firstRelease.extra, "v10.0.0");
   assert.ok(firstRelease.calls.some((call) => call.includes("releases/10 -f make_latest=true")));
-});
 
-test("a release published after an in-flight Latest read is picked up by the queued reconciliation", () => {
-  const step = wf.jobs.latest.steps[0];
-  const gh = [
-    'case "$*" in',
-    '  *"releases/latest"*) cat fake-latest.txt ;;',
-    '  *"--method PATCH"*) printf \'%s\\n\' "$VERIFIED_RELEASE_TAG" > fake-latest.txt ;;',
-    '  *) exit 99 ;;',
-    "esac",
-  ].join("\n");
-  const setup = (dir) => {
-    fs.writeFileSync(path.join(dir, "fake-latest.txt"), "v1.3.0\n");
-    fs.writeFileSync(path.join(dir, "newer-release-public.txt"), "v1.4.0\n");
-  };
-  const first = runStep(step, {
-    gh,
-    env: { VERIFIED_RELEASE_ID: "10", VERIFIED_RELEASE_TAG: "v1.3.0" },
-    setup,
-    after: (dir) => ({
-      latest: fs.readFileSync(path.join(dir, "fake-latest.txt"), "utf8").trim(),
-      published: fs.readFileSync(path.join(dir, "newer-release-public.txt"), "utf8").trim(),
-    }),
+  const changedAssets = runStep(step, {
+    gh: gh.replace('cp fake-assets/* latest-assets/', 'cp fake-assets/* latest-assets/\nprintf changed >> latest-assets/cla-bot-v10.0.0.tar.gz'),
+    env: {
+      VERIFIED_RELEASE_ID: "10",
+      VERIFIED_RELEASE_TAG: "v10.0.0",
+      VERIFIED_ASSET_DIGEST: assetDigest,
+      VERIFIED_TAG_OBJECT: "b".repeat(40),
+      VERIFIED_COMMIT: "c".repeat(40),
+      DEFAULT_BRANCH: "main",
+      DEFAULT_SHA: "d".repeat(40),
+    },
+    setup: (dir) => {
+      fs.mkdirSync(path.join(dir, "fake-assets"));
+      for (const [name, body] of Object.entries(contents)) fs.writeFileSync(path.join(dir, "fake-assets", name), body);
+      fs.writeFileSync(
+        path.join(dir, "public-releases.json"),
+        JSON.stringify([[{ id: 10, tag_name: "v10.0.0", draft: false, prerelease: false }]]),
+      );
+    },
   });
-  assert.strictEqual(first.status, 0, first.output);
-  assert.strictEqual(first.extra.latest, "v1.3.0");
-  assert.strictEqual(first.extra.published, "v1.4.0");
+  assert.notStrictEqual(changedAssets.status, 0);
+  assert.match(changedAssets.output, /assets changed before Latest reconciliation/);
+  assert.ok(!changedAssets.calls.some((call) => call.includes("--method PATCH")));
 
-  // The newer publication's queued reconciliation runs after the first one,
-  // after its candidate has passed the release verification job.
-  const second = runStep(step, {
-    gh,
-    env: { VERIFIED_RELEASE_ID: "11", VERIFIED_RELEASE_TAG: "v1.4.0" },
-    setup,
-    after: (dir) => fs.readFileSync(path.join(dir, "fake-latest.txt"), "utf8").trim(),
-  });
-  assert.strictEqual(second.status, 0, second.output);
-  assert.strictEqual(second.extra, "v1.4.0");
+  const newerReleasePublished = run("v9.0.0", "v11.0.0");
+  assert.notStrictEqual(newerReleasePublished.status, 0);
+  assert.match(newerReleasePublished.output, /highest public stable release changed/);
+  assert.ok(!newerReleasePublished.calls.some((call) => call.includes("--method PATCH")));
 });
 
 test("every job has a timeout", () => {
@@ -819,11 +853,12 @@ test("the release is created as a DRAFT bound to the pushed tag, and only a late
   assert.match(publishCall, /-f make_latest=false/);
 });
 
-test("a published release is never overwritten; only a leftover draft is replaced", () => {
+test("release creation never deletes or overwrites an existing release", () => {
   const create =
     publish.steps[runsMatching(publish.steps, /gh release create/)].run;
-  assert.match(create, /already published and is never overwritten/);
-  assert.match(create, /gh release delete "\$RELEASE_TAG" --yes/);
+  assert.match(create, /gh release create "\$RELEASE_TAG"/);
+  assert.doesNotMatch(create, /gh release delete/);
+  assert.match(raw, /Never delete an existing release/);
   assert.ok(!/--clobber/.test(raw), "no --clobber anywhere");
 });
 
@@ -1503,7 +1538,7 @@ test("policy (real shell): the immutability policy must be declared as `required
   }
 });
 
-test("policy (real shell, fake gh): the `release` environment must have at least one required reviewer", () => {
+test("policy (real shell, fake gh): unset RELEASE_APPROVAL requires reviewers on the environment", () => {
   const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
   const ok = runStep(step, { gh: ghAnswers("1 true") });
   assert.strictEqual(ok.status, 0, ok.output);
@@ -1538,15 +1573,23 @@ test("policy (real shell, fake gh): the `release` environment must have at least
   assert.match(unreadable.output, /Could not read the 'release' environment/);
 });
 
-test("policy (real shell, fake gh): `RELEASE_APPROVAL=not-required` is the only way to skip the reviewer check, and it is visible", () => {
+test("policy (real shell, fake gh): `not-required` must match an environment with no reviewers", () => {
   const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
   const optOut = runStep(step, {
     gh: ghAnswers("0 false"),
     env: { RELEASE_APPROVAL: "not-required" },
   });
   assert.strictEqual(optOut.status, 0, optOut.output);
-  assert.match(optOut.output, /::warning::.*No reviewer approval is required/);
-  assert.deepStrictEqual(optOut.calls, [], "the environment is not even read");
+  assert.match(optOut.output, /No required reviewers are configured/);
+  assert.strictEqual(optOut.calls.length, 1, "always inspect actual protection");
+
+  const conflict = runStep(step, {
+    gh: ghAnswers("2 false"),
+    env: { RELEASE_APPROVAL: "not-required" },
+  });
+  assert.strictEqual(conflict.status, 1, conflict.output);
+  assert.match(conflict.output, /conflicts with the 'release' environment/);
+  assert.strictEqual(conflict.calls.length, 1);
   for (const value of ["yes", "true", "Not-Required", "none", "required"]) {
     const r = runStep(step, {
       gh: ghAnswers("5 true"),
@@ -1554,11 +1597,7 @@ test("policy (real shell, fake gh): `RELEASE_APPROVAL=not-required` is the only 
     });
     assert.strictEqual(r.status, 1, value);
     assert.match(r.output, /RELEASE_APPROVAL must be unset or not-required/);
-    assert.deepStrictEqual(
-      r.calls,
-      [],
-      "an invalid value never reaches the API",
-    );
+    assert.deepStrictEqual(r.calls, [], "invalid value never reaches the API");
   }
   // An EMPTY variable behaves as unset: the check is enforced.
   const empty = runStep(step, {
@@ -1575,7 +1614,12 @@ test("policy (real shell, fake gh): `RELEASE_APPROVAL=not-required` is the only 
 // jq (or gojq, which is what `gh` embeds) on payloads shaped like GitHub's.
 
 const JQ = ["jq", "gojq"].find(
-  (bin) => spawnSync(bin, ["--version"]).status === 0,
+  (bin) =>
+    spawnSync(bin, ["-r", ".x"], {
+      input: '{"x":1}',
+      encoding: "utf8",
+      timeout: 3000,
+    }).status === 0,
 );
 function jqProgram(job, stepName, anchor) {
   const step = job.steps[stepNamed(job.steps, stepName)];
@@ -1589,6 +1633,7 @@ function evalJq(program, payload) {
   const r = spawnSync(JQ, ["-r", program], {
     input: JSON.stringify(payload),
     encoding: "utf8",
+    timeout: 3000,
   });
   assert.strictEqual(r.status, 0, r.stderr);
   return r.stdout.replace(/\n$/, "");

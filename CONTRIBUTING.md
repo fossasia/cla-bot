@@ -214,11 +214,15 @@ published releases remain allowed for repository writers, but do not qualify
 for Latest unless they satisfy those same checks. Publishing an older valid
 version to backfill a gap does not demote a newer valid release.
 
-Reconciliation is eventually consistent: if a newer release becomes public
-after an in-flight run selects a candidate, the marker can briefly point to
-the previous highest verified version. Latest updates are serialized, and the
-newer run verifies the current release list and moves the marker forward. The
-workflow test suite models this publication race and asserts convergence.
+Latest rechecks the public stable-version maximum, tag binding, branch ancestry,
+release metadata and verified asset fingerprint immediately before changing
+the marker. If a newer stable release appears after candidate verification,
+the stale run fails without promoting its older candidate; rerun the workflow
+to verify and reconcile the current release set. GitHub has no atomic
+verify-and-promote API, so an external release can still change in the small
+interval between the final checks and the marker update. The workflow test
+suite models the newer-publication race and asserts that stale promotion is
+rejected.
 
 Every example and setup doc in this project (`examples/consumer-workflow.yml`,
 "SETUP_GUIDE.md", this file) refers to a release as `@vX.Y.Z`. That release
@@ -241,14 +245,17 @@ when something about releasing seems off:
    Secrets and variables -> Actions -> Variables):
    - `RELEASE_APPROVAL` = `not-required` because anyone with repository release
      rights is authorized to publish without a second-person approval.
+   - The workflow always reads the actual `release` environment rules and
+     fails before building if the declaration and environment disagree.
    - Mutability is intentionally `not-required` in the reviewed release
      workflow. Changing it requires a reviewed workflow change; it is not a
      repository variable that a repository writer can silently alter.
 3. **Create the `release` environment** (Settings -> Environments -> New
    environment). Under "Deployment branches and tags" allow only the selected
-   tag pattern `v*`. No required reviewers are needed. The environment keeps
-   the deployment tag restriction; it does not add an approval gate when
-   `RELEASE_APPROVAL` is `not-required`.
+   tag pattern `v*`. Leave required reviewers empty when using
+   `RELEASE_APPROVAL=not-required`. GitHub enforces environment protection
+   independently of repository variables; the workflow checks that this
+   environment cannot silently add an approval gate.
 4. **Import the release tag ruleset** in `.github/rulesets/release-tags.json`
    as a repository admin. It lets writers create version tags but blocks
    moving or deleting them after creation. A tag correction uses a new version.
@@ -344,11 +351,15 @@ but signing and attesting need a real GitHub run.
   the workflow policy says `required`. Turn it on before the next release
   (it cannot be applied to this one), or change the policy through a reviewed
   workflow update if mutable releases are intended.
+- **An existing release for the tag** (draft or published) prevents creation:
+  inspect it and confirm it is safe to remove before deleting it manually.
+  The workflow never deletes an existing release because its state could
+  change between a check and a delete. Then rerun the failed job.
 - **The `publish` job failed** (Sigstore or GitHub outage, upload error): use
-  "Re-run failed jobs". It is safe to repeat; a leftover **draft** is
-  replaced, and a release that is already **published**
-  is never overwritten (the run stops instead). If it failed after
-  publication, the read-only candidate verification still runs when possible;
+  "Re-run failed jobs" only if no release already exists for the tag. The
+  workflow never deletes or overwrites an existing draft or published release.
+  If it failed after publication, the read-only candidate verification still
+  runs when possible;
   if that check also failed transiently, use **Run workflow** in Actions for
   the Release workflow. Manual recovery re-verifies published candidates and
   reconciles Latest without rebuilding or overwriting a release.
