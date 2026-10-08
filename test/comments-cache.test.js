@@ -116,7 +116,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     };
     const cache = new Map();
     await getExistingBotComments(1, { cache, anyBotIdentity: true });
-    const raw = await cache.get(1).promise;
+    const { comments: raw } = await cache.get(1).promise;
     assert.strictEqual(
       raw.length,
       1,
@@ -173,7 +173,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       [3],
       "both spoofed comments must be rejected, not just filtered out of the final result",
     );
-    const raw = await cache.get(1).promise;
+    const { comments: raw } = await cache.get(1).promise;
     assert.strictEqual(
       raw.length,
       1,
@@ -214,7 +214,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       cache,
       anyBotIdentity: true,
     });
-    const raw = await cache.get(1).promise;
+    const { comments: raw } = await cache.get(1).promise;
     assert.ok(
       raw.length <= 200,
       `the cache must never exceed MAX_CACHED_COMMENTS (200), got ${raw.length}`,
@@ -471,6 +471,54 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     };
     return () => count;
   }
+
+  await test("a REAL pending flag from 250+ admitted comments ago (older than MAX_CACHED_COMMENTS) still correctly triggers a success announcement", async () => {
+    // Proves the capped comments LIST (MAX_CACHED_COMMENTS) is never used to
+    // answer this question - only the uncapped lastPendingSeq/lastSuccessSeq
+    // counters are. A genuine, still-unresolved "pending" flag from long
+    // before the cap would otherwise silently vanish and the bot would stay
+    // quiet when it should announce.
+    const oldPending = {
+      id: 1,
+      body: "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:pending -->\nold pending list",
+      user: BOT,
+    };
+    // 250 bot-marked "other"-category comments after it - more than
+    // MAX_CACHED_COMMENTS (200), and none of them pending or success, so a
+    // trimmed-list-based check would find neither category and (wrongly)
+    // conclude there was nothing to announce.
+    const noise = Array.from({ length: 250 }, (_, i) => ({
+      id: 100 + i,
+      body: `${MARKER}\nunrelated bot chatter #${i}`,
+      user: BOT,
+    }));
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "alice" }],
+      },
+      comments: [oldPending, ...noise],
+    });
+    countCommentReads(gh); // wires up global.fetch to this gh instance
+
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "head-sha-abc" } },
+    });
+
+    assert.ok(
+      gh.comments.some((c) => c.body.includes("All contributors")),
+      "the success comment must still be posted - the old pending flag must not be lost to the cap",
+    );
+  });
 
   await test("a quiet, already-blocked PR going back to 'signed' does the history check and the dedupe pre-check as ONE shared read, plus one fresh cleanup read - 2 total, not 3", async () => {
     const gh = makeFakeGitHub({

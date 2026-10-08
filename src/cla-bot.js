@@ -1247,7 +1247,10 @@ const MAX_CACHED_COMMENTS = 200;
 // A public PR can carry comments from untrusted contributors in unbounded
 // number and size, so this run's cache must never hold more than the bot's
 // own small, bounded set of comments - not every human comment's full
-// GitHub payload for the whole life of the run. Three things keep it small:
+// GitHub payload for the whole life of the run. Three things keep the
+// CACHED LIST small - see the separate note on lastPendingSeq/lastSuccessSeq
+// below for the one thing that is deliberately NOT bounded by any of these,
+// because it cannot be without a real correctness cost:
 //
 // - Only a comment that BOTH carries BOT_MARKER AND has an authenticated
 //   identity isPossiblyBotIdentity() accepts is ever kept at all. The
@@ -1260,20 +1263,38 @@ const MAX_CACHED_COMMENTS = 200;
 //   past it would mean already controlling some Bot-type account.
 // - MAX_CACHED_COMMENTS hard-caps what even an admitted flood can cost (see
 //   above): only the most recent MAX_CACHED_COMMENTS admitted comments are
-//   ever kept, trimmed as they come in, so this never holds more than that
-//   regardless of how many qualify in total. Trimming the OLDEST entries
-//   (GitHub returns comments oldest-first) rather than refusing new ones is
-//   what keeps this correct, not just small: every caller of this list
-//   (dedupe, the "last comment of this category" checks, the duplicate
-//   cleanup) only ever cares about the most recent matches, so a flood of
-//   old noise is exactly what should be dropped first. Every page is still
-//   read in full either way - a flood earlier in the thread can never make
-//   this stop short of a genuine, more recent bot comment later in it.
+//   ever kept, trimmed as they come in, so the LIST never holds more than
+//   that regardless of how many qualify in total. Trimming the OLDEST
+//   entries (GitHub returns comments oldest-first) rather than refusing new
+//   ones is deliberate: this list is only ever used to find an EXACT,
+//   recent duplicate (postComment()'s own dedupe, and the post-write
+//   cleanup) - both inherently care about recent matches only, so a flood
+//   of old noise is exactly what should be dropped first. Every page is
+//   still read in full either way - a flood earlier in the thread can never
+//   make this stop short of a genuine, more recent bot comment later in it.
 // - Only the few fields the rest of this file ever reads from a comment
 //   (id, body, user.login, user.type) are kept, not the full GitHub object
 //   (timestamps, URLs, avatar, reactions, and so on).
+//
+// lastPendingSeq/lastSuccessSeq answer a DIFFERENT question than the list
+// above: not "what did the bot say recently" but "did a pending flag ever
+// go out that a success announcement hasn't closed out yet" - checkPR()'s
+// quietIfNeverFlagged check (see pendingIsNewerThanSuccess() below) needs
+// the TRUE answer over the PR's whole history, not just its most recent
+// MAX_CACHED_COMMENTS comments: trimming old entries from the list above is
+// safe for exact-duplicate lookups, but would silently give the wrong
+// answer here if an old, still-unresolved pending comment ever aged out of
+// the window. So these two are never trimmed and never hold a comment or
+// its body at all - just which admission-order position ("seq") the most
+// recent "pending" and the most recent "success" were last seen at, each
+// overwritten in place as a later one of the same category comes along.
+// That is two integers, genuinely O(1) regardless of how many comments a PR
+// has ever accumulated - correct at any scale, not just within a cap.
 async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
   const all = [];
+  let seq = 0;
+  let lastPendingSeq = -1;
+  let lastSuccessSeq = -1;
   let page = 1;
   for (;;) {
     const comments = await gh(
@@ -1286,21 +1307,25 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
     // here so the caller can start this fetch and resolveBotLogin() at the
     // same time instead of one after the other.
     const botLogin = await botLoginPromise;
-    all.push(
-      ...comments
-        .filter(
-          (c) =>
-            c.user &&
-            c.body &&
-            c.body.includes(BOT_MARKER) &&
-            isPossiblyBotIdentity(c.user, botLogin),
-        )
-        .map((c) => ({
-          id: c.id,
-          body: c.body,
-          user: { login: c.user.login, type: c.user.type },
-        })),
-    );
+    for (const c of comments) {
+      if (
+        !c.user ||
+        !c.body ||
+        !c.body.includes(BOT_MARKER) ||
+        !isPossiblyBotIdentity(c.user, botLogin)
+      ) {
+        continue;
+      }
+      const category = classifyBotComment(c.body);
+      if (category === "pending") lastPendingSeq = seq;
+      else if (category === "success") lastSuccessSeq = seq;
+      seq += 1;
+      all.push({
+        id: c.id,
+        body: c.body,
+        user: { login: c.user.login, type: c.user.type },
+      });
+    }
     // Trimmed here, inside the loop, not just once at the end - otherwise a
     // large flood could still blow up peak memory while it's being read,
     // even if the final cached result would have ended up small.
@@ -1310,7 +1335,26 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
     if (comments.length < 100) break;
     page += 1;
   }
-  return all;
+  return { comments: all, lastPendingSeq, lastSuccessSeq };
+}
+
+// Whether a broad-identity "pending" comment is more recent than the last
+// broad-identity "success" comment (or there is no success yet) - the exact
+// question checkPR()'s quietIfNeverFlagged branch needs answered, using
+// lastPendingSeq/lastSuccessSeq above so the answer is correct regardless of
+// how many bot-marked comments the PR has ever accumulated, not just within
+// MAX_CACHED_COMMENTS. Shares the same cached fetch as any other read for
+// this PR in the same run (when `cache` is set), same as
+// getExistingBotComments() - this only reads the sequence numbers from it,
+// never the list itself.
+async function pendingIsNewerThanSuccess(prNumber) {
+  const cache = commentsCacheStorage.getStore();
+  const botLoginPromise = resolveBotLogin();
+  const { lastPendingSeq, lastSuccessSeq } = await fetchAllIssueComments(
+    prNumber,
+    { cache, botLoginPromise },
+  );
+  return lastPendingSeq > lastSuccessSeq;
 }
 
 // Drops one comment id from the current run's cached list, if this PR's list
@@ -1323,7 +1367,7 @@ async function forgetCachedComment(prNumber, commentId) {
   const cache = commentsCacheStorage.getStore();
   const entry = cache && cache.get(prNumber);
   if (!entry) return;
-  const list = await entry.promise;
+  const { comments: list } = await entry.promise;
   for (let i = list.length - 1; i >= 0; i--) {
     if (list[i].id === commentId) list.splice(i, 1);
   }
@@ -1345,7 +1389,7 @@ async function getExistingBotComments(
   // (which needs it too, to decide what's even safe to cache - see
   // isPossiblyBotIdentity()) instead of adding its own separate round trip.
   const botLoginPromise = resolveBotLogin();
-  const [botLogin, all] = await Promise.all([
+  const [botLogin, { comments: all }] = await Promise.all([
     botLoginPromise,
     fetchAllIssueComments(prNumber, { fresh, cache, botLoginPromise }),
   ]);
@@ -1603,20 +1647,12 @@ async function checkPRBody(
       "All contributors have signed the CLA.",
     );
     if (statusOnly) return;
-    if (quietIfNeverFlagged) {
-      // Comments come back oldest first, so the last match per category is
-      // the latest one. Success is announced only when a pending comment is
-      // newer than the last success comment (or there is none yet).
-      const existing = await getExistingBotComments(prNumber, {
-        anyBotIdentity: true,
-      });
-      const lastPendingIdx = existing.findLastIndex(
-        (c) => classifyBotComment(c.body) === "pending",
-      );
-      const lastSuccessIdx = existing.findLastIndex(
-        (c) => classifyBotComment(c.body) === "success",
-      );
-      if (lastPendingIdx <= lastSuccessIdx) return;
+    // Success is announced only when a pending comment is newer than the
+    // last success comment (or there is none yet) - see
+    // pendingIsNewerThanSuccess() for why this stays correct no matter how
+    // large the PR's comment history gets.
+    if (quietIfNeverFlagged && !(await pendingIsNewerThanSuccess(prNumber))) {
+      return;
     }
     // Name the signer only when their signature completed this PR, never just
     // because a `signer` was passed. See signerCompletedRequirement().
