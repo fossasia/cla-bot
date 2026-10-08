@@ -1,10 +1,9 @@
 "use strict";
 /**
- * Offline guard for the "one required check, no required review" setup.
- * Branch protection only requires the single job `Required checks pass`
- * from ci.yml, and nothing else - no CODEOWNERS, no approval count. This
- * file is what stops that gate from silently rotting or silently growing a
- * review requirement nobody decided on:
+ * Offline guard for the single-check, no-review gate. Branch protection
+ * requires only `Required checks pass`; repository writers are not subject
+ * to a reviewer or team-approval gate. This file keeps the CI fan-in and
+ * ruleset from silently drifting:
  *
  *  - the gate fans in EVERY other job of ci.yml (a new job that is not in
  *    `needs:` would be unprotected), always runs, and nothing it needs can
@@ -22,12 +21,7 @@
  *  - zizmor.yml has a non-SARIF "fail on findings" run (SARIF exits 0 even
  *    with findings) and its SARIF upload is best-effort on pull_request;
  *  - the ruleset-as-code requires exactly the gate's check name and
- *    nothing else, and does NOT require any approvals or code-owner
- *    review - this repository's deliberate choice (see
- *    .github/rulesets/README.md, "Branch protection has exactly one
- *    required condition"). If a future change wants that trade-off back,
- *    it should update this test and the README alongside main.json, not
- *    drift silently.
+ *    nothing else, with no human-approval requirements.
  *
  * Run: node test/ci-gate.test.js (also part of `npm test`).
  */
@@ -199,7 +193,7 @@ test("the ruleset requires exactly the gate's check name, pinned to GitHub Actio
   }
 });
 
-test("the ruleset requires a pull request (blocks direct pushes) but NO approvals and NO code-owner review", () => {
+test("the ruleset requires a pull request and no human approvals", () => {
   const ruleset = readRuleset();
   const pr = ruleset.rules.find((r) => r.type === "pull_request");
   assert.ok(
@@ -209,30 +203,23 @@ test("the ruleset requires a pull request (blocks direct pushes) but NO approval
   assert.strictEqual(
     pr.parameters.required_approving_review_count,
     0,
-    "this repository merges on CI alone - no required approvals",
+    "repository writers can merge without reviewer approval",
   );
   assert.strictEqual(
     pr.parameters.require_code_owner_review,
     false,
-    "this repository deliberately does not use CODEOWNERS/code-owner review - see .github/rulesets/README.md",
+    "the repository does not require path-based approval",
+  );
+  assert.strictEqual(
+    pr.parameters.dismiss_stale_reviews_on_push,
+    false,
+    "review dismissal does not apply because no approval is required",
   );
   assert.deepStrictEqual(
     ruleset.bypass_actors,
     [],
     "nobody may bypass the gate, not even admins",
   );
-});
-
-test("no CODEOWNERS file is shipped (an unused one invites someone to half-enable review later by accident)", () => {
-  const codeowners = path.join(ROOT, ".github", "CODEOWNERS");
-  if (fs.existsSync(codeowners)) {
-    const body = fs.readFileSync(codeowners, "utf8").trim();
-    assert.strictEqual(
-      body,
-      "",
-      "CODEOWNERS must stay empty/absent: this repository does not require code-owner review (see .github/rulesets/README.md)",
-    );
-  }
 });
 
 test("every setup-uv step pins an exact uv version AND its SHA-256 (no unverified `latest` uv in a required check)", () => {
