@@ -69,7 +69,8 @@ name: Release
 on:
   push:
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
+      # GitHub Actions glob only; release-check.js enforces strict stable SemVer.
+      - 'v*.*.*'
   workflow_dispatch:
 
 permissions: {}

@@ -47,37 +47,6 @@ function test(name, fn) {
 // Escapes EVERY regular-expression metacharacter, backslash included.
 const escapeRegExp = (text) => text.replace(/[\\^$.*+?()[\]{}|]/g, "\\$&");
 
-// Turns a GitHub tag filter into a RegExp. Supports exactly the syntax
-// release.yml uses (literal characters, `[0-9]`-style classes, `+`) and throws
-// on anything else, so the matcher can never silently disagree with GitHub.
-// Nothing is concatenated unescaped.
-function filterToRegExp(pattern) {
-  let source = "";
-  for (let i = 0; i < pattern.length; i += 1) {
-    const char = pattern[i];
-    if (char === "[") {
-      const end = pattern.indexOf("]", i);
-      const body = end === -1 ? "" : pattern.slice(i + 1, end);
-      assert.match(
-        body,
-        /^[0-9a-zA-Z-]+$/,
-        `unsupported character class in ${pattern}`,
-      );
-      source += `[${body}]`;
-      i = end;
-    } else if (char === "+") {
-      source += "+";
-    } else {
-      assert.ok(
-        !"*?!\\]".includes(char),
-        `unsupported filter syntax "${char}" in ${pattern}`,
-      );
-      source += escapeRegExp(char);
-    }
-  }
-  return new RegExp(`^${source}$`);
-}
-
 const raw = read(".github", "workflows", "release.yml");
 const wf = yaml.load(raw);
 const { policy, build, checks, sign, publish } = wf.jobs;
@@ -269,16 +238,17 @@ test("release publication is tag-push only, and manual dispatch is available for
   assert.deepStrictEqual(Object.keys(triggers), ["push", "workflow_dispatch"]);
   assert.deepStrictEqual(Object.keys(triggers.push), ["tags"]);
   assert.strictEqual(triggers.push.tags.length, 1);
-  // GitHub's filter syntax: "+" repeats the previous character class, "." is literal.
-  const filter = filterToRegExp(triggers.push.tags[0]);
+  // Keep the Actions glob deliberately simple. Do not emulate GitHub's matcher
+  // here; the release validator is the authoritative strict SemVer gate.
+  assert.strictEqual(triggers.push.tags[0], "v*.*.*");
   const { TAG_PATTERN } = require(
     path.join(ROOT, ".github", "scripts", "release-check.js"),
   );
   for (const tag of ["v0.0.1", "v1.0.0", "v12.34.56"]) {
-    assert.ok(TAG_PATTERN.test(tag) && filter.test(tag), tag);
+    assert.ok(TAG_PATTERN.test(tag), tag);
   }
   for (const tag of ["1.0.0", "v1.0", "v1.0.0-rc.1", "latest", "main"]) {
-    assert.ok(!filter.test(tag), `${tag} must not start a release`);
+    assert.ok(!TAG_PATTERN.test(tag), `${tag} must be rejected by strict release validation`);
   }
 });
 
@@ -361,27 +331,6 @@ test("published release verification fails closed on changed metadata or notes",
   assert.notStrictEqual(notes.status, 0);
   assert.match(notes.output, /release notes differ from the verified notes/);
   assert.strictEqual(notes.calls.length, 1, "must stop before touching assets");
-});
-
-test("the tag-filter matcher escapes everything and rejects syntax it does not model", () => {
-  assert.strictEqual(escapeRegExp("a\\b.c+d"), "a\\\\b\\.c\\+d");
-  const f = filterToRegExp("v[0-9]+.[0-9]+");
-  assert.ok(f.test("v1.2") && f.test("v10.20"));
-  assert.ok(!f.test("v1x2"), "'.' is literal");
-  assert.ok(!f.test("v1.2\n"), "anchored");
-  // A backslash is GitHub's escape character, which this matcher does not model.
-  for (const unsupported of [
-    "v*",
-    "v?",
-    "!v1",
-    "v[0-9",
-    "v[]",
-    "v]",
-    "v[^a]",
-    "a\\b",
-  ]) {
-    assert.throws(() => filterToRegExp(unsupported), undefined, unsupported);
-  }
 });
 
 test("workflow-level permissions are empty and jobs must opt in", () => {
