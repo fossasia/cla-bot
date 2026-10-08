@@ -338,10 +338,12 @@ function listActionDependencies(actionYml) {
   return [...dependencies.values()];
 }
 
-// package URL for a GitHub Action: pkg:githubactions/owner/repo@sha#subpath
+// package URL for a GitHub Action: pkg:github/owner/repo@sha#action-subpath.
+// GitHub Actions are repositories (or paths in repositories), not a separate
+// registered PURL ecosystem; `github` is the standardized type.
 function actionPurl({ name, ref }) {
   const [owner, repo, ...subpath] = name.toLowerCase().split("/");
-  const base = `pkg:githubactions/${owner}/${repo}@${ref}`;
+  const base = `pkg:github/${owner}/${repo}@${ref}`;
   return subpath.length > 0 ? `${base}#${subpath.join("/")}` : base;
 }
 

@@ -11,6 +11,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const CDX = require("@cyclonedx/cyclonedx-library");
 
 const SCRIPT = path.join(
   __dirname,
@@ -855,11 +856,11 @@ test("listActionDependencies rejects malformed owner/repository/action identifie
 test("actionPurl lowercases and handles sub-path actions", () => {
   assert.strictEqual(
     actionPurl({ name: "Actions/Setup-Node", ref: SHA_A }),
-    `pkg:githubactions/actions/setup-node@${SHA_A}`,
+    `pkg:github/actions/setup-node@${SHA_A}`,
   );
   assert.strictEqual(
     actionPurl({ name: "github/codeql-action/upload-sarif", ref: SHA_B }),
-    `pkg:githubactions/github/codeql-action@${SHA_B}#upload-sarif`,
+    `pkg:github/github/codeql-action@${SHA_B}#upload-sarif`,
   );
 });
 
@@ -912,6 +913,26 @@ test("buildSbom omits the timestamp when none is given and tolerates zero depend
   assert.ok(!("timestamp" in sbom.metadata));
   assert.deepStrictEqual(sbom.components, []);
   assert.deepStrictEqual(sbom.dependencies[0].dependsOn, []);
+});
+
+test("generated SBOM validates against the official CycloneDX 1.6 JSON schema", async () => {
+  const sbom = buildSbom({
+    packageJson: PACKAGE,
+    tag: "v1.2.3",
+    repository: "fossasia/cla-bot",
+    actionYml: ACTION_YML,
+    timestamp: "2026-10-06T00:00:00Z",
+  });
+  const validator = new CDX.Validation.JsonStrictValidator(
+    CDX.Spec.Spec1dot6.version,
+  );
+  const errors = await validator.validate(JSON.stringify(sbom));
+  assert.strictEqual(errors, null, JSON.stringify(errors));
+
+  const invalid = { ...sbom };
+  delete invalid.bomFormat;
+  const invalidErrors = await validator.validate(JSON.stringify(invalid));
+  assert.notStrictEqual(invalidErrors, null, "missing required bomFormat must be rejected");
 });
 
 test("buildSbom itself refuses npm dependencies in every field, independent of `verify` having run", () => {

@@ -26,14 +26,19 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - Consumer instructions resolve the tag commit once, require both attestations
   to match it via `--source-digest`, and pin that same SHA in `uses:`. The
   release workflow requires GitHub CLI 2.102.0 or newer for attestation
-  verification, verifies published notes/title/tag/latest metadata, retains
-  cross-job artifacts for 90 days, and explicitly queues up to 100 release runs.
+  verification, verifies published notes/title/tag metadata, retains cross-job
+  artifacts for 90 days, and isolates different version runs from each other.
+- The release workflow now publishes without changing GitHub's `Latest` marker,
+  then reconciles it in a globally serialized job to the highest published
+  stable SemVer tag. Backfilling an older version can no longer demote a newer
+  release; queued reconciliation runs safely re-read the full release list.
 - The release helper refuses npm dependencies in every field that can pull
   code in (`dependencies`, `optionalDependencies`, `peerDependencies`,
   `bundleDependencies`/`bundledDependencies`), and reads `action.yml` as YAML
   instead of with a line regex.
 - Before publishing, the draft release's assets are downloaded and compared
   byte for byte, and as a set, with the files that were signed and verified.
+  The published copy is also checked byte for byte and as a set after upload.
   The build job now builds and hashes the assets before any repository test
   code runs (the publish job re-checks that digest), and uploads only after the
   tests pass.
@@ -42,6 +47,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   input or a `with:` value is not a dependency), versions components by their
   pinned commit, and keeps the human version label as an annotation that is
   dropped when the source comments disagree.
+- Action dependencies use the registered `pkg:github` PURL type, including the
+  action subpath where applicable; tests validate output against the official
+  CycloneDX 1.6 JSON schema.
 - The tag check also verifies the signed tag object's own name equals the tag
   being released, so a validly signed tag for another version cannot be
   replayed under a new ref. The draft check covers release metadata (title,
@@ -54,10 +62,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   validates owner/repository/action path syntax and refuses extra `@` suffixes;
   its changelog parser ignores `##` lines inside fenced code blocks.
 - Third-party code no longer shares a machine with the archive. The release is
-  now four jobs: `policy`, `build` (verifies the tag and builds the archive with
+  now five jobs: `policy`, `build` (verifies the tag and builds the archive with
   `git` and Node built-ins only, no npm), `checks` (installs dev dependencies,
   generates the SBOM, runs the tests and the 100% coverage gate) and `publish`
-  (which needs both, re-checks both digests, and writes `SHA256SUMS` itself).
+  (which needs both, re-checks both digests, and writes `SHA256SUMS` itself),
+  plus `latest` (which promotes the highest stable SemVer release).
 - A release policy gate runs before anything is built: the repository
   variable `RELEASE_IMMUTABILITY` must be declared (`required` or
   `not-required`; GitHub's setting cannot be read from a workflow token), and

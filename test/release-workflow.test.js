@@ -6,7 +6,8 @@
  * later edit cannot quietly undo one:
  *
  *  - it only runs for pushed stable-semver tags (never a PR, branch or manual
- *    trigger), serialised and never cancelled, with an explicit max queue;
+ *    trigger); same-tag runs serialize, and Latest reconciliation is globally
+ *    serialized without dropping the publication of other versions;
  *  - least privilege: workflow permissions are empty; `policy`, `build` and
  *    `checks` can only READ; only `publish` can sign/attest/write, and
  *    `publish` runs no repository or third-party code (no checkout, no
@@ -173,13 +174,23 @@ function runStep(
 // A fake `gh` that answers every call with one line.
 const ghAnswers = (text) => `printf '%s\\n' '${text}'`;
 const HAS_SHA256SUM = spawnSync("sha256sum", ["--version"]).status === 0;
+const publishTagGh = (answer) =>
+  [
+    'case "$*" in',
+    '  *"--json databaseId"*) printf "%s\\n" 123 ;;',
+    `  *"git/ref/tags/"*) printf '%s\\n' '${answer}' ;;`,
+    '  *"--method PATCH"*) exit 0 ;;',
+    '  *) exit 99 ;;',
+    "esac",
+  ].join("\n");
 
 // --- triggers and top-level hygiene -------------------------------------------
 
-test("release.yml has exactly four jobs: policy, build, checks, publish, and is not a reusable workflow", () => {
+test("release.yml has five jobs, including isolated Latest reconciliation, and is not reusable", () => {
   assert.deepStrictEqual(Object.keys(wf.jobs).sort(), [
     "build",
     "checks",
+    "latest",
     "policy",
     "publish",
   ]);
@@ -253,7 +264,7 @@ test("published release verification fails closed on changed metadata or notes",
   const step = publish.steps[stepNamed(publish.steps, PUBLISHED_CHECK)];
   const gh = [
     'case "$*" in',
-    '  *"--json name,tagName,isDraft,isPrerelease,isLatest"*) printf "%s\\n" "$FAKE_META" ;;',
+    '  *"--json name,tagName,isDraft,isPrerelease"*) printf "%s\\n" "$FAKE_META" ;;',
     '  *"--json body"*) printf "%s\\n" "$FAKE_BODY" ;;',
     '  *) exit 99 ;;',
     "esac",
@@ -261,18 +272,18 @@ test("published release verification fails closed on changed metadata or notes",
   const metadata = runStep(step, {
     gh,
     env: {
-      FAKE_META: "v1.2.3 v1.2.3 false false false",
+      FAKE_META: "v1.2.3 v1.2.3 true false",
       FAKE_BODY: "notes",
     },
   });
   assert.notStrictEqual(metadata.status, 0);
-  assert.match(metadata.output, /expected the named release to be published, stable and latest/);
+  assert.match(metadata.output, /expected the named release to be published and stable/);
   assert.strictEqual(metadata.calls.length, 1, "must stop before touching assets");
 
   const notes = runStep(step, {
     gh,
     env: {
-      FAKE_META: "v1.2.3 v1.2.3 false false true",
+      FAKE_META: "v1.2.3 v1.2.3 false false",
       FAKE_BODY: "altered notes",
     },
     setup: (dir) => {
@@ -316,6 +327,63 @@ test("workflow-level permissions are empty and jobs must opt in", () => {
 test("same-tag release runs are serialised and never cancelled mid-flight", () => {
   assert.strictEqual(wf.concurrency.group, "release-${{ github.ref }}");
   assert.strictEqual(wf.concurrency["cancel-in-progress"], false);
+});
+
+test("Latest reconciliation is globally serialized, least-privilege, and runs after publication", () => {
+  assert.strictEqual(wf.jobs.latest.needs, "publish");
+  assert.strictEqual(wf.jobs.latest.concurrency.group, "release-latest-marker");
+  assert.strictEqual(wf.jobs.latest.concurrency["cancel-in-progress"], false);
+  assert.deepStrictEqual(wf.jobs.latest.permissions, { contents: "write" });
+  assert.ok(!/\b(checkout|npm|node)\b/.test(runText(wf.jobs.latest.steps)));
+});
+
+test("Latest reconciliation chooses the numerically highest published stable SemVer and leaves an already-correct marker alone", () => {
+  const step = wf.jobs.latest.steps[0];
+  const releases = [
+    { id: 2, tag_name: "v2.10.0", draft: false, prerelease: false },
+    { id: 9, tag_name: "v9.99.99", draft: false, prerelease: false },
+    { id: 10, tag_name: "v10.0.0", draft: false, prerelease: false },
+    { id: 99, tag_name: "v99.0.0-rc.1", draft: false, prerelease: true },
+    { id: 100, tag_name: "v1000.0.0", draft: true, prerelease: false },
+    { id: 101, tag_name: "release-v100.0.0", draft: false, prerelease: false },
+  ];
+  const gh = [
+    'case "$*" in',
+    '  *"releases?per_page=100"*) printf \'%s\\n\' "$FAKE_RELEASES" ;;',
+    '  *"releases/latest"*) if [ -s fake-latest.txt ]; then cat fake-latest.txt; else exit 1; fi ;;',
+    '  *"--method PATCH"*) printf \'%s\\n\' "$FAKE_PROMOTE_TAG" > fake-latest.txt ;;',
+    '  *) exit 99 ;;',
+    "esac",
+  ].join("\n");
+  const run = (currentLatest) =>
+    runStep(step, {
+      gh,
+      env: {
+        FAKE_RELEASES: JSON.stringify([releases]),
+        FAKE_LATEST: currentLatest,
+        FAKE_PROMOTE_TAG: "v10.0.0",
+      },
+      setup: (dir) =>
+        fs.writeFileSync(path.join(dir, "fake-latest.txt"), `${currentLatest}\n`),
+      after: (dir) => fs.readFileSync(path.join(dir, "fake-latest.txt"), "utf8").trim(),
+    });
+
+  const backfill = run("v2.10.0");
+  assert.strictEqual(backfill.status, 0, backfill.output);
+  assert.strictEqual(backfill.extra, "v10.0.0");
+  assert.ok(backfill.calls.some((call) => call.includes("releases/10 -f make_latest=true")));
+
+  const alreadyCorrect = run("v10.0.0");
+  assert.strictEqual(alreadyCorrect.status, 0, alreadyCorrect.output);
+  assert.deepStrictEqual(
+    alreadyCorrect.calls.filter((call) => call.includes("--method PATCH")),
+    [],
+  );
+
+  const firstRelease = run("");
+  assert.strictEqual(firstRelease.status, 0, firstRelease.output);
+  assert.strictEqual(firstRelease.extra, "v10.0.0");
+  assert.ok(firstRelease.calls.some((call) => call.includes("releases/10 -f make_latest=true")));
 });
 
 test("every job has a timeout", () => {
@@ -607,9 +675,10 @@ test("the release is created as a DRAFT bound to the pushed tag, and only a late
   assert.match(create, /--draft\b/);
   assert.match(create, /--verify-tag\b/);
   assert.ok(!/--latest/.test(create), "creation must not publish");
-  const edit =
-    publish.steps[runsMatching(publish.steps, /gh release edit/)].run;
-  assert.match(edit, /--draft=false/);
+  const publishCall =
+    publish.steps[runsMatching(publish.steps, /gh api --method PATCH/)].run;
+  assert.match(publishCall, /-F draft=false/);
+  assert.match(publishCall, /-f make_latest=false/);
 });
 
 test("a published release is never overwritten; only a leftover draft is replaced", () => {
@@ -704,16 +773,13 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   const script = publish.steps[pub].run;
   const checkAt = script.indexOf("git/ref/tags/");
   const compareAt = script.indexOf('if [ -z "$EXPECTED_TAG_OBJECT"');
-  const editAt = script.indexOf("gh release edit");
+  const editAt = script.indexOf("gh api --method PATCH");
   assert.ok(
     checkAt >= 0 && checkAt < compareAt && compareAt < editAt,
     "look up, compare, then publish, in one script",
   );
-  assert.strictEqual(script.match(/gh release edit/g).length, 1);
-  assert.match(
-    script,
-    /gh release edit "\$RELEASE_TAG" --draft=false --latest/,
-  );
+  assert.strictEqual((script.match(/gh api --method PATCH/g) ?? []).length, 1);
+  assert.match(script, /gh api --method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=false/);
   const between = script.slice(compareAt, editAt);
   assert.ok(
     !/\b(gh|git|curl|sleep|npm|node)\b/.test(between),
@@ -729,22 +795,52 @@ test("after publishing, the tag is checked once more and the release is called c
   assert.match(finalStep, /compromised/);
 });
 
+test("post-publish verification compares the exact expected asset set and every asset byte for byte", () => {
+  const finalStep =
+    publish.steps[stepNamed(publish.steps, PUBLISHED_CHECK)].run;
+  assert.match(finalStep, /gh release download "\$RELEASE_TAG" --dir published/);
+  assert.match(finalStep, /find published -maxdepth 1 -type f/);
+  assert.match(finalStep, /Published release has \$\{count\} assets/);
+  assert.match(finalStep, /for asset in "\$\{assets\[@\]\}"/);
+  assert.match(finalStep, /cmp -s -- "dist\/\$\{asset\}" "published\/\$\{asset\}"/);
+  assert.ok(
+    finalStep.indexOf("cmp -s") < finalStep.indexOf("sha256sum --check"),
+    "all files must match before checksum/signature validation proceeds",
+  );
+});
+
 test("re-check (real shell, fake gh): passes only while the tag still resolves to the verified tag object, and only then does the publish call happen", () => {
   for (const name of [CREATE_RECHECK, PUBLISH_STEP]) {
     const step = publish.steps[stepNamed(publish.steps, name)];
     const same = runStep(step, {
-      gh: ghAnswers(`tag ${SHA_VERIFIED}`),
+      gh:
+        name === PUBLISH_STEP
+          ? [
+              'case "$*" in',
+              '  *"git/ref/tags/"*) printf "%s\\n" "tag ' + SHA_VERIFIED + '" ;;',
+              '  *"--json databaseId"*) printf "%s\\n" 123 ;;',
+              '  *"--method PATCH"*) exit 0 ;;',
+              '  *) exit 99 ;;',
+              "esac",
+            ].join("\n")
+          : ghAnswers(`tag ${SHA_VERIFIED}`),
       env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
     });
     assert.strictEqual(same.status, 0, `${name}\n${same.output}`);
-    assert.match(
-      same.calls[0],
-      /^api repos\/fossasia\/cla-bot\/git\/ref\/tags\/v1\.2\.3 --jq /,
+    assert.ok(
+      same.calls.some((call) =>
+        /^api repos\/fossasia\/cla-bot\/git\/ref\/tags\/v1\.2\.3 --jq /.test(
+          call,
+        ),
+      ),
+      "the verified tag ref is queried",
     );
     assert.deepStrictEqual(
-      same.calls.filter((call) => call.startsWith("release edit")),
+      same.calls.filter((call) => call.startsWith("api --method PATCH")),
       name === PUBLISH_STEP
-        ? ["release edit v1.2.3 --draft=false --latest"]
+        ? [
+            "api --method PATCH repos/fossasia/cla-bot/releases/123 -F draft=false -f make_latest=false",
+          ]
         : [],
       name,
     );
@@ -764,7 +860,7 @@ test("re-check (real shell, fake gh): a MOVED, re-created-as-lightweight, or une
       ["empty answer", ""],
     ]) {
       const r = runStep(step, {
-        gh: ghAnswers(current),
+        gh: name === PUBLISH_STEP ? publishTagGh(current) : ghAnswers(current),
         env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
       });
       assert.notStrictEqual(r.status, 0, `${name}: ${label}`);
@@ -785,7 +881,7 @@ test("re-check (real shell, fake gh): an empty expected value or a failing gh ca
   for (const name of [CREATE_RECHECK, PUBLISH_STEP]) {
     const step = publish.steps[stepNamed(publish.steps, name)];
     const noExpected = runStep(step, {
-      gh: ghAnswers("tag "),
+      gh: name === PUBLISH_STEP ? publishTagGh("tag ") : ghAnswers("tag "),
       env: { EXPECTED_TAG_OBJECT: "" },
     });
     assert.notStrictEqual(

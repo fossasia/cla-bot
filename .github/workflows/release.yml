@@ -49,7 +49,9 @@ name: Release
 #                                           it, so they are not listed in it;
 #                                           each verifies on its own.
 # The release is created as a DRAFT, filled, verified, and only then
-# published. That order matters: with "Immutable releases" enabled (see
+# published. It is published without changing the Latest marker; a final,
+# globally serialised job points Latest at the highest stable SemVer release.
+# That order matters: with "Immutable releases" enabled (see
 # CONTRIBUTING.md) a published release can never be edited, so a broken one
 # would burn its version number.
 on:
@@ -546,22 +548,31 @@ jobs:
       - name: Re-check the tag and publish the release
         run: |
           set -euo pipefail
+          release_id="$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not resolve the GitHub release ID for ${RELEASE_TAG}."
+            exit 1
+          fi
           current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
           expected="tag ${EXPECTED_TAG_OBJECT}"
           if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
             echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
             exit 1
           fi
-          gh release edit "$RELEASE_TAG" --draft=false --latest
+          # Keep this release from changing Latest during publication. A final
+          # globally serialized job reconciles the marker to highest SemVer.
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false \
+            -f make_latest=false
 
       # Download what users will download and verify it the way users will,
       # with the SAME constraints as before publishing (workflow, tag, commit).
       - name: Verify the published release end to end
         run: |
           set -euo pipefail
-          meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease,isLatest --jq '[.name, .tagName, .isDraft, .isPrerelease, .isLatest] | join(" ")')"
-          if [ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false true" ]; then
-            echo "::error::Published release metadata is '${meta}', expected the named release to be published, stable and latest."
+          meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease --jq '[.name, .tagName, .isDraft, .isPrerelease] | join(" ")')"
+          if [ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false" ]; then
+            echo "::error::Published release metadata is '${meta}', expected the named release to be published and stable."
             exit 1
           fi
           body="$(gh release view "$RELEASE_TAG" --json body --jq .body | tr -d '\r')"
@@ -579,6 +590,26 @@ jobs:
           workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
           mkdir published
           gh release download "$RELEASE_TAG" --dir published
+          assets=(
+            "${name}.tar.gz"
+            "${name}.tar.gz.sigstore.json"
+            "${name}.sbom.cdx.json"
+            "${name}.provenance.intoto.jsonl"
+            "${name}.sbom.intoto.jsonl"
+            SHA256SUMS
+            SHA256SUMS.sigstore.json
+          )
+          count="$(find published -maxdepth 1 -type f | wc -l)"
+          if [ "$count" -ne "${#assets[@]}" ]; then
+            echo "::error::Published release has ${count} assets, expected ${#assets[@]}."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if ! cmp -s -- "dist/${asset}" "published/${asset}"; then
+              echo "::error::Published asset ${asset} differs from the locally verified file."
+              exit 1
+            fi
+          done
           (cd published && sha256sum --check --strict SHA256SUMS)
           for file in "${name}.tar.gz" SHA256SUMS; do
             cosign verify-blob \
@@ -587,6 +618,7 @@ jobs:
               --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
               "published/${file}"
           done
+
           gh attestation verify "published/${name}.tar.gz" \
             --bundle "published/${name}.provenance.intoto.jsonl" \
             --repo "$GITHUB_REPOSITORY" \
@@ -642,3 +674,58 @@ jobs:
           done
           echo "::error::${RELEASE_TAG} is immutable, but GitHub's release attestation could not be verified after ${attempts} attempts."
           exit 1
+
+  latest:
+    name: Point Latest at the highest stable SemVer release
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Global serialization is safe here: if GitHub replaces a pending run,
+    # the surviving run re-reads every published release before reconciling.
+    concurrency:
+      group: release-latest-marker
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Reconcile Latest to the highest stable SemVer
+        run: |
+          set -euo pipefail
+          releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          highest="$(jq -cer '
+            def stable_semver:
+              test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$");
+            def semver_key:
+              sub("^v"; "") | split(".") | map([length, .]);
+            [.[][]
+              | select(.draft == false and .prerelease == false)
+              | select(.tag_name | stable_semver)]
+            | if length == 0 then error("no published stable SemVer releases")
+              else max_by(.tag_name | semver_key)
+              end
+          ' <<< "$releases")"
+          highest_tag="$(jq -r .tag_name <<< "$highest")"
+          highest_id="$(jq -r .id <<< "$highest")"
+          if [[ ! "$highest_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not resolve the release ID for highest version ${highest_tag}."
+            exit 1
+          fi
+
+          # A new repository has no /releases/latest endpoint until the first
+          # stable release is marked; PATCH below establishes it.
+          if ! current_latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"; then
+            current_latest=""
+          fi
+          if [ "$current_latest" != "$highest_tag" ]; then
+            echo "GitHub Latest is ${current_latest}; promoting highest stable version ${highest_tag}."
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${highest_id}" \
+              -f make_latest=true
+          fi
+          confirmed_latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [ "$confirmed_latest" != "$highest_tag" ]; then
+            echo "::error::GitHub Latest is ${confirmed_latest}, expected highest stable version ${highest_tag}."
+            exit 1
+          fi
+          echo "${highest_tag} is the highest stable SemVer release and GitHub Latest."

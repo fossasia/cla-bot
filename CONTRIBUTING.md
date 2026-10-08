@@ -201,6 +201,11 @@ key to guard), publishes the release, and verifies what it published. What a
 release contains and how consumers verify it: "Verifying a release" in
 `SECURITY.md`.
 
+GitHub's `Latest` marker tracks the numerically highest published stable
+`vMAJOR.MINOR.PATCH` release. Publishing an older version to backfill a gap does
+not demote a newer release; the workflow reconciles the marker after verifying
+each published release.
+
 Every example and setup doc in this project (`examples/consumer-workflow.yml`,
 "SETUP_GUIDE.md", this file) refers to a release as `@vX.Y.Z`. That release
 has to exist before anything referencing it works, which is why the last step

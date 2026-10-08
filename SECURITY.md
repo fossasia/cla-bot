@@ -80,7 +80,12 @@ Out of scope:
    and release" below. The
    draft release is also compared with what was prepared and verified, right
    before it is published: its assets byte for byte and as a set, and its
-   title, tag, notes, draft and pre-release flags.
+   title, tag, notes, draft and pre-release flags. After publication, all
+   downloaded assets are again compared byte for byte with the verified build
+   and checked as a set before the signatures and attestations are verified.
+   The release is published without changing GitHub's `Latest` marker; a
+   separate globally serialized job points it at the highest published stable
+   SemVer version, so a backfilled older tag cannot demote a newer release.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The jobs
@@ -89,9 +94,11 @@ Out of scope:
    on a different machine, installs the dev dependencies and runs them (the
    YAML parser for the SBOM, the coverage tool) and the test suite, and can
    at worst falsify the SBOM, never the archive; `publish` (the only job that
-   can sign or write) runs neither repository nor third-party code and
+   can sign assets) runs neither repository nor third-party code and
    re-checks the digests the other two reported through job outputs. `policy`,
-   `build` and `checks` can only read.
+   `build` and `checks` can only read. The separate `latest` job has only
+   `contents: write`, runs shell commands without checkout or repository
+   code, and uses that permission only to reconcile GitHub's Latest marker.
 8. A release does not start unless the release policy is declared, before
    anything is built: `RELEASE_IMMUTABILITY` must be `required` or
    `not-required`, and `RELEASE_APPROVAL` must be unset or `not-required`.
@@ -116,7 +123,7 @@ use it.
 | --------------------------------------- | ------------------------------------------------------------------ |
 | `cla-bot-<tag>.tar.gz`                  | Source archive of the tagged commit (deterministic `git archive`). |
 | `cla-bot-<tag>.tar.gz.sigstore.json`    | Sigstore (cosign) signature bundle for the archive.                |
-| `cla-bot-<tag>.sbom.cdx.json`           | CycloneDX SBOM: the pinned third-party actions this action runs.   |
+| `cla-bot-<tag>.sbom.cdx.json`           | CycloneDX SBOM: pinned third-party actions using registered GitHub PURLs. |
 | `cla-bot-<tag>.provenance.intoto.jsonl` | SLSA build-provenance attestation (archive and SBOM).              |
 | `cla-bot-<tag>.sbom.intoto.jsonl`       | Attestation binding the SBOM to the archive.                       |
 | `SHA256SUMS`                            | Checksums of the archive and the SBOM.                             |
@@ -259,6 +266,11 @@ What the signatures do **not** protect against, and what does:
   workflow's repeated tag checks narrow but do not eliminate the tag race.
 
 ## Known limitations (not vulnerabilities, but worth knowing)
+
+- The CycloneDX SBOM's `metadata.timestamp` is the source commit timestamp, not
+  the time the SBOM was generated. This keeps the SBOM reproducible for a given
+  commit; use the GitHub attestation and release publication time when you
+  need to know when the build actually ran or the artifact became public.
 
 - Commits whose author email isn't linked to a GitHub account can't be
   automatically resolved and are flagged for manual review. This is a

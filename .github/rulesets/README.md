@@ -31,6 +31,10 @@ with repository write access, as described in `SECURITY.md`.
 
 Import it once as a repository admin:
 
+This is an external repository setting: the release workflow does not query
+GitHub's effective rulesets and cannot prove this protection is active. Treat
+importing and verifying it as a required setup step before the first release.
+
 ```bash
 gh api --method POST repos/fossasia/cla-bot/rulesets --input .github/rulesets/release-tags.json
 ```
