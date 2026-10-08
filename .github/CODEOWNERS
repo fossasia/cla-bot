@@ -1,8 +1,0 @@
-/.github/CODEOWNERS           @fossasia/cla-admins
-/.github/                    @fossasia/cla-admins
-/.c8rc.json                  @fossasia/cla-admins
-/action.yml                  @fossasia/cla-admins
-/package.json                @fossasia/cla-admins
-/package-lock.json           @fossasia/cla-admins
-/src/                         @fossasia/cla-admins
-/test/                        @fossasia/cla-admins

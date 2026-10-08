@@ -46,11 +46,11 @@
  *    form and a regex cannot chase every wrapper without false positives.
  *  - The test process that produces the coverage data is PR code. A
  *    malicious test can forge the V8 coverage files that c8 reads (c8 trusts
- *    any JSON in its temp dir) and so fake 100%. CODEOWNERS requires the
- *    trusted maintainers to review changes to tests and the coverage gate,
- *    but CI does not cryptographically prove that the coverage data came
- *    from genuine test execution; that would need a second trusted job or
- *    signed coverage artifacts.
+ *    any JSON in its temp dir) and so fake 100%. Repository writers can
+ *    change tests and the coverage gate without separate approval, and CI
+ *    does not cryptographically prove that coverage came from genuine test
+ *    execution; that would need a second trusted job or signed coverage
+ *    artifacts.
  *
  * Scope: every .js/.cjs/.mjs file under src/ (the shipped action). If a
  * file type here is not matched by .c8rc.json's `include`, it is reported

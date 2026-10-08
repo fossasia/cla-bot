@@ -31,15 +31,15 @@ App token - no long-lived personal access token is stored anywhere.
 4. **Cut a signed release - don't skip this, everything after this step
    depends on it existing.** Releases are built, signed and published by CI
    from a signed tag; nobody creates one by hand. The one-time repository
-   settings (mutable releases and the `RELEASE_IMMUTABILITY` declaration, the
+   settings (mutable releases, the
    `release` environment and tag ruleset, and a registered signing key) and the exact steps are in CONTRIBUTING.md's
    "Releasing a new version" section. In short:
    ```bash
    git tag -s v1.0.0 -m "cla-bot v1.0.0"   # or whatever version CHANGELOG.md says
    git push origin v1.0.0
    ```
-   With `RELEASE_APPROVAL=not-required`, the **Release** workflow publishes
-   without a second-person approval; wait for its verification to finish.
+   The **Release** workflow publishes without a second-person approval; wait
+   for its verification to finish.
 5. **Verify the release before anyone depends on it.** Open
    `https://github.com/fossasia/cla-bot/releases` and confirm the release
    carries `RELEASE_NOTES.md`, the signed archive and SBOM, their Cosign
@@ -68,10 +68,10 @@ App token - no long-lived personal access token is stored anywhere.
    handles FOSSASIA's legal matters before treating it as final).
 3. Don't manually create `signatures/cla.json` - the bot creates it
    automatically the first time anyone signs.
-4. **Access control**: give only a small team (e.g. `fossasia/cla-admins`)
-   access to this repo. It will contain contributors' names, GitHub ids,
-   and timestamps, which is personal data - nobody else in the org should
-   be able to see it.
+4. **Privacy access control**: give access to this private repo only to the
+   people who need to manage CLA records. It contains contributors' names,
+   GitHub ids, and timestamps. This limits access to personal data; it does
+   not create an approval requirement for code changes or releases.
 
 ## Step 3 - Create a GitHub App (for cross-repo access, not a personal token)
 
@@ -118,22 +118,12 @@ tries to sign - that's when the write fails and the job errors out. After
 rolling this out, double-check the values in one repo's workflow file
 match `cla-signatures` exactly.
 
-## Step 5 - Lock down who can edit the workflow file
+## Step 5 - Repository change and release permissions
 
-1. In each repo, add a `.github/CODEOWNERS` entry making a trusted team
-   (e.g. `@fossasia/cla-admins`) the required approver for changes under
-   `.github/workflows/`.
-2. In each repo's branch protection rule (Settings → Branches, for
-   main/master), turn on **"Require review from Code Owners"**.
-3. ⚠️ **Important**: give that team **explicit write access on every
-   individual repo**. GitHub requires a team to have write access to a
-   specific repo for its CODEOWNERS entry to apply there, even if members
-   already have access some other way (org membership, another team). Skip
-   this and CODEOWNERS silently does nothing on that repo, with no warning.
-
-This stops a regular contributor, or a compromised low-trust maintainer
-account, from quietly editing `cla.yml` to leak a secret - any such change
-now needs a CLA-admin's review before it can merge.
+Repository permissions determine who can propose and merge changes, including
+workflow changes, and who can create releases. This setup requires no extra
+reviewer or team approval. Required CI checks and the release workflow's tag,
+artifact, and environment-policy validations still apply.
 
 ## Step 6 - Check the org-wide default permission (a PII leak check)
 
@@ -163,8 +153,7 @@ access control from Step 2.
 
 ## Step 8 - Roll out across the whole org
 
-Copy `examples/consumer-workflow.yml` (and, if you use one, a CODEOWNERS
-entry from Step 5) into every repo that needs the CLA check. If you're
+Copy `examples/consumer-workflow.yml` into every repo that needs the CLA check. If you're
 rolling out to many repos, a small internal script that pushes the
 workflow file via the GitHub API (skipping repos that already have a
 customized `cla.yml`) is worth writing, but that tooling isn't part of

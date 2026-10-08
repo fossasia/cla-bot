@@ -67,11 +67,10 @@ lower a threshold, narrow `include`, point `action.yml` at an unmeasured
 script, or change the test command and still show a green check with the
 same job name.
 
-The main ruleset requires code-owner review for `.github/`, application
-source, coverage configuration, release inputs and the test suite, as listed
-in `.github/CODEOWNERS`. This closes the self-modifying-gate path for those
-protected files. Other paths retain the zero global approval count.
-`coverage-comment.yml` also posts a visible warning when gate files change.
+Repository writers may change the files that define the coverage gate. This is
+an accepted trust boundary: anyone with repository write access can propose
+and merge such changes when CI passes. `coverage-comment.yml` posts a visible
+warning when gate files change, but does not require reviewer or team approval.
 
 **What the code does** (CI job "Enforce 100% coverage"):
 
@@ -101,8 +100,8 @@ protected files. Other paths retain the zero global approval count.
   It also fails if the tests hid an edit from git with
   `update-index --assume-unchanged` / `--skip-worktree`. This catches
   tampering with `.c8rc.json`, the scripts, `src/` or `c8` itself. It cannot
-  stop a test that forges coverage data or a PR that edits the workflow -
-  only review can.
+  stop a test that forges coverage data or a repository writer from changing
+  the workflow and its checks.
 - The comment workflow (`coverage-comment.yml`, which always runs the
   version on `main`) puts a warning at the top of the PR comment whenever a
   PR changes a gate file (`.c8rc.json`, `action.yml`, `package.json`,
@@ -117,8 +116,9 @@ protected files. Other paths retain the zero global approval count.
   its temp directory, so a malicious test can write a forged file claiming
   every line of `src/` is hit and pass both `c8 check-coverage` and
   `verify-coverage.js`. Closing this needs a second trusted job that never
-  runs PR code, or signed coverage artifacts - disproportionate here. Code
-  owner review is the control.
+  runs PR code, or signed coverage artifacts - disproportionate here. This
+  limitation is accepted for repository writers; the required CI check is the
+  merge gate.
 - **Dynamic imports.** Only literal specifiers are followed:
   `require(path.join(__dirname, "../x.js"))`, `import(variable)` and
   `createRequire()` are invisible. Resolving every dynamic load statically is
@@ -131,10 +131,9 @@ actually makes the gate binding, not just a convention):
 
 Mark the single **`Required checks pass`** job of the `CI` workflow as a
 **required status check** on `main` (see `.github/rulesets/main.json`). It
-already fans in the coverage gate and every other check. The ruleset also
-requires `@fossasia/cla-admins` review for the paths in `.github/CODEOWNERS`,
-while leaving ordinary changes without a global approval count. Confirm that
-team has write access to the repository.
+already fans in the coverage gate and every other check. No human or team
+approval is required; repository write access and the required CI status check
+are the merge controls.
 
 ## CI structure and the single required check
 
@@ -177,11 +176,9 @@ infer from the name:
 - A green `codeql` job means the analysis ran, not that there are no
   alerts. It does not block on alerts by itself (opt-in in
   `.github/rulesets/README.md`, "Optional: block on CodeQL alerts").
-- Release-critical workflows, verification scripts, rulesets, action metadata,
-  source, tests and release inputs require review from `@fossasia/cla-admins`
-  through the main ruleset and `.github/CODEOWNERS`. Other paths have no global
-  approval count. Release tag creation itself remains available to authorized
-  writers.
+- Repository writers can change any path and can create release tags. No
+  reviewer or team approval is required; the configured CI checks and release
+  validation still apply.
 - Merge queue is not enabled. If it ever is, add `merge_group:` to `ci.yml`
   (and confirm CodeQL and the SARIF uploads behave on that event) first,
   otherwise queued pull requests never get their checks.
@@ -233,24 +230,19 @@ when something about releasing seems off:
    as needed. Replacing a signed asset invalidates its signatures/checksums;
    consumers must reject it, so publish a newly signed asset under the next
    patch version instead of silently replacing it in place.
-2. **Set the release approval policy** as a repository variable (Settings ->
-   Secrets and variables -> Actions -> Variables):
-   - `RELEASE_APPROVAL` = `not-required` because anyone with repository release
-     rights is authorized to publish without a second-person approval.
-   - The workflow always reads the actual `release` environment rules and
-     fails before building if the declaration and environment disagree.
-   - Mutability is intentionally `not-required` in the reviewed release
-     workflow. Changing it requires a reviewed workflow change; it is not a
-     repository variable that a repository writer can silently alter.
+2. **Release authorization and mutability:** repository permissions alone
+   determine who may publish; no separate reviewer or team approval is
+   required. The workflow reads the actual `release` environment rules and
+   fails before building if required reviewers are configured. Mutability is
+   intentionally `not-required` in workflow code.
 3. **Create the `release` environment** (Settings -> Environments -> New
    environment). Under "Deployment branches and tags", select "Selected
    branches and tags" and add exactly one rule: tag pattern `v*` (no branch
    rules and no additional patterns). The policy job reads the environment
    mode and the complete paginated rules list, and fails before build if they
-   differ. Leave required reviewers empty when using
-   `RELEASE_APPROVAL=not-required`. GitHub enforces environment protection
-   independently of repository variables; the workflow checks that this
-   environment cannot silently add an approval gate.
+   differ. Leave required reviewers empty. GitHub enforces environment
+   protection independently; the workflow checks this before building so the
+   environment cannot add an approval gate.
 4. **Import the release tag ruleset** in `.github/rulesets/release-tags.json`
    as a repository admin. It lets writers create version tags but blocks
    moving or deleting them after creation. A tag correction uses a new version.
@@ -303,10 +295,9 @@ but signing and attesting need a real GitHub run.
    ```
    Only `vMAJOR.MINOR.PATCH` starts a release; no pre-release suffixes. A
    lightweight tag (`git tag vX.Y.Z`) or an unverified one fails the run.
-4. Watch the **Release** workflow (Actions tab). With the documented
-   `RELEASE_APPROVAL=not-required` setting, the `publish` job runs without a
-   second-person approval and ends by downloading and verifying the published
-   release the way a consumer would.
+4. Watch the **Release** workflow (Actions tab). The `publish` job runs
+   without a second-person approval and ends by downloading and verifying the
+   published release the way a consumer would.
 5. **Only after it succeeded**, open
    `https://github.com/fossasia/cla-bot/releases/tag/vX.Y.Z`, run the
    verification in `SECURITY.md` once from a clean machine, and then update
@@ -340,15 +331,15 @@ but signing and attesting need a real GitHub run.
   differ from what was prepared) means someone or something changed the draft
   after it was created. Nothing is public. The workflow fails closed; inspect
   the draft and delete it manually only after confirming it is safe, then rerun.
-- **A "policy" job failure** (invalid workflow immutability policy, missing
-  reviewers when approval is required, or inability to read the `release`
+- **A "policy" job failure** (invalid workflow immutability policy, required
+  reviewers configured on the `release` environment, or inability to read the
   environment): nothing was built or published. Do the one-time
   setup it names, then re-run the failed jobs.
 - **"... NOT immutable (isImmutable=false)"** at the very end: the release is
   published, signed and verified, but "Immutable releases" is off although
   the workflow policy says `required`. Turn it on before the next release
-  (it cannot be applied to this one), or change the policy through a reviewed
-  workflow update if mutable releases are intended.
+  (it cannot be applied to this one), or change the policy in workflow code if
+  mutable releases are intended.
 - **An existing release for the tag** (draft or published) prevents creation:
   a matching draft is reused only after its metadata, notes and every asset
   match this run's verified files. A mismatching draft fails closed; inspect it

@@ -72,9 +72,8 @@
  *  4. The PR can also edit the files that DEFINE the gate (.c8rc.json,
  *     package.json, action.yml, ci.yml, coverage.yml ...), because ci.yml
  *     (which calls coverage.yml) runs the PR's own copy on `pull_request`.
- *     This repository deliberately does not require a human/code-owner
- *     review on top of CI (see "Branch protection has exactly one required
- *     condition" in .github/rulesets/README.md), so nothing here can
+ *     This repository deliberately does not require a human review on top of
+ *     CI (see .github/rulesets/README.md), so nothing here can
  *     *block* such a PR - the required status check is the only gate, and
  *     it would be evaluated with the PR's own, possibly weakened, rules.
  *     What this privileged job adds is visibility, not enforcement: it
@@ -125,7 +124,7 @@ const NOTICE_RESERVE = 2000;
 
 // Files whose content decides what "100% coverage" means, what counts as
 // the shipped code, or whether the check runs at all. A change to any of
-// them is flagged to reviewers.
+// them is surfaced in a warning; the warning does not require approval.
 const GATE_FILES = new Set([
   ".c8rc.json",
   "action.yml",
@@ -380,7 +379,7 @@ async function gateChangeNotice({ github, context, core, pr }) {
     core.warning(
       `Could not list PR #${pr.number}'s files to check for gate changes. (${err.message || err})`,
     );
-    return "> [!WARNING]\n> Could not check whether this PR changes the coverage gate itself (the file list was unavailable). Reviewers: check `.c8rc.json`, `package.json`, `action.yml` and `.github/` manually.\n\n";
+    return "> [!WARNING]\n> Could not check whether this PR changes the coverage gate itself (the file list was unavailable). This is informational; repository writers may merge when required CI checks pass.\n\n";
   }
 
   const touched = new Set();
@@ -400,7 +399,7 @@ async function gateChangeNotice({ github, context, core, pr }) {
   }
   return [
     "> [!WARNING]",
-    "> **This PR changes files that define the coverage gate.** The result below was measured with this PR's own versions of them, so it proves nothing about the rules on `main`. Reviewers: review these changes by hand.",
+    "> **This PR changes files that define the coverage gate.** The result below was measured with this PR's own versions of them, so it proves nothing about the rules on `main`. This warning is informational; no additional approval is required.",
     ">",
     ...shown,
     "",

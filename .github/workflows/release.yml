@@ -16,11 +16,9 @@ name: Release
 # any repository code can sign or publish:
 #
 #   policy   actions: read ONLY. Fails fast, before anything is built, unless
-#            the release policy is explicit: mutability is a reviewed workflow
-#            setting; `RELEASE_APPROVAL` declares whether the `release`
-#            environment must have reviewers or must have none. The actual
-#            environment and its exact v* tag deployment restriction are read
-#            and validated through the API before anything is built.
+#            release settings match policy: mutability is a workflow setting,
+#            the `release` environment has no required reviewers, and its
+#            exact v* tag deployment restriction is validated through the API.
 #   build    contents: read ONLY. Verifies the tag and builds the source
 #            archive and release notes with `git` and Node built-ins. It
 #            installs and executes NO third-party code (no npm), so nothing
@@ -94,15 +92,14 @@ jobs:
       actions: read # read the `release` environment and deployment policies
     env:
       GH_TOKEN: ${{ github.token }}
-      # Keep this policy in protected workflow code; repository writers can
-      # change Actions variables without changing the reviewed workflow.
+      # Keep the declaration in workflow code so a repository variable cannot
+      # silently change the immutability policy.
       RELEASE_IMMUTABILITY: not-required
-      RELEASE_APPROVAL: ${{ vars.RELEASE_APPROVAL }}
     steps:
       # GitHub's setting "Immutable releases" can only be read with the
       # `administration` permission, which no workflow token can have, so it
       # cannot be checked from here BEFORE publishing. The policy is therefore
-      # a reviewed workflow setting; after publishing, the release itself is
+      # declared in workflow code; after publishing, the release itself is
       # checked and the run fails if the repository setting contradicts it.
       - name: Require the immutability policy to be declared
         run: |
@@ -126,18 +123,6 @@ jobs:
       - name: Check the release environment approval policy
         run: |
           set -euo pipefail
-          case "${RELEASE_APPROVAL:-}" in
-            "")
-              expected="required"
-              ;;
-            not-required)
-              expected="not-required"
-              ;;
-            *)
-              echo "::error::RELEASE_APPROVAL must be unset or not-required, not '${RELEASE_APPROVAL}'."
-              exit 1
-              ;;
-          esac
           if ! environment="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release")"; then
             echo "::error::Could not read the 'release' environment approval rules. Configure the environment and grant this workflow actions:read access."
             exit 1
@@ -152,7 +137,7 @@ jobs:
             echo "::error::Could not parse the 'release' environment approval rules. Refusing to release."
             exit 1
           fi
-          read -r reviewers prevent_self_review <<< "$summary"
+          read -r reviewers _ <<< "$summary"
           # `[ x -lt 1 ]` with a non-number is an ERROR (status 2), which `if`
           # treats as "false". Reject anything that is not a plain number first,
           # so an unexpected answer can never pass as "has reviewers".
@@ -162,21 +147,11 @@ jobs:
               exit 1
               ;;
           esac
-          if [ "$expected" = "not-required" ]; then
-            if [ "$reviewers" -ne 0 ]; then
-              echo "::error::RELEASE_APPROVAL=not-required conflicts with the 'release' environment, which has ${reviewers} required reviewer(s). Remove those reviewers to allow authorized release writers to publish without a second-person approval."
-              exit 1
-            fi
-            echo "No required reviewers are configured on the 'release' environment; GitHub will not add an environment approval gate."
-          else
-            if [ "$reviewers" -lt 1 ]; then
-              echo "::error::RELEASE_APPROVAL is unset, so approval is required, but the 'release' environment has no required reviewers. Add reviewers or explicitly set RELEASE_APPROVAL=not-required."
-              exit 1
-            fi
-            if [ "${prevent_self_review:-false}" != "true" ]; then
-              echo "::notice::The 'release' environment allows self-review: whoever pushes the tag may also approve its release."
-            fi
+          if [ "$reviewers" -ne 0 ]; then
+            echo "::error::The 'release' environment has ${reviewers} required reviewer(s). Remove them; repository release rights are the only human authorization for publishing."
+            exit 1
           fi
+          echo "No required reviewers are configured on the 'release' environment; repository release rights are the only human authorization for publishing."
 
           # The documented deployment restriction is exactly one custom TAG
           # rule named v*. Verify both the environment mode and every rule;
@@ -538,7 +513,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # Keep publication under the release environment so its tag restrictions
-    # apply. Approval behavior remains governed by the explicit policy opt-out.
+    # apply. The preflight rejects required reviewers; repository rights alone
+    # authorize publishing.
     environment:
       name: release
     permissions:
@@ -949,7 +925,7 @@ jobs:
             --predicate-type "https://cyclonedx.org/bom"
 
       # The release is already public here, so this step cannot undo anything.
-      # It checks that GitHub's setting matches the reviewed workflow policy.
+      # It checks that GitHub's setting matches the declared workflow policy.
       # A mismatch is a red run, never a quiet downgrade of the guarantee
       # SECURITY.md describes. The direct signal is the release's
       # own `immutable` flag (gh: isImmutable). `gh release verify` additionally

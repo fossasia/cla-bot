@@ -1910,16 +1910,15 @@ test("consumer verification pins the resolved tag commit to both attestations an
 
 // --- the release policy gate (runs before anything is built) -----------------------
 
-test("mutable releases are the reviewed policy in preflight, publish, Latest and the security docs", () => {
+test("mutable releases are the declared policy in preflight, publish, Latest and the security docs", () => {
   assert.deepStrictEqual(policy.env, {
     GH_TOKEN: "${{ github.token }}",
     RELEASE_IMMUTABILITY: "not-required",
-    RELEASE_APPROVAL: "${{ vars.RELEASE_APPROVAL }}",
   });
   assert.strictEqual(publish.steps[stepNamed(publish.steps, IMMUTABLE_CHECK)].env.RELEASE_IMMUTABILITY, "not-required");
   assert.strictEqual(verifyLatest.env.RELEASE_IMMUTABILITY, "not-required");
-  assert.match(read("CONTRIBUTING.md"), /Mutability is intentionally `not-required`/);
-  assert.match(read("SECURITY.md"), /reviewed `not-required` policy does not fail for mutable releases/);
+  assert.match(read("CONTRIBUTING.md"), /Mutability is\s+intentionally `not-required`/);
+  assert.match(read("SECURITY.md"), /declared `not-required` policy does not fail for mutable releases/);
   assert.match(read("SECURITY.md"), /Release notes, the source archive and the SBOM\s+each have a direct Cosign signature/);
   assert.match(read("SECURITY.md"), /Mutable metadata such as the title\s+is not signed/);
 });
@@ -1958,7 +1957,7 @@ test("policy (real shell): the immutability policy must be declared as `required
 });
 
 const releaseEnvironment = ({
-  reviewers = 1,
+  reviewers = 0,
   preventSelfReview = true,
   deploymentBranchPolicy = {
     protected_branches: false,
@@ -1998,7 +1997,7 @@ const validReleasePolicy = {
   },
 };
 
-test("policy (real shell, fake gh): unset RELEASE_APPROVAL requires reviewers and the exact release tag policy", () => {
+test("policy (real shell, fake gh): release environment has no required reviewers and has the exact tag policy", () => {
   const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
   const ok = runStep(step, { ...validReleasePolicy });
   assert.strictEqual(ok.status, 0, ok.output);
@@ -2013,27 +2012,18 @@ test("policy (real shell, fake gh): unset RELEASE_APPROVAL requires reviewers an
     "self-review is off, nothing to point out",
   );
 
-  const selfReview = runStep(step, {
-    ...validReleasePolicy,
-    env: {
-      ...validReleasePolicy.env,
-      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(
-        releaseEnvironment({ reviewers: 3, preventSelfReview: false }),
-      ),
-    },
-  });
-  assert.strictEqual(selfReview.status, 0, selfReview.output);
-  assert.match(selfReview.output, /::notice::.*allows self-review/);
+  assert.match(ok.output, /No required reviewers are configured/);
 
-  const noReviewers = runStep(step, {
+  const unexpectedReviewers = runStep(step, {
     ...validReleasePolicy,
     env: {
       ...validReleasePolicy.env,
-      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 0 })),
+      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 2 })),
     },
   });
-  assert.strictEqual(noReviewers.status, 1, noReviewers.output);
-  assert.match(noReviewers.output, /has no required reviewers/);
+  assert.strictEqual(unexpectedReviewers.status, 1, unexpectedReviewers.output);
+  assert.match(unexpectedReviewers.output, /has 2 required reviewer/);
+  assert.strictEqual(unexpectedReviewers.calls.length, 1, "reject before checking deployment rules");
 
   const malformedReviewers = runStep(step, {
     ...validReleasePolicy,
@@ -2051,43 +2041,6 @@ test("policy (real shell, fake gh): unset RELEASE_APPROVAL requires reviewers an
   const unreadable = runStep(step, { gh: "exit 1" });
   assert.strictEqual(unreadable.status, 1);
   assert.match(unreadable.output, /Could not read the 'release' environment/);
-});
-
-test("policy (real shell, fake gh): `not-required` must match an environment with no reviewers", () => {
-  const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
-  const optOut = runStep(step, {
-    ...validReleasePolicy,
-    env: { ...validReleasePolicy.env, RELEASE_APPROVAL: "not-required",
-      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 0 })) },
-  });
-  assert.strictEqual(optOut.status, 0, optOut.output);
-  assert.match(optOut.output, /No required reviewers are configured/);
-  assert.strictEqual(optOut.calls.length, 2, "inspect environment and deployment rules");
-
-  const conflict = runStep(step, {
-    ...validReleasePolicy,
-    env: { ...validReleasePolicy.env, RELEASE_APPROVAL: "not-required",
-      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 2, preventSelfReview: false })) },
-  });
-  assert.strictEqual(conflict.status, 1, conflict.output);
-  assert.match(conflict.output, /conflicts with the 'release' environment/);
-  assert.strictEqual(conflict.calls.length, 1);
-  for (const value of ["yes", "true", "Not-Required", "none", "required"]) {
-    const r = runStep(step, {
-      ...validReleasePolicy,
-      env: { RELEASE_APPROVAL: value },
-    });
-    assert.strictEqual(r.status, 1, value);
-    assert.match(r.output, /RELEASE_APPROVAL must be unset or not-required/);
-    assert.deepStrictEqual(r.calls, [], "invalid value never reaches the API");
-  }
-  // An EMPTY variable behaves as unset: the check is enforced.
-  const empty = runStep(step, {
-    ...validReleasePolicy,
-    env: { ...validReleasePolicy.env, RELEASE_APPROVAL: "",
-      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 0 })) },
-  });
-  assert.strictEqual(empty.status, 1);
 });
 
 test("release environment deployment policy fails closed for absent, broad, branch, extra, or malformed restrictions", () => {

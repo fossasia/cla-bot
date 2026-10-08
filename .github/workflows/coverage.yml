@@ -20,13 +20,11 @@ name: Test Coverage
 #   therefore of this file), and the PR's own package.json / .c8rc.json /
 #   scripts decide what is measured, so a PR could in principle weaken the
 #   gate itself by editing this file, ci.yml, or the scripts it calls. This
-#   repository's main ruleset now requires code-owner review for the
-#   workflow, scripts, configuration and source paths that define this gate
-#   (see .github/CODEOWNERS and .github/rulesets/README.md). Ordinary paths
-#   still have no global approval count. coverage-comment.yml posts a
-#   visible warning on the PR when a gate file is touched, so this is never
-#   silent, but it is a visibility aid, not a hard block. See "How the
-#   coverage gate is enforced" in CONTRIBUTING.md for the full write-up.
+#   repository writers can change this file, ci.yml, or the scripts it calls.
+#   No separate review or team approval is required; coverage-comment.yml
+#   posts a visible warning when gate files change, but it is a visibility
+#   aid, not a hard block. See "How the coverage gate is enforced" in
+#   CONTRIBUTING.md for the full write-up.
 # - The tests are PR-controlled code that runs before the gate. So the gate
 #   does not trust the workspace the tests ran in: after them it verifies
 #   that no tracked/untracked file changed, reinstalls node_modules from the

@@ -7,11 +7,6 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **Path-scoped release-policy review.** The main ruleset now requires
-  `@fossasia/cla-admins` approval for release workflows, verification code,
-  rulesets, action inputs, source and tests. The global approval count remains
-  zero, so authorized writers can still publish releases without a separate
-  release approval.
 - **Signed, attested releases.** Pushing a signed, annotated `vMAJOR.MINOR.PATCH`
   tag runs `.github/workflows/release.yml`, the supported verified release
   path. Repository writers can still create releases manually. CI verifies the
@@ -87,12 +82,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `verify-latest` (which validates releases from their signed tags through
   asset attestations and provides a recovery path), and `latest` (which
   promotes the highest verified stable SemVer release).
-- A release policy gate runs before anything is built: the repository
-  variable `RELEASE_IMMUTABILITY` must be declared (`required` or
-  `not-required`; GitHub's setting cannot be read from a workflow token), and
-  the `release` environment must have required reviewers unless
-  `RELEASE_APPROVAL=not-required`. This project intentionally uses the opt-outs
-  to allow mutable releases and publication by any actor with release rights.
+- A release policy gate runs before anything is built: the workflow declares
+  `RELEASE_IMMUTABILITY` (`required` or `not-required`; GitHub's setting cannot
+  be read from a workflow token), and the `release` environment must have no
+  required reviewers. Any actor with repository release rights can publish;
+  the project intentionally permits mutable releases.
 - The last tag check and the publish call are now one shell step, so nothing
   but one API round trip sits between them.
 - Least-privilege release pipeline: the job that runs repository code can only

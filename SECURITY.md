@@ -124,12 +124,10 @@ Out of scope:
    repository code, and uses that permission only to reconcile GitHub's Latest
    marker.
 8. A release does not start unless the workflow's immutability policy is
-   explicit and `RELEASE_APPROVAL` is unset or `not-required`. Mutability is
-   intentionally `not-required` in reviewed workflow code; changing it requires
-   a workflow change through the protected branch. `RELEASE_APPROVAL` is a
-   repository variable because anyone with release rights may publish without
-   second-person approval. GitHub's actual environment protection rules still
-   apply to the publish job. Release notes, the source archive and the SBOM
+   explicit and the `release` environment has no required reviewers. Mutability
+   is intentionally `not-required` in workflow code. Repository release rights
+   are the only human authorization for publishing. GitHub's actual environment
+   protection rules still apply to the publish job. Release notes, the source archive and the SBOM
    each have a direct Cosign signature and are listed in the signed checksum
    manifest. A changed release-body copy is rejected by release verification
    unless it matches the signed notes asset. Mutable metadata such as the title
@@ -269,12 +267,10 @@ What the signatures do **not** protect against, and what does:
   file can stop it. The
   policy gate protects against misconfiguration and against someone who can
   push tags but not change the workflow; it is **not** a defence against a
-  malicious change to the workflow. That needs a human review of changes to
-  the release pipeline files. The narrowest way to get it without slowing
-  down the rest of the repository is a path-scoped code-owner review for
-  those files only (see "Optional: add required review back" in
-  `.github/rulesets/README.md`, which lists the paths). Until you adopt it, check the diff of
-  `release.yml` and `release-check.js` between the releases you adopt.
+  malicious change to the workflow. Repository writers are trusted to change
+  the release pipeline, and no separate human or team approval is required.
+  Consumers should inspect the `release.yml` and `release-check.js` changes
+  between the releases they adopt.
 - **A tag moved between verification and release.** The publish job refuses
   to continue unless the tag still resolves to the exact signed tag object
   that was verified (`gh release create --verify-tag` alone would not catch
@@ -403,7 +399,7 @@ What the signatures do **not** protect against, and what does:
   changed, its signature and checksum no longer match; consumers must verify
   again and reject changed assets until corrected signatures/checksums are
   published. The workflow records whether a release is immutable, but its
-  reviewed `not-required` policy does not fail for mutable releases.
+  declared `not-required` policy does not fail for mutable releases.
 - The release SBOM lists the pinned third-party actions that `action.yml`
   runs (`runs.steps[*].uses`). It deliberately models only a composite action
   with no local `./` actions: anything else makes the release fail instead of

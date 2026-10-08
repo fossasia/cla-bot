@@ -1,10 +1,9 @@
 "use strict";
 /**
- * Offline guard for the single-check gate with selective CODEOWNERS review.
- * Branch protection requires `Required checks pass` and code-owner approval
- * only for trust-critical paths; ordinary paths have no global approval count.
- * This file keeps the CI fan-in and review-policy checks from silently
- * drifting:
+ * Offline guard for the single-check, no-review gate. Branch protection
+ * requires only `Required checks pass`; repository writers are not subject
+ * to a reviewer or team-approval gate. This file keeps the CI fan-in and
+ * ruleset from silently drifting:
  *
  *  - the gate fans in EVERY other job of ci.yml (a new job that is not in
  *    `needs:` would be unprotected), always runs, and nothing it needs can
@@ -22,8 +21,7 @@
  *  - zizmor.yml has a non-SARIF "fail on findings" run (SARIF exits 0 even
  *    with findings) and its SARIF upload is best-effort on pull_request;
  *  - the ruleset-as-code requires exactly the gate's check name and
- *    nothing else, while requiring code-owner review for trust-critical
- *    paths and no global approval count.
+ *    nothing else, with no human-approval requirements.
  *
  * Run: node test/ci-gate.test.js (also part of `npm test`).
  */
@@ -195,7 +193,7 @@ test("the ruleset requires exactly the gate's check name, pinned to GitHub Actio
   }
 });
 
-test("the ruleset requires a pull request and code-owner review for protected release and CI files", () => {
+test("the ruleset requires a pull request and no human approvals", () => {
   const ruleset = readRuleset();
   const pr = ruleset.rules.find((r) => r.type === "pull_request");
   assert.ok(
@@ -205,55 +203,18 @@ test("the ruleset requires a pull request and code-owner review for protected re
   assert.strictEqual(
     pr.parameters.required_approving_review_count,
     0,
-    "ordinary changes remain free of a global approval count",
+    "repository writers can merge without reviewer approval",
   );
   assert.strictEqual(
     pr.parameters.require_code_owner_review,
-    true,
-    "release-critical paths require approval from their code owner",
+    false,
+    "the repository does not require path-based approval",
   );
   assert.strictEqual(
     pr.parameters.dismiss_stale_reviews_on_push,
-    true,
-    "new commits invalidate prior approvals",
+    false,
+    "review dismissal does not apply because no approval is required",
   );
-  const codeowners = fs.readFileSync(
-    path.join(ROOT, ".github", "CODEOWNERS"),
-    "utf8",
-  );
-  for (const path of [
-    "/.github/CODEOWNERS",
-    "/.github/workflows/release.yml",
-    "/.github/scripts/release-check.js",
-    "/.github/scripts/verify-release-candidate.sh",
-    "/.github/rulesets/",
-    "/.github/workflows/ci.yml",
-    "/.github/workflows/coverage.yml",
-    "/.github/scripts/verify-coverage.js",
-    "/src/",
-    "/.c8rc.json",
-    "/action.yml",
-    "/package.json",
-    "/package-lock.json",
-    "/test/release-check.test.js",
-    "/test/release-candidate.test.js",
-    "/test/release-workflow.test.js",
-    "/test/ci-gate.test.js",
-  ]) {
-    assert.ok(
-      codeowners
-        .split("\n")
-        .some((line) => {
-          const [pattern, owner] = line.trim().split(/\s+/);
-          return (
-            owner === "@fossasia/cla-admins" &&
-            (pattern === path ||
-              (pattern.endsWith("/") && path.startsWith(pattern)))
-          );
-        }),
-      `CODEOWNERS must assign ${path} to @fossasia/cla-admins`,
-    );
-  }
   assert.deepStrictEqual(
     ruleset.bypass_actors,
     [],
