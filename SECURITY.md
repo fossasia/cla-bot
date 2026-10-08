@@ -258,19 +258,17 @@ What the signatures do **not** protect against, and what does:
   tagger is identifiable from the signed tag. This project intentionally does
   not require a second-person approval; repository actors with release rights
   are authorized to publish.
-- **A change to `release.yml` itself.** This repository deliberately has no
-  required code review on `main` (see `.github/rulesets/README.md`), and the
-  signing identity above names the workflow _file_, not its contents. A pull
-  request that passes CI could therefore change `release.yml`, including
-  removing the policy checks or the `environment: release` line that applies
-  the environment's deployment tag restriction, and no check inside that same
-  file can stop it. The
-  policy gate protects against misconfiguration and against someone who can
-  push tags but not change the workflow; it is **not** a defence against a
-  malicious change to the workflow. Repository writers are trusted to change
-  the release pipeline, and no separate human or team approval is required.
-  Consumers should inspect the `release.yml` and `release-check.js` changes
-  between the releases they adopt.
+- **A change to `release.yml` itself.** Repository writers can merge any
+  CI-passing change, including one that removes policy checks or the
+  `environment: release` tag restriction. The signatures and attestations
+  identify the workflow path, source ref, and source digest that produced an
+  artifact; they do not independently prove that the workflow code had a
+  separate review or was unchanged. This is the project's intentional trust
+  boundary: repository writers are trusted to change the release pipeline,
+  and no additional human or team approval is required. The policy preflight
+  catches environment drift, but cannot defend against a malicious change to
+  itself. Consumers should inspect `release.yml` and `release-check.js`
+  changes between the releases they adopt.
 - **A tag moved between verification and release.** The publish job refuses
   to continue unless the tag still resolves to the exact signed tag object
   that was verified (`gh release create --verify-tag` alone would not catch
@@ -400,11 +398,13 @@ What the signatures do **not** protect against, and what does:
   again and reject changed assets until corrected signatures/checksums are
   published. The workflow records whether a release is immutable, but its
   declared `not-required` policy does not fail for mutable releases.
-- The release SBOM lists the pinned third-party actions that `action.yml`
-  runs (`runs.steps[*].uses`). It deliberately models only a composite action
-  with no local `./` actions: anything else makes the release fail instead of
-  producing an incomplete SBOM. It does not describe anything a step
-  downloads at run time. It is generated in the `checks` job by the pinned
+- The release SBOM inventories the direct pinned third-party Actions that
+  `action.yml` references through `runs.steps[*].uses`. It deliberately models
+  only a composite action with no local `./` actions: anything else makes the
+  release fail instead of producing an incomplete direct-action inventory.
+  This is not a complete runtime or transitive dependency inventory: shell
+  commands, downloaded code and dependencies internal to referenced Actions
+  are outside its scope. It is generated in the `checks` job by the pinned
   `js-yaml` dev dependency, so a compromised copy of that package could
   falsify the SBOM's contents (never the archive, which is built in a
   different job on a different machine); the SBOM is evidence about the

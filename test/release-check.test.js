@@ -619,6 +619,18 @@ test("listActionDependencies finds pinned third-party actions and ignores commen
   );
 });
 
+test("the SBOM inventory covers direct pinned `uses` references, not shell commands or runtime downloads", () => {
+  const yml = composite(
+    [
+      "    - run: curl -fsSL https://example.invalid/tool.sh | sh",
+      `    - uses: actions/setup-node@${SHA_A}`,
+    ].join("\n"),
+  );
+  assert.deepStrictEqual(listActionDependencies(yml), [
+    { name: "actions/setup-node", ref: SHA_A, comment: undefined },
+  ]);
+});
+
 test("listActionDependencies fails closed on anything that is not a full-SHA pin", () => {
   for (const target of [
     "actions/checkout@v4",

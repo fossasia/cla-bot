@@ -11,10 +11,11 @@
  *         2. package.json's "version" equals the tag without its "v".
  *         3. package.json declares no runtime dependencies of ANY kind
  *            (dependencies, optionalDependencies, peerDependencies,
- *            bundleDependencies / bundledDependencies). The SBOM below only
- *            describes the action's own `uses:` dependencies, so an npm
- *            dependency would make it silently incomplete. Teach buildSbom
- *            about it before adding one (and see CONTRIBUTING.md).
+ *            bundleDependencies / bundledDependencies). The SBOM below
+ *            inventories direct pinned GitHub Actions referenced by the
+ *            composite action; npm runtime dependencies are outside that
+ *            inventory. Teach buildSbom about them before adding one (and see
+ *            CONTRIBUTING.md).
  *         4. CHANGELOG.md has a non-empty "## [X.Y.Z]" section. It becomes
  *            the release notes, written to --notes.
  *         5. The tag is ANNOTATED, the tag object's own name is the tag being
@@ -30,10 +31,13 @@
  *       closes the gap between "verified at build time" and "released later".
  *
  *   node release-check.js sbom --out <file>
- *       Writes a CycloneDX 1.6 SBOM listing what the action actually
- *       depends on at runtime: the third-party actions in action.yml, each
- *       pinned to a full commit SHA. action.yml is PARSED as YAML and the
- *       `uses` of every entry of `runs.steps` is read, so no layout (flow
+ *       Writes a CycloneDX 1.6 SBOM inventory of the direct third-party
+ *       GitHub Actions referenced by action.yml, each pinned to a full
+ *       commit SHA. This is not a complete inventory of everything that may
+ *       execute at runtime: shell commands, downloaded code, and dependencies
+ *       internal to referenced actions are outside its scope. action.yml is
+ *       PARSED as YAML; the `uses` value in every `runs.steps` entry is read,
+ *       so no layout (flow
  *       style, value on the next line, quoting) can hide one, while a
  *       `uses` key that is merely data (an input or `with:` value named
  *       "uses") is correctly not a dependency. Only composite actions are
@@ -41,7 +45,7 @@
  *       an error rather than an incomplete SBOM.
  *       An unpinned `uses:` fails the command, so a release can never ship
  *       a mutable dependency. `sbom` ALSO refuses npm dependencies itself,
- *       so its completeness never relies on `verify` having run first.
+ *       so the scope checks never rely on `verify` having run first.
  *
  * Environment (set by the workflow, never interpolated into shell text):
  *   RELEASE_TAG        e.g. v1.2.3 (github.ref_name)
@@ -64,7 +68,8 @@ const REPOSITORY_PATTERN = /^[\w.-]+\/[\w.-]+$/;
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
 const ACTION_NAME_PATTERN = /^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/;
 // Every package.json field through which npm can pull code in at install or
-// pack time. All must be empty for the SBOM to be complete.
+// pack time. All must be empty because this SBOM inventories direct GitHub
+// Action references, not npm runtime dependencies.
 const NPM_DEPENDENCY_FIELDS = [
   "dependencies",
   "optionalDependencies",
@@ -152,7 +157,7 @@ function npmDependencyFields(packageJson) {
 }
 
 function npmDependencyMessage(fields) {
-  return `package.json declares npm dependencies (${fields.join(", ")}), which the release SBOM does not describe; extend buildSbom first.`;
+  return `package.json declares npm dependencies (${fields.join(", ")}), which are outside the release SBOM's direct GitHub Action inventory; extend buildSbom first.`;
 }
 
 // Static consistency checks between the tag and the files it releases.
@@ -243,10 +248,11 @@ async function verifyTagSignature(options) {
   return (await inspectTag(options)).problems;
 }
 
-// The steps of a composite action, validated. Only `runs.steps[*].uses` can
-// make a composite action run someone else's code, so that is the whole
-// dependency surface; a `uses` anywhere else (an input, a `with:` value) is
-// data and must not be mistaken for a dependency.
+// The steps of a composite action, validated. This SBOM inventories direct
+// GitHub Actions declared by `runs.steps[*].uses`. A `uses` anywhere else
+// (an input, a `with:` value) is data, not an action dependency. `run:` shell
+// commands, remote downloads and transitive dependencies inside referenced
+// actions are deliberately outside this inventory.
 function compositeSteps(document) {
   const runs = document?.runs;
   if (runs?.using !== "composite") {
@@ -348,8 +354,8 @@ function actionPurl({ name, ref }) {
 }
 
 function buildSbom({ packageJson, tag, repository, actionYml, timestamp }) {
-  // Enforced here, at the point the SBOM is produced, so its completeness
-  // never depends on `verify` having been run before it.
+  // Enforced when this scoped action-reference inventory is produced, so its
+  // scope checks never depend on `verify` having run first.
   const npmFields = npmDependencyFields(packageJson);
   if (npmFields.length > 0) throw new Error(npmDependencyMessage(npmFields));
 

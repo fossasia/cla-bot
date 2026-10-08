@@ -45,17 +45,19 @@ FOSSASIA's projects.
 5. Changes to `action.yml` inputs should stay backward compatible where
    possible; if a breaking change is unavoidable, bump the major version
    tag and note it in `CHANGELOG.md`.
-6. **Don't weaken the release pipeline** (`.github/workflows/release.yml`,
-   `.github/scripts/release-check.js`)
-   without discussing it in an issue first: `test/release-workflow.test.js`
-   pins its least-privilege, pinning and ordering properties on purpose.
-   Every third-party action there is pinned to a full commit SHA. The
+6. **When changing the release pipeline** (`.github/workflows/release.yml`,
+   `.github/scripts/release-check.js`), update its regression tests and keep
+   the documented behavior accurate. Repository writers can merge changes to
+   these files under the same PR and CI rules as every other path; there is no
+   separate team approval. `test/release-workflow.test.js` checks important
+   least-privilege, pinning and ordering properties. Every third-party action
+   there is pinned to a full commit SHA. The
    `publish` job has `contents: write` but runs no third-party actions or
    repository code; actions needing OIDC/signing permissions are isolated in
    the separate `sign` job, which cannot publish releases. The shipped
-   `action.yml` may only `uses:` actions pinned that way, and no local `./`
-   action (the release SBOM refuses anything else rather than describing it
-   incompletely).
+   `action.yml` may only `uses:` direct Actions pinned that way, and no local
+   `./` action (the SBOM refuses anything else rather than omitting it from
+   its direct-action inventory).
 
 ## How the coverage gate is enforced (maintainers)
 
@@ -238,7 +240,8 @@ when something about releasing seems off:
 3. **Create the `release` environment** (Settings -> Environments -> New
    environment). Under "Deployment branches and tags", select "Selected
    branches and tags" and add exactly one rule: tag pattern `v*` (no branch
-   rules and no additional patterns). The policy job reads the environment
+   rules and no additional patterns). Do not configure a wait timer or custom
+   deployment protection rule. The policy job reads the environment
    mode and the complete paginated rules list, and fails before build if they
    differ. Leave required reviewers empty. GitHub enforces environment
    protection independently; the workflow checks this before building so the

@@ -607,7 +607,7 @@ test("job graph: build/checks feed signing; publish waits for all verified produ
   assert.deepStrictEqual(publish.needs, ["build", "checks", "sign"]);
 });
 
-test("publish uses the `release` environment, and policy reads its reviewers and exact deployment restrictions", () => {
+test("publish uses the `release` environment and policy rejects every protection except the exact tag restriction", () => {
   assert.strictEqual(publish.environment.name, "release");
   assert.match(runText(policy.steps), /environments\/release"/);
   assert.match(runText(policy.steps), /deployment-branch-policies\?per_page=100/);
@@ -615,6 +615,7 @@ test("publish uses the `release` environment, and policy reads its reviewers and
   assert.match(runText(policy.steps), /custom_branch_policies == true/);
   assert.match(runText(policy.steps), /\.type == "tag"/);
   assert.match(runText(policy.steps), /\.name == "v\*"/);
+  assert.match(runText(policy.steps), /deployment_protection_rules/);
 });
 
 test("publish runs no repository code or third-party actions", () => {
@@ -674,14 +675,14 @@ test("build verifies the tag first (default branch, read-only token), then build
   assert.strictEqual(build.steps[upload].with.name, "release-source");
 });
 
-test("checks (where third-party code runs) installs from the lockfile without scripts, builds the SBOM, runs the coverage gate, and uploads only the SBOM", () => {
+test("checks install without scripts, pass tests and coverage before generating/uploading the SBOM", () => {
   const install = runsMatching(checks.steps, /npm ci --ignore-scripts/);
   const sbom = indexOfStep(checks.steps, (s) => s.id === "sbom", "sbom step");
   const tests = runsMatching(checks.steps, /npm run coverage/);
   const upload = usesStartingWith(checks.steps, "actions/upload-artifact@");
   assert.ok(
-    install < sbom && sbom < tests && tests < upload,
-    "a failing test must stop the job before anything is uploaded",
+    install < tests && tests < sbom && sbom < upload,
+    "a failing test must stop the job before the SBOM is generated or uploaded",
   );
   assert.strictEqual(checks.steps[upload].with.name, "release-sbom");
   assert.match(checks.steps[sbom].run, /release-check\.js sbom --out/);
@@ -1927,8 +1928,17 @@ test("release setup documentation describes the exact environment policy the wor
   const contributing = read("CONTRIBUTING.md");
   assert.match(contributing, /Selected\s+branches and tags/);
   assert.match(contributing, /exactly one rule: tag pattern `v\*`/);
+  assert.match(contributing, /Do not configure a wait timer or custom\s+deployment protection rule/);
   assert.match(contributing, /no branch\s+rules and no additional patterns/);
   assert.match(contributing, /complete paginated rules list/);
+});
+
+test("security docs explicitly define repository writers as the release trust root", () => {
+  const security = read("SECURITY.md");
+  assert.match(security, /Repository writers can merge any\s+CI-passing change/);
+  assert.match(security, /do not independently prove that the workflow code had a\s+separate review/);
+  assert.match(security, /repository writers are trusted to change the release pipeline/);
+  assert.match(security, /no additional human or team approval is required/);
 });
 
 test("policy (real shell): the immutability policy must be declared as `required` or `not-required`, otherwise nothing is built", () => {
@@ -1959,13 +1969,14 @@ test("policy (real shell): the immutability policy must be declared as `required
 const releaseEnvironment = ({
   reviewers = 0,
   preventSelfReview = true,
+  protectionRules,
   deploymentBranchPolicy = {
     protected_branches: false,
     custom_branch_policies: true,
   },
 } = {}) => ({
-  protection_rules: reviewers === 0
-    ? []
+  protection_rules: protectionRules ?? (reviewers === 0
+    ? [{ type: "branch_policy" }]
     : [{
         type: "required_reviewers",
         reviewers: Array.from({ length: reviewers }, (_, id) => ({
@@ -1973,7 +1984,7 @@ const releaseEnvironment = ({
           reviewer: { login: `reviewer-${id}`, id },
         })),
         prevent_self_review: preventSelfReview,
-      }],
+      }]),
   deployment_branch_policy: deploymentBranchPolicy,
 });
 const deploymentPolicies = (...branchPolicies) => ({
@@ -1982,6 +1993,7 @@ const deploymentPolicies = (...branchPolicies) => ({
 });
 const releasePolicyGh = [
   'case "$*" in',
+  '  *"deployment_protection_rules"*) printf "%s\\n" "$FAKE_CUSTOM_PROTECTION_RULES" ;;',
   '  *"deployment-branch-policies"*) printf "%s\\n" "$FAKE_DEPLOYMENT_POLICIES" ;;',
   '  *"environments/release"*) printf "%s\\n" "$FAKE_RELEASE_ENVIRONMENT" ;;',
   '  *) exit 9 ;;',
@@ -1994,6 +2006,10 @@ const validReleasePolicy = {
     FAKE_DEPLOYMENT_POLICIES: JSON.stringify(
       deploymentPolicies({ name: "v*", type: "tag" }),
     ),
+    FAKE_CUSTOM_PROTECTION_RULES: JSON.stringify({
+      total_count: 0,
+      custom_deployment_protection_rules: [],
+    }),
   },
 };
 
@@ -2006,7 +2022,9 @@ test("policy (real shell, fake gh): release environment has no required reviewer
     /^api repos\/fossasia\/cla-bot\/environments\/release$/,
   );
   assert.match(ok.calls[1], /--paginate repos\/fossasia\/cla-bot\/environments\/release\/deployment-branch-policies\?per_page=100/);
+  assert.strictEqual(ok.calls[2], "api repos/fossasia/cla-bot/environments/release/deployment_protection_rules");
   assert.match(ok.output, /Verified the 'release' environment deployment restriction: tag v\*/);
+  assert.match(ok.output, /no custom deployment protection rules/);
   assert.ok(
     !/::notice::/.test(ok.output),
     "self-review is off, nothing to point out",
@@ -2025,6 +2043,22 @@ test("policy (real shell, fake gh): release environment has no required reviewer
   assert.match(unexpectedReviewers.output, /has 2 required reviewer/);
   assert.strictEqual(unexpectedReviewers.calls.length, 1, "reject before checking deployment rules");
 
+  for (const [label, protectionRules] of [
+    ["wait timer", [{ type: "wait_timer", wait_timer: 30 }]],
+    ["unknown built-in rule", [{ type: "future_protection" }]],
+  ]) {
+    const result = runStep(step, {
+      ...validReleasePolicy,
+      env: {
+        ...validReleasePolicy.env,
+        FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ protectionRules })),
+      },
+    });
+    assert.strictEqual(result.status, 1, `${label}: ${result.output}`);
+    assert.match(result.output, /unsupported protection rule/);
+    assert.strictEqual(result.calls.length, 1, `${label} must fail before other API calls`);
+  }
+
   const malformedReviewers = runStep(step, {
     ...validReleasePolicy,
     env: {
@@ -2036,7 +2070,49 @@ test("policy (real shell, fake gh): release environment has no required reviewer
     },
   });
   assert.strictEqual(malformedReviewers.status, 1);
-  assert.match(malformedReviewers.output, /Could not parse the 'release' environment approval rules/);
+  assert.match(malformedReviewers.output, /Could not parse the 'release' environment protection rules/);
+
+  const missingProtectionRules = runStep(step, {
+    ...validReleasePolicy,
+    env: {
+      ...validReleasePolicy.env,
+      FAKE_RELEASE_ENVIRONMENT: JSON.stringify({
+        deployment_branch_policy: {
+          protected_branches: false,
+          custom_branch_policies: true,
+        },
+      }),
+    },
+  });
+  assert.strictEqual(missingProtectionRules.status, 1);
+  assert.match(missingProtectionRules.output, /Could not parse the 'release' environment protection rules/);
+
+  const unreadableCustomRules = runStep(step, {
+    ...validReleasePolicy,
+    gh: [
+      'case "$*" in',
+      '  *"deployment_protection_rules"*) exit 1 ;;',
+      '  *"deployment-branch-policies"*) printf "%s\\n" "$FAKE_DEPLOYMENT_POLICIES" ;;',
+      '  *"environments/release"*) printf "%s\\n" "$FAKE_RELEASE_ENVIRONMENT" ;;',
+      '  *) exit 9 ;;',
+      'esac',
+    ].join("\n"),
+  });
+  assert.strictEqual(unreadableCustomRules.status, 1);
+  assert.match(unreadableCustomRules.output, /Could not read custom deployment protection rules/);
+
+  for (const invalid of [
+    "not-json",
+    JSON.stringify({ total_count: 1, custom_deployment_protection_rules: [{ enabled: true }] }),
+    JSON.stringify({ total_count: 0, custom_deployment_protection_rules: null }),
+  ]) {
+    const result = runStep(step, {
+      ...validReleasePolicy,
+      env: { ...validReleasePolicy.env, FAKE_CUSTOM_PROTECTION_RULES: invalid },
+    });
+    assert.strictEqual(result.status, 1, invalid);
+    assert.match(result.output, /must not have custom deployment protection rules/);
+  }
 
   const unreadable = runStep(step, { gh: "exit 1" });
   assert.strictEqual(unreadable.status, 1);
@@ -2099,12 +2175,29 @@ test("release environment policy rejects failed, malformed, and incomplete pagin
     assert.match(result.output, /exactly one deployment policy/);
   }
 
+  // `gh api --paginate` writes each page response as a separate JSON document.
+  // Feed that exact stream shape through the workflow's real shell pipeline.
+  const twoPageStream = [
+    { total_count: 101, branch_policies: [{ id: 1, name: "v*", type: "tag" }] },
+    { total_count: 101, branch_policies: [{ id: 2, name: "main", type: "branch" }] },
+  ].map((page) => JSON.stringify(page)).join("\n");
+  const multiplePages = runStep(step, {
+    ...validReleasePolicy,
+    env: {
+      ...validReleasePolicy.env,
+      FAKE_DEPLOYMENT_POLICIES: twoPageStream,
+    },
+  });
+  assert.strictEqual(multiplePages.status, 1, multiplePages.output);
+  assert.match(multiplePages.output, /exactly one deployment policy/);
+  assert.strictEqual(multiplePages.calls.length, 2);
+
   const malformedEnvironment = runStep(step, {
     ...validReleasePolicy,
     env: { ...validReleasePolicy.env, FAKE_RELEASE_ENVIRONMENT: "not-json" },
   });
   assert.strictEqual(malformedEnvironment.status, 1);
-  assert.match(malformedEnvironment.output, /Could not parse the 'release' environment approval rules/);
+  assert.match(malformedEnvironment.output, /Could not parse the 'release' environment protection rules/);
 });
 
 // --- the jq programs that ship in the workflow ---------------------------------------
@@ -2135,6 +2228,12 @@ function localJqProgram(job, stepName, assignment) {
   assert.ok(match, `no local jq program assigned to ${assignment} in "${stepName}"`);
   return match[1];
 }
+function deploymentPoliciesJqProgram() {
+  const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
+  const match = /gh api --paginate "[^"]*deployment-branch-policies[^\n]*\| jq -ers '([\s\S]*?)'/.exec(step.run);
+  assert.ok(match, "deployment policy query must slurp all paginated API response objects");
+  return match[1];
+}
 function evalJq(program, payload) {
   const r = spawnSync(JQ, ["-r", program], {
     input: JSON.stringify(payload),
@@ -2145,12 +2244,64 @@ function evalJq(program, payload) {
   return r.stdout.replace(/\n$/, "");
 }
 
+test("deployment-policy pagination contract matches GitHub's object response shape", () => {
+  const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
+  const program = deploymentPoliciesJqProgram();
+  assert.match(step.run, /gh api --paginate [^\n]*\| jq -ers/);
+  assert.match(program, /\[\.\[\]\.total_count\] \| unique/);
+  assert.match(program, /\[\.\[\]\.branch_policies\[\]\?\]/);
+
+  // `gh api --paginate` emits one JSON object per page. jq's `-s` option
+  // collects those objects into the array traversed by `.[].total_count`.
+  const page = {
+    total_count: 1,
+    branch_policies: [{ id: 42, name: "v*", type: "tag" }],
+  };
+  const pages = [page];
+  const counts = [...new Set(pages.map((response) => response.total_count))];
+  const policies = pages.flatMap((response) => response.branch_policies ?? []);
+  assert.deepStrictEqual(counts, [1]);
+  assert.deepStrictEqual(policies, [{ id: 42, name: "v*", type: "tag" }]);
+  assert.strictEqual(counts.length === 1 && counts[0] === 1 && policies.length === 1 && policies[0].type === "tag" && policies[0].name === "v*", true);
+
+  const multiplePages = [
+    { total_count: 101, branch_policies: [{ name: "v*", type: "tag" }] },
+    { total_count: 101, branch_policies: [{ name: "main", type: "branch" }] },
+  ];
+  const multiCounts = [...new Set(multiplePages.map((response) => response.total_count))];
+  const multiPolicies = multiplePages.flatMap((response) => response.branch_policies ?? []);
+  assert.strictEqual(multiCounts.length === 1 && multiCounts[0] === 1 && multiPolicies.length === 1, false);
+});
+
 test("the jq programs that ship in the workflow answer correctly on GitHub-shaped payloads (real jq/gojq, when installed)", () => {
   if (!JQ)
     return console.log(
       "  (skipped: neither jq nor gojq is installed on this machine)",
     );
   const reviewers = localJqProgram(policy, POLICY_REVIEWERS, "summary");
+  const deploymentPolicies = deploymentPoliciesJqProgram();
+  const validPolicyResponse = JSON.stringify({
+    total_count: 1,
+    branch_policies: [{ id: 42, name: "v*", type: "tag" }],
+  });
+  const validPolicy = spawnSync(JQ, ["-ers", deploymentPolicies], {
+    input: `${validPolicyResponse}\n`,
+    encoding: "utf8",
+    timeout: 3000,
+  });
+  assert.strictEqual(validPolicy.status, 0, validPolicy.stderr);
+  assert.strictEqual(validPolicy.stdout.trim(), "tag v*");
+
+  const paginatedPolicy = spawnSync(JQ, ["-ers", deploymentPolicies], {
+    input: [
+      { total_count: 101, branch_policies: [{ name: "v*", type: "tag" }] },
+      { total_count: 101, branch_policies: [{ name: "main", type: "branch" }] },
+    ].map((response) => JSON.stringify(response)).join("\n"),
+    encoding: "utf8",
+    timeout: 3000,
+  });
+  assert.notStrictEqual(paginatedPolicy.status, 0, "multiple pages or rules never pass as exactly one v* tag policy");
+
   const user = { type: "User", reviewer: { login: "octo", id: 1 } };
   for (const [label, payload, want] of [
     [
@@ -2165,7 +2316,7 @@ test("the jq programs that ship in the workflow answer correctly on GitHub-shape
           },
         ],
       },
-      "2 true",
+      "2 1",
     ],
     [
       "one reviewer, self-review allowed",
@@ -2178,18 +2329,17 @@ test("the jq programs that ship in the workflow answer correctly on GitHub-shape
           },
         ],
       },
-      "1 false",
+      "1 0",
     ],
     [
       "no protection rules",
       { name: "release", protection_rules: [] },
-      "0 false",
+      "0 0",
     ],
-    ["protection_rules absent", { name: "release" }, "0 false"],
     [
       "only a wait timer",
       { protection_rules: [{ type: "wait_timer" }] },
-      "0 false",
+      "0 1",
     ],
     [
       "required_reviewers with an empty list",
@@ -2202,7 +2352,7 @@ test("the jq programs that ship in the workflow answer correctly on GitHub-shape
           },
         ],
       },
-      "0 true",
+      "0 0",
     ],
   ]) {
     assert.strictEqual(evalJq(reviewers, payload), want, label);
@@ -2214,6 +2364,11 @@ test("the jq programs that ship in the workflow answer correctly on GitHub-shape
     encoding: "utf8",
   });
   assert.notStrictEqual(malformedReviewer.status, 0, "malformed reviewer rule is rejected");
+  const missingProtectionRules = spawnSync(JQ, ["-r", reviewers], {
+    input: JSON.stringify({ name: "release" }),
+    encoding: "utf8",
+  });
+  assert.notStrictEqual(missingProtectionRules.status, 0, "missing protection_rules shape is rejected");
 
   const tagRef = jqProgram(
     publish,

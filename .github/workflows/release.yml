@@ -128,16 +128,22 @@ jobs:
             exit 1
           fi
           if ! summary="$(jq -er '
-            [.protection_rules[]? | select(.type == "required_reviewers")] as $rules |
-            if all($rules[]; (.reviewers | type == "array") and (.prevent_self_review | type == "boolean"))
-            then "\($rules | map(.reviewers | length) | add // 0) \($rules | map(.prevent_self_review) | any)"
-            else error("malformed required-reviewer protection rule")
+            if (.protection_rules | type) != "array"
+            then error("protection_rules must be an array")
+            else
+              [.protection_rules[]?] as $rules |
+              [$rules[] | select(.type == "required_reviewers")] as $review_rules |
+              [$rules[] | select(.type != "required_reviewers" and .type != "branch_policy")] as $unexpected |
+              if all($review_rules[]; (.reviewers | type == "array") and (.prevent_self_review | type == "boolean"))
+              then "\($review_rules | map(.reviewers | length) | add // 0) \($unexpected | length)"
+              else error("malformed required-reviewer protection rule")
+              end
             end
           ' <<< "$environment")"; then
-            echo "::error::Could not parse the 'release' environment approval rules. Refusing to release."
+            echo "::error::Could not parse the 'release' environment protection rules. Refusing to release."
             exit 1
           fi
-          read -r reviewers _ <<< "$summary"
+          read -r reviewers unexpected_rules <<< "$summary"
           # `[ x -lt 1 ]` with a non-number is an ERROR (status 2), which `if`
           # treats as "false". Reject anything that is not a plain number first,
           # so an unexpected answer can never pass as "has reviewers".
@@ -147,11 +153,22 @@ jobs:
               exit 1
               ;;
           esac
+          case "${unexpected_rules:-}" in
+            "" | *[!0-9]*)
+              echo "::error::Unexpected protection-rule summary for the 'release' environment ('${summary}'). Refusing to release."
+              exit 1
+              ;;
+          esac
           if [ "$reviewers" -ne 0 ]; then
             echo "::error::The 'release' environment has ${reviewers} required reviewer(s). Remove them; repository release rights are the only human authorization for publishing."
             exit 1
           fi
+          if [ "$unexpected_rules" -ne 0 ]; then
+            echo "::error::The 'release' environment has ${unexpected_rules} unsupported protection rule(s). Remove wait timers and other protection rules; only the v* tag deployment policy is allowed."
+            exit 1
+          fi
           echo "No required reviewers are configured on the 'release' environment; repository release rights are the only human authorization for publishing."
+          echo "No wait-timer or other built-in protection rules are configured."
 
           # The documented deployment restriction is exactly one custom TAG
           # rule named v*. Verify both the environment mode and every rule;
@@ -163,6 +180,9 @@ jobs:
             echo "::error::The 'release' environment must use custom deployment policies with protected_branches=false and custom_branch_policies=true."
             exit 1
           fi
+          # `gh api --paginate` emits one JSON response per page. jq `-s`
+          # slurps those objects into an array, so .[].total_count intentionally
+          # reads the count from each page response.
           if ! branch_policy="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/environments/release/deployment-branch-policies?per_page=100" | jq -ers '
             [.[].branch_policies[]?] as $policies |
             ([.[].total_count] | unique) as $counts |
@@ -178,6 +198,19 @@ jobs:
             exit 1
           fi
           echo "Verified the 'release' environment deployment restriction: ${branch_policy}."
+          if ! custom_rules="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release/deployment_protection_rules")"; then
+            echo "::error::Could not read custom deployment protection rules for the 'release' environment. Refusing to release."
+            exit 1
+          fi
+          if ! jq -e '
+            .total_count == 0 and
+            (.custom_deployment_protection_rules | type == "array") and
+            (.custom_deployment_protection_rules | length == 0)
+          ' <<< "$custom_rules" >/dev/null; then
+            echo "::error::The 'release' environment must not have custom deployment protection rules. Only the exact v* tag deployment policy is allowed."
+            exit 1
+          fi
+          echo "Verified the 'release' environment has no custom deployment protection rules."
 
   build:
     name: Verify the tag and build the source archive
@@ -300,6 +333,18 @@ jobs:
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
+      # The same suite and the same 100% coverage gate as pull requests. A tag
+      # that does not pass them is never released: this step fails the job, so
+      # no SBOM is generated or uploaded and publish never runs.
+      - name: Syntax check, tests and 100% coverage
+        run: |
+          set -euo pipefail
+          node --check src/cla-bot.js
+          npm run coverage
+
+      # Generate release metadata only after the test and coverage gate has
+      # passed. The SBOM inventory is the direct pinned Actions referenced by
+      # action.yml; run commands and runtime downloads are outside its scope.
       - name: Generate the SBOM
         id: sbom
         env:
@@ -313,15 +358,6 @@ jobs:
           node .github/scripts/release-check.js sbom --out "dist/${name}.sbom.cdx.json"
           sbom_digest="$(sha256sum "dist/${name}.sbom.cdx.json" | cut -d' ' -f1)"
           echo "sbom-digest=${sbom_digest}" >> "$GITHUB_OUTPUT"
-
-      # The same suite and the same 100% coverage gate as pull requests. A tag
-      # that does not pass them is never released: this step fails the job, so
-      # the artifact below is never uploaded and publish never runs.
-      - name: Syntax check, tests and 100% coverage
-        run: |
-          set -euo pipefail
-          node --check src/cla-bot.js
-          npm run coverage
 
       - name: Upload the SBOM for the publish job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

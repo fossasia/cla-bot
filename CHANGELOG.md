@@ -59,7 +59,8 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   reads only `runs.steps[*].uses` of a composite action (a `uses` that is an
   input or a `with:` value is not a dependency), versions components by their
   pinned commit, and keeps the human version label as an annotation that is
-  dropped when the source comments disagree.
+  dropped when the source comments disagree. Its scope is the direct pinned
+  GitHub Actions inventory, not all runtime or transitive dependencies.
 - Action dependencies use the registered `pkg:github` PURL type, including the
   action subpath where applicable; tests validate output against the official
   CycloneDX 1.6 JSON schema.
