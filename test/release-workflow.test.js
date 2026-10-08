@@ -1090,7 +1090,6 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   );
   const script = publish.steps[pub].run;
   const checkAt = script.indexOf("git/ref/tags/");
-  const compareAt = script.indexOf('if [ -z "$EXPECTED_TAG_OBJECT"');
   const editAt = script.indexOf("gh api --method PATCH");
   const finalAssetsAt = script.indexOf('releases/assets/${asset_id}');
   const finalCompareAt = script.indexOf('cmp -s -- "dist/${asset}" "final-draft/${asset}"');
