@@ -49,7 +49,10 @@ FOSSASIA's projects.
    `.github/scripts/release-check.js`)
    without discussing it in an issue first: `test/release-workflow.test.js`
    pins its least-privilege, pinning and ordering properties on purpose.
-   Every third-party action there is pinned to a full commit SHA, and
+   Every third-party action there is pinned to a full commit SHA. The
+   `publish` job has `contents: write` but runs no third-party actions or
+   repository code; actions needing OIDC/signing permissions are isolated in
+   the separate `sign` job, which cannot publish releases. The shipped
    `action.yml` may only `uses:` actions pinned that way, and no local `./`
    action (the release SBOM refuses anything else rather than describing it
    incompletely).
@@ -193,8 +196,10 @@ infer from the name:
 
 ## Releasing a new version
 
-Releases are **signed and published by CI, never by hand**. Someone pushes a
-signed, annotated tag; `.github/workflows/release.yml` then verifies
+The supported release path is **signed publication by CI**. Repository actors
+with release rights can still create releases manually; this workflow does not
+prevent that. For the verified path, someone pushes a signed, annotated tag;
+`.github/workflows/release.yml` then verifies
 it, re-runs the whole test suite and the 100% coverage gate, builds the
 assets, signs and attests them with Sigstore (keyless, so there is no signing
 key to guard), publishes the release, and verifies what it published. What a
@@ -202,9 +207,18 @@ release contains and how consumers verify it: "Verifying a release" in
 `SECURITY.md`.
 
 GitHub's `Latest` marker tracks the numerically highest published stable
-`vMAJOR.MINOR.PATCH` release. Publishing an older version to backfill a gap does
-not demote a newer release; the workflow reconciles the marker after verifying
-each published release.
+`vMAJOR.MINOR.PATCH` release that passes the pipeline's verification: signed
+annotated tag, default-branch ancestry, exact expected asset set and checksums,
+Cosign signatures, and GitHub attestations from this workflow. Manually
+published releases remain allowed for repository writers, but do not qualify
+for Latest unless they satisfy those same checks. Publishing an older valid
+version to backfill a gap does not demote a newer valid release.
+
+Reconciliation is eventually consistent: if a newer release becomes public
+after an in-flight run selects a candidate, the marker can briefly point to
+the previous highest verified version. Latest updates are serialized, and the
+newer run verifies the current release list and moves the marker forward. The
+workflow test suite models this publication race and asserts convergence.
 
 Every example and setup doc in this project (`examples/consumer-workflow.yml`,
 "SETUP_GUIDE.md", this file) refers to a release as `@vX.Y.Z`. That release
@@ -249,8 +263,9 @@ when something about releasing seems off:
    Key type **Signing Key**. The workflow refuses any tag GitHub does not
    report as _verified_.
 5. If your organisation restricts which actions may run, allow
-   `actions/attest`, `actions/upload-artifact`, `actions/download-artifact`
-   and `sigstore/cosign-installer` (plus the ones the CI already uses).
+   `actions/attest`, `actions/upload-artifact` and
+   `sigstore/cosign-installer` (plus the ones the CI already uses). The
+   release-writing job downloads artifacts with the runner's GitHub CLI.
 
 ### Rehearse in a fork first
 
@@ -332,7 +347,11 @@ but signing and attesting need a real GitHub run.
 - **The `publish` job failed** (Sigstore or GitHub outage, upload error): use
   "Re-run failed jobs". It is safe to repeat; a leftover **draft** is
   replaced, and a release that is already **published**
-  is never overwritten (the run stops instead).
+  is never overwritten (the run stops instead). If it failed after
+  publication, the read-only candidate verification still runs when possible;
+  if that check also failed transiently, use **Run workflow** in Actions for
+  the Release workflow. Manual recovery re-verifies published candidates and
+  reconciles Latest without rebuilding or overwriting a release.
 - **A published release turns out to be wrong:** edit its notes for a notes
   issue. For an asset or source correction, release the next patch version and
   say in its changelog which version it supersedes; consumers must reject any

@@ -8,8 +8,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 ### Added
 
 - **Signed, attested releases.** Pushing a signed, annotated `vMAJOR.MINOR.PATCH`
-  tag now runs `.github/workflows/release.yml`, the only way a release is
-  created. It verifies the tag (annotated, GitHub-verified signature, on
+  tag runs `.github/workflows/release.yml`, the supported verified release
+  path. Repository writers can still create releases manually. CI verifies the
+  tag (annotated, GitHub-verified signature, on
   `main`, matches `package.json` and `CHANGELOG.md`), re-runs the full test
   suite and the 100% coverage gate, and publishes a release carrying: a
   deterministic source archive, a Sigstore (cosign, keyless) signature bundle,
@@ -17,6 +18,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `SHA256SUMS`. The release is created as a draft, verified, published, and
   verified again from the public copy. See "Verifying a release" in
   `SECURITY.md`.
+- **Verified Latest selection and recovery.** Latest only advances to the
+  highest stable release whose signed tag, default-branch ancestry, exact
+  assets, checksums, signatures and workflow attestations verify. The workflow
+  supports manual reconciliation after a post-publication failure, without
+  overwriting a published release; updates are eventually consistent when a
+  new release races with an in-flight reconciliation.
 - The publish job pins the tag: it re-checks (before creating the release,
   before publishing, and after) that the tag still resolves to the exact
   signed tag object the build job verified. `.github/rulesets/release-tags.json`
@@ -62,11 +69,13 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   validates owner/repository/action path syntax and refuses extra `@` suffixes;
   its changelog parser ignores `##` lines inside fenced code blocks.
 - Third-party code no longer shares a machine with the archive. The release is
-  now five jobs: `policy`, `build` (verifies the tag and builds the archive with
+  now six jobs: `policy`, `build` (verifies the tag and builds the archive with
   `git` and Node built-ins only, no npm), `checks` (installs dev dependencies,
   generates the SBOM, runs the tests and the 100% coverage gate) and `publish`
   (which needs both, re-checks both digests, and writes `SHA256SUMS` itself),
-  plus `latest` (which promotes the highest stable SemVer release).
+  `verify-latest` (which validates releases from their signed tags through
+  asset attestations and provides a recovery path), and `latest` (which
+  promotes the highest verified stable SemVer release).
 - A release policy gate runs before anything is built: the repository
   variable `RELEASE_IMMUTABILITY` must be declared (`required` or
   `not-required`; GitHub's setting cannot be read from a workflow token), and

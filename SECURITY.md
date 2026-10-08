@@ -80,12 +80,24 @@ Out of scope:
    and release" below. The
    draft release is also compared with what was prepared and verified, right
    before it is published: its assets byte for byte and as a set, and its
-   title, tag, notes, draft and pre-release flags. After publication, all
-   downloaded assets are again compared byte for byte with the verified build
-   and checked as a set before the signatures and attestations are verified.
+   title, tag, notes, draft and pre-release flags. Before publication the
+   `sign` job verifies the signatures and attestations. After publication, all
+   downloaded assets are compared byte for byte with the digest-pinned signed
+   artifact and checked as a set; the post-publication checks verify its
+   attestations again.
    The release is published without changing GitHub's `Latest` marker; a
-   separate globally serialized job points it at the highest published stable
-   SemVer version, so a backfilled older tag cannot demote a newer release.
+   separate globally serialized job points it at the highest verified stable
+   SemVer release. Candidate verification requires a signed annotated tag that
+   directly names a commit on the default branch, the exact expected asset
+   set, valid checksums and Cosign signatures, and workflow attestations bound
+   to the tag and commit. A manually created release can be public, but cannot
+   become Latest unless it passes these same checks.
+   Reconciliation is eventually consistent: a newer release published after
+   an in-flight run selects a candidate can briefly leave Latest behind; the
+   serialized run for that publication verifies the current release list and
+   converges the marker. If post-publication verification fails, `verify-latest`
+   independently re-verifies public candidates; `workflow_dispatch` provides
+   a manual recovery path without modifying published assets.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The jobs
@@ -93,12 +105,17 @@ Out of scope:
    Node built-ins and runs **no third-party code at all**; the `checks` job,
    on a different machine, installs the dev dependencies and runs them (the
    YAML parser for the SBOM, the coverage tool) and the test suite, and can
-   at worst falsify the SBOM, never the archive; `publish` (the only job that
-   can sign assets) runs neither repository nor third-party code and
-   re-checks the digests the other two reported through job outputs. `policy`,
-   `build` and `checks` can only read. The separate `latest` job has only
-   `contents: write`, runs shell commands without checkout or repository
-   code, and uses that permission only to reconcile GitHub's Latest marker.
+   at worst falsify the SBOM, never the archive; `sign` verifies both producer
+   digests, signs and attests without checking out repository code, then
+   passes a digest of the complete signed artifact through a job output.
+   Third-party actions that need OIDC/signing permissions run only in `sign`.
+   `publish` has `contents: write` but no OIDC permission and no third-party
+   actions or repository code; it downloads the artifact with the runner's
+   GitHub CLI and checks the sign job's digest before publication. `policy`,
+   `build`, `checks`, and `sign` cannot publish releases. The separate `latest`
+   job has only `contents: write`, runs shell commands without checkout or
+   repository code, and uses that permission only to reconcile GitHub's Latest
+   marker.
 8. A release does not start unless the release policy is declared, before
    anything is built: `RELEASE_IMMUTABILITY` must be `required` or
    `not-required`, and `RELEASE_APPROVAL` must be unset or `not-required`.

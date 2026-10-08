@@ -5,14 +5,13 @@
  * workflow - it pins the properties that make the pipeline trustworthy, so a
  * later edit cannot quietly undo one:
  *
- *  - it only runs for pushed stable-semver tags (never a PR, branch or manual
- *    trigger); same-tag runs serialize, and Latest reconciliation is globally
+ *  - it publishes on stable-semver tag pushes and supports manual Latest
+ *    recovery; same-tag runs serialize, and Latest reconciliation is globally
  *    serialized without dropping the publication of other versions;
  *  - least privilege: workflow permissions are empty; `policy`, `build` and
- *    `checks` can only READ; only `publish` can sign/attest/write, and
- *    `publish` runs no repository or third-party code (no checkout, no
- *    node/npm), waits on the `release` environment, and re-checks the digests
- *    `build` and `checks` reported;
+ *    `checks` can only READ; `sign` can sign/attest but cannot publish, and
+ *    `publish` has contents:write but runs no third-party action or repo code;
+ *    both jobs verify digests delivered through job outputs;
  *  - third-party code (npm packages) only ever runs in `checks`, never on the
  *    machine that builds the archive;
  *  - the release policy (immutability declared, reviewers on the environment)
@@ -81,13 +80,16 @@ function filterToRegExp(pattern) {
 
 const raw = read(".github", "workflows", "release.yml");
 const wf = yaml.load(raw);
-const { policy, build, checks, publish } = wf.jobs;
+const { policy, build, checks, sign, publish } = wf.jobs;
+const verifyLatest = wf.jobs["verify-latest"];
 const triggers = wf.on ?? wf[true];
 const allSteps = [
   ...policy.steps,
   ...build.steps,
   ...checks.steps,
+  ...sign.steps,
   ...publish.steps,
+  ...verifyLatest.steps,
 ];
 const runText = (steps) =>
   steps
@@ -149,6 +151,7 @@ function runStep(
     const environment = {
       PATH: `${bin}:${process.env.PATH}`,
       GITHUB_REPOSITORY: "fossasia/cla-bot",
+      GITHUB_OUTPUT: path.join(dir, "github-output"),
       RELEASE_TAG: "v1.2.3",
     };
     for (const [key, value] of Object.entries(env)) {
@@ -165,6 +168,9 @@ function runStep(
       calls: fs.existsSync(log)
         ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean)
         : [],
+      githubOutput: fs.existsSync(environment.GITHUB_OUTPUT)
+        ? fs.readFileSync(environment.GITHUB_OUTPUT, "utf8")
+        : "",
       extra: after(dir),
     };
   } finally {
@@ -186,19 +192,21 @@ const publishTagGh = (answer) =>
 
 // --- triggers and top-level hygiene -------------------------------------------
 
-test("release.yml has five jobs, including isolated Latest reconciliation, and is not reusable", () => {
+test("release.yml has seven jobs, including isolated signing, candidate verification and Latest reconciliation", () => {
   assert.deepStrictEqual(Object.keys(wf.jobs).sort(), [
     "build",
     "checks",
     "latest",
     "policy",
     "publish",
+    "sign",
+    "verify-latest",
   ]);
   assert.ok(!Object.keys(triggers).includes("workflow_call"));
 });
 
-test("the only trigger is a push of stable-semver tags: no PR, no branch, no manual run", () => {
-  assert.deepStrictEqual(Object.keys(triggers), ["push"]);
+test("release publication is tag-push only, and manual dispatch is available for safe Latest recovery", () => {
+  assert.deepStrictEqual(Object.keys(triggers), ["push", "workflow_dispatch"]);
   assert.deepStrictEqual(Object.keys(triggers.push), ["tags"]);
   assert.strictEqual(triggers.push.tags.length, 1);
   // GitHub's filter syntax: "+" repeats the previous character class, "." is literal.
@@ -220,11 +228,11 @@ test("release runs serialize per tag without replacing another version's pending
   assert.strictEqual(wf.concurrency["cancel-in-progress"], false);
 });
 
-test("both source artifacts are retained for the maximum public-repository window", () => {
+test("all inter-job artifacts are retained for the maximum public-repository window", () => {
   const uploads = allSteps.filter(
     (step) => String(step.uses ?? "").startsWith("actions/upload-artifact@"),
   );
-  assert.strictEqual(uploads.length, 2);
+  assert.strictEqual(uploads.length, 3);
   for (const upload of uploads) {
     assert.strictEqual(upload.with["retention-days"], 90);
   }
@@ -330,28 +338,67 @@ test("same-tag release runs are serialised and never cancelled mid-flight", () =
 });
 
 test("Latest reconciliation is globally serialized, least-privilege, and runs after publication", () => {
-  assert.strictEqual(wf.jobs.latest.needs, "publish");
+  assert.strictEqual(wf.jobs.latest.needs, "verify-latest");
   assert.strictEqual(wf.jobs.latest.concurrency.group, "release-latest-marker");
   assert.strictEqual(wf.jobs.latest.concurrency["cancel-in-progress"], false);
   assert.deepStrictEqual(wf.jobs.latest.permissions, { contents: "write" });
   assert.ok(!/\b(checkout|npm|node)\b/.test(runText(wf.jobs.latest.steps)));
 });
 
-test("Latest reconciliation chooses the numerically highest published stable SemVer and leaves an already-correct marker alone", () => {
-  const step = wf.jobs.latest.steps[0];
+test("candidate verification is read-only, checks published releases after a publish failure, and supports manual recovery", () => {
+  assert.deepStrictEqual(verifyLatest.permissions, {
+    contents: "read",
+    attestations: "read",
+  });
+  assert.deepStrictEqual(verifyLatest.needs, ["policy", "publish"]);
+  assert.match(verifyLatest.if, /always\(\)/);
+  assert.match(verifyLatest.if, /workflow_dispatch/);
+  assert.match(runText(verifyLatest.steps), /verify-release-candidate\.sh/);
+  assert.match(runText(verifyLatest.steps), /sort_by\(.tag_name \| semver_key\) \| reverse/);
+});
+
+test("candidate selector tries releases in numeric SemVer order and skips an unverified higher manual release", () => {
+  const step = verifyLatest.steps.find((candidate) => candidate.id === "select");
   const releases = [
     { id: 2, tag_name: "v2.10.0", draft: false, prerelease: false },
-    { id: 9, tag_name: "v9.99.99", draft: false, prerelease: false },
     { id: 10, tag_name: "v10.0.0", draft: false, prerelease: false },
-    { id: 99, tag_name: "v99.0.0-rc.1", draft: false, prerelease: true },
-    { id: 100, tag_name: "v1000.0.0", draft: true, prerelease: false },
-    { id: 101, tag_name: "release-v100.0.0", draft: false, prerelease: false },
+    { id: 99, tag_name: "v999.0.0", draft: false, prerelease: false },
+    { id: 100, tag_name: "v1000.0.0-rc.1", draft: false, prerelease: true },
+    { id: 101, tag_name: "v1001.0.0", draft: true, prerelease: false },
   ];
+  const result = runStep(step, {
+    gh: 'printf \'%s\\n\' "$FAKE_RELEASES"',
+    env: {
+      FAKE_RELEASES: JSON.stringify([releases]),
+      DEFAULT_BRANCH: "main",
+      GH_TOKEN: "test-token",
+      RELEASE_IMMUTABILITY: "not-required",
+    },
+    setup: (dir) => {
+      const helper = path.join(dir, ".github", "scripts");
+      fs.mkdirSync(helper, { recursive: true });
+      fs.writeFileSync(
+        path.join(helper, "verify-release-candidate.sh"),
+        '#!/bin/bash\necho "$RELEASE_TAG" >> attempts.log\n[ "$RELEASE_TAG" != v999.0.0 ]\n',
+        { mode: 0o755 },
+      );
+    },
+    after: (dir) => fs.existsSync(path.join(dir, "attempts.log"))
+      ? fs.readFileSync(path.join(dir, "attempts.log"), "utf8").trim().split("\n")
+      : [],
+  });
+  assert.strictEqual(result.status, 0, result.output);
+  assert.deepStrictEqual(result.extra, ["v999.0.0", "v10.0.0"]);
+  assert.match(result.githubOutput, /release-id=10/);
+  assert.match(result.githubOutput, /release-tag=v10\.0\.0/);
+});
+
+test("Latest promotes only the verified candidate output and leaves an already-correct marker alone", () => {
+  const step = wf.jobs.latest.steps[0];
   const gh = [
     'case "$*" in',
-    '  *"releases?per_page=100"*) printf \'%s\\n\' "$FAKE_RELEASES" ;;',
     '  *"releases/latest"*) if [ -s fake-latest.txt ]; then cat fake-latest.txt; else exit 1; fi ;;',
-    '  *"--method PATCH"*) printf \'%s\\n\' "$FAKE_PROMOTE_TAG" > fake-latest.txt ;;',
+    '  *"--method PATCH"*) printf \'%s\\n\' "$VERIFIED_RELEASE_TAG" > fake-latest.txt ;;',
     '  *) exit 99 ;;',
     "esac",
   ].join("\n");
@@ -359,9 +406,8 @@ test("Latest reconciliation chooses the numerically highest published stable Sem
     runStep(step, {
       gh,
       env: {
-        FAKE_RELEASES: JSON.stringify([releases]),
-        FAKE_LATEST: currentLatest,
-        FAKE_PROMOTE_TAG: "v10.0.0",
+        VERIFIED_RELEASE_ID: "10",
+        VERIFIED_RELEASE_TAG: "v10.0.0",
       },
       setup: (dir) =>
         fs.writeFileSync(path.join(dir, "fake-latest.txt"), `${currentLatest}\n`),
@@ -386,6 +432,44 @@ test("Latest reconciliation chooses the numerically highest published stable Sem
   assert.ok(firstRelease.calls.some((call) => call.includes("releases/10 -f make_latest=true")));
 });
 
+test("a release published after an in-flight Latest read is picked up by the queued reconciliation", () => {
+  const step = wf.jobs.latest.steps[0];
+  const gh = [
+    'case "$*" in',
+    '  *"releases/latest"*) cat fake-latest.txt ;;',
+    '  *"--method PATCH"*) printf \'%s\\n\' "$VERIFIED_RELEASE_TAG" > fake-latest.txt ;;',
+    '  *) exit 99 ;;',
+    "esac",
+  ].join("\n");
+  const setup = (dir) => {
+    fs.writeFileSync(path.join(dir, "fake-latest.txt"), "v1.3.0\n");
+    fs.writeFileSync(path.join(dir, "newer-release-public.txt"), "v1.4.0\n");
+  };
+  const first = runStep(step, {
+    gh,
+    env: { VERIFIED_RELEASE_ID: "10", VERIFIED_RELEASE_TAG: "v1.3.0" },
+    setup,
+    after: (dir) => ({
+      latest: fs.readFileSync(path.join(dir, "fake-latest.txt"), "utf8").trim(),
+      published: fs.readFileSync(path.join(dir, "newer-release-public.txt"), "utf8").trim(),
+    }),
+  });
+  assert.strictEqual(first.status, 0, first.output);
+  assert.strictEqual(first.extra.latest, "v1.3.0");
+  assert.strictEqual(first.extra.published, "v1.4.0");
+
+  // The newer publication's queued reconciliation runs after the first one,
+  // after its candidate has passed the release verification job.
+  const second = runStep(step, {
+    gh,
+    env: { VERIFIED_RELEASE_ID: "11", VERIFIED_RELEASE_TAG: "v1.4.0" },
+    setup,
+    after: (dir) => fs.readFileSync(path.join(dir, "fake-latest.txt"), "utf8").trim(),
+  });
+  assert.strictEqual(second.status, 0, second.output);
+  assert.strictEqual(second.extra, "v1.4.0");
+});
+
 test("every job has a timeout", () => {
   for (const [id, job] of Object.entries(wf.jobs)) {
     assert.ok(job["timeout-minutes"] > 0, `job ${id}`);
@@ -404,21 +488,32 @@ test("policy, build and checks can only read; none of them can sign, attest or w
       assert.strictEqual(level, "read", scope);
     }
   }
+  assert.strictEqual(sign.environment, undefined);
+  assert.strictEqual(sign.permissions.contents, "read");
+  assert.strictEqual(publish.permissions.contents, "write");
 });
 
-test("publish holds exactly the three permissions signing and publishing need", () => {
-  assert.deepStrictEqual(publish.permissions, {
-    contents: "write",
+test("signing and publishing permissions are isolated by job", () => {
+  assert.deepStrictEqual(sign.permissions, {
+    contents: "read",
+    actions: "read",
     "id-token": "write",
     attestations: "write",
   });
+  assert.deepStrictEqual(publish.permissions, {
+    contents: "write",
+    actions: "read",
+  });
+  assert.strictEqual(publish.permissions["id-token"], undefined);
+  assert.strictEqual(publish.permissions.attestations, undefined);
 });
 
-test("job graph: policy first; build and checks wait for it; publish needs BOTH build and checks", () => {
+test("job graph: build/checks feed signing; publish waits for all verified producers", () => {
   assert.strictEqual(policy.needs, undefined);
   assert.strictEqual(build.needs, "policy");
   assert.strictEqual(checks.needs, "policy");
-  assert.deepStrictEqual(publish.needs, ["build", "checks"]);
+  assert.deepStrictEqual(sign.needs, ["build", "checks"]);
+  assert.deepStrictEqual(publish.needs, ["build", "checks", "sign"]);
 });
 
 test("publish runs in the `release` environment, and the policy job reads that same environment", () => {
@@ -426,7 +521,7 @@ test("publish runs in the `release` environment, and the policy job reads that s
   assert.match(runText(policy.steps), /environments\/release"/);
 });
 
-test("publish executes no repository or third-party code: no checkout, no node/npm, no scripts from the tagged tree", () => {
+test("publish runs no repository code or third-party actions", () => {
   assert.ok(
     !publish.steps.some((s) =>
       String(s.uses ?? "").startsWith("actions/checkout@"),
@@ -439,6 +534,8 @@ test("publish executes no repository or third-party code: no checkout, no node/n
     !/\.github\/scripts/.test(text),
     "publish must not run repo scripts",
   );
+  assert.strictEqual(publish.steps.filter((s) => s.uses).length, 0);
+  assert.match(runText(publish.steps), /gh run download/);
   assert.strictEqual(publish.env.GH_REPO, "${{ github.repository }}");
 });
 
@@ -499,7 +596,7 @@ test("checks (where third-party code runs) installs from the lockfile without sc
   assert.deepStrictEqual(Object.keys(checks.outputs), ["sbom-digest"]);
 });
 
-test("publish verifies BOTH job-output digests and rejects stray files before signing, and is the only job that writes SHA256SUMS", () => {
+test("sign verifies BOTH producer job-output digests and rejects stray files before signing", () => {
   assert.match(
     build.outputs["source-digest"],
     /steps\.archive\.outputs\.source-digest/,
@@ -508,8 +605,8 @@ test("publish verifies BOTH job-output digests and rejects stray files before si
     checks.outputs["sbom-digest"],
     /steps\.sbom\.outputs\.sbom-digest/,
   );
-  const idx = stepNamed(publish.steps, DIGEST_STEP);
-  const step = publish.steps[idx];
+  const idx = stepNamed(sign.steps, DIGEST_STEP);
+  const step = sign.steps[idx];
   assert.strictEqual(
     step.env.EXPECTED_SOURCE_DIGEST,
     "${{ needs.build.outputs.source-digest }}",
@@ -518,16 +615,11 @@ test("publish verifies BOTH job-output digests and rejects stray files before si
     step.env.EXPECTED_SBOM_DIGEST,
     "${{ needs.checks.outputs.sbom-digest }}",
   );
-  const downloads = publish.steps
-    .map((s, i) =>
-      String(s.uses ?? "").startsWith("actions/download-artifact@") ? i : -1,
-    )
-    .filter((i) => i >= 0);
-  assert.strictEqual(downloads.length, 2);
-  assert.ok(Math.max(...downloads) < idx, "downloads precede the digest check");
-  assert.ok(idx < usesStartingWith(publish.steps, "actions/attest@"));
+  assert.match(runText(sign.steps), /gh run download .*release-source/);
+  assert.match(runText(sign.steps), /gh run download .*release-sbom/);
+  assert.ok(idx < usesStartingWith(sign.steps, "actions/attest@"));
   assert.ok(
-    idx < usesStartingWith(publish.steps, "sigstore/cosign-installer@"),
+    idx < usesStartingWith(sign.steps, "sigstore/cosign-installer@"),
   );
   assert.match(
     step.run,
@@ -582,8 +674,8 @@ test("every `uses:` is pinned to a full commit SHA with a version comment", () =
 
 test("cosign is pinned to an exact version, and signing is keyless (no key material anywhere)", () => {
   const installer =
-    publish.steps[
-      usesStartingWith(publish.steps, "sigstore/cosign-installer@")
+    sign.steps[
+      usesStartingWith(sign.steps, "sigstore/cosign-installer@")
     ];
   assert.match(installer.with["cosign-release"], /^v\d+\.\d+\.\d+$/);
   assert.ok(
@@ -633,23 +725,19 @@ test("checkouts keep no credentials (build needs full history); every setup-node
 
 test("npm runs only in `checks`, from the lockfile, with lifecycle scripts disabled", () => {
   assert.match(runText(checks.steps), /npm ci --ignore-scripts/);
-  for (const job of [policy, build, publish]) {
+  for (const job of [policy, build, sign, publish]) {
     assert.ok(!/\bnpm\b/.test(runText(job.steps)));
   }
 });
 
 // --- order of operations --------------------------------------------------------------
 
-test("publish: downloads, verifies digests, signs, self-verifies, drafts, checks the draft, re-checks the tag AND publishes, verifies the public copy, then requires immutability", () => {
+test("sign verifies producer outputs, signs, self-verifies and uploads; publish verifies that artifact, drafts, publishes and verifies the public copy", () => {
   const steps = publish.steps;
   const order = [
-    usesStartingWith(steps, "actions/download-artifact@"),
-    stepNamed(steps, DIGEST_STEP),
-    usesStartingWith(steps, "sigstore/cosign-installer@"),
-    indexOfStep(steps, (s) => s.id === "provenance", "provenance attestation"),
-    indexOfStep(steps, (s) => s.id === "sbom", "SBOM attestation"),
-    runsMatching(steps, /cosign sign-blob/),
-    runsMatching(steps, /cosign verify-blob[\s\S]*gh attestation verify/),
+    stepNamed(steps, "Download the signed release files"),
+    stepNamed(steps, "Verify the signed artifact digest before publishing"),
+    stepNamed(steps, "Require a patched GitHub CLI"),
     runsMatching(steps, /gh release create/),
     stepNamed(steps, DRAFT_CHECK),
     stepNamed(steps, PUBLISH_STEP),
@@ -667,6 +755,17 @@ test("publish: downloads, verifies digests, signs, self-verifies, drafts, checks
     steps.length - 1,
     "the immutability requirement is the last step",
   );
+  const signingOrder = [
+    stepNamed(sign.steps, DIGEST_STEP),
+    usesStartingWith(sign.steps, "sigstore/cosign-installer@"),
+    indexOfStep(sign.steps, (s) => s.id === "provenance", "provenance attestation"),
+    indexOfStep(sign.steps, (s) => s.id === "sbom", "SBOM attestation"),
+    runsMatching(sign.steps, /cosign sign-blob/),
+    runsMatching(sign.steps, /cosign verify-blob[\s\S]*gh attestation verify/),
+    stepNamed(sign.steps, "Record the exact signed artifact digest"),
+    usesStartingWith(sign.steps, "actions/upload-artifact@"),
+  ];
+  assert.deepStrictEqual(signingOrder, [...signingOrder].sort((a, b) => a - b));
 });
 
 test("the release is created as a DRAFT bound to the pushed tag, and only a later step publishes it", () => {
@@ -691,28 +790,28 @@ test("a published release is never overwritten; only a leftover draft is replace
 
 test("each attest step's bundle is copied to its final name immediately (the action may reuse one path)", () => {
   const prov = indexOfStep(
-    publish.steps,
+    sign.steps,
     (s) => s.id === "provenance",
     "provenance",
   );
-  const sbom = indexOfStep(publish.steps, (s) => s.id === "sbom", "sbom");
+  const sbom = indexOfStep(sign.steps, (s) => s.id === "sbom", "sbom");
   assert.match(
-    publish.steps[prov + 1].env.BUNDLE,
+    sign.steps[prov + 1].env.BUNDLE,
     /steps\.provenance\.outputs\.bundle-path/,
   );
-  assert.match(publish.steps[prov + 1].run, /provenance\.intoto\.jsonl/);
+  assert.match(sign.steps[prov + 1].run, /provenance\.intoto\.jsonl/);
   assert.match(
-    publish.steps[sbom + 1].env.BUNDLE,
+    sign.steps[sbom + 1].env.BUNDLE,
     /steps\.sbom\.outputs\.bundle-path/,
   );
-  assert.match(publish.steps[sbom + 1].run, /sbom\.intoto\.jsonl/);
+  assert.match(sign.steps[sbom + 1].run, /sbom\.intoto\.jsonl/);
   for (const i of [prov, sbom]) {
-    assert.strictEqual(publish.steps[i].with["create-storage-record"], false);
+    assert.strictEqual(sign.steps[i].with["create-storage-record"], false);
   }
 });
 
 test("verification pins WHO may have signed: this exact workflow file, on this tag, this commit", () => {
-  const text = runText(publish.steps);
+  const text = runText(sign.steps);
   assert.match(
     text,
     /--certificate-identity "https:\/\/github\.com\/\$\{workflow\}@\$\{GITHUB_REF\}"/,
@@ -1544,7 +1643,7 @@ function runDigestStep({ tamper = () => {}, expected = {} } = {}) {
     [`${DIGEST_NAME}.tar.gz`]: archive,
     [`${DIGEST_NAME}.sbom.cdx.json`]: sbom,
   };
-  const result = runStep(publish.steps[stepNamed(publish.steps, DIGEST_STEP)], {
+  const result = runStep(sign.steps[stepNamed(sign.steps, DIGEST_STEP)], {
     env: {
       EXPECTED_SOURCE_DIGEST: expected.source ?? sourceDigest,
       EXPECTED_SBOM_DIGEST: expected.sbom ?? sha256hex(sbom),
@@ -1648,6 +1747,66 @@ test("digest step (real shell): any altered, missing, extra or mismatching file 
       null,
       `${label}: SHA256SUMS must not be written`,
     );
+  }
+});
+
+const SIGNED_ARTIFACT_FILES = [
+  "RELEASE_NOTES.md",
+  `${DIGEST_NAME}.tar.gz`,
+  `${DIGEST_NAME}.tar.gz.sigstore.json`,
+  `${DIGEST_NAME}.sbom.cdx.json`,
+  `${DIGEST_NAME}.provenance.intoto.jsonl`,
+  `${DIGEST_NAME}.sbom.intoto.jsonl`,
+  "SHA256SUMS",
+  "SHA256SUMS.sigstore.json",
+];
+
+function runSignedArtifactCheck({ tamper = () => {}, mismatch = false } = {}) {
+  const content = new Map(
+    SIGNED_ARTIFACT_FILES.map((name) => [name, Buffer.from(`verified ${name}\n`)]),
+  );
+  const digestInput = SIGNED_ARTIFACT_FILES.map(
+    (name) => `${sha256hex(content.get(name))}  ${name}\n`,
+  ).join("");
+  const expected = sha256hex(Buffer.from(digestInput));
+  return runStep(
+    publish.steps[
+      stepNamed(publish.steps, "Verify the signed artifact digest before publishing")
+    ],
+    {
+      env: { EXPECTED_SIGNED_DIGEST: mismatch ? "0".repeat(64) : expected },
+      setup: (dir) => {
+        const dist = path.join(dir, "dist");
+        fs.mkdirSync(dist);
+        for (const [name, bytes] of content)
+          fs.writeFileSync(path.join(dist, name), bytes);
+        tamper(dist);
+      },
+    },
+  );
+}
+
+test("publisher accepts only the complete, unchanged signed artifact reported by the signing job", () => {
+  if (!HAS_SHA256SUM)
+    return console.log("  (skipped: sha256sum not available on this machine)");
+  const valid = runSignedArtifactCheck();
+  assert.strictEqual(valid.status, 0, valid.output);
+
+  for (const [label, options] of [
+    ["artifact digest output is missing or wrong", { mismatch: true }],
+    ["a signed file changed in transit", {
+      tamper: (dist) => fs.appendFileSync(path.join(dist, "SHA256SUMS"), "tampered\n"),
+    }],
+    ["an extra file appeared in transit", {
+      tamper: (dist) => fs.writeFileSync(path.join(dist, "unexpected"), "extra"),
+    }],
+    ["a symlink appeared in transit", {
+      tamper: (dist) => fs.symlinkSync("SHA256SUMS", path.join(dist, "unexpected-link")),
+    }],
+  ]) {
+    const result = runSignedArtifactCheck(options);
+    assert.notStrictEqual(result.status, 0, label);
+    assert.match(result.output, /Refusing to publish/);
   }
 });
 
