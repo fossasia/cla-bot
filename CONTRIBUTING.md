@@ -67,19 +67,11 @@ lower a threshold, narrow `include`, point `action.yml` at an unmeasured
 script, or change the test command and still show a green check with the
 same job name.
 
-**This repository's deliberate choice**: unlike a setup that closes that
-gap with mandatory code-owner review, this repository does **not** require
-any human review on top of CI - see "Branch protection has exactly one
-required condition" in `.github/rulesets/README.md`. The 100% rule is
-therefore enforced against honest pull requests, and a pull request that
-also edits the gate's own definition is an accepted residual risk, not
-something CI can block by itself. `coverage-comment.yml` still posts a
-visible warning on the PR when a gate file is touched (see `GATE_FILES` /
-`GATE_DIR_PREFIXES` in `.github/scripts/post-coverage-comment.js`), so this
-is never silent - it just isn't a hard block. If a specific repository or
-team later wants that hard block back, see "Optional: add required review
-back" in `.github/rulesets/README.md` - it is a two-field change to
-`main.json`, nothing in `ci.yml` has to move.
+The main ruleset requires code-owner review for `.github/`, application
+source, coverage configuration, release inputs and the test suite, as listed
+in `.github/CODEOWNERS`. This closes the self-modifying-gate path for those
+protected files. Other paths retain the zero global approval count.
+`coverage-comment.yml` also posts a visible warning when gate files change.
 
 **What the code does** (CI job "Enforce 100% coverage"):
 
@@ -139,12 +131,10 @@ actually makes the gate binding, not just a convention):
 
 Mark the single **`Required checks pass`** job of the `CI` workflow as a
 **required status check** on `main` (see `.github/rulesets/main.json`). It
-already fans in the coverage gate and every other check, so there is
-nothing else to mark required. There is deliberately **no** required
-code-owner review and **no** `CODEOWNERS` file for this - see "Branch
-protection has exactly one required condition" in
-`.github/rulesets/README.md` for the trade-off, and the note above for what
-that means for this coverage gate specifically.
+already fans in the coverage gate and every other check. The ruleset also
+requires `@fossasia/cla-admins` review for the paths in `.github/CODEOWNERS`,
+while leaving ordinary changes without a global approval count. Confirm that
+team has write access to the repository.
 
 ## CI structure and the single required check
 
@@ -187,9 +177,11 @@ infer from the name:
 - A green `codeql` job means the analysis ran, not that there are no
   alerts. It does not block on alerts by itself (opt-in in
   `.github/rulesets/README.md`, "Optional: block on CodeQL alerts").
-- There is no required review of any kind on `main` - see
-  `.github/rulesets/README.md` for why, and how to add one back for a given
-  repository if a team wants it.
+- Release-critical workflows, verification scripts, rulesets, action metadata,
+  source, tests and release inputs require review from `@fossasia/cla-admins`
+  through the main ruleset and `.github/CODEOWNERS`. Other paths have no global
+  approval count. Release tag creation itself remains available to authorized
+  writers.
 - Merge queue is not enabled. If it ever is, add `merge_group:` to `ci.yml`
   (and confirm CodeQL and the SARIF uploads behave on that event) first,
   otherwise queued pull requests never get their checks.

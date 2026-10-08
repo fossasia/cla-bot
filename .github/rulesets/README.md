@@ -11,14 +11,14 @@ it stays consistent with `ci.yml`.
 | ---------------------- | ------------------------------------------------------------------------------------------------------------- |
 | Require a pull request | Changes can only land through a pull request (this also blocks direct pushes to `main`).                      |
 | Require status checks  | Only **`Required checks pass`**, from the GitHub Actions app (id `15368`); the branch need not be up to date. |
-| Reviews / code owners  | **None.** `required_approving_review_count: 0`, `require_code_owner_review: false`.                           |
+| Reviews / code owners  | No global count; code-owner approval is required for protected trust-critical paths.                           |
 | Bypass list            | Empty - nobody skips CI, including admins.                                                                    |
 
-So: **the only thing that decides whether a pull request can be merged is
-whether CI is green.** Anyone with write access to the repository can open a
-PR and merge it themselves the moment `Required checks pass` succeeds - no
-approval, no code-owner review, no second person required. This is a
-deliberate choice for this repository (see below), not an oversight.
+Ordinary changes have no global approval count and can merge once CI is green.
+Changes to trust-critical paths assigned in `.github/CODEOWNERS` also require
+approval from `@fossasia/cla-admins`. The team must exist and have write access
+to this repository; verify its GitHub membership and repository access before
+relying on the ruleset.
 
 ## Protect published release tags
 
@@ -43,21 +43,22 @@ Verify that the active ruleset targets `refs/tags/v*`, has both `update` and
 `deletion` rules, and has an empty bypass list. A correction that requires
 moving or deleting a version tag must be released under a new version instead.
 
-### Branch protection has exactly one required condition, by design
+### Release-critical paths require code-owner review
 
-This repository intentionally does **not** use `CODEOWNERS` or a required
-code-owner/human review. Some setups pair a single CI gate with mandatory
-review specifically because a pull request can edit the very workflow files
-that define the gate (see the "Threat model" comment at the top of
-`coverage.yml` and "How the coverage gate is enforced" in
-`CONTRIBUTING.md`) - a required review is the one control a PR cannot grant
-itself. That trade-off is **not** adopted here: this repository's maintainers
-have chosen to keep merging frictionless for anyone with write access, and
-accept that a PR could in principle touch the gate's own definition as long
-as its own (possibly weakened) copy of the gate still reports green. If that
-trade-off ever needs tightening for this or another repository, see
-"Optional: add required review back" below - it is a small, additive change
-to `main.json`, nothing else has to move.
+The ruleset keeps `required_approving_review_count` at zero so release-tag
+creation remains available to authorized writers without adding a global
+second-person approval gate. It enables `require_code_owner_review`, and
+`.github/CODEOWNERS` assigns release/CI workflows, verification code, rulesets,
+action metadata, source, tests and release inputs to `@fossasia/cla-admins`.
+Stale reviews are dismissed when commits are pushed. The team must have write
+access to this repository for GitHub to apply its CODEOWNERS entries.
+
+This specifically protects the workflow trust anchor from a PR changing its
+own release checks and approving itself. It does not add an approval step to
+the release workflow: repository writers retain the existing ability to cut
+releases, while changes to protected files need the designated team's review.
+The team slug and repository access must be validated in GitHub before relying
+on this protection.
 
 Why one check: `Required checks pass` (job `required-checks-pass` in
 `ci.yml`) `needs:` every other job, so adding, removing or renaming a check
@@ -110,55 +111,23 @@ _add, verify, then remove_:
 - `gh api repos/fossasia/cla-bot/rules/branches/main` lists the
   `pull_request` and `required_status_checks` rules, and nothing else.
 - A throwaway PR that only edits `README.md`: merge box shows exactly one
-  required check, `Required checks pass`, and **no** review requirement -
-  the "Merge" button is enabled as soon as CI is green, for any contributor
-  with write access.
+  required status check, `Required checks pass`, and no review requirement.
+- A throwaway PR that edits `release.yml` or another owned path: verify the
+  merge stays blocked until `@fossasia/cla-admins` approves, and a later push
+  dismisses that approval.
 - Break one check on a throwaway PR (for example an actionlint error): the
   gate must go red (not skipped), and Merge must stay blocked until it is
   fixed and reruns green.
 
-## Optional: add required review back
+## Optional: require approval for every pull request
 
-Not used by this repository today, but if a team wants a human in the loop
-later without giving up the "one required check" structure, two small,
-independent additions do that without touching `ci.yml`:
+If a team wants a human approval for every change, set
+`required_approving_review_count` to `1` (or more) in the `pull_request` rule
+in `main.json`. This is separate from the selective CODEOWNERS protection
+already applied to release-critical files.
 
-- **Any reviewer, no CODEOWNERS file needed:** set
-  `required_approving_review_count` to `1` (or more) in the `pull_request`
-  rule in `main.json`, leave `require_code_owner_review: false`. Any
-  collaborator with write access can give that approval.
-- **Specific owners for specific paths:** add a `.github/CODEOWNERS` file
-  and set `require_code_owner_review: true` in addition. This is the
-  pattern the comment at the top of `coverage.yml` describes as the control
-  that closes the "a PR can edit its own gate" gap - deliberately not
-  enabled by default here (see above).
-
-Either way, `required_approving_review_count` and
-`require_code_owner_review` are the only two fields that change; the status
-check and bypass list stay exactly as they are.
-
-**For the release pipeline specifically** ("A change to `release.yml` itself"
-in `SECURITY.md`): keep `required_approving_review_count` at `0`, set
-`require_code_owner_review: true`, and let `.github/CODEOWNERS` name owners
-for the release-critical paths only, so that every other change still merges
-without a review:
-
-```
-/.github/workflows/release.yml    @OWNER
-/.github/scripts/release-check.js @OWNER
-/.github/rulesets/                @OWNER
-/.github/CODEOWNERS               @OWNER
-/action.yml                       @OWNER
-/package.json                     @OWNER
-```
-
-`@OWNER` must be a user or team with write access to the repository: a path
-whose owner does not exist or cannot approve makes every pull request that
-touches it impossible to merge. Check it on a throwaway PR that edits
-`release.yml`. This repository ships no `CODEOWNERS` on purpose and
-`test/ci-gate.test.js` asserts that, so adopting this means changing that
-test and the "Branch protection has exactly one required condition, by
-design" text above.
+In addition, code-owner review remains enabled for the selected trust-critical
+paths. The status-check rule and empty bypass list remain unchanged.
 
 ## Optional: block on CodeQL alerts
 
@@ -191,8 +160,8 @@ needs `merge_group:` added to `ci.yml`). Enable it once CodeQL has run on
 
 Same pattern per repository: one `ci.yml` with a final `if: always()` job
 that `needs:` the others, and one ruleset requiring only that job's check
-name (plus, as here, a plain `pull_request` rule with zero required
-approvals if you want merges to stay review-free). An organization ruleset
+name (plus, as here, a `pull_request` rule with zero global approvals and
+selective code-owner review). An organization ruleset
 can target many repositories with the same JSON shape - status-check names
 are not indexed above repository level, so type the name instead of picking
 it from a dropdown, and let each repository's own `ci.yml` keep `needs:` in

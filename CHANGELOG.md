@@ -7,6 +7,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
+- **Path-scoped release-policy review.** The main ruleset now requires
+  `@fossasia/cla-admins` approval for release workflows, verification code,
+  rulesets, action inputs, source and tests. The global approval count remains
+  zero, so authorized writers can still publish releases without a separate
+  release approval.
 - **Signed, attested releases.** Pushing a signed, annotated `vMAJOR.MINOR.PATCH`
   tag runs `.github/workflows/release.yml`, the supported verified release
   path. Repository writers can still create releases manually. CI verifies the

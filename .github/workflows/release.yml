@@ -224,6 +224,7 @@ jobs:
       - name: Check out the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           # Full history: the next step needs origin/<default branch> to ask
           # "is this commit on main?".
           fetch-depth: 0
@@ -308,6 +309,7 @@ jobs:
       - name: Check out the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
 
       - name: Set up Node.js

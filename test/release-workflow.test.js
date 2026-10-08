@@ -805,6 +805,11 @@ test("checkouts keep no credentials (build needs full history); every setup-node
   for (const job of [build, checks]) {
     const checkout =
       job.steps[usesStartingWith(job.steps, "actions/checkout@")];
+    assert.strictEqual(
+      checkout.with.ref,
+      "${{ github.sha }}",
+      `${job.name} must validate/build the exact event commit`,
+    );
     assert.strictEqual(checkout.with["persist-credentials"], false);
     const node = job.steps[usesStartingWith(job.steps, "actions/setup-node@")];
     assert.strictEqual(node.with["package-manager-cache"], false);
