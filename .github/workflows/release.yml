@@ -19,7 +19,8 @@ name: Release
 #            the release policy is explicit: mutability is a reviewed workflow
 #            setting; `RELEASE_APPROVAL` declares whether the `release`
 #            environment must have reviewers or must have none. The actual
-#            environment is always checked through the API.
+#            environment and its exact v* tag deployment restriction are read
+#            and validated through the API before anything is built.
 #   build    contents: read ONLY. Verifies the tag and builds the source
 #            archive and release notes with `git` and Node built-ins. It
 #            installs and executes NO third-party code (no npm), so nothing
@@ -86,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
-      actions: read # read the `release` environment's protection rules
+      actions: read # read the `release` environment and deployment policies
     env:
       GH_TOKEN: ${{ github.token }}
       # Keep this policy in protected workflow code; repository writers can
@@ -115,10 +116,9 @@ jobs:
               ;;
           esac
 
-      # The workflow file is repository-controlled, so a human approval is only
       # GitHub enforces environment protection independently of workflow
-      # variables. Always read the actual rules so the declared policy cannot
-      # disagree with a reviewer gate that would still block the publish job.
+      # variables. Read the actual reviewer rules and deployment policies so
+      # the declaration cannot drift from a GitHub gate that applies to publish.
       - name: Check the release environment approval policy
         run: |
           set -euo pipefail
@@ -134,8 +134,18 @@ jobs:
               exit 1
               ;;
           esac
-          if ! summary="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release" --jq '[.protection_rules[]? | select(.type == "required_reviewers")] | "\(map(.reviewers | length) | add // 0) \(map(.prevent_self_review) | any)"')"; then
+          if ! environment="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release")"; then
             echo "::error::Could not read the 'release' environment approval rules. Configure the environment and grant this workflow actions:read access."
+            exit 1
+          fi
+          if ! summary="$(jq -er '
+            [.protection_rules[]? | select(.type == "required_reviewers")] as $rules |
+            if all($rules[]; (.reviewers | type == "array") and (.prevent_self_review | type == "boolean"))
+            then "\($rules | map(.reviewers | length) | add // 0) \($rules | map(.prevent_self_review) | any)"
+            else error("malformed required-reviewer protection rule")
+            end
+          ' <<< "$environment")"; then
+            echo "::error::Could not parse the 'release' environment approval rules. Refusing to release."
             exit 1
           fi
           read -r reviewers prevent_self_review <<< "$summary"
@@ -163,6 +173,32 @@ jobs:
               echo "::notice::The 'release' environment allows self-review: whoever pushes the tag may also approve its release."
             fi
           fi
+
+          # The documented deployment restriction is exactly one custom TAG
+          # rule named v*. Verify both the environment mode and every rule;
+          # reviewer checks alone do not establish which refs may deploy.
+          if ! jq -e '
+            .deployment_branch_policy.protected_branches == false and
+            .deployment_branch_policy.custom_branch_policies == true
+          ' <<< "$environment" >/dev/null; then
+            echo "::error::The 'release' environment must use custom deployment policies with protected_branches=false and custom_branch_policies=true."
+            exit 1
+          fi
+          if ! branch_policy="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/environments/release/deployment-branch-policies?per_page=100" | jq -ers '
+            [.[].branch_policies[]?] as $policies |
+            ([.[].total_count] | unique) as $counts |
+            if ($counts | length) == 1 and $counts[0] == 1 and
+               ($policies | length) == 1 and
+               $policies[0].type == "tag" and
+               $policies[0].name == "v*"
+            then "tag v*"
+            else error("expected exactly one deployment policy: tag v*")
+            end
+          ')"; then
+            echo "::error::The 'release' environment must have exactly one deployment policy, a tag pattern named v*. Remove branch, broad, or additional policies; API read or validation failed."
+            exit 1
+          fi
+          echo "Verified the 'release' environment deployment restriction: ${branch_policy}."
 
   build:
     name: Verify the tag and build the source archive

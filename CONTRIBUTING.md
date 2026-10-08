@@ -251,8 +251,11 @@ when something about releasing seems off:
      workflow. Changing it requires a reviewed workflow change; it is not a
      repository variable that a repository writer can silently alter.
 3. **Create the `release` environment** (Settings -> Environments -> New
-   environment). Under "Deployment branches and tags" allow only the selected
-   tag pattern `v*`. Leave required reviewers empty when using
+   environment). Under "Deployment branches and tags", select "Selected
+   branches and tags" and add exactly one rule: tag pattern `v*` (no branch
+   rules and no additional patterns). The policy job reads the environment
+   mode and the complete paginated rules list, and fails before build if they
+   differ. Leave required reviewers empty when using
    `RELEASE_APPROVAL=not-required`. GitHub enforces environment protection
    independently of repository variables; the workflow checks that this
    environment cannot silently add an approval gate.

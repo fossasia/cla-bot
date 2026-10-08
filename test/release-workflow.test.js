@@ -643,9 +643,14 @@ test("job graph: build/checks feed signing; publish waits for all verified produ
   assert.deepStrictEqual(publish.needs, ["build", "checks", "sign"]);
 });
 
-test("publish runs in the `release` environment, and the policy job reads that same environment", () => {
+test("publish uses the `release` environment, and policy reads its reviewers and exact deployment restrictions", () => {
   assert.strictEqual(publish.environment.name, "release");
   assert.match(runText(policy.steps), /environments\/release"/);
+  assert.match(runText(policy.steps), /deployment-branch-policies\?per_page=100/);
+  assert.match(runText(policy.steps), /protected_branches == false/);
+  assert.match(runText(policy.steps), /custom_branch_policies == true/);
+  assert.match(runText(policy.steps), /\.type == "tag"/);
+  assert.match(runText(policy.steps), /\.name == "v\*"/);
 });
 
 test("publish runs no repository code or third-party actions", () => {
@@ -1929,6 +1934,14 @@ test("mutable releases are the reviewed policy in preflight, publish, Latest and
   assert.match(read("SECURITY.md"), /release notes and mutable metadata are not covered by/);
 });
 
+test("release setup documentation describes the exact environment policy the workflow enforces", () => {
+  const contributing = read("CONTRIBUTING.md");
+  assert.match(contributing, /Selected\s+branches and tags/);
+  assert.match(contributing, /exactly one rule: tag pattern `v\*`/);
+  assert.match(contributing, /no branch\s+rules and no additional patterns/);
+  assert.match(contributing, /complete paginated rules list/);
+});
+
 test("policy (real shell): the immutability policy must be declared as `required` or `not-required`, otherwise nothing is built", () => {
   const step = policy.steps[stepNamed(policy.steps, POLICY_IMMUTABILITY)];
   const required = runStep(step, { env: { RELEASE_IMMUTABILITY: "required" } });
@@ -1954,36 +1967,97 @@ test("policy (real shell): the immutability policy must be declared as `required
   }
 });
 
-test("policy (real shell, fake gh): unset RELEASE_APPROVAL requires reviewers on the environment", () => {
+const releaseEnvironment = ({
+  reviewers = 1,
+  preventSelfReview = true,
+  deploymentBranchPolicy = {
+    protected_branches: false,
+    custom_branch_policies: true,
+  },
+} = {}) => ({
+  protection_rules: reviewers === 0
+    ? []
+    : [{
+        type: "required_reviewers",
+        reviewers: Array.from({ length: reviewers }, (_, id) => ({
+          type: "User",
+          reviewer: { login: `reviewer-${id}`, id },
+        })),
+        prevent_self_review: preventSelfReview,
+      }],
+  deployment_branch_policy: deploymentBranchPolicy,
+});
+const deploymentPolicies = (...branchPolicies) => ({
+  total_count: branchPolicies.length,
+  branch_policies: branchPolicies,
+});
+const releasePolicyGh = [
+  'case "$*" in',
+  '  *"deployment-branch-policies"*) printf "%s\\n" "$FAKE_DEPLOYMENT_POLICIES" ;;',
+  '  *"environments/release"*) printf "%s\\n" "$FAKE_RELEASE_ENVIRONMENT" ;;',
+  '  *) exit 9 ;;',
+  'esac',
+].join("\n");
+const validReleasePolicy = {
+  gh: releasePolicyGh,
+  env: {
+    FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment()),
+    FAKE_DEPLOYMENT_POLICIES: JSON.stringify(
+      deploymentPolicies({ name: "v*", type: "tag" }),
+    ),
+  },
+};
+
+test("policy (real shell, fake gh): unset RELEASE_APPROVAL requires reviewers and the exact release tag policy", () => {
   const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
-  const ok = runStep(step, { gh: ghAnswers("1 true") });
+  const ok = runStep(step, { ...validReleasePolicy });
   assert.strictEqual(ok.status, 0, ok.output);
   assert.match(
     ok.calls[0],
-    /^api repos\/fossasia\/cla-bot\/environments\/release --jq /,
+    /^api repos\/fossasia\/cla-bot\/environments\/release$/,
   );
+  assert.match(ok.calls[1], /--paginate repos\/fossasia\/cla-bot\/environments\/release\/deployment-branch-policies\?per_page=100/);
+  assert.match(ok.output, /Verified the 'release' environment deployment restriction: tag v\*/);
   assert.ok(
     !/::notice::/.test(ok.output),
     "self-review is off, nothing to point out",
   );
 
-  const selfReview = runStep(step, { gh: ghAnswers("3 false") });
+  const selfReview = runStep(step, {
+    ...validReleasePolicy,
+    env: {
+      ...validReleasePolicy.env,
+      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(
+        releaseEnvironment({ reviewers: 3, preventSelfReview: false }),
+      ),
+    },
+  });
   assert.strictEqual(selfReview.status, 0, selfReview.output);
   assert.match(selfReview.output, /::notice::.*allows self-review/);
 
-  for (const [label, answer] of [
-    ["no reviewers", "0 false"],
-    ["no reviewers, self-review off", "0 true"],
-    ["empty answer", ""],
-    ["a non-number", "garbage true"],
-    ["a negative number", "-1 true"],
-    ["a decimal", "1.5 true"],
-    ["only whitespace", "   "],
-  ]) {
-    const r = runStep(step, { gh: ghAnswers(answer) });
-    assert.notStrictEqual(r.status, 0, `${label} must NOT pass`);
-    assert.match(r.output, /::error::/, label);
-  }
+  const noReviewers = runStep(step, {
+    ...validReleasePolicy,
+    env: {
+      ...validReleasePolicy.env,
+      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 0 })),
+    },
+  });
+  assert.strictEqual(noReviewers.status, 1, noReviewers.output);
+  assert.match(noReviewers.output, /has no required reviewers/);
+
+  const malformedReviewers = runStep(step, {
+    ...validReleasePolicy,
+    env: {
+      ...validReleasePolicy.env,
+      FAKE_RELEASE_ENVIRONMENT: JSON.stringify({
+        protection_rules: [{ type: "required_reviewers", reviewers: "unexpected" }],
+        deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
+      }),
+    },
+  });
+  assert.strictEqual(malformedReviewers.status, 1);
+  assert.match(malformedReviewers.output, /Could not parse the 'release' environment approval rules/);
+
   const unreadable = runStep(step, { gh: "exit 1" });
   assert.strictEqual(unreadable.status, 1);
   assert.match(unreadable.output, /Could not read the 'release' environment/);
@@ -1992,23 +2066,25 @@ test("policy (real shell, fake gh): unset RELEASE_APPROVAL requires reviewers on
 test("policy (real shell, fake gh): `not-required` must match an environment with no reviewers", () => {
   const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
   const optOut = runStep(step, {
-    gh: ghAnswers("0 false"),
-    env: { RELEASE_APPROVAL: "not-required" },
+    ...validReleasePolicy,
+    env: { ...validReleasePolicy.env, RELEASE_APPROVAL: "not-required",
+      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 0 })) },
   });
   assert.strictEqual(optOut.status, 0, optOut.output);
   assert.match(optOut.output, /No required reviewers are configured/);
-  assert.strictEqual(optOut.calls.length, 1, "always inspect actual protection");
+  assert.strictEqual(optOut.calls.length, 2, "inspect environment and deployment rules");
 
   const conflict = runStep(step, {
-    gh: ghAnswers("2 false"),
-    env: { RELEASE_APPROVAL: "not-required" },
+    ...validReleasePolicy,
+    env: { ...validReleasePolicy.env, RELEASE_APPROVAL: "not-required",
+      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 2, preventSelfReview: false })) },
   });
   assert.strictEqual(conflict.status, 1, conflict.output);
   assert.match(conflict.output, /conflicts with the 'release' environment/);
   assert.strictEqual(conflict.calls.length, 1);
   for (const value of ["yes", "true", "Not-Required", "none", "required"]) {
     const r = runStep(step, {
-      gh: ghAnswers("5 true"),
+      ...validReleasePolicy,
       env: { RELEASE_APPROVAL: value },
     });
     assert.strictEqual(r.status, 1, value);
@@ -2017,10 +2093,75 @@ test("policy (real shell, fake gh): `not-required` must match an environment wit
   }
   // An EMPTY variable behaves as unset: the check is enforced.
   const empty = runStep(step, {
-    gh: ghAnswers("0 false"),
-    env: { RELEASE_APPROVAL: "" },
+    ...validReleasePolicy,
+    env: { ...validReleasePolicy.env, RELEASE_APPROVAL: "",
+      FAKE_RELEASE_ENVIRONMENT: JSON.stringify(releaseEnvironment({ reviewers: 0 })) },
   });
   assert.strictEqual(empty.status, 1);
+});
+
+test("release environment deployment policy fails closed for absent, broad, branch, extra, or malformed restrictions", () => {
+  const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
+  const cases = [
+    ["no custom policy mode", releaseEnvironment({ deploymentBranchPolicy: null }), deploymentPolicies({ name: "v*", type: "tag" })],
+    ["protected branches enabled", releaseEnvironment({ deploymentBranchPolicy: { protected_branches: true, custom_branch_policies: true } }), deploymentPolicies({ name: "v*", type: "tag" })],
+    ["custom policies disabled", releaseEnvironment({ deploymentBranchPolicy: { protected_branches: false, custom_branch_policies: false } }), deploymentPolicies({ name: "v*", type: "tag" })],
+    ["no rules", releaseEnvironment(), deploymentPolicies()],
+    ["branch rule", releaseEnvironment(), deploymentPolicies({ name: "v*", type: "branch" })],
+    ["broad tag rule", releaseEnvironment(), deploymentPolicies({ name: "*", type: "tag" })],
+    ["different tag pattern", releaseEnvironment(), deploymentPolicies({ name: "v[0-9]*", type: "tag" })],
+    ["additional branch rule", releaseEnvironment(), deploymentPolicies({ name: "v*", type: "tag" }, { name: "main", type: "branch" })],
+    ["missing policy type", releaseEnvironment(), deploymentPolicies({ name: "v*" })],
+  ];
+  for (const [label, environment, policies] of cases) {
+    const result = runStep(step, {
+      ...validReleasePolicy,
+      env: {
+        ...validReleasePolicy.env,
+        FAKE_RELEASE_ENVIRONMENT: JSON.stringify(environment),
+        FAKE_DEPLOYMENT_POLICIES: JSON.stringify(policies),
+      },
+    });
+    assert.strictEqual(result.status, 1, `${label}: ${result.output}`);
+    assert.match(result.output, /::error::/);
+    assert.strictEqual(
+      result.calls.length,
+      label === "no custom policy mode" || label === "protected branches enabled" || label === "custom policies disabled" ? 1 : 2,
+      `${label}: stop at the invalid environment mode, otherwise read both configuration endpoints`,
+    );
+  }
+});
+
+test("release environment policy rejects failed, malformed, and incomplete paginated policy reads", () => {
+  const step = policy.steps[stepNamed(policy.steps, POLICY_REVIEWERS)];
+  const failure = runStep(step, {
+    ...validReleasePolicy,
+    gh: [
+      'case "$*" in',
+      '  *"deployment-branch-policies"*) exit 1 ;;',
+      '  *"environments/release"*) printf "%s\\n" "$FAKE_RELEASE_ENVIRONMENT" ;;',
+      '  *) exit 9 ;;',
+      'esac',
+    ].join("\n"),
+  });
+  assert.strictEqual(failure.status, 1);
+  assert.match(failure.output, /exactly one deployment policy/);
+
+  for (const invalid of ["not-json", JSON.stringify({ total_count: 2, branch_policies: [{ name: "v*", type: "tag" }] })]) {
+    const result = runStep(step, {
+      ...validReleasePolicy,
+      env: { ...validReleasePolicy.env, FAKE_DEPLOYMENT_POLICIES: invalid },
+    });
+    assert.strictEqual(result.status, 1, invalid);
+    assert.match(result.output, /exactly one deployment policy/);
+  }
+
+  const malformedEnvironment = runStep(step, {
+    ...validReleasePolicy,
+    env: { ...validReleasePolicy.env, FAKE_RELEASE_ENVIRONMENT: "not-json" },
+  });
+  assert.strictEqual(malformedEnvironment.status, 1);
+  assert.match(malformedEnvironment.output, /Could not parse the 'release' environment approval rules/);
 });
 
 // --- the jq programs that ship in the workflow ---------------------------------------
@@ -2045,6 +2186,12 @@ function jqProgram(job, stepName, anchor) {
   assert.ok(match, `no --jq program after ${anchor} in "${stepName}"`);
   return match[1];
 }
+function localJqProgram(job, stepName, assignment) {
+  const step = job.steps[stepNamed(job.steps, stepName)];
+  const match = /summary="\$\(jq -er '([\s\S]*?)' <<< "\$environment"\)"/.exec(step.run);
+  assert.ok(match, `no local jq program assigned to ${assignment} in "${stepName}"`);
+  return match[1];
+}
 function evalJq(program, payload) {
   const r = spawnSync(JQ, ["-r", program], {
     input: JSON.stringify(payload),
@@ -2060,11 +2207,7 @@ test("the jq programs that ship in the workflow answer correctly on GitHub-shape
     return console.log(
       "  (skipped: neither jq nor gojq is installed on this machine)",
     );
-  const reviewers = jqProgram(
-    policy,
-    POLICY_REVIEWERS,
-    'environments/release"',
-  );
+  const reviewers = localJqProgram(policy, POLICY_REVIEWERS, "summary");
   const user = { type: "User", reviewer: { login: "octo", id: 1 } };
   for (const [label, payload, want] of [
     [
@@ -2118,18 +2261,16 @@ test("the jq programs that ship in the workflow answer correctly on GitHub-shape
       },
       "0 true",
     ],
-    [
-      "required_reviewers without a reviewers key",
-      {
-        protection_rules: [
-          { type: "required_reviewers", prevent_self_review: true },
-        ],
-      },
-      "0 true",
-    ],
   ]) {
     assert.strictEqual(evalJq(reviewers, payload), want, label);
   }
+  const malformedReviewer = spawnSync(JQ, ["-r", reviewers], {
+    input: JSON.stringify({
+      protection_rules: [{ type: "required_reviewers", prevent_self_review: true }],
+    }),
+    encoding: "utf8",
+  });
+  assert.notStrictEqual(malformedReviewer.status, 0, "malformed reviewer rule is rejected");
 
   const tagRef = jqProgram(
     publish,
