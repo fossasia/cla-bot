@@ -116,7 +116,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     };
     const cache = new Map();
     await getExistingBotComments(1, { cache, anyBotIdentity: true });
-    const raw = await cache.get(1);
+    const raw = await cache.get(1).promise;
     assert.strictEqual(
       raw.length,
       1,
@@ -134,6 +134,52 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     );
     assert.strictEqual(raw[0].id, 2);
     assert.strictEqual(raw[0].user.login, "github-actions[bot]");
+  });
+
+  await test("a PUBLIC CONTRIBUTOR spoofing BOT_MARKER in their own comment body is never cached, however many times they try", async () => {
+    // The literal marker text is visible in every bot comment, so anyone can
+    // paste it into their own comment. What must stop this is the
+    // AUTHENTICATED identity on the comment (user.login/user.type, set by
+    // GitHub, not editable from the comment body) - never the marker alone.
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      return res(200, [
+        {
+          id: 1,
+          body: `${MARKER}\npretending to be the real bot, attempt 1`,
+          user: { login: "attacker-one", type: "User" },
+        },
+        {
+          id: 2,
+          body: `${MARKER}\npretending to be the real bot, attempt 2`,
+          user: { login: "attacker-two", type: "User" },
+        },
+        {
+          id: 3,
+          body: `${MARKER}\nthe real bot comment`,
+          user: { login: "github-actions[bot]", type: "Bot" },
+        },
+      ]);
+    };
+    const cache = new Map();
+    // Ask with anyBotIdentity: true, the most permissive mode there is - if
+    // a spoofed comment could ever get in, it would be here.
+    const result = await getExistingBotComments(1, {
+      cache,
+      anyBotIdentity: true,
+    });
+    assert.deepStrictEqual(
+      result.map((c) => c.id),
+      [3],
+      "both spoofed comments must be rejected, not just filtered out of the final result",
+    );
+    const raw = await cache.get(1).promise;
+    assert.strictEqual(
+      raw.length,
+      1,
+      "a spoofed comment must never even enter the cache - not admitted, not trimmed, not retained at all",
+    );
+    assert.strictEqual(raw[0].id, 3);
   });
 
   await test("a cache is scoped per PR number - a different PR is never served from another PR's entry", async () => {

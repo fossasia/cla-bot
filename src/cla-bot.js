@@ -1149,10 +1149,9 @@ async function fetchBotLogin() {
 // tests - simply finds no store, so it gets no caching: the original,
 // always-fresh behavior for a one-off call.
 //
-// Like the identity lookups above, a cache entry holds the in-flight
-// PROMISE, so callers that overlap share one fetch, and a failed fetch
-// evicts itself so the next caller gets a real retry instead of a cached
-// error.
+// Like the identity lookups above, a cache entry holds the in-flight fetch,
+// so callers that overlap share one fetch, and a failed fetch evicts itself
+// so the next caller gets a real retry instead of a cached error.
 //
 // `fresh: true` always hits GitHub and replaces the cache entry. Only the
 // post-write duplicate cleanup uses it: that check exists specifically to
@@ -1160,19 +1159,38 @@ async function fetchBotLogin() {
 // must see GitHub's real state right now, not a snapshot a write could have
 // made stale. The fresh result then becomes the new cache entry, so later
 // reads in the same run (e.g. a second postComment() call) still get a hit.
+// This only orders a stale fetch's own FAILURE against a newer one's success
+// (see the eviction guard below) - two fresh:true fetches for the same PR
+// that both succeed settle on whichever happens to finish last, same as any
+// cache with concurrent writers. That is fine for the one real caller:
+// checkPR()'s own AsyncLocalStorage scope never reads a PR's comments twice
+// in parallel, so this never actually arises there - `cache` is exposed as
+// a plain parameter mainly so tests can exercise the caching on its own,
+// without a whole checkPR() run.
 // ---------------------------------------------------------------------------
 const commentsCacheStorage = new AsyncLocalStorage();
 
-async function fetchAllIssueComments(prNumber, { fresh = false, cache }) {
-  if (!cache) return fetchAllIssueCommentsUncached(prNumber);
+async function fetchAllIssueComments(
+  prNumber,
+  { fresh = false, cache, botLoginPromise },
+) {
+  if (!cache) return fetchAllIssueCommentsUncached(prNumber, botLoginPromise);
   if (!fresh) {
-    const cached = cache.get(prNumber);
-    if (cached !== undefined) return cached;
+    const entry = cache.get(prNumber);
+    if (entry !== undefined) return entry.promise;
   }
-  const fetchPromise = fetchAllIssueCommentsUncached(prNumber);
-  cache.set(prNumber, fetchPromise);
+  // `entry` (a plain object), not the fetch promise itself, is what goes in
+  // the cache and what the eviction check below compares by reference. A
+  // static analyzer reasonably assumes a bare Promise sitting in a `===`
+  // check was meant to be awaited; wrapping it sidesteps that false read
+  // without changing what's actually being asked: "is this still MY fetch,
+  // or did a newer one already replace it?"
+  const entry = {
+    promise: fetchAllIssueCommentsUncached(prNumber, botLoginPromise),
+  };
+  cache.set(prNumber, entry);
   try {
-    return await fetchPromise;
+    return await entry.promise;
   } catch (e) {
     // Don't leave a failed page load cached - the next caller should get a
     // real retry, not the same error forever. Guarded by identity: `cache`
@@ -1181,9 +1199,36 @@ async function fetchAllIssueComments(prNumber, { fresh = false, cache }) {
     // may already have replaced this entry with a newer (and possibly
     // already-succeeded) fetch by the time this older one rejects. Only
     // remove the entry if it's still the one this call itself set.
-    if (cache.get(prNumber) === fetchPromise) cache.delete(prNumber);
+    if (cache.get(prNumber) === entry) cache.delete(prNumber);
     throw e;
   }
+}
+
+// Whether a comment's AUTHENTICATED identity - GitHub's own user.login /
+// user.type on the comment - could possibly be a bot comment, under either
+// `anyBotIdentity` value. Deliberately the union of both: this is also the
+// cache-admission gate below, and admitting anything broader than this union
+// would let an attacker's comment BODY (fully attacker-controlled on a
+// public PR, unlike user.login/user.type) decide what sits in this run's
+// memory.
+//
+// `anyBotIdentity` itself is a broader match, used only for checkPR()'s
+// history check and never for postComment()'s dedupe, which stays strict to
+// the current identity. Without it, switching GITHUB_TOKEN to a PAT or
+// another App token would hide comments posted under the old identity, and
+// a PR that was blocked before the switch would look as if it never was.
+//
+// `type === "Bot"` is set by GitHub and an ordinary account cannot fake it.
+// The DEFAULT_BOT_LOGIN check is a fallback for the common plain
+// GITHUB_TOKEN case in case `type` is missing. Neither covers a switch from
+// one PAT-owned account to another, since both look like ordinary users.
+// That limit is documented in CHANGELOG.md.
+function isPossiblyBotIdentity(user, botLogin) {
+  return (
+    user.login === botLogin ||
+    user.type === "Bot" ||
+    user.login === DEFAULT_BOT_LOGIN
+  );
 }
 
 // A public PR can carry comments from untrusted contributors in unbounded
@@ -1191,16 +1236,19 @@ async function fetchAllIssueComments(prNumber, { fresh = false, cache }) {
 // own small, bounded set of comments - not every human comment's full
 // GitHub payload for the whole life of the run. Two things keep it small:
 //
-// - Only a comment whose body carries BOT_MARKER is ever kept at all. That
-//   check is the same one getExistingBotComments() already needs before it
-//   can trust ANY comment, under both `anyBotIdentity` values - it is a
-//   prerequisite either way, not specific to one identity mode - so running
-//   it here, once, is lossless for both and is exactly what the pre-cache
-//   code did (it filtered per page too, before this cache existed).
+// - Only a comment that BOTH carries BOT_MARKER AND has an authenticated
+//   identity isPossiblyBotIdentity() accepts is ever kept at all. The
+//   identity half is what actually makes this safe: BOT_MARKER alone is
+//   just a literal HTML comment, and any contributor can paste it into
+//   their own comment on a public PR - user.login/user.type are set by
+//   GitHub from who is actually authenticated as posting, which a commenter
+//   cannot forge by editing their comment body. A spoofed marker on an
+//   ordinary human comment fails this check and is never cached - getting
+//   past it would mean already controlling the bot's own account.
 // - Only the few fields the rest of this file ever reads from a comment
 //   (id, body, user.login, user.type) are kept, not the full GitHub object
 //   (timestamps, URLs, avatar, reactions, and so on).
-async function fetchAllIssueCommentsUncached(prNumber) {
+async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
   const all = [];
   let page = 1;
   for (;;) {
@@ -1209,9 +1257,20 @@ async function fetchAllIssueCommentsUncached(prNumber) {
       GITHUB_TOKEN,
     );
     if (!comments.length) break;
+    // Resolved once, reused for every page (botLogin cannot change mid-run -
+    // resolveBotLogin() caches it for the whole process). Not awaited until
+    // here so the caller can start this fetch and resolveBotLogin() at the
+    // same time instead of one after the other.
+    const botLogin = await botLoginPromise;
     all.push(
       ...comments
-        .filter((c) => c.user && c.body && c.body.includes(BOT_MARKER))
+        .filter(
+          (c) =>
+            c.user &&
+            c.body &&
+            c.body.includes(BOT_MARKER) &&
+            isPossiblyBotIdentity(c.user, botLogin),
+        )
         .map((c) => ({
           id: c.id,
           body: c.body,
@@ -1229,12 +1288,12 @@ async function fetchAllIssueCommentsUncached(prNumber) {
 // the same run doesn't show a comment that is already gone. Only ever
 // called after the list was itself just fetched successfully (see
 // dedupeIdenticalTrailingComments's own `fresh: true` read), so the cached
-// promise here is already resolved.
+// entry's promise here is already resolved.
 async function forgetCachedComment(prNumber, commentId) {
   const cache = commentsCacheStorage.getStore();
-  const cached = cache && cache.get(prNumber);
-  if (!cached) return;
-  const list = await cached;
+  const entry = cache && cache.get(prNumber);
+  if (!entry) return;
+  const list = await entry.promise;
   for (let i = list.length - 1; i >= 0; i--) {
     if (list[i].id === commentId) list.splice(i, 1);
   }
@@ -1252,34 +1311,18 @@ async function getExistingBotComments(
     cache = commentsCacheStorage.getStore(),
   } = {},
 ) {
-  // Independent requests (one reads the comment list, the other identifies
-  // who "the bot" is), so run them together instead of one after the other.
+  // Not awaited yet - started so it overlaps with the comments fetch below
+  // (which needs it too, to decide what's even safe to cache - see
+  // isPossiblyBotIdentity()) instead of adding its own separate round trip.
+  const botLoginPromise = resolveBotLogin();
   const [botLogin, all] = await Promise.all([
-    resolveBotLogin(),
-    fetchAllIssueComments(prNumber, { fresh, cache }),
+    botLoginPromise,
+    fetchAllIssueComments(prNumber, { fresh, cache, botLoginPromise }),
   ]);
-  // `all` already contains only comments carrying BOT_MARKER, with a user
-  // present (see fetchAllIssueCommentsUncached) - this just narrows by
-  // identity.
-  return all.filter((c) => {
-    if (c.user.login === botLogin) return true;
-    // `anyBotIdentity` is a broader match, used only for checkPR()'s
-    // history check and never for postComment()'s dedupe, which stays
-    // strict to the current identity. Without it, switching GITHUB_TOKEN
-    // to a PAT or another App token would hide comments posted under the
-    // old identity, and a PR that was blocked before the switch would look
-    // as if it never was.
-    //
-    // `type === "Bot"` is set by GitHub and an ordinary account cannot
-    // fake it. The DEFAULT_BOT_LOGIN check is a fallback for the common
-    // plain GITHUB_TOKEN case in case `type` is missing. Neither covers a
-    // switch from one PAT-owned account to another, since both look like
-    // ordinary users. That limit is documented in CHANGELOG.md.
-    return (
-      anyBotIdentity &&
-      (c.user.type === "Bot" || c.user.login === DEFAULT_BOT_LOGIN)
-    );
-  });
+  // Already the broad match (see isPossiblyBotIdentity() above).
+  if (anyBotIdentity) return all;
+  // Narrow further, to just the current identity.
+  return all.filter((c) => c.user.login === botLogin);
 }
 
 async function postComment(prNumber, body, dedupe = true) {
