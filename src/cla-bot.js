@@ -1393,6 +1393,32 @@ async function postComment(prNumber, body, dedupe = true) {
   }
 }
 
+// Deletes targeted by one dedupeIdenticalTrailingComments() cleanup are each
+// independent, so they run together rather than one after another - but
+// without some limit, a pathological PR with many duplicate bot comments
+// (MAX_CACHED_COMMENTS already bounds that count, but it's still up to a few
+// hundred in the worst case) would fire that many DELETE requests at GitHub
+// in one burst. That is more likely to trip its secondary rate limiting than
+// to finish any faster, so only this many run at once.
+const MAX_CONCURRENT_DELETES = 10;
+
+async function deleteDuplicateComment(prNumber, dup) {
+  try {
+    await gh(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${encodeURIComponent(dup.id)}`,
+      GITHUB_TOKEN,
+      { method: "DELETE" },
+    );
+    await forgetCachedComment(prNumber, dup.id);
+  } catch (e) {
+    // It may already be gone, or the token may lack permission. This is
+    // cosmetic cleanup, so do not fail the run.
+    console.warn(
+      `::warning::Could not delete duplicate comment ${dup.id}: ${e.message}`,
+    );
+  }
+}
+
 // The "no matching comment yet, so post" check in postComment() is two HTTP
 // calls with nothing atomic between them, so two concurrent runs can both
 // post. This cannot prevent that, but it cleans up right after: it finds the
@@ -1418,28 +1444,17 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
       `::warning::Found ${duplicates.length} duplicate bot comment(s) on PR #${prNumber} and removing them - two runs likely posted the same comment at the same time. If this keeps happening, check that the consuming workflow sets the \`concurrency:\` group shown in examples/consumer-workflow.yml (see SECURITY.md).`,
     );
   }
-  // Each delete targets its own comment id, so they don't depend on each
-  // other - run them together instead of one after another. Every branch
-  // below already catches its own error, so one failing delete can never
-  // make Promise.all reject or stop the others.
-  await Promise.all(
-    duplicates.map(async (dup) => {
-      try {
-        await gh(
-          `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${encodeURIComponent(dup.id)}`,
-          GITHUB_TOKEN,
-          { method: "DELETE" },
-        );
-        await forgetCachedComment(prNumber, dup.id);
-      } catch (e) {
-        // It may already be gone, or the token may lack permission. This is
-        // cosmetic cleanup, so do not fail the run.
-        console.warn(
-          `::warning::Could not delete duplicate comment ${dup.id}: ${e.message}`,
-        );
-      }
-    }),
-  );
+  // In batches of MAX_CONCURRENT_DELETES - every delete in a batch is
+  // independent of the others, so each batch itself still runs in
+  // parallel; deleteDuplicateComment() catches its own error, so one
+  // failing delete can never stop the rest of a batch or the batches
+  // after it.
+  for (let i = 0; i < duplicates.length; i += MAX_CONCURRENT_DELETES) {
+    const batch = duplicates.slice(i, i + MAX_CONCURRENT_DELETES);
+    await Promise.all(
+      batch.map((dup) => deleteDuplicateComment(prNumber, dup)),
+    );
+  }
 }
 
 async function setStatus(sha, state, description) {
