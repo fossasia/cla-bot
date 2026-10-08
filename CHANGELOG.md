@@ -12,12 +12,14 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   path. Repository writers can still create releases manually. CI verifies the
   tag (annotated, GitHub-verified signature, on
   `main`, matches `package.json` and `CHANGELOG.md`), re-runs the full test
-  suite and the 100% coverage gate, and publishes a release carrying: a
-  deterministic source archive, a Sigstore (cosign, keyless) signature bundle,
-  a CycloneDX SBOM, SLSA build-provenance and SBOM attestations, and a signed
-  `SHA256SUMS`. The release is created as a draft, verified, published, and
-  verified again from the public copy. See "Verifying a release" in
-  `SECURITY.md`.
+  suite and the 100% coverage gate, and publishes generated release notes, a
+  deterministic source archive, and a CycloneDX SBOM, each with a direct
+  Sigstore (cosign, keyless) signature. The signed `SHA256SUMS` covers those
+  payloads; SLSA build-provenance and SBOM attestations provide additional
+  signed proof. Signature and attestation bundles are verified as proof files,
+  not recursively signed. The release is created as a draft, verified,
+  published, and verified again from the public copy. See the "Verifying a
+  release" section in `SECURITY.md`.
 - **Verified Latest selection and recovery.** Latest only advances to the
   highest stable release whose signed tag, default-branch ancestry, exact
   assets, checksums, signatures and workflow attestations verify. The workflow

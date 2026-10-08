@@ -42,10 +42,11 @@ App token - no long-lived personal access token is stored anywhere.
    without a second-person approval; wait for its verification to finish.
 5. **Verify the release before anyone depends on it.** Open
    `https://github.com/fossasia/cla-bot/releases` and confirm the release
-   carries the signature, SBOM, attestation and `SHA256SUMS` assets, then run
-   the commands in SECURITY.md's "Verifying a release" section. Until a
-   release exists **and verifies**, any workflow referencing it will fail to
-   resolve or should not be trusted.
+   carries `RELEASE_NOTES.md`, the signed archive and SBOM, their Cosign
+   signature bundles, the provenance and SBOM attestations, and signed
+   `SHA256SUMS`, then run the commands in SECURITY.md's "Verifying a release"
+   section. Until a release exists **and verifies**, any workflow referencing
+   it will fail to resolve or should not be trusted.
 6. **Get the commit SHA to pin** (this is what goes into every consumer
    workflow, not the tag):
    ```bash

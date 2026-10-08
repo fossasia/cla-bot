@@ -298,7 +298,10 @@ but signing and attesting need a real GitHub run.
    npm version X.Y.Z --no-git-tag-version   # updates package.json and package-lock.json
    ```
    The section's text becomes the release notes, and the workflow fails if
-   the tag, `package.json` and `CHANGELOG.md` disagree. Merge it.
+   the tag, `package.json` and `CHANGELOG.md` disagree. Merge it. The
+   workflow publishes that text as `RELEASE_NOTES.md`, signs it alongside the
+   source archive and SBOM, and signs a `SHA256SUMS` manifest covering all
+   three payloads. Signature and attestation bundles are verified as proofs.
 3. Tag the merge commit **with a signature**, check it, and push it:
    ```bash
    git switch main && git pull

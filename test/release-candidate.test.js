@@ -12,16 +12,19 @@ const script = path.join(ROOT, ".github/scripts/verify-release-candidate.sh");
 const tag = "v1.2.3";
 const archiveName = `cla-bot-${tag}.tar.gz`;
 
-function candidate({ extra = false } = {}) {
+function candidate({ extra = false, body = "fixture:RELEASE_NOTES.md" } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "release-candidate-"));
   const bin = path.join(dir, "bin");
   const assets = path.join(dir, "assets");
   fs.mkdirSync(bin);
   fs.mkdirSync(assets);
   const assetNames = [
+    "RELEASE_NOTES.md",
+    "RELEASE_NOTES.md.sigstore.json",
     archiveName,
     `${archiveName}.sigstore.json`,
     `cla-bot-${tag}.sbom.cdx.json`,
+    `cla-bot-${tag}.sbom.cdx.json.sigstore.json`,
     `cla-bot-${tag}.provenance.intoto.jsonl`,
     `cla-bot-${tag}.sbom.intoto.jsonl`,
     "SHA256SUMS",
@@ -39,9 +42,13 @@ function candidate({ extra = false } = {}) {
     .createHash("sha256")
     .update(fs.readFileSync(path.join(assets, sbom)))
     .digest("hex");
+  const notesHash = crypto
+    .createHash("sha256")
+    .update(fs.readFileSync(path.join(assets, "RELEASE_NOTES.md")))
+    .digest("hex");
   fs.writeFileSync(
     path.join(assets, "SHA256SUMS"),
-    `${archiveHash}  ${archiveName}\n${sbomHash}  ${sbom}\n`,
+    `${notesHash}  RELEASE_NOTES.md\n${archiveHash}  ${archiveName}\n${sbomHash}  ${sbom}\n`,
   );
   if (extra) fs.writeFileSync(path.join(assets, "unexpected.txt"), "extra\n");
   const releaseAssetNames = extra ? [...assetNames, "unexpected.txt"] : assetNames;
@@ -55,6 +62,7 @@ function candidate({ extra = false } = {}) {
       draft: false,
       prerelease: false,
       immutable: false,
+      body,
       assets: releaseAssetNames.map((name, index) => ({
         id: 100 + index,
         name,
@@ -65,7 +73,7 @@ function candidate({ extra = false } = {}) {
 
   fs.writeFileSync(
     path.join(bin, "gh"),
-    `#!/bin/bash
+`#!/bin/bash
 set -e
 case "$*" in
   *"version"*) echo "gh version $FAKE_GH_VERSION (2026-10-01)" ;;
@@ -89,7 +97,7 @@ esac
   );
   fs.writeFileSync(
     path.join(bin, "cosign"),
-    '#!/bin/bash\n[ "${FAKE_COSIGN:-pass}" = pass ] || { echo "signature failed" >&2; exit 1; }\n',
+    '#!/bin/bash\necho "$*" >> "$FAKE_COSIGN_LOG"\nif [ "${FAKE_COSIGN:-pass}" != pass ] || { [ -n "${FAKE_COSIGN_BAD_FILE:-}" ] && [[ "$*" == *"$FAKE_COSIGN_BAD_FILE"* ]]; }; then echo "signature failed" >&2; exit 1; fi\n',
     { mode: 0o755 },
   );
 
@@ -106,6 +114,7 @@ esac
         DEFAULT_BRANCH: "main",
         GH_TOKEN: "test-token",
         FAKE_ASSETS: assets,
+        FAKE_COSIGN_LOG: path.join(dir, "cosign.log"),
         FAKE_RELEASE_JSON: releaseJson,
         FAKE_GH_VERSION: "2.102.0",
         FAKE_VERIFIED: "true",
@@ -118,7 +127,13 @@ esac
         ...overrides,
       },
     });
-    return { status: result.status, output: result.stdout + result.stderr };
+    return {
+      status: result.status,
+      output: result.stdout + result.stderr,
+      cosignCalls: fs.existsSync(path.join(dir, "cosign.log"))
+        ? fs.readFileSync(path.join(dir, "cosign.log"), "utf8").trim().split("\n")
+        : [],
+    };
   }
 
   return { run, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }), assets };
@@ -129,6 +144,26 @@ try {
   const result = valid.run();
   assert.strictEqual(result.status, 0, result.output);
   assert.match(result.output, /is a verified release from/);
+  assert.deepStrictEqual(
+    result.cosignCalls
+      .filter((call) => call.startsWith("verify-blob"))
+      .map((call) => path.basename(call.split(" ").at(-1))),
+    [
+      "RELEASE_NOTES.md",
+      archiveName,
+      `cla-bot-${tag}.sbom.cdx.json`,
+      "SHA256SUMS",
+    ],
+  );
+
+  const changedBody = candidate({ body: "unverified edited release body" });
+  try {
+    const failed = changedBody.run();
+    assert.notStrictEqual(failed.status, 0);
+    assert.match(failed.output, /release body differs from its signed RELEASE_NOTES.md asset/);
+  } finally {
+    changedBody.cleanup();
+  }
 
   for (const value of [undefined, "", "unexpected"]) {
     const undeclaredPolicy = valid.run({ RELEASE_IMMUTABILITY: value });
@@ -170,6 +205,17 @@ try {
     const failed = valid.run(overrides);
     assert.notStrictEqual(failed.status, 0, name);
     assert.match(failed.output, message, name);
+  }
+
+  for (const file of [
+    "RELEASE_NOTES.md",
+    archiveName,
+    `cla-bot-${tag}.sbom.cdx.json`,
+    "SHA256SUMS",
+  ]) {
+    const badSignature = valid.run({ FAKE_COSIGN_BAD_FILE: file });
+    assert.notStrictEqual(badSignature.status, 0, `${file} signature must be checked`);
+    assert.match(badSignature.output, /signature failed/, file);
   }
 
   const extra = candidate({ extra: true });

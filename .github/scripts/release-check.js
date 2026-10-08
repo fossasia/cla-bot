@@ -464,7 +464,7 @@ async function runVerify({ argv, env, cwd, stdout, stderr, fetchImpl }) {
   }
 
   const section = extractChangelogSection(changelog, parseTag(tag));
-  const notes = `${section}\n\n---\n\nEvery asset is signed. Verify before use: https://github.com/${env.GITHUB_REPOSITORY}/blob/${tag}/SECURITY.md#verifying-a-release\n`;
+  const notes = `${section}\n\n---\n\nRelease payloads are individually signed or attested. Verify every signature and attestation before use: https://github.com/${env.GITHUB_REPOSITORY}/blob/${tag}/SECURITY.md#verifying-a-release\n`;
   fs.writeFileSync(notesFile, notes);
   if (env.GITHUB_OUTPUT) {
     fs.appendFileSync(env.GITHUB_OUTPUT, `tag-object-sha=${tagObjectSha}\n`);

@@ -83,11 +83,12 @@ Every release is built and published by
 [`release.yml`](./.github/workflows/release.yml) when a signed, annotated
 tag is pushed. It runs the full test suite, then attaches to the release:
 
-- the source archive, signed with [Sigstore](https://www.sigstore.dev/)
-  (keyless - there is no signing key to leak),
-- a CycloneDX SBOM,
-- SLSA build provenance and SBOM attestations,
-- `SHA256SUMS`, itself signed.
+- generated `RELEASE_NOTES.md`, the source archive, and the CycloneDX SBOM,
+  each directly signed with [Sigstore](https://www.sigstore.dev/) (keyless -
+  there is no signing key to leak),
+- Cosign signature bundles for those payloads and a signed `SHA256SUMS`
+  manifest covering all three,
+- SLSA build provenance and SBOM attestation bundles, verified with GitHub CLI.
 
 Verify a release before you first use it (`sha256sum`, `cosign verify-blob`,
 `gh attestation verify`, `gh release verify`); the exact commands, what the

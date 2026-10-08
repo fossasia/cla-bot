@@ -84,9 +84,12 @@ fi
 
 mkdir "$temporary/assets"
 expected_assets=(
+  RELEASE_NOTES.md
+  RELEASE_NOTES.md.sigstore.json
   "${name}.tar.gz"
   "${name}.tar.gz.sigstore.json"
   "${name}.sbom.cdx.json"
+  "${name}.sbom.cdx.json.sigstore.json"
   "${name}.provenance.intoto.jsonl"
   "${name}.sbom.intoto.jsonl"
   SHA256SUMS
@@ -116,16 +119,22 @@ for asset in "${expected_assets[@]}"; do
     exit 1
   fi
 done
+release_body="$(jq -r '.body // ""' <<< "$release_json" | tr -d '\r')"
+signed_notes="$(tr -d '\r' < "$temporary/assets/RELEASE_NOTES.md")"
+if [[ "$release_body" != "$signed_notes" ]]; then
+  echo "${RELEASE_TAG} release body differs from its signed RELEASE_NOTES.md asset." >&2
+  exit 1
+fi
 
 mapfile -t checksum_assets < <(awk '{ print $2 }' "$temporary/assets/SHA256SUMS" | sort)
-mapfile -t expected_checksums < <(printf '%s\n' "${name}.tar.gz" "${name}.sbom.cdx.json" | sort)
+mapfile -t expected_checksums < <(printf '%s\n' RELEASE_NOTES.md "${name}.tar.gz" "${name}.sbom.cdx.json" | sort)
 if [[ "${checksum_assets[*]}" != "${expected_checksums[*]}" ]]; then
-  echo "${RELEASE_TAG} SHA256SUMS does not list exactly the archive and SBOM." >&2
+  echo "${RELEASE_TAG} SHA256SUMS does not list exactly the notes, archive, and SBOM." >&2
   exit 1
 fi
 (cd "$temporary/assets" && sha256sum --check --strict SHA256SUMS)
 
-for file in "${name}.tar.gz" SHA256SUMS; do
+for file in RELEASE_NOTES.md "${name}.tar.gz" "${name}.sbom.cdx.json" SHA256SUMS; do
   cosign verify-blob \
     --bundle "${temporary}/assets/${file}.sigstore.json" \
     --certificate-identity "$identity" \

@@ -129,27 +129,36 @@ Out of scope:
    a workflow change through the protected branch. `RELEASE_APPROVAL` is a
    repository variable because anyone with release rights may publish without
    second-person approval. GitHub's actual environment protection rules still
-   apply to the publish job. Signed assets and checksums let consumers detect
-  asset changes, but release notes and mutable metadata are not covered by
-  those asset signatures. For an asset correction, publish a new patch version;
-  consumers must reject an in-place replacement whose existing signatures no
-  longer verify.
+   apply to the publish job. Release notes, the source archive and the SBOM
+   each have a direct Cosign signature and are listed in the signed checksum
+   manifest. A changed release-body copy is rejected by release verification
+   unless it matches the signed notes asset. Mutable metadata such as the title
+   is not signed. For a payload correction, publish a new patch version;
+   consumers must reject an in-place replacement whose signatures no longer
+   verify.
 
 ## Verifying a release
 
 Every release of this action is built and signed by GitHub Actions
 (`.github/workflows/release.yml`), not on anyone's laptop. A release that does
 not carry **all** the assets below is not a release of this project; do not
-use it.
+use it. The release notes, source archive, and SBOM are payloads and each has
+a direct Cosign signature. `SHA256SUMS` covers those three payloads and is
+itself directly signed. Cosign signature bundles and GitHub attestation
+bundles are cryptographic proof files; verify them with their corresponding
+tools rather than trying to recursively sign proof files.
 
 | Asset                                   | What it is                                                         |
 | --------------------------------------- | ------------------------------------------------------------------ |
+| `RELEASE_NOTES.md`                      | Generated release notes, directly signed and checksummed.         |
+| `RELEASE_NOTES.md.sigstore.json`        | Sigstore (cosign) signature bundle for the release notes.          |
 | `cla-bot-<tag>.tar.gz`                  | Source archive of the tagged commit (deterministic `git archive`). |
 | `cla-bot-<tag>.tar.gz.sigstore.json`    | Sigstore (cosign) signature bundle for the archive.                |
-| `cla-bot-<tag>.sbom.cdx.json`           | CycloneDX SBOM: pinned third-party actions using registered GitHub PURLs. |
-| `cla-bot-<tag>.provenance.intoto.jsonl` | SLSA build-provenance attestation (archive and SBOM).              |
+| `cla-bot-<tag>.sbom.cdx.json`           | CycloneDX SBOM, directly signed and checksummed.                   |
+| `cla-bot-<tag>.sbom.cdx.json.sigstore.json` | Sigstore (cosign) signature bundle for the SBOM.               |
+| `cla-bot-<tag>.provenance.intoto.jsonl` | SLSA build-provenance attestation for checksummed payloads.        |
 | `cla-bot-<tag>.sbom.intoto.jsonl`       | Attestation binding the SBOM to the archive.                       |
-| `SHA256SUMS`                            | Checksums of the archive and the SBOM.                             |
+| `SHA256SUMS`                            | Checksums of release notes, archive, and SBOM.                     |
 | `SHA256SUMS.sigstore.json`              | Sigstore signature bundle for `SHA256SUMS`.                        |
 
 The signatures prove **where a release came from**: this repository's
@@ -178,12 +187,21 @@ fi
 gh release download "$TAG" --repo "$REPO" --dir cla-bot-release
 cd cla-bot-release
 
-# 1. The files are the ones that were signed.
+# 1. The payloads match the signed checksum manifest.
 sha256sum --check --strict SHA256SUMS
 
-# 2. Sigstore signatures (cosign v3 or later). The identity is matched EXACTLY:
+# 2. The visible release body matches the signed release-notes asset.
+RELEASE_BODY="$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.body // ""' | tr -d '\r')"
+SIGNED_NOTES="$(tr -d '\r' < RELEASE_NOTES.md)"
+if [[ "$RELEASE_BODY" != "$SIGNED_NOTES" ]]; then
+  echo "The release body differs from the signed RELEASE_NOTES.md asset" >&2
+  exit 1
+fi
+
+# 3. Sigstore signatures (cosign v3 or later). The identity is matched EXACTLY:
 #    this workflow file, on this tag, issued by GitHub's OIDC provider.
-for f in "cla-bot-$TAG.tar.gz" SHA256SUMS; do
+for f in RELEASE_NOTES.md "cla-bot-$TAG.tar.gz" \
+    "cla-bot-$TAG.sbom.cdx.json" SHA256SUMS; do
   cosign verify-blob \
     --bundle "$f.sigstore.json" \
     --certificate-identity "https://github.com/$WORKFLOW@refs/tags/$TAG" \
@@ -191,7 +209,7 @@ for f in "cla-bot-$TAG.tar.gz" SHA256SUMS; do
     "$f"
 done
 
-# 3. GitHub build-provenance and SBOM attestations.
+# 4. GitHub build-provenance and SBOM attestations.
 # Resolve the tag once. The provenance check below must attest this exact
 # commit, and this same value is the only SHA to use in the consumer workflow.
 SOURCE_SHA="$(git ls-remote --tags "https://github.com/$REPO.git" "$TAG" "$TAG^{}" | awk '$2 ~ /\^\{\}$/ {print $1}')"
@@ -209,7 +227,7 @@ gh attestation verify "cla-bot-$TAG.tar.gz" \
   --source-ref "refs/tags/$TAG" --source-digest "$SOURCE_SHA" \
   --predicate-type https://cyclonedx.org/bom
 
-# 4. GitHub's release immutability attestation is available only when the
+# 5. GitHub's release immutability attestation is available only when the
 #    repository has "Immutable releases" enabled. Mutable releases are
 #    intentional here, so check it only when that setting is on.
 if [ "$(gh release view "$TAG" --repo "$REPO" --json isImmutable --jq .isImmutable)" = true ]; then

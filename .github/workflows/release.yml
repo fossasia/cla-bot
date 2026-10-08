@@ -45,18 +45,21 @@ name: Release
 #            branch ancestry, exact assets, signatures and workflow attestations.
 #            Runs after publication even if a post-publication check fails.
 #
-# What every release carries (all signed by this workflow's identity via
-# Sigstore, keyless: there is no signing key to steal or rotate):
+# Every payload is directly signed by this workflow's identity via Sigstore
+# (keyless) and listed in the signed checksum manifest. Signature bundles and
+# GitHub attestation bundles are the cryptographic proofs; consumers verify
+# those bundles instead of recursively signing proof files.
+# What every release carries:
+#   RELEASE_NOTES.md                       generated release notes, signed
+#   RELEASE_NOTES.md.sigstore.json         signature bundle for release notes
 #   cla-bot-<tag>.tar.gz                    source archive of the tagged commit
 #   cla-bot-<tag>.tar.gz.sigstore.json      cosign signature bundle
-#   cla-bot-<tag>.sbom.cdx.json             CycloneDX SBOM
+#   cla-bot-<tag>.sbom.cdx.json             CycloneDX SBOM, signed
+#   cla-bot-<tag>.sbom.cdx.json.sigstore.json  signature bundle for the SBOM
 #   cla-bot-<tag>.provenance.intoto.jsonl   SLSA build provenance (GitHub attestation)
 #   cla-bot-<tag>.sbom.intoto.jsonl         SBOM attestation
-#   SHA256SUMS + SHA256SUMS.sigstore.json   checksums of the archive and the
-#                                           SBOM, signed. The signature bundles
-#                                           and attestations are created after
-#                                           it, so they are not listed in it;
-#                                           each verifies on its own.
+#   SHA256SUMS + SHA256SUMS.sigstore.json   signed checksums of notes, archive,
+#                                           and SBOM
 # The release is created as a DRAFT, filled, verified, and only then
 # published. It is published without changing the Latest marker; a final,
 # globally serialised job points Latest at the highest verified stable release.
@@ -434,7 +437,7 @@ jobs:
             echo "::error::The SBOM does not match the digest reported by the checks job (expected '${EXPECTED_SBOM_DIGEST}', got '${sbom_digest}'). Refusing to sign."
             exit 1
           fi
-          (cd dist && sha256sum "${name}.tar.gz" "${name}.sbom.cdx.json" > SHA256SUMS)
+          (cd dist && sha256sum RELEASE_NOTES.md "${name}.tar.gz" "${name}.sbom.cdx.json" > SHA256SUMS)
 
       # cosign is pinned by version here; Dependabot bumps the installer
       # action but not this value, so bump `cosign-release` alongside it.
@@ -470,13 +473,16 @@ jobs:
           BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
         run: cp -- "$BUNDLE" "dist/cla-bot-${RELEASE_TAG}.sbom.intoto.jsonl"
 
-      # Signing SHA256SUMS covers the SBOM too; the archive is signed on its
-      # own so it verifies without the checksum file.
-      - name: Sign the archive and the checksums with cosign (keyless)
+      # Sign each payload independently, as well as the manifest that binds
+      # their exact bytes together. Signature and attestation bundles are
+      # verified as proofs and are not recursively signed.
+      - name: Sign every payload and the checksums with cosign (keyless)
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
           cosign sign-blob --yes --bundle "dist/${name}.tar.gz.sigstore.json" "dist/${name}.tar.gz"
+          cosign sign-blob --yes --bundle "dist/${name}.sbom.cdx.json.sigstore.json" "dist/${name}.sbom.cdx.json"
+          cosign sign-blob --yes --bundle dist/RELEASE_NOTES.md.sigstore.json dist/RELEASE_NOTES.md
           cosign sign-blob --yes --bundle "dist/SHA256SUMS.sigstore.json" dist/SHA256SUMS
 
       # Verify what was just produced, with the exact checks a consumer is
@@ -486,7 +492,7 @@ jobs:
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
           workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
-          for file in "${name}.tar.gz" SHA256SUMS; do
+          for file in RELEASE_NOTES.md "${name}.tar.gz" "${name}.sbom.cdx.json" SHA256SUMS; do
             cosign verify-blob \
               --bundle "dist/${file}.sigstore.json" \
               --certificate-identity "https://github.com/${workflow}@${GITHUB_REF}" \
@@ -512,7 +518,7 @@ jobs:
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
-          assets=(RELEASE_NOTES.md "${name}.tar.gz" "${name}.tar.gz.sigstore.json" "${name}.sbom.cdx.json" "${name}.provenance.intoto.jsonl" "${name}.sbom.intoto.jsonl" SHA256SUMS SHA256SUMS.sigstore.json)
+          assets=(RELEASE_NOTES.md RELEASE_NOTES.md.sigstore.json "${name}.tar.gz" "${name}.tar.gz.sigstore.json" "${name}.sbom.cdx.json" "${name}.sbom.cdx.json.sigstore.json" "${name}.provenance.intoto.jsonl" "${name}.sbom.intoto.jsonl" SHA256SUMS SHA256SUMS.sigstore.json)
           (cd dist && sha256sum "${assets[@]}" | sha256sum | awk '{print "digest=" $1}' >> "$GITHUB_OUTPUT")
 
       - name: Upload the verified signed release files
@@ -550,7 +556,7 @@ jobs:
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
-          assets=(RELEASE_NOTES.md "${name}.tar.gz" "${name}.tar.gz.sigstore.json" "${name}.sbom.cdx.json" "${name}.provenance.intoto.jsonl" "${name}.sbom.intoto.jsonl" SHA256SUMS SHA256SUMS.sigstore.json)
+          assets=(RELEASE_NOTES.md RELEASE_NOTES.md.sigstore.json "${name}.tar.gz" "${name}.tar.gz.sigstore.json" "${name}.sbom.cdx.json" "${name}.sbom.cdx.json.sigstore.json" "${name}.provenance.intoto.jsonl" "${name}.sbom.intoto.jsonl" SHA256SUMS SHA256SUMS.sigstore.json)
           count="$(find dist -maxdepth 1 -type f | wc -l)"
           unexpected="$(find dist -mindepth 1 ! -type f -print -quit)"
           if [ "$count" -ne "${#assets[@]}" ] || [ -n "$unexpected" ]; then
@@ -630,9 +636,12 @@ jobs:
               --verify-tag \
               --title "$RELEASE_TAG" \
               --notes-file dist/RELEASE_NOTES.md \
+              dist/RELEASE_NOTES.md \
+              dist/RELEASE_NOTES.md.sigstore.json \
               "dist/${name}.tar.gz" \
               "dist/${name}.tar.gz.sigstore.json" \
               "dist/${name}.sbom.cdx.json" \
+              "dist/${name}.sbom.cdx.json.sigstore.json" \
               "dist/${name}.provenance.intoto.jsonl" \
               "dist/${name}.sbom.intoto.jsonl" \
               dist/SHA256SUMS \
@@ -681,9 +690,12 @@ jobs:
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
           assets=(
+            RELEASE_NOTES.md
+            RELEASE_NOTES.md.sigstore.json
             "${name}.tar.gz"
             "${name}.tar.gz.sigstore.json"
             "${name}.sbom.cdx.json"
+            "${name}.sbom.cdx.json.sigstore.json"
             "${name}.provenance.intoto.jsonl"
             "${name}.sbom.intoto.jsonl"
             SHA256SUMS
@@ -763,9 +775,12 @@ jobs:
           # changes the snapshot and fails closed.
           name="cla-bot-${RELEASE_TAG}"
           assets=(
+            RELEASE_NOTES.md
+            RELEASE_NOTES.md.sigstore.json
             "${name}.tar.gz"
             "${name}.tar.gz.sigstore.json"
             "${name}.sbom.cdx.json"
+            "${name}.sbom.cdx.json.sigstore.json"
             "${name}.provenance.intoto.jsonl"
             "${name}.sbom.intoto.jsonl"
             SHA256SUMS
@@ -876,9 +891,12 @@ jobs:
           workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
           mkdir published
           assets=(
+            RELEASE_NOTES.md
+            RELEASE_NOTES.md.sigstore.json
             "${name}.tar.gz"
             "${name}.tar.gz.sigstore.json"
             "${name}.sbom.cdx.json"
+            "${name}.sbom.cdx.json.sigstore.json"
             "${name}.provenance.intoto.jsonl"
             "${name}.sbom.intoto.jsonl"
             SHA256SUMS
@@ -1116,9 +1134,12 @@ jobs:
 
           name="cla-bot-${highest_tag}"
           assets=(
+            RELEASE_NOTES.md
+            RELEASE_NOTES.md.sigstore.json
             "${name}.tar.gz"
             "${name}.tar.gz.sigstore.json"
             "${name}.sbom.cdx.json"
+            "${name}.sbom.cdx.json.sigstore.json"
             "${name}.provenance.intoto.jsonl"
             "${name}.sbom.intoto.jsonl"
             SHA256SUMS
@@ -1143,6 +1164,12 @@ jobs:
             gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
               --header 'Accept: application/octet-stream' > "latest-assets/${asset}"
           done
+          release_body="$(jq -r '.body // ""' <<< "$release_json" | tr -d '\r')"
+          signed_notes="$(tr -d '\r' < latest-assets/RELEASE_NOTES.md)"
+          if [ "$release_body" != "$signed_notes" ]; then
+            echo "::error::The public release body differs from its signed RELEASE_NOTES.md asset."
+            exit 1
+          fi
           entry_count="$(find latest-assets -mindepth 1 -maxdepth 1 | wc -l)"
           file_count="$(find latest-assets -mindepth 1 -maxdepth 1 -type f | wc -l)"
           if [ "$entry_count" -ne "${#assets[@]}" ] || [ "$file_count" -ne "${#assets[@]}" ]; then

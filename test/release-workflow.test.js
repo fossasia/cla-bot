@@ -152,9 +152,12 @@ const HAS_SHA256SUM = spawnSync("sha256sum", ["--version"]).status === 0;
 const releaseAssets = (tag = "v1.2.3") => {
   const name = `cla-bot-${tag}`;
   return [
+    "RELEASE_NOTES.md",
+    "RELEASE_NOTES.md.sigstore.json",
     `${name}.tar.gz`,
     `${name}.tar.gz.sigstore.json`,
     `${name}.sbom.cdx.json`,
+    `${name}.sbom.cdx.json.sigstore.json`,
     `${name}.provenance.intoto.jsonl`,
     `${name}.sbom.intoto.jsonl`,
     "SHA256SUMS",
@@ -187,9 +190,8 @@ const releasePayload = (
 function setupPublishDraft(dir, mutate = () => {}) {
   fs.mkdirSync(path.join(dir, "dist"));
   fs.mkdirSync(path.join(dir, "served"));
-  fs.writeFileSync(path.join(dir, "dist", "RELEASE_NOTES.md"), "notes\n");
   for (const asset of releaseAssets()) {
-    const bytes = `content of ${asset}\n`;
+    const bytes = asset === "RELEASE_NOTES.md" ? "notes\n" : `content of ${asset}\n`;
     fs.writeFileSync(path.join(dir, "dist", asset), bytes);
     fs.writeFileSync(path.join(dir, "served", asset), bytes);
   }
@@ -427,9 +429,12 @@ test("candidate selector tries releases in numeric SemVer order and skips an unv
 test("Latest revalidates the verified release fingerprint before promotion", () => {
   const step = wf.jobs.latest.steps[0];
   const assets = [
+    "RELEASE_NOTES.md",
+    "RELEASE_NOTES.md.sigstore.json",
     "cla-bot-v10.0.0.tar.gz",
     "cla-bot-v10.0.0.tar.gz.sigstore.json",
     "cla-bot-v10.0.0.sbom.cdx.json",
+    "cla-bot-v10.0.0.sbom.cdx.json.sigstore.json",
     "cla-bot-v10.0.0.provenance.intoto.jsonl",
     "cla-bot-v10.0.0.sbom.intoto.jsonl",
     "SHA256SUMS",
@@ -440,6 +445,7 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
     tag_name: "v10.0.0",
     draft: false,
     prerelease: false,
+    body: "verified:RELEASE_NOTES.md",
     assets: assets.map((name, index) => ({ id: 200 + index, name, state: "uploaded" })),
   });
   const gh = [
@@ -453,18 +459,22 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
     '  *"branches/main"*) printf "%s\\n" "$DEFAULT_SHA" ;;',
     '  *"compare/"*) printf "ahead\\n" ;;',
     ...assets.map((asset, index) =>
-      `  *"releases/assets/${200 + index} "*) cat "fake-assets/${asset}"${index === 0 ? ' ; [ "$TAMPER_ASSET" != yes ] || printf changed' : ""} ;;`,
+      `  *"releases/assets/${200 + index} "*) cat "fake-assets/${asset}"${index === 2 ? ' ; [ "$TAMPER_ASSET" != yes ] || printf changed' : ""} ;;`,
     ),
     '  *"--method PATCH"*) printf \'%s\\n\' "$VERIFIED_RELEASE_TAG" > fake-latest.txt ;;',
     '  *) exit 99 ;;',
     "esac",
   ].join("\n");
-  const contents = Object.fromEntries(assets.map((name) => [name, `verified:${name}\n`]));
+  const contents = Object.fromEntries(assets.map((name) => [name, name === "RELEASE_NOTES.md" ? "verified:RELEASE_NOTES.md\n" : `verified:${name}\n`]));
   const fingerprint = assets
     .map((name) => `${crypto.createHash("sha256").update(contents[name]).digest("hex")}  ${name}`)
     .join("\n") + "\n";
   const assetDigest = crypto.createHash("sha256").update(fingerprint).digest("hex");
-  const run = (currentLatest, highestPublicTag = "v10.0.0") =>
+  const run = (
+    currentLatest,
+    highestPublicTag = "v10.0.0",
+    publicBody = "verified:RELEASE_NOTES.md",
+  ) =>
     runStep(step, {
       gh,
       env: {
@@ -475,7 +485,7 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
         VERIFIED_COMMIT: "c".repeat(40),
         DEFAULT_BRANCH: "main",
         DEFAULT_SHA: "d".repeat(40),
-        FAKE_RELEASE_JSON: releaseJson,
+        FAKE_RELEASE_JSON: JSON.stringify({ ...JSON.parse(releaseJson), body: publicBody }),
       },
       setup: (dir) => {
         fs.mkdirSync(path.join(dir, "fake-assets"));
@@ -513,6 +523,11 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
   assert.strictEqual(firstRelease.status, 0, firstRelease.output);
   assert.strictEqual(firstRelease.extra, "v10.0.0");
   assert.ok(firstRelease.calls.some((call) => call.includes("releases/10 -f make_latest=true")));
+
+  const changedBody = run("v10.0.0", "v10.0.0", "untrusted edited release body");
+  assert.notStrictEqual(changedBody.status, 0);
+  assert.match(changedBody.output, /public release body differs from its signed RELEASE_NOTES.md asset/);
+  assert.ok(!changedBody.calls.some((call) => call.includes("--method PATCH")));
 
   const changedAssets = runStep(step, {
     gh,
@@ -735,7 +750,7 @@ test("sign verifies BOTH producer job-output digests and rejects stray files bef
   );
   assert.match(
     step.run,
-    /sha256sum "\$\{name\}\.tar\.gz" "\$\{name\}\.sbom\.cdx\.json" > SHA256SUMS/,
+    /sha256sum RELEASE_NOTES\.md "\$\{name\}\.tar\.gz" "\$\{name\}\.sbom\.cdx\.json" > SHA256SUMS/,
   );
 });
 
@@ -1123,7 +1138,7 @@ test("post-publish verification downloads assets only by the retained release an
       setupPublishDraft(dir);
       const checksum = spawnSync(
         "sha256sum",
-        ["cla-bot-v1.2.3.tar.gz", "cla-bot-v1.2.3.sbom.cdx.json"],
+        ["RELEASE_NOTES.md", "cla-bot-v1.2.3.tar.gz", "cla-bot-v1.2.3.sbom.cdx.json"],
         { cwd: path.join(dir, "dist"), encoding: "utf8" },
       );
       assert.strictEqual(checksum.status, 0, checksum.stderr);
@@ -1134,7 +1149,7 @@ test("post-publish verification downloads assets only by the retained release an
   });
   assert.strictEqual(result.status, 0, `${result.output}\n${result.calls.join("\n")}`);
   assert.ok(result.calls.includes("api repos/fossasia/cla-bot/releases/123"));
-  for (let assetId = 100; assetId < 107; assetId += 1) {
+  for (let assetId = 100; assetId < 110; assetId += 1) {
     assert.ok(
       result.calls.some((call) => call.startsWith(`api repos/fossasia/cla-bot/releases/assets/${assetId} `)),
       `downloads asset ID ${assetId}`,
@@ -1490,7 +1505,7 @@ function runDraftCheck(
   mutate,
   {
     meta = "123 v1.2.3 v1.2.3 true false",
-    body = "notes, never uploaded",
+    body = "signed release notes",
     apiAssets = releaseAssets(),
   } = {},
 ) {
@@ -1498,9 +1513,12 @@ function runDraftCheck(
   try {
     const name = "cla-bot-v1.2.3";
     const assets = [
+      "RELEASE_NOTES.md",
+      "RELEASE_NOTES.md.sigstore.json",
       `${name}.tar.gz`,
       `${name}.tar.gz.sigstore.json`,
       `${name}.sbom.cdx.json`,
+      `${name}.sbom.cdx.json.sigstore.json`,
       `${name}.provenance.intoto.jsonl`,
       `${name}.sbom.intoto.jsonl`,
       "SHA256SUMS",
@@ -1509,16 +1527,13 @@ function runDraftCheck(
     fs.mkdirSync(path.join(dir, "dist"));
     fs.mkdirSync(path.join(dir, "served"));
     for (const asset of assets) {
-      fs.writeFileSync(path.join(dir, "dist", asset), `content of ${asset}\n`);
+      const bytes = asset === "RELEASE_NOTES.md" ? "signed release notes\n" : `content of ${asset}\n`;
+      fs.writeFileSync(path.join(dir, "dist", asset), bytes);
       fs.writeFileSync(
         path.join(dir, "served", asset),
-        `content of ${asset}\n`,
+        bytes,
       );
     }
-    fs.writeFileSync(
-      path.join(dir, "dist", "RELEASE_NOTES.md"),
-      "notes, never uploaded\n",
-    );
     mutate({ served: path.join(dir, "served"), name });
     fs.mkdirSync(path.join(dir, "bin"));
     fs.writeFileSync(
@@ -1573,7 +1588,22 @@ test("draft check (real shell, fake gh): a changed byte, a swapped, missing or e
         fs.writeFileSync(
           path.join(served, `${name}.tar.gz.sigstore.json`),
           "forged",
-        ),
+      ),
+    ],
+    [
+      "signed release notes altered",
+      ({ served }) =>
+        fs.appendFileSync(path.join(served, "RELEASE_NOTES.md"), "tampered\n"),
+    ],
+    [
+      "release notes signature bundle replaced",
+      ({ served }) =>
+        fs.writeFileSync(path.join(served, "RELEASE_NOTES.md.sigstore.json"), "forged"),
+    ],
+    [
+      "SBOM signature bundle replaced",
+      ({ served, name }) =>
+        fs.writeFileSync(path.join(served, `${name}.sbom.cdx.json.sigstore.json`), "forged"),
     ],
     [
       "SHA256SUMS replaced",
@@ -1584,6 +1614,11 @@ test("draft check (real shell, fake gh): a changed byte, a swapped, missing or e
       "asset missing",
       ({ served }) => fs.rmSync(path.join(served, "SHA256SUMS.sigstore.json")),
       { apiAssets: releaseAssets().filter((asset) => asset !== "SHA256SUMS.sigstore.json") },
+    ],
+    [
+      "signed notes asset missing",
+      ({ served }) => fs.rmSync(path.join(served, "RELEASE_NOTES.md")),
+      { apiAssets: releaseAssets().filter((asset) => asset !== "RELEASE_NOTES.md") },
     ],
     [
       "extra asset added",
@@ -1619,7 +1654,7 @@ test("draft check (real shell, fake gh): changed title, tag, draft/pre-release f
     ["notes replaced", { body: "totally different notes" }],
     [
       "notes with text appended",
-      { body: "notes, never uploaded\nplus a malicious link" },
+      { body: "signed release notes\nplus a malicious link" },
     ],
     ["empty notes", { body: "" }],
   ]) {
@@ -1631,9 +1666,9 @@ test("draft check (real shell, fake gh): changed title, tag, draft/pre-release f
 
 test("draft check (real shell, fake gh): harmless storage differences in the notes (CRLF, trailing newlines) do not cause false alarms", () => {
   for (const body of [
-    "notes, never uploaded\r",
-    "notes, never uploaded\r\n\r\n",
-    "notes, never uploaded\n\n\n",
+    "signed release notes\r",
+    "signed release notes\r\n\r\n",
+    "signed release notes\n\n\n",
   ]) {
     const result = runDraftCheck(() => {}, { body });
     assert.strictEqual(
@@ -1652,10 +1687,10 @@ test("the draft check compares the same asset set that is uploaded", () => {
   ].map((m) => m[1]);
   const listed = [
     ...draftStep.run.matchAll(
-      /^\s+"?(\$\{name\}[^"\s]*|SHA256SUMS[^"\s]*)"?$/gm,
+      /^\s+"?(RELEASE_NOTES\.md(?:\.sigstore\.json)?|\$\{name\}[^"\s]*|SHA256SUMS[^"\s]*)"?$/gm,
     ),
   ].map((m) => m[1]);
-  assert.strictEqual(uploaded.length, 7);
+  assert.strictEqual(uploaded.length, 10);
   assert.deepStrictEqual([...listed].sort(), [...uploaded].sort());
 });
 
@@ -1880,7 +1915,8 @@ test("mutable releases are the reviewed policy in preflight, publish, Latest and
   assert.strictEqual(verifyLatest.env.RELEASE_IMMUTABILITY, "not-required");
   assert.match(read("CONTRIBUTING.md"), /Mutability is intentionally `not-required`/);
   assert.match(read("SECURITY.md"), /reviewed `not-required` policy does not fail for mutable releases/);
-  assert.match(read("SECURITY.md"), /release notes and mutable metadata are not covered by/);
+  assert.match(read("SECURITY.md"), /Release notes, the source archive and the SBOM\s+each have a direct Cosign signature/);
+  assert.match(read("SECURITY.md"), /Mutable metadata such as the title\s+is not signed/);
 });
 
 test("release setup documentation describes the exact environment policy the workflow enforces", () => {
@@ -2304,11 +2340,11 @@ function runDigestStep({ tamper = () => {}, expected = {} } = {}) {
   });
   return {
     ...result,
-    expectedSums: `${sha256hex(archive)}  ${DIGEST_NAME}.tar.gz\n${sha256hex(sbom)}  ${DIGEST_NAME}.sbom.cdx.json\n`,
+    expectedSums: `${sha256hex(notes)}  RELEASE_NOTES.md\n${sha256hex(archive)}  ${DIGEST_NAME}.tar.gz\n${sha256hex(sbom)}  ${DIGEST_NAME}.sbom.cdx.json\n`,
   };
 }
 
-test("digest step (real shell): untouched files pass and SHA256SUMS is written over exactly the archive and the SBOM", () => {
+test("digest step (real shell): untouched files pass and SHA256SUMS covers notes, archive, and SBOM", () => {
   if (!HAS_SHA256SUM)
     return console.log("  (skipped: sha256sum not available on this machine)");
   const r = runDigestStep();
@@ -2394,9 +2430,11 @@ test("digest step (real shell): any altered, missing, extra or mismatching file 
 
 const SIGNED_ARTIFACT_FILES = [
   "RELEASE_NOTES.md",
+  "RELEASE_NOTES.md.sigstore.json",
   `${DIGEST_NAME}.tar.gz`,
   `${DIGEST_NAME}.tar.gz.sigstore.json`,
   `${DIGEST_NAME}.sbom.cdx.json`,
+  `${DIGEST_NAME}.sbom.cdx.json.sigstore.json`,
   `${DIGEST_NAME}.provenance.intoto.jsonl`,
   `${DIGEST_NAME}.sbom.intoto.jsonl`,
   "SHA256SUMS",
@@ -2458,6 +2496,7 @@ const ASSET_SUFFIXES = [
   ".tar.gz",
   ".tar.gz.sigstore.json",
   ".sbom.cdx.json",
+  ".sbom.cdx.json.sigstore.json",
   ".provenance.intoto.jsonl",
   ".sbom.intoto.jsonl",
 ];
@@ -2471,6 +2510,8 @@ test("the assets uploaded are exactly the documented set, and include what Score
   assert.deepStrictEqual(
     uploaded.sort(),
     [
+      "dist/RELEASE_NOTES.md",
+      "dist/RELEASE_NOTES.md.sigstore.json",
       // "${name}" is the shell variable the step defines: cla-bot-${RELEASE_TAG}
       ...ASSET_SUFFIXES.map((suffix) => "dist/${name}" + suffix),
       "dist/SHA256SUMS",
@@ -2479,6 +2520,23 @@ test("the assets uploaded are exactly the documented set, and include what Score
   );
   assert.ok(uploaded.some((f) => f.endsWith(".sigstore.json")));
   assert.ok(uploaded.some((f) => f.endsWith(".intoto.jsonl")));
+  const signScript = runText(sign.steps);
+  for (const payload of [
+    "RELEASE_NOTES.md",
+    "${name}.tar.gz",
+    "${name}.sbom.cdx.json",
+    "SHA256SUMS",
+  ]) {
+    assert.match(signScript, new RegExp(`cosign sign-blob[^\\n]*${escapeRegExp(payload)}`));
+  }
+  for (const payload of [
+    "RELEASE_NOTES.md",
+    "${name}.tar.gz",
+    "${name}.sbom.cdx.json",
+    "SHA256SUMS",
+  ]) {
+    assert.match(signScript, new RegExp(`cosign verify-blob[\\s\\S]*?${escapeRegExp(payload)}`));
+  }
 });
 
 test("SECURITY.md documents every released asset and the commands that verify them", () => {
@@ -2486,6 +2544,9 @@ test("SECURITY.md documents every released asset and the commands that verify th
   assert.match(security, /^## Verifying a release$/m);
   for (const suffix of [
     ...ASSET_SUFFIXES,
+    "RELEASE_NOTES.md",
+    "RELEASE_NOTES.md.sigstore.json",
+    "cla-bot-<tag>.sbom.cdx.json.sigstore.json",
     "SHA256SUMS",
     "SHA256SUMS.sigstore.json",
   ]) {
@@ -2502,6 +2563,9 @@ test("SECURITY.md documents every released asset and the commands that verify th
     ".github/workflows/release.yml",
     "https://token.actions.githubusercontent.com",
     "gh release verify",
+    "covers those three payloads",
+    "release body differs from the signed RELEASE_NOTES.md asset",
+    "cla-bot-<tag>.sbom.cdx.json.sigstore.json",
   ]) {
     assert.ok(security.includes(needle), `SECURITY.md is missing: ${needle}`);
   }
@@ -2510,6 +2574,8 @@ test("SECURITY.md documents every released asset and the commands that verify th
 test("the release notes footer link points at an anchor that exists in SECURITY.md", () => {
   const script = read(".github", "scripts", "release-check.js");
   assert.match(script, /SECURITY\.md#verifying-a-release/);
+  assert.match(script, /Release payloads are individually signed or attested/);
+  assert.doesNotMatch(script, /Every asset is signed/);
   assert.match(read("SECURITY.md"), /^## Verifying a release$/m);
 });
 
@@ -2520,6 +2586,8 @@ test("CONTRIBUTING.md documents the release procedure, the one-time setup and fa
     "git push origin vX.Y.Z",
     "Immutable releases",
     "`release` environment",
+    "RELEASE_NOTES.md",
+    "SHA256SUMS` manifest covering all",
     "If a release run fails",
   ]) {
     assert.ok(
