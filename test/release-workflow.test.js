@@ -192,6 +192,26 @@ const releaseAssets = (tag = "v1.2.3") => {
     "SHA256SUMS.sigstore.json",
   ];
 };
+const releasePayload = (
+  meta = "123 v1.2.3 v1.2.3 true false",
+  body = "notes",
+  assets = releaseAssets(),
+) => {
+  const [id, tag_name, name, draft, prerelease] = meta.split(" ");
+  return JSON.stringify({
+    id: Number(id),
+    tag_name,
+    name,
+    draft: draft === "true",
+    prerelease: prerelease === "true",
+    body,
+    assets: assets.map((asset, index) => ({
+      id: 100 + index,
+      name: asset,
+      state: "uploaded",
+    })),
+  });
+};
 function setupPublishDraft(dir, mutate = () => {}) {
   fs.mkdirSync(path.join(dir, "dist"));
   fs.mkdirSync(path.join(dir, "served"));
@@ -205,13 +225,20 @@ function setupPublishDraft(dir, mutate = () => {}) {
 }
 const publishTagGh = (
   answer,
-  { meta = "123 v1.2.3 v1.2.3 true false", body = "notes" } = {},
+  {
+    meta = "123 v1.2.3 v1.2.3 true false",
+    body = "notes",
+    assets = releaseAssets(),
+  } = {},
 ) =>
   [
     'case "$*" in',
     '  *"releases/123"*)',
-    `    case "$*" in *"--jq .body"*) printf '%s\\n' '${body}' ;; *) printf '%s\\n' '${meta}' ;; esac ;;`,
-    '  *"release download"*) cp "$FAKE_DRAFT_DIR"/* "$5"/ ;;',
+    `    printf '%s\\n' '${releasePayload(meta, body, assets)}' ;;`,
+    '  *"release download"*) printf \'wrong release 999\' > "$5/wrong-release-999" ;;',
+    ...assets.map((asset, index) =>
+      `  *"releases/assets/${100 + index} "*) cat "$FAKE_DRAFT_DIR/${asset}" 2>/dev/null || : ;;`,
+    ),
     `  *"git/ref/tags/"*) printf '%s\\n' '${answer}' ;;`,
     '  *"--method PATCH"*) exit 0 ;;',
     '  *) exit 99 ;;',
@@ -300,16 +327,15 @@ test("published release verification fails closed on changed metadata or notes",
   const step = publish.steps[stepNamed(publish.steps, PUBLISHED_CHECK)];
   const gh = [
     'case "$*" in',
-    '  *"--json name,tagName,isDraft,isPrerelease"*) printf "%s\\n" "$FAKE_META" ;;',
-    '  *"--json body"*) printf "%s\\n" "$FAKE_BODY" ;;',
+    '  *"releases/123"*) printf "%s\\n" "$FAKE_RELEASE_JSON" ;;',
     '  *) exit 99 ;;',
     "esac",
   ].join("\n");
   const metadata = runStep(step, {
     gh,
     env: {
-      FAKE_META: "v1.2.3 v1.2.3 true false",
-      FAKE_BODY: "notes",
+      EXPECTED_RELEASE_ID: "123",
+      FAKE_RELEASE_JSON: releasePayload("123 v1.2.3 v1.2.3 true false", "notes"),
     },
   });
   assert.notStrictEqual(metadata.status, 0);
@@ -319,8 +345,8 @@ test("published release verification fails closed on changed metadata or notes",
   const notes = runStep(step, {
     gh,
     env: {
-      FAKE_META: "v1.2.3 v1.2.3 false false",
-      FAKE_BODY: "altered notes",
+      EXPECTED_RELEASE_ID: "123",
+      FAKE_RELEASE_JSON: releasePayload("123 v1.2.3 v1.2.3 false false", "altered notes"),
     },
     setup: (dir) => {
       fs.mkdirSync(path.join(dir, "dist"));
@@ -329,7 +355,7 @@ test("published release verification fails closed on changed metadata or notes",
   });
   assert.notStrictEqual(notes.status, 0);
   assert.match(notes.output, /release notes differ from the verified notes/);
-  assert.strictEqual(notes.calls.length, 2, "must stop before touching assets");
+  assert.strictEqual(notes.calls.length, 1, "must stop before touching assets");
 });
 
 test("the tag-filter matcher escapes everything and rejects syntax it does not model", () => {
@@ -389,6 +415,9 @@ test("candidate verification is read-only, checks published releases after a pub
   assert.match(runText(verifyLatest.steps), /verify-release-candidate\.sh/);
   assert.match(runText(verifyLatest.steps), /sort_by\(.tag_name \| semver_key\) \| reverse/);
   const verifier = read(".github", "scripts", "verify-release-candidate.sh");
+  assert.match(verifier, /releases\/\$\{RELEASE_ID\}/);
+  assert.match(verifier, /releases\/assets\/\$\{asset_id\}/);
+  assert.doesNotMatch(verifier, /gh release download "\$RELEASE_TAG"/);
   assert.match(verifier, /verified-asset-digest=%s/);
   assert.match(verifier, /verified-tag-object=%s/);
   assert.match(verifier, /verified-commit=%s/);
@@ -427,7 +456,7 @@ test("candidate selector tries releases in numeric SemVer order and skips an unv
       fs.mkdirSync(helper, { recursive: true });
       fs.writeFileSync(
         path.join(helper, "verify-release-candidate.sh"),
-        '#!/bin/bash\necho "$RELEASE_TAG" >> attempts.log\n[ "$RELEASE_TAG" != v999.0.0 ] || exit 1\nprintf "verified-asset-digest=%064d\\nverified-tag-object=%040d\\nverified-commit=%040d\\n" 0 0 0 >> "$GITHUB_OUTPUT"\n',
+        '#!/bin/bash\necho "$RELEASE_ID:$RELEASE_TAG" >> attempts.log\n[ "$RELEASE_TAG" != v999.0.0 ] || exit 1\nprintf "verified-asset-digest=%064d\\nverified-tag-object=%040d\\nverified-commit=%040d\\n" 0 0 0 >> "$GITHUB_OUTPUT"\n',
         { mode: 0o755 },
       );
     },
@@ -436,27 +465,13 @@ test("candidate selector tries releases in numeric SemVer order and skips an unv
       : [],
   });
   assert.strictEqual(result.status, 0, result.output);
-  assert.deepStrictEqual(result.extra, ["v999.0.0", "v10.0.0"]);
+  assert.deepStrictEqual(result.extra, ["99:v999.0.0", "10:v10.0.0"]);
   assert.match(result.githubOutput, /release-id=10/);
   assert.match(result.githubOutput, /release-tag=v10\.0\.0/);
 });
 
 test("Latest revalidates the verified release fingerprint before promotion", () => {
   const step = wf.jobs.latest.steps[0];
-  const gh = [
-    'case "$*" in',
-    '  *"releases/tags/v10.0.0"*) printf "10 v10.0.0 false false\\n" ;;',
-    '  *"--paginate --slurp"*) cat public-releases.json ;;',
-    '  *"git/ref/tags/v10.0.0"*) printf "tag %s\\n" "$VERIFIED_TAG_OBJECT" ;;',
-    '  *"git/tags/"*) printf "commit %s\\n" "$VERIFIED_COMMIT" ;;',
-    '  *"branches/main"*) printf "%s\\n" "$DEFAULT_SHA" ;;',
-    '  *"compare/"*) printf "ahead\\n" ;;',
-    '  *"release download"*) cp fake-assets/* latest-assets/ ;;',
-    '  *"releases/latest"*) if [ -s fake-latest.txt ]; then cat fake-latest.txt; else exit 1; fi ;;',
-    '  *"--method PATCH"*) printf \'%s\\n\' "$VERIFIED_RELEASE_TAG" > fake-latest.txt ;;',
-    '  *) exit 99 ;;',
-    "esac",
-  ].join("\n");
   const assets = [
     "cla-bot-v10.0.0.tar.gz",
     "cla-bot-v10.0.0.tar.gz.sigstore.json",
@@ -466,6 +481,30 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
     "SHA256SUMS",
     "SHA256SUMS.sigstore.json",
   ];
+  const releaseJson = JSON.stringify({
+    id: 10,
+    tag_name: "v10.0.0",
+    draft: false,
+    prerelease: false,
+    assets: assets.map((name, index) => ({ id: 200 + index, name, state: "uploaded" })),
+  });
+  const gh = [
+    'case "$*" in',
+    '  *"releases/latest"*) if [ -s fake-latest.txt ]; then cat fake-latest.txt; else exit 1; fi ;;',
+    '  *"releases/10") printf \'%s\\n\' "$FAKE_RELEASE_JSON" ;;',
+    '  *"release download"*) printf \'wrong release 999\' > "$5/wrong-release-999" ;;',
+    '  *"--paginate --slurp"*) cat public-releases.json ;;',
+    '  *"git/ref/tags/v10.0.0"*) printf "tag %s\\n" "$VERIFIED_TAG_OBJECT" ;;',
+    '  *"git/tags/"*) printf "commit %s\\n" "$VERIFIED_COMMIT" ;;',
+    '  *"branches/main"*) printf "%s\\n" "$DEFAULT_SHA" ;;',
+    '  *"compare/"*) printf "ahead\\n" ;;',
+    ...assets.map((asset, index) =>
+      `  *"releases/assets/${200 + index} "*) cat "fake-assets/${asset}"${index === 0 ? ' ; [ "$TAMPER_ASSET" != yes ] || printf changed' : ""} ;;`,
+    ),
+    '  *"--method PATCH"*) printf \'%s\\n\' "$VERIFIED_RELEASE_TAG" > fake-latest.txt ;;',
+    '  *) exit 99 ;;',
+    "esac",
+  ].join("\n");
   const contents = Object.fromEntries(assets.map((name) => [name, `verified:${name}\n`]));
   const fingerprint = assets
     .map((name) => `${crypto.createHash("sha256").update(contents[name]).digest("hex")}  ${name}`)
@@ -482,6 +521,7 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
         VERIFIED_COMMIT: "c".repeat(40),
         DEFAULT_BRANCH: "main",
         DEFAULT_SHA: "d".repeat(40),
+        FAKE_RELEASE_JSON: releaseJson,
       },
       setup: (dir) => {
         fs.mkdirSync(path.join(dir, "fake-assets"));
@@ -502,6 +542,11 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
   assert.strictEqual(backfill.status, 0, backfill.output);
   assert.strictEqual(backfill.extra, "v10.0.0");
   assert.ok(backfill.calls.some((call) => call.includes("releases/10 -f make_latest=true")));
+  assert.ok(backfill.calls.includes("api repos/fossasia/cla-bot/releases/10"));
+  assert.ok(
+    !backfill.calls.some((call) => /release (view|download)|releases\/tags\//.test(call)),
+    "Latest reconciliation keeps metadata and assets bound to release ID 10",
+  );
 
   const alreadyCorrect = run("v10.0.0");
   assert.strictEqual(alreadyCorrect.status, 0, alreadyCorrect.output);
@@ -516,7 +561,7 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
   assert.ok(firstRelease.calls.some((call) => call.includes("releases/10 -f make_latest=true")));
 
   const changedAssets = runStep(step, {
-    gh: gh.replace('cp fake-assets/* latest-assets/', 'cp fake-assets/* latest-assets/\nprintf changed >> latest-assets/cla-bot-v10.0.0.tar.gz'),
+    gh,
     env: {
       VERIFIED_RELEASE_ID: "10",
       VERIFIED_RELEASE_TAG: "v10.0.0",
@@ -525,6 +570,8 @@ test("Latest revalidates the verified release fingerprint before promotion", () 
       VERIFIED_COMMIT: "c".repeat(40),
       DEFAULT_BRANCH: "main",
       DEFAULT_SHA: "d".repeat(40),
+      FAKE_RELEASE_JSON: releaseJson,
+      TAMPER_ASSET: "yes",
     },
     setup: (dir) => {
       fs.mkdirSync(path.join(dir, "fake-assets"));
@@ -1040,7 +1087,7 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   const checkAt = script.indexOf("git/ref/tags/");
   const compareAt = script.indexOf('if [ -z "$EXPECTED_TAG_OBJECT"');
   const editAt = script.indexOf("gh api --method PATCH");
-  const finalAssetsAt = script.indexOf('gh release download "$RELEASE_TAG" --dir final-draft');
+  const finalAssetsAt = script.indexOf('releases/assets/${asset_id}');
   const finalCompareAt = script.indexOf('cmp -s -- "dist/${asset}" "final-draft/${asset}"');
   assert.ok(
     checkAt >= 0 && checkAt < compareAt && compareAt < editAt,
@@ -1071,7 +1118,9 @@ test("after publishing, the tag is checked once more and the release is called c
 test("post-publish verification compares the exact expected asset set and every asset byte for byte", () => {
   const finalStep =
     publish.steps[stepNamed(publish.steps, PUBLISHED_CHECK)].run;
-  assert.match(finalStep, /gh release download "\$RELEASE_TAG" --dir published/);
+  assert.match(finalStep, /releases\/assets\/\$\{asset_id\}/);
+  assert.match(finalStep, /EXPECTED_RELEASE_ID/);
+  assert.doesNotMatch(finalStep, /gh release (view|download) "\$RELEASE_TAG"/);
   assert.match(finalStep, /find published -maxdepth 1 -type f/);
   assert.match(finalStep, /Published release has \$\{count\} assets/);
   assert.match(finalStep, /for asset in "\$\{assets\[@\]\}"/);
@@ -1079,6 +1128,57 @@ test("post-publish verification compares the exact expected asset set and every 
   assert.ok(
     finalStep.indexOf("cmp -s") < finalStep.indexOf("sha256sum --check"),
     "all files must match before checksum/signature validation proceeds",
+  );
+});
+
+test("post-publish verification downloads assets only by the retained release and asset IDs", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISHED_CHECK)];
+  const gh = [
+    'case "$*" in',
+    '  *"releases/123"*) printf \'%s\\n\' "$FAKE_RELEASE_JSON" ;;',
+    '  *"release download"*) printf \'wrong release 999\' > "$5/wrong-release-999" ;;',
+    ...releaseAssets().map((asset, index) =>
+      `  *"releases/assets/${100 + index} "*) cat "$FAKE_DRAFT_DIR/${asset}" 2>/dev/null || : ;;`,
+    ),
+    '  *"git/ref/tags/"*) printf \'%s\\n\' "tag $EXPECTED_TAG_OBJECT" ;;',
+    '  "attestation verify"*) exit 0 ;;',
+    '  *) exit 99 ;;',
+    "esac",
+  ].join("\n");
+  const result = runStep(step, {
+    gh,
+    env: {
+      EXPECTED_RELEASE_ID: "123",
+      EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+      FAKE_RELEASE_JSON: releasePayload("123 v1.2.3 v1.2.3 false false", "notes"),
+      FAKE_DRAFT_DIR: "served",
+      GITHUB_REF: "refs/tags/v1.2.3",
+      GITHUB_SHA: "0123456789abcdef0123456789abcdef01234567",
+    },
+    setup: (dir) => {
+      setupPublishDraft(dir);
+      const checksum = spawnSync(
+        "sha256sum",
+        ["cla-bot-v1.2.3.tar.gz", "cla-bot-v1.2.3.sbom.cdx.json"],
+        { cwd: path.join(dir, "dist"), encoding: "utf8" },
+      );
+      assert.strictEqual(checksum.status, 0, checksum.stderr);
+      for (const destination of ["dist", "served"]) {
+        fs.writeFileSync(path.join(dir, destination, "SHA256SUMS"), checksum.stdout);
+      }
+    },
+  });
+  assert.strictEqual(result.status, 0, `${result.output}\n${result.calls.join("\n")}`);
+  assert.ok(result.calls.includes("api repos/fossasia/cla-bot/releases/123"));
+  for (let assetId = 100; assetId < 107; assetId += 1) {
+    assert.ok(
+      result.calls.some((call) => call.startsWith(`api repos/fossasia/cla-bot/releases/assets/${assetId} `)),
+      `downloads asset ID ${assetId}`,
+    );
+  }
+  assert.ok(
+    !result.calls.some((call) => /release (view|download)|releases\/tags\//.test(call)),
+    "verification never resolves an asset or release again by tag",
   );
 });
 
@@ -1196,6 +1296,7 @@ test("final publish step rechecks the draft bytes and metadata after the earlier
     }],
     ["extra asset", {
       mutate: (served) => fs.writeFileSync(path.join(served, "unexpected.txt"), "extra"),
+      assets: [...releaseAssets(), "unexpected.txt"],
     }],
     ["metadata changed", {
       meta: "123 v1.2.3 v1.2.3 false false",
@@ -1206,6 +1307,7 @@ test("final publish step rechecks the draft bytes and metadata after the earlier
       gh: publishTagGh(`tag ${SHA_VERIFIED}`, {
         ...(options.meta ? { meta: options.meta } : {}),
         ...(options.body ? { body: options.body } : {}),
+        ...(options.assets ? { assets: options.assets } : {}),
       }),
       env: {
         EXPECTED_TAG_OBJECT: SHA_VERIFIED,
@@ -1226,7 +1328,11 @@ test("final publish step rechecks the draft bytes and metadata after the earlier
 const draftStep = publish.steps[stepNamed(publish.steps, DRAFT_CHECK)];
 function runDraftCheck(
   mutate,
-  { meta = "123 v1.2.3 v1.2.3 true false", body = "notes, never uploaded" } = {},
+  {
+    meta = "123 v1.2.3 v1.2.3 true false",
+    body = "notes, never uploaded",
+    apiAssets = releaseAssets(),
+  } = {},
 ) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "draft-check-"));
   try {
@@ -1259,13 +1365,12 @@ function runDraftCheck(
       path.join(dir, "bin", "gh"),
       [
         "#!/bin/sh",
-        'case "$1 $2" in',
-        '  "release download") cp "$FAKE_DRAFT_DIR"/* "$5"/ ;;  # gh release download <tag> --dir <dir>',
-        '  "api "*)',
-        '    case "$*" in',
-        '      *"--jq .body"*) printf \'%s\\n\' "$FAKE_BODY" ;;',
-        "      *) printf '%s\\n' \"$FAKE_META\" ;;",
-        "    esac ;;",
+        'case "$*" in',
+        '  *"releases/123"*) printf \'%s\\n\' "$FAKE_RELEASE_JSON" ;;',
+        '  *"release download"*) printf \'wrong release 999\' > "$5/wrong-release-999" ;;',
+        ...assets.map((asset, index) =>
+          `  *"releases/assets/${100 + index} "*) cat "$FAKE_DRAFT_DIR/${asset}" 2>/dev/null || : ;;`,
+        ),
         "  *) exit 9 ;;",
         "esac",
         "",
@@ -1280,8 +1385,7 @@ function runDraftCheck(
         FAKE_DRAFT_DIR: path.join(dir, "served"),
         EXPECTED_RELEASE_ID: "123",
         GITHUB_REPOSITORY: "fossasia/cla-bot",
-        FAKE_META: meta,
-        FAKE_BODY: body,
+        FAKE_RELEASE_JSON: releasePayload(meta, body, apiAssets),
       },
       encoding: "utf8",
     });
@@ -1319,11 +1423,13 @@ test("draft check (real shell, fake gh): a changed byte, a swapped, missing or e
     [
       "asset missing",
       ({ served }) => fs.rmSync(path.join(served, "SHA256SUMS.sigstore.json")),
+      { apiAssets: releaseAssets().filter((asset) => asset !== "SHA256SUMS.sigstore.json") },
     ],
     [
       "extra asset added",
       ({ served }) =>
         fs.writeFileSync(path.join(served, "backdoor.sh"), "#!/bin/sh"),
+      { apiAssets: [...releaseAssets(), "backdoor.sh"] },
     ],
     [
       "asset swapped for another name",
@@ -1335,8 +1441,8 @@ test("draft check (real shell, fake gh): a changed byte, a swapped, missing or e
       },
     ],
   ];
-  for (const [label, mutate] of cases) {
-    const result = runDraftCheck(mutate);
+  for (const [label, mutate, options] of cases) {
+    const result = runDraftCheck(mutate, options);
     assert.notStrictEqual(result.status, 0, label);
     assert.match(result.output, /Refusing to publish/, label);
   }
@@ -1348,7 +1454,7 @@ test("draft check (real shell, fake gh): changed title, tag, draft/pre-release f
     ["tag changed", { meta: "123 v1.2.3 v9.9.9 true false" }],
     ["no longer a draft", { meta: "123 v1.2.3 v1.2.3 false false" }],
     ["marked as a pre-release", { meta: "123 v1.2.3 v1.2.3 true true" }],
-    ["extra metadata field", { meta: "123 v1.2.3 v1.2.3 true false extra" }],
+    ["invalid release ID", { meta: "not-a-number v1.2.3 v1.2.3 true false" }],
     ["empty metadata", { meta: "" }],
     ["notes replaced", { body: "totally different notes" }],
     [
@@ -1400,6 +1506,7 @@ test("the immutability requirement is its own final step; the published-release 
   assert.ok(published < immutable);
   assert.ok(!/gh release verify/.test(publish.steps[published].run));
   assert.deepStrictEqual(publish.steps[immutable].env, {
+    EXPECTED_RELEASE_ID: "${{ steps.draft.outputs.release-id }}",
     RELEASE_IMMUTABILITY: "not-required",
   });
   // The ONLY failure that is turned into a message is the informational lookup
@@ -1410,7 +1517,7 @@ test("the immutability requirement is its own final step; the published-release 
   );
   assert.match(
     publish.steps[immutable].run,
-    /not-required\)\s+state="\$\(gh release view .*\|\| echo unknown\)"/,
+    /not-required\)\s+state="\$\(gh api .*releases\/\$\{EXPECTED_RELEASE_ID\}.*\|\| echo unknown\)"/,
   );
 });
 
@@ -1418,7 +1525,7 @@ test("the immutability check uses the release's own `isImmutable` flag AND GitHu
   const script = publish.steps[stepNamed(publish.steps, IMMUTABLE_CHECK)].run;
   assert.match(
     script,
-    /gh release view "\$RELEASE_TAG" --json isImmutable --jq \.isImmutable/,
+    /gh api "repos\/\$\{GITHUB_REPOSITORY\}\/releases\/\$\{EXPECTED_RELEASE_ID\}" --jq \.immutable/,
   );
   assert.match(
     script,
@@ -1430,14 +1537,15 @@ test("the immutability check uses the release's own `isImmutable` flag AND GitHu
   assert.match(script, /sleep "\$\{RETRY_DELAY:-10\}"/);
 });
 
-// A fake `gh` for the immutability step. `view` answers FAKE_IMMUTABLE (or fails);
-// `verify` fails its first FAKE_VERIFY_FAILS calls, counting in ./counter.
+// A fake `gh` for the immutability step. The release-ID API read answers
+// FAKE_IMMUTABLE (or fails); `verify` fails its first FAKE_VERIFY_FAILS calls,
+// counting in ./counter.
 const IMMUTABLE_GH = [
-  'case "$1 $2" in',
-  '  "release view")',
+  'case "$*" in',
+  '  *"releases/123"*)',
   '    [ -z "$FAKE_VIEW_FAIL" ] || exit 1',
   `    printf '%s\\n' "$FAKE_IMMUTABLE" ;;`,
-  '  "release verify")',
+  '  "release verify"*)',
   '    n=$(cat counter 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > counter',
   '    [ "$n" -gt "$FAKE_VERIFY_FAILS" ] ;;',
   "  *) exit 9 ;;",
@@ -1454,6 +1562,7 @@ function runImmutable({
     gh: IMMUTABLE_GH,
     env: {
       RELEASE_IMMUTABILITY: declared,
+      EXPECTED_RELEASE_ID: "123",
       FAKE_IMMUTABLE: immutable,
       FAKE_VERIFY_FAILS: String(verifyFails),
       FAKE_VIEW_FAIL: viewFails ? "1" : "",
@@ -1472,7 +1581,7 @@ test("immutability (real shell, fake gh): `required` passes only for a release t
     /is immutable and its GitHub release attestation verifies/,
   );
   assert.deepStrictEqual(ok.calls, [
-    "release view v1.2.3 --json isImmutable --jq .isImmutable",
+    "api repos/fossasia/cla-bot/releases/123 --jq .immutable",
     "release verify v1.2.3",
   ]);
 
@@ -1827,11 +1936,12 @@ test("the jq programs that ship in the workflow answer correctly on GitHub-shape
     `commit ${SHA_VERIFIED}`,
   );
 
-  const meta = jqProgram(
-    publish,
-    DRAFT_CHECK,
-    'releases/${EXPECTED_RELEASE_ID}"',
+  const draftMetaScript = publish.steps[stepNamed(publish.steps, DRAFT_CHECK)].run;
+  const metaMatch = /meta="\$\(jq -r '([^']+)' <<< "\$release_json"\)"/.exec(
+    draftMetaScript,
   );
+  assert.ok(metaMatch, "draft metadata must be extracted from the release-ID response");
+  const meta = metaMatch[1];
   assert.strictEqual(
     evalJq(meta, {
       id: 123,

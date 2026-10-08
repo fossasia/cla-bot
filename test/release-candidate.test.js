@@ -44,6 +44,24 @@ function candidate({ extra = false } = {}) {
     `${archiveHash}  ${archiveName}\n${sbomHash}  ${sbom}\n`,
   );
   if (extra) fs.writeFileSync(path.join(assets, "unexpected.txt"), "extra\n");
+  const releaseAssetNames = extra ? [...assetNames, "unexpected.txt"] : assetNames;
+  const releaseJson = path.join(dir, "release.json");
+  fs.writeFileSync(
+    releaseJson,
+    JSON.stringify({
+      id: 123,
+      name: tag,
+      tag_name: tag,
+      draft: false,
+      prerelease: false,
+      immutable: false,
+      assets: releaseAssetNames.map((name, index) => ({
+        id: 100 + index,
+        name,
+        state: "uploaded",
+      })),
+    }),
+  );
 
   fs.writeFileSync(
     path.join(bin, "gh"),
@@ -51,23 +69,18 @@ function candidate({ extra = false } = {}) {
 set -e
 case "$*" in
   *"version"*) echo "gh version $FAKE_GH_VERSION (2026-10-01)" ;;
-  *"release view"*) echo '${tag} ${tag} false false '$FAKE_IMMUTABLE ;;
   *"release verify"*) [ "$FAKE_GH_RELEASE_VERIFY" = pass ] || { echo 'release verification failed' >&2; exit 1; } ;;
-  *"releases/tags/"*)
-    if [ "$FAKE_EXTRA" = true ]; then
-      echo '["${archiveName}","${archiveName}.sigstore.json","cla-bot-${tag}.sbom.cdx.json","cla-bot-${tag}.provenance.intoto.jsonl","cla-bot-${tag}.sbom.intoto.jsonl","SHA256SUMS","SHA256SUMS.sigstore.json","unexpected.txt"]' | jq -c sort
-    else
-      echo '["${archiveName}","${archiveName}.sigstore.json","cla-bot-${tag}.sbom.cdx.json","cla-bot-${tag}.provenance.intoto.jsonl","cla-bot-${tag}.sbom.intoto.jsonl","SHA256SUMS","SHA256SUMS.sigstore.json"]' | jq -c sort
-    fi
+  *"releases/123"*) jq --argjson immutable "$FAKE_IMMUTABLE" '.immutable = $immutable' "$FAKE_RELEASE_JSON" ;;
+  *"release download"*) echo 'tag lookup resolved to unrelated release 999' > "$FAKE_ASSETS/wrong-release-999" ;;
+  *"releases/assets/"*)
+    asset_id="\${2##*/}"
+    asset_name="$(jq -er --argjson id "$asset_id" '.assets[] | select(.id == $id) | .name' "$FAKE_RELEASE_JSON")"
+    cat "$FAKE_ASSETS/$asset_name"
     ;;
   *"git/ref/tags/"*) echo '{"object":{"type":"tag","sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}' ;;
   *"git/tags/"*) printf '{"tag":"${tag}","object":{"type":"commit","sha":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"verification":{"verified":%s}}\\n' "$FAKE_VERIFIED" ;;
   *"branches/main"*) echo '{"commit":{"sha":"cccccccccccccccccccccccccccccccccccccccc"}}' ;;
   *"compare/"*) printf '%s\\n' "$FAKE_COMPARE" ;;
-  *"release download"*)
-    while [ "$#" -gt 0 ]; do if [ "$1" = --dir ]; then dest="$2"; shift 2; else shift; fi; done
-    cp "$FAKE_ASSETS"/* "$dest"/
-    ;;
   *"attestation verify"*) [ "$FAKE_ATTESTATION" = pass ] || { echo 'attestation failed' >&2; exit 1; } ;;
   *) echo "unexpected gh call: $*" >&2; exit 98 ;;
 esac
@@ -88,10 +101,12 @@ esac
         ...process.env,
         PATH: `${bin}:${process.env.PATH}`,
         RELEASE_TAG: tag,
+        RELEASE_ID: "123",
         GITHUB_REPOSITORY: "fossasia/cla-bot",
         DEFAULT_BRANCH: "main",
         GH_TOKEN: "test-token",
         FAKE_ASSETS: assets,
+        FAKE_RELEASE_JSON: releaseJson,
         FAKE_GH_VERSION: "2.102.0",
         FAKE_VERIFIED: "true",
         FAKE_COMPARE: "ahead",

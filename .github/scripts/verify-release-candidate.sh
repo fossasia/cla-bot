@@ -3,11 +3,16 @@
 set -euo pipefail
 
 : "${RELEASE_TAG:?RELEASE_TAG is required}"
+: "${RELEASE_ID:?RELEASE_ID is required}"
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 : "${DEFAULT_BRANCH:?DEFAULT_BRANCH is required}"
 
 if [[ ! "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
   echo "Not a stable SemVer release tag: ${RELEASE_TAG}" >&2
+  exit 1
+fi
+if [[ ! "$RELEASE_ID" =~ ^[0-9]+$ ]]; then
+  echo "Invalid GitHub release ID: ${RELEASE_ID}" >&2
   exit 1
 fi
 
@@ -36,15 +41,16 @@ case "${RELEASE_IMMUTABILITY:-}" in
     ;;
 esac
 
-meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease,isImmutable --jq '[.name, .tagName, .isDraft, .isPrerelease, .isImmutable] | join(" ")')"
+release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}")"
+meta="$(jq -r '[.id, .name, .tag_name, .draft, .prerelease, .immutable] | join(" ")' <<< "$release_json")"
 if [[ "$RELEASE_IMMUTABILITY" == required && \
-      "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false true" ]]; then
+      "$meta" != "${RELEASE_ID} ${RELEASE_TAG} ${RELEASE_TAG} false false true" ]]; then
   echo "Release metadata is not public, stable, correctly named, and immutable: ${meta}" >&2
   exit 1
 fi
 if [[ "$RELEASE_IMMUTABILITY" == not-required && \
-      "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false true" && \
-      "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false false" ]]; then
+      "$meta" != "${RELEASE_ID} ${RELEASE_TAG} ${RELEASE_TAG} false false true" && \
+      "$meta" != "${RELEASE_ID} ${RELEASE_TAG} ${RELEASE_TAG} false false false" ]]; then
   echo "Release metadata is not public, stable, and correctly named: ${meta}" >&2
   exit 1
 fi
@@ -87,12 +93,17 @@ expected_assets=(
   SHA256SUMS.sigstore.json
 )
 expected_assets_json="$(jq -cn --args '$ARGS.positional | sort' -- "${expected_assets[@]}")"
-actual_assets_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${RELEASE_TAG}" --jq '[.assets[].name] | sort')"
+actual_assets_json="$(jq -c '[.assets[].name] | sort' <<< "$release_json")"
 if [[ "$actual_assets_json" != "$expected_assets_json" ]]; then
   echo "${RELEASE_TAG} has a missing or unexpected release asset." >&2
   exit 1
 fi
-gh release download "$RELEASE_TAG" --dir "$temporary/assets"
+asset_ids="$(jq -c '.assets' <<< "$release_json")"
+for asset in "${expected_assets[@]}"; do
+  asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+  gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+    --header 'Accept: application/octet-stream' > "${temporary}/assets/${asset}"
+done
 entry_count="$(find "$temporary/assets" -mindepth 1 -maxdepth 1 | wc -l)"
 file_count="$(find "$temporary/assets" -mindepth 1 -maxdepth 1 -type f | wc -l)"
 if [[ "$entry_count" -ne "${#expected_assets[@]}" || "$file_count" -ne "${#expected_assets[@]}" ]]; then

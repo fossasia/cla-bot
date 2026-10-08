@@ -652,14 +652,39 @@ jobs:
             SHA256SUMS
             SHA256SUMS.sigstore.json
           )
-          meta="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --jq '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")')"
+          download_release_assets() {
+            local release_json="$1" directory="$2" expected_names asset_ids asset asset_id
+            expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s .)"
+            if ! jq -e --argjson expected "$expected_names" '
+              .assets as $release_assets
+              | [$release_assets[].name] as $names
+              | (($names | length) == ($expected | length)
+                 and ($names | unique | length) == ($expected | length)
+                 and ($names | sort) == ($expected | sort)
+                 and all($release_assets[]; .state == "uploaded" and (.id | type) == "number" and (.name | type) == "string"))
+            ' <<< "$release_json" >/dev/null; then
+              echo "::error::Release ${EXPECTED_RELEASE_ID} does not contain exactly the expected uploaded assets. Refusing to publish."
+              return 1
+            fi
+            asset_ids="$(jq -c '.assets' <<< "$release_json")"
+            for asset in "${assets[@]}"; do
+              asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+              # The asset endpoint is addressed by immutable asset ID. gh api
+              # streams the octet-stream response to stdout and follows GitHub's
+              # redirect, so the signed URL is never resolved by release tag.
+              gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                --header 'Accept: application/octet-stream' > "${directory}/${asset}"
+            done
+          }
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}")"
+          meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$release_json")"
           if [ "$meta" != "${EXPECTED_RELEASE_ID} ${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
             echo "::error::Draft metadata is '${meta}', expected title and tag '${RELEASE_TAG}', draft, not a pre-release. Refusing to publish."
             exit 1
           fi
           # $(...) drops trailing newlines on both sides; CRs are ignored in case
           # GitHub stores the body with CRLF line endings.
-          body="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --jq .body | tr -d '\r')"
+          body="$(jq -r .body <<< "$release_json" | tr -d '\r')"
           notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
           if [ "$body" != "$notes" ]; then
             echo "::error::The draft's release notes differ from the notes that were generated. Refusing to publish."
@@ -667,7 +692,7 @@ jobs:
           fi
           rm -rf draft
           mkdir draft
-          gh release download "$RELEASE_TAG" --dir draft
+          download_release_assets "$release_json" draft
           count="$(find draft -type f | wc -l)"
           if [ "$count" -ne "${#assets[@]}" ]; then
             echo "::error::The draft holds ${count} assets, expected ${#assets[@]}. Refusing to publish."
@@ -708,12 +733,34 @@ jobs:
             SHA256SUMS
             SHA256SUMS.sigstore.json
           )
-          meta="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")')"
+          download_release_assets() {
+            local release_json="$1" directory="$2" expected_names asset_ids asset asset_id
+            expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s .)"
+            if ! jq -e --argjson expected "$expected_names" '
+              .assets as $release_assets
+              | [$release_assets[].name] as $names
+              | (($names | length) == ($expected | length)
+                 and ($names | unique | length) == ($expected | length)
+                 and ($names | sort) == ($expected | sort)
+                 and all($release_assets[]; .state == "uploaded" and (.id | type) == "number" and (.name | type) == "string"))
+            ' <<< "$release_json" >/dev/null; then
+              echo "::error::Release ${release_id} does not contain exactly the expected uploaded assets. Refusing to publish."
+              return 1
+            fi
+            asset_ids="$(jq -c '.assets' <<< "$release_json")"
+            for asset in "${assets[@]}"; do
+              asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+              gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                --header 'Accept: application/octet-stream' > "${directory}/${asset}"
+            done
+          }
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$release_json")"
           if [ "$meta" != "${release_id} ${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
             echo "::error::Draft metadata changed before publication ('${meta}'). Refusing to publish."
             exit 1
           fi
-          body="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq .body | tr -d '\r')"
+          body="$(jq -r .body <<< "$release_json" | tr -d '\r')"
           notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
           if [ "$body" != "$notes" ]; then
             echo "::error::Draft release notes changed before publication. Refusing to publish."
@@ -721,7 +768,7 @@ jobs:
           fi
           rm -rf final-draft
           mkdir final-draft
-          gh release download "$RELEASE_TAG" --dir final-draft
+          download_release_assets "$release_json" final-draft
           count="$(find final-draft -type f | wc -l)"
           if [ "$count" -ne "${#assets[@]}" ]; then
             echo "::error::Draft now holds ${count} assets, expected ${#assets[@]}. Refusing to publish."
@@ -749,14 +796,22 @@ jobs:
       # Download what users will download and verify it the way users will,
       # with the SAME constraints as before publishing (workflow, tag, commit).
       - name: Verify the published release end to end
+        env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
         run: |
           set -euo pipefail
-          meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease --jq '[.name, .tagName, .isDraft, .isPrerelease] | join(" ")')"
-          if [ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false" ]; then
+          release_id="${EXPECTED_RELEASE_ID:-}"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not resolve the GitHub release ID for ${RELEASE_TAG}."
+            exit 1
+          fi
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$release_json")"
+          if [ "$meta" != "${release_id} ${RELEASE_TAG} ${RELEASE_TAG} false false" ]; then
             echo "::error::Published release metadata is '${meta}', expected the named release to be published and stable."
             exit 1
           fi
-          body="$(gh release view "$RELEASE_TAG" --json body --jq .body | tr -d '\r')"
+          body="$(jq -r .body <<< "$release_json" | tr -d '\r')"
           notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
           if [ "$body" != "$notes" ]; then
             echo "::error::Published release notes differ from the verified notes."
@@ -770,7 +825,6 @@ jobs:
           name="cla-bot-${RELEASE_TAG}"
           workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
           mkdir published
-          gh release download "$RELEASE_TAG" --dir published
           assets=(
             "${name}.tar.gz"
             "${name}.tar.gz.sigstore.json"
@@ -780,6 +834,24 @@ jobs:
             SHA256SUMS
             SHA256SUMS.sigstore.json
           )
+          expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s .)"
+          if ! jq -e --argjson expected "$expected_names" '
+            .assets as $release_assets
+            | [$release_assets[].name] as $names
+            | (($names | length) == ($expected | length)
+               and ($names | unique | length) == ($expected | length)
+               and ($names | sort) == ($expected | sort)
+               and all($release_assets[]; .state == "uploaded" and (.id | type) == "number" and (.name | type) == "string"))
+          ' <<< "$release_json" >/dev/null; then
+            echo "::error::Release ${release_id} does not contain exactly the expected uploaded assets."
+            exit 1
+          fi
+          asset_ids="$(jq -c '.assets' <<< "$release_json")"
+          for asset in "${assets[@]}"; do
+            asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              --header 'Accept: application/octet-stream' > "published/${asset}"
+          done
           count="$(find published -maxdepth 1 -type f | wc -l)"
           if [ "$count" -ne "${#assets[@]}" ]; then
             echo "::error::Published release has ${count} assets, expected ${#assets[@]}."
@@ -815,13 +887,14 @@ jobs:
       # immutable releases and can take a moment to appear, hence the retries.
       - name: Check the release immutability policy
         env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
           RELEASE_IMMUTABILITY: not-required
         run: |
           set -euo pipefail
           case "${RELEASE_IMMUTABILITY:-}" in
             required) ;;
             not-required)
-              state="$(gh release view "$RELEASE_TAG" --json isImmutable --jq .isImmutable || echo unknown)"
+              state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --jq .immutable || echo unknown)"
               echo "::notice::Mutable releases are allowed by the workflow policy; ${RELEASE_TAG} isImmutable=${state}."
               exit 0
               ;;
@@ -830,7 +903,7 @@ jobs:
               exit 1
               ;;
           esac
-          immutable="$(gh release view "$RELEASE_TAG" --json isImmutable --jq .isImmutable)"
+          immutable="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --jq .immutable)"
           if [ "$immutable" != "true" ]; then
             echo "::error::${RELEASE_TAG} is published, signed and verified, but GitHub reports it as NOT immutable (isImmutable=${immutable}). The workflow policy requires immutable releases; see CONTRIBUTING.md."
             exit 1
@@ -907,7 +980,7 @@ jobs:
               echo "::warning::Ignoring release with invalid ID '${release_id}'."
               continue
             fi
-            if RELEASE_TAG="$release_tag" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            if RELEASE_TAG="$release_tag" RELEASE_ID="$release_id" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
               DEFAULT_BRANCH="$DEFAULT_BRANCH" GH_TOKEN="$GH_TOKEN" \
               RELEASE_IMMUTABILITY="$RELEASE_IMMUTABILITY" \
               bash .github/scripts/verify-release-candidate.sh; then
@@ -955,7 +1028,8 @@ jobs:
           # verify-latest is read-only and runs separately. Reconfirm that the
           # same release, signed tag object, ancestry, and exact verified bytes
           # are still public before using contents:write.
-          release_meta="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${highest_tag}" --jq '[.id, .tag_name, .draft, .prerelease] | join(" ")')"
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${highest_id}")"
+          release_meta="$(jq -r '[.id, .tag_name, .draft, .prerelease] | join(" ")' <<< "$release_json")"
           if [ "$release_meta" != "${highest_id} ${highest_tag} false false" ]; then
             echo "::error::Verified release metadata changed before Latest reconciliation ('${release_meta}')."
             exit 1
@@ -1001,7 +1075,24 @@ jobs:
             SHA256SUMS.sigstore.json
           )
           mkdir latest-assets
-          gh release download "$highest_tag" --dir latest-assets
+          expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s .)"
+          if ! jq -e --argjson expected "$expected_names" '
+            .assets as $release_assets
+            | [$release_assets[].name] as $names
+            | (($names | length) == ($expected | length)
+               and ($names | unique | length) == ($expected | length)
+               and ($names | sort) == ($expected | sort)
+               and all($release_assets[]; .state == "uploaded" and (.id | type) == "number" and (.name | type) == "string"))
+          ' <<< "$release_json" >/dev/null; then
+            echo "::error::Verified release ${highest_id} has a missing, extra, or incomplete asset."
+            exit 1
+          fi
+          asset_ids="$(jq -c '.assets' <<< "$release_json")"
+          for asset in "${assets[@]}"; do
+            asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              --header 'Accept: application/octet-stream' > "latest-assets/${asset}"
+          done
           entry_count="$(find latest-assets -mindepth 1 -maxdepth 1 | wc -l)"
           file_count="$(find latest-assets -mindepth 1 -maxdepth 1 -type f | wc -l)"
           if [ "$entry_count" -ne "${#assets[@]}" ] || [ "$file_count" -ne "${#assets[@]}" ]; then
