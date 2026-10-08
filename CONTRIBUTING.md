@@ -237,13 +237,13 @@ when something about releasing seems off:
    as needed. Replacing a signed asset invalidates its signatures/checksums;
    consumers must reject it, so publish a newly signed asset under the next
    patch version instead of silently replacing it in place.
-2. **Declare the release policy** as repository variables (Settings -> Secrets
-   and variables -> Actions -> Variables):
-   - `RELEASE_IMMUTABILITY` = `not-required` while mutable releases are
-     intended. The workflow reports whether GitHub marked the published
-     release immutable; it does not fail when this variable is `not-required`.
+2. **Set the release approval policy** as a repository variable (Settings ->
+   Secrets and variables -> Actions -> Variables):
    - `RELEASE_APPROVAL` = `not-required` because anyone with repository release
      rights is authorized to publish without a second-person approval.
+   - Mutability is intentionally `not-required` in the reviewed release
+     workflow. Changing it requires a reviewed workflow change; it is not a
+     repository variable that a repository writer can silently alter.
 3. **Create the `release` environment** (Settings -> Environments -> New
    environment). Under "Deployment branches and tags" allow only the selected
    tag pattern `v*`. No required reviewers are needed. The environment keeps
@@ -335,15 +335,15 @@ but signing and attesting need a real GitHub run.
   differ from what was prepared) means someone or something changed the draft
   after it was created. Nothing is public. Delete the draft, find out why, and
   re-run the failed jobs.
-- **A "policy" job failure** (invalid immutability declaration, missing
+- **A "policy" job failure** (invalid workflow immutability policy, missing
   reviewers when approval is required, or inability to read the `release`
   environment): nothing was built or published. Do the one-time
   setup it names, then re-run the failed jobs.
 - **"... NOT immutable (isImmutable=false)"** at the very end: the release is
   published, signed and verified, but "Immutable releases" is off although
-  `RELEASE_IMMUTABILITY` says `required`. Turn it on before the next release
-  (it cannot be applied to this one), or correct the variable if opting out
-  was the intent.
+  the workflow policy says `required`. Turn it on before the next release
+  (it cannot be applied to this one), or change the policy through a reviewed
+  workflow update if mutable releases are intended.
 - **The `publish` job failed** (Sigstore or GitHub outage, upload error): use
   "Re-run failed jobs". It is safe to repeat; a leftover **draft** is
   replaced, and a release that is already **published**

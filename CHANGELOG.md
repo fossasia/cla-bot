@@ -26,8 +26,12 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   new release races with an in-flight reconciliation.
 - The publish job pins the tag: it re-checks (before creating the release,
   before publishing, and after) that the tag still resolves to the exact
-  signed tag object the build job verified. `.github/rulesets/release-tags.json`
-  blocks updates/deletions of release tags once imported. Every `gh attestation
+  signed tag object the build job verified. The final publish step also
+  rechecks draft metadata and every asset immediately before publication.
+  `.github/rulesets/release-tags.json` blocks updates/deletions of release tags
+  once imported. The Latest verifier is pinned to the workflow commit, manual
+  recovery cannot bypass the policy gate, and mutability is set in reviewed
+  workflow code. Every `gh attestation
   verify`, before and after publishing, uses the persisted bundle and pins the
   repository, signer workflow, tag ref and commit digest.
 - Consumer instructions resolve the tag commit once, require both attestations

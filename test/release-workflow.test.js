@@ -120,7 +120,7 @@ const PUBLISH_STEP = "Re-check the tag and publish the release";
 const CREATE_RECHECK = "Re-check the tag before creating the release";
 const POLICY_IMMUTABILITY = "Require the immutability policy to be declared";
 const POLICY_REVIEWERS = "Require reviewers on the release environment";
-const IMMUTABLE_CHECK = "Require the release to be immutable";
+const IMMUTABLE_CHECK = "Check the release immutability policy";
 const PUBLISHED_CHECK = "Verify the published release end to end";
 const usesStartingWith = (steps, prefix) =>
   indexOfStep(
@@ -180,10 +180,36 @@ function runStep(
 // A fake `gh` that answers every call with one line.
 const ghAnswers = (text) => `printf '%s\\n' '${text}'`;
 const HAS_SHA256SUM = spawnSync("sha256sum", ["--version"]).status === 0;
-const publishTagGh = (answer) =>
+const releaseAssets = (tag = "v1.2.3") => {
+  const name = `cla-bot-${tag}`;
+  return [
+    `${name}.tar.gz`,
+    `${name}.tar.gz.sigstore.json`,
+    `${name}.sbom.cdx.json`,
+    `${name}.provenance.intoto.jsonl`,
+    `${name}.sbom.intoto.jsonl`,
+    "SHA256SUMS",
+    "SHA256SUMS.sigstore.json",
+  ];
+};
+function setupPublishDraft(dir, mutate = () => {}) {
+  fs.mkdirSync(path.join(dir, "dist"));
+  fs.mkdirSync(path.join(dir, "served"));
+  fs.writeFileSync(path.join(dir, "dist", "RELEASE_NOTES.md"), "notes\n");
+  for (const asset of releaseAssets()) {
+    const bytes = `content of ${asset}\n`;
+    fs.writeFileSync(path.join(dir, "dist", asset), bytes);
+    fs.writeFileSync(path.join(dir, "served", asset), bytes);
+  }
+  mutate(path.join(dir, "served"));
+}
+const publishTagGh = (answer, { meta = "v1.2.3 v1.2.3 true false", body = "notes" } = {}) =>
   [
     'case "$*" in',
     '  *"--json databaseId"*) printf "%s\\n" 123 ;;',
+    `  *--json*name,tagName,isDraft,isPrerelease*) printf '%s\\n' '${meta}' ;;`,
+    `  *--json*body*) printf '%s\\n' '${body}' ;;`,
+    '  *"release download"*) cp "$FAKE_DRAFT_DIR"/* "$5"/ ;;',
     `  *"git/ref/tags/"*) printf '%s\\n' '${answer}' ;;`,
     '  *"--method PATCH"*) exit 0 ;;',
     '  *) exit 99 ;;',
@@ -352,9 +378,22 @@ test("candidate verification is read-only, checks published releases after a pub
   });
   assert.deepStrictEqual(verifyLatest.needs, ["policy", "publish"]);
   assert.match(verifyLatest.if, /always\(\)/);
-  assert.match(verifyLatest.if, /workflow_dispatch/);
+  assert.match(verifyLatest.if, /needs\.policy\.result == 'success'/);
+  assert.ok(
+    verifyLatest.if.indexOf("needs.policy.result == 'success'") <
+      verifyLatest.if.indexOf("github.event_name == 'workflow_dispatch'"),
+    "manual dispatch must not bypass the release policy gate",
+  );
   assert.match(runText(verifyLatest.steps), /verify-release-candidate\.sh/);
   assert.match(runText(verifyLatest.steps), /sort_by\(.tag_name \| semver_key\) \| reverse/);
+  const checkout = verifyLatest.steps.find((step) =>
+    String(step.uses ?? "").startsWith("actions/checkout@"),
+  );
+  assert.strictEqual(checkout.with.ref, "${{ github.workflow_sha }}");
+  assert.ok(
+    !/github\.event\.repository\.default_branch/.test(checkout.with.ref),
+    "the verifier must not come from a moving default-branch ref",
+  );
 });
 
 test("candidate selector tries releases in numeric SemVer order and skips an unverified higher manual release", () => {
@@ -873,9 +912,16 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   const checkAt = script.indexOf("git/ref/tags/");
   const compareAt = script.indexOf('if [ -z "$EXPECTED_TAG_OBJECT"');
   const editAt = script.indexOf("gh api --method PATCH");
+  const finalAssetsAt = script.indexOf('gh release download "$RELEASE_TAG" --dir final-draft');
+  const finalCompareAt = script.indexOf('cmp -s -- "dist/${asset}" "final-draft/${asset}"');
   assert.ok(
     checkAt >= 0 && checkAt < compareAt && compareAt < editAt,
     "look up, compare, then publish, in one script",
+  );
+  assert.ok(
+    finalAssetsAt >= 0 && finalAssetsAt < finalCompareAt &&
+      finalCompareAt < checkAt,
+    "re-read the final DRAFT and compare every asset immediately before the tag check and publish",
   );
   assert.strictEqual((script.match(/gh api --method PATCH/g) ?? []).length, 1);
   assert.match(script, /gh api --method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=false/);
@@ -914,18 +960,15 @@ test("re-check (real shell, fake gh): passes only while the tag still resolves t
     const same = runStep(step, {
       gh:
         name === PUBLISH_STEP
-          ? [
-              'case "$*" in',
-              '  *"git/ref/tags/"*) printf "%s\\n" "tag ' + SHA_VERIFIED + '" ;;',
-              '  *"--json databaseId"*) printf "%s\\n" 123 ;;',
-              '  *"--method PATCH"*) exit 0 ;;',
-              '  *) exit 99 ;;',
-              "esac",
-            ].join("\n")
+          ? publishTagGh(`tag ${SHA_VERIFIED}`)
           : ghAnswers(`tag ${SHA_VERIFIED}`),
-      env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
+      env: {
+        EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+        FAKE_DRAFT_DIR: "served",
+      },
+      setup: name === PUBLISH_STEP ? setupPublishDraft : undefined,
     });
-    assert.strictEqual(same.status, 0, `${name}\n${same.output}`);
+    assert.strictEqual(same.status, 0, `${name}\n${same.output}\n${same.calls.join("\n")}`);
     assert.ok(
       same.calls.some((call) =>
         /^api repos\/fossasia\/cla-bot\/git\/ref\/tags\/v1\.2\.3 --jq /.test(
@@ -960,7 +1003,11 @@ test("re-check (real shell, fake gh): a MOVED, re-created-as-lightweight, or une
     ]) {
       const r = runStep(step, {
         gh: name === PUBLISH_STEP ? publishTagGh(current) : ghAnswers(current),
-        env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
+        env: {
+          EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+          FAKE_DRAFT_DIR: "served",
+        },
+        setup: name === PUBLISH_STEP ? setupPublishDraft : undefined,
       });
       assert.notStrictEqual(r.status, 0, `${name}: ${label}`);
       assert.match(
@@ -981,7 +1028,8 @@ test("re-check (real shell, fake gh): an empty expected value or a failing gh ca
     const step = publish.steps[stepNamed(publish.steps, name)];
     const noExpected = runStep(step, {
       gh: name === PUBLISH_STEP ? publishTagGh("tag ") : ghAnswers("tag "),
-      env: { EXPECTED_TAG_OBJECT: "" },
+      env: { EXPECTED_TAG_OBJECT: "", FAKE_DRAFT_DIR: "served" },
+      setup: name === PUBLISH_STEP ? setupPublishDraft : undefined,
     });
     assert.notStrictEqual(
       noExpected.status,
@@ -991,6 +1039,7 @@ test("re-check (real shell, fake gh): an empty expected value or a failing gh ca
     const ghDown = runStep(step, {
       gh: "exit 1",
       env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
+      setup: name === PUBLISH_STEP ? setupPublishDraft : undefined,
     });
     assert.notStrictEqual(
       ghDown.status,
@@ -1003,6 +1052,43 @@ test("re-check (real shell, fake gh): an empty expected value or a failing gh ca
         `${name}: must not publish`,
       );
     }
+  }
+});
+
+test("final publish step rechecks the draft bytes and metadata after the earlier draft check", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISH_STEP)];
+  for (const [label, options] of [
+    ["asset changed", {
+      mutate: (served) => fs.appendFileSync(path.join(served, "SHA256SUMS"), "changed\n"),
+    }],
+    ["asset missing", {
+      mutate: (served) => fs.rmSync(path.join(served, "SHA256SUMS")),
+    }],
+    ["extra asset", {
+      mutate: (served) => fs.writeFileSync(path.join(served, "unexpected.txt"), "extra"),
+    }],
+    ["metadata changed", {
+      meta: "v1.2.3 v1.2.3 false false",
+    }],
+    ["notes changed", { body: "altered notes" }],
+  ]) {
+    const result = runStep(step, {
+      gh: publishTagGh(`tag ${SHA_VERIFIED}`, {
+        ...(options.meta ? { meta: options.meta } : {}),
+        ...(options.body ? { body: options.body } : {}),
+      }),
+      env: {
+        EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+        FAKE_DRAFT_DIR: "served",
+      },
+      setup: (dir) => setupPublishDraft(dir, options.mutate),
+    });
+    assert.notStrictEqual(result.status, 0, label);
+    assert.match(result.output, /Refusing to publish/);
+    assert.ok(
+      !result.calls.some((call) => call.startsWith("api --method PATCH")),
+      `${label}: must stop before publishing`,
+    );
   }
 });
 
@@ -1181,7 +1267,7 @@ test("the immutability requirement is its own final step; the published-release 
   assert.ok(published < immutable);
   assert.ok(!/gh release verify/.test(publish.steps[published].run));
   assert.deepStrictEqual(publish.steps[immutable].env, {
-    RELEASE_IMMUTABILITY: "${{ vars.RELEASE_IMMUTABILITY }}",
+    RELEASE_IMMUTABILITY: "not-required",
   });
   // The ONLY failure that is turned into a message is the informational lookup
   // in the not-required branch; nothing in the release path swallows an error.
@@ -1277,7 +1363,7 @@ test("immutability (real shell, fake gh): `required` passes only for a release t
     mutable.output,
     /::error::.*NOT immutable \(isImmutable=false\)/,
   );
-  assert.match(mutable.output, /RELEASE_IMMUTABILITY/);
+  assert.match(mutable.output, /workflow policy requires immutable releases/);
 });
 
 test("immutability (real shell, fake gh): the release attestation may take a moment (retried), but never passes without verifying", () => {
@@ -1298,12 +1384,12 @@ test("immutability (real shell, fake gh): the release attestation may take a mom
   );
 });
 
-test("immutability (real shell, fake gh): `not-required` is an explicit, visible opt-out; an undeclared or invalid policy fails", () => {
+test("immutability (real shell, fake gh): the workflow's `not-required` policy is visible and an invalid policy fails", () => {
   const optOut = runImmutable({ policy: "not-required", immutable: "false" });
   assert.strictEqual(optOut.status, 0, optOut.output);
   assert.match(
     optOut.output,
-    /::notice::.*not required here.*isImmutable=false/,
+    /::notice::.*Mutable releases are allowed.*isImmutable=false/,
   );
   assert.strictEqual(verifyCalls(optOut), 0);
   const lookupFails = runImmutable({ policy: "not-required", viewFails: true });
@@ -1382,12 +1468,14 @@ test("consumer verification pins the resolved tag commit to both attestations an
 
 // --- the release policy gate (runs before anything is built) -----------------------
 
-test("policy reads its declarations from repository variables, and only those", () => {
+test("immutability is pinned in reviewed workflow code; only the approval opt-out is a variable", () => {
   assert.deepStrictEqual(policy.env, {
     GH_TOKEN: "${{ github.token }}",
-    RELEASE_IMMUTABILITY: "${{ vars.RELEASE_IMMUTABILITY }}",
+    RELEASE_IMMUTABILITY: "not-required",
     RELEASE_APPROVAL: "${{ vars.RELEASE_APPROVAL }}",
   });
+  assert.strictEqual(publish.steps[stepNamed(publish.steps, IMMUTABLE_CHECK)].env.RELEASE_IMMUTABILITY, "not-required");
+  assert.strictEqual(verifyLatest.env.RELEASE_IMMUTABILITY, "not-required");
 });
 
 test("policy (real shell): the immutability policy must be declared as `required` or `not-required`, otherwise nothing is built", () => {

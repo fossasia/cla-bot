@@ -71,7 +71,9 @@ Out of scope:
    uploads release assets by hand. The signed tag object the build verified
    is pinned: the publish job re-checks that the tag still resolves to that
    exact object right before it creates the draft, and again in the very same
-   shell step as the publish call. The release tag ruleset
+   shell step as the publish call. That final step also re-downloads and
+   compares the DRAFT's assets and metadata immediately before publication;
+   only the final GitHub API round-trip remains non-atomic. The release tag ruleset
    (`.github/rulesets/release-tags.json`) prevents ordinary writers from
    updating or deleting a `v*` tag once created; it must be imported in GitHub
    settings. Without it, repeated checks only narrow the tag race. The
@@ -96,8 +98,10 @@ Out of scope:
    an in-flight run selects a candidate can briefly leave Latest behind; the
    serialized run for that publication verifies the current release list and
    converges the marker. If post-publication verification fails, `verify-latest`
-   independently re-verifies public candidates; `workflow_dispatch` provides
-   a manual recovery path without modifying published assets.
+   independently re-verifies public candidates using the helper from the exact
+   workflow commit. It requires the policy job to pass on manual dispatch too.
+   `workflow_dispatch` provides a manual recovery path without modifying
+   published assets.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The jobs
@@ -116,14 +120,13 @@ Out of scope:
    job has only `contents: write`, runs shell commands without checkout or
    repository code, and uses that permission only to reconcile GitHub's Latest
    marker.
-8. A release does not start unless the release policy is declared, before
-   anything is built: `RELEASE_IMMUTABILITY` must be `required` or
-   `not-required`, and `RELEASE_APPROVAL` must be unset or `not-required`.
-   This project intentionally uses `not-required` for both: releases remain
-  editable, and repository actors with release rights may publish without a
-  second-person approval. These repository variables express operating
-  policy; they are not a security boundary against actors who can change
-  repository configuration. Signed assets and checksums let consumers detect
+8. A release does not start unless the workflow's immutability policy is
+   explicit and `RELEASE_APPROVAL` is unset or `not-required`. Mutability is
+   intentionally `not-required` in reviewed workflow code; changing it requires
+   a workflow change through the protected branch. `RELEASE_APPROVAL` is a
+   repository variable because anyone with release rights may publish without
+   second-person approval. GitHub's actual environment protection rules still
+   apply to the publish job. Signed assets and checksums let consumers detect
   asset changes, but release notes and mutable metadata are not covered by
   those asset signatures. For an asset correction, publish a new patch version;
   consumers must reject an in-place replacement whose existing signatures no
@@ -376,8 +379,8 @@ What the signatures do **not** protect against, and what does:
   maintainers with release rights to correct them. When a signed asset is
   changed, its signature and checksum no longer match; consumers must verify
   again and reject changed assets until corrected signatures/checksums are
-  published. The workflow records whether a release is immutable, but with
-  `RELEASE_IMMUTABILITY=not-required` it does not fail for mutable releases.
+  published. The workflow records whether a release is immutable, but its
+  reviewed `not-required` policy does not fail for mutable releases.
 - The release SBOM lists the pinned third-party actions that `action.yml`
   runs (`runs.steps[*].uses`). It deliberately models only a composite action
   with no local `./` actions: anything else makes the release fail instead of

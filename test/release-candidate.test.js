@@ -115,6 +115,12 @@ try {
   assert.strictEqual(result.status, 0, result.output);
   assert.match(result.output, /is a verified release from/);
 
+  for (const value of [undefined, "", "unexpected"]) {
+    const undeclaredPolicy = valid.run({ RELEASE_IMMUTABILITY: value });
+    assert.notStrictEqual(undeclaredPolicy.status, 0, "policy must be explicit");
+    assert.match(undeclaredPolicy.output, /must be explicitly set/);
+  }
+
   const oldCli = valid.run({ FAKE_GH_VERSION: "2.101.99" });
   assert.notStrictEqual(oldCli.status, 0);
   assert.match(oldCli.output, /require 2\.102\.0 or newer/);

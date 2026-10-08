@@ -16,10 +16,10 @@ name: Release
 # any repository code can sign or publish:
 #
 #   policy   actions: read ONLY. Fails fast, before anything is built, unless
-#            the release policy has been declared: the immutability policy
-#            (repository variable RELEASE_IMMUTABILITY) and that the `release`
-#            environment has required reviewers (checked through the API,
-#            opt-out: RELEASE_APPROVAL=not-required).
+#            the release policy is explicit: mutability is a reviewed workflow
+#            setting; `RELEASE_APPROVAL` is the no-approval opt-out. The
+#            `release` environment is checked through the API when no opt-out
+#            is set.
 #   build    contents: read ONLY. Verifies the tag and builds the source
 #            archive and release notes with `git` and Node built-ins. It
 #            installs and executes NO third-party code (no npm), so nothing
@@ -88,15 +88,16 @@ jobs:
       actions: read # read the `release` environment's protection rules
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_IMMUTABILITY: ${{ vars.RELEASE_IMMUTABILITY }}
+      # Keep this policy in protected workflow code; repository writers can
+      # change Actions variables without changing the reviewed workflow.
+      RELEASE_IMMUTABILITY: not-required
       RELEASE_APPROVAL: ${{ vars.RELEASE_APPROVAL }}
     steps:
       # GitHub's setting "Immutable releases" can only be read with the
       # `administration` permission, which no workflow token can have, so it
-      # cannot be checked from here BEFORE publishing. What can be done before
-      # anything irreversible happens is to require an explicit declaration by
-      # whoever administers the repository; after publishing, the release
-      # itself is checked and the run fails if the declaration was wrong.
+      # cannot be checked from here BEFORE publishing. The policy is therefore
+      # a reviewed workflow setting; after publishing, the release itself is
+      # checked and the run fails if the repository setting contradicts it.
       - name: Require the immutability policy to be declared
         run: |
           set -euo pipefail
@@ -105,10 +106,10 @@ jobs:
               echo "Immutable releases are declared as enabled; this is verified on the published release."
               ;;
             not-required)
-              echo "::warning::Immutable releases are NOT required (RELEASE_IMMUTABILITY=not-required): a published release can still be edited."
+              echo "::warning::Immutable releases are NOT required: published releases can be edited."
               ;;
             *)
-              echo "::error::Declare the immutability policy first. Turn on \"Immutable releases\" in the repository settings and set the repository variable RELEASE_IMMUTABILITY to required, or set it to not-required to accept mutable releases on purpose (see CONTRIBUTING.md). Nothing has been built or published."
+              echo "::error::Invalid immutability policy in the release workflow. Set RELEASE_IMMUTABILITY to required or not-required in this reviewed workflow (see CONTRIBUTING.md). Nothing has been built or published."
               exit 1
               ;;
           esac
@@ -588,9 +589,9 @@ jobs:
       # What GitHub now holds in the DRAFT must be exactly what was prepared
       # and verified above: the assets byte for byte and as a set (no missing
       # and no extra asset), and the release metadata (title, tag, notes,
-      # draft and pre-release flags). Checked after the upload and right before
-      # the last tag check and the publish. This narrows, but cannot close, the
-      # window in which someone with write access could alter a draft.
+      # draft and pre-release flags). This is the early failure with a clear
+      # diagnostic; the final publish step repeats these checks immediately
+      # before the tag check and publish call.
       - name: Verify the draft's assets and metadata are exactly what was verified
         run: |
           set -euo pipefail
@@ -644,6 +645,46 @@ jobs:
             echo "::error::Could not resolve the GitHub release ID for ${RELEASE_TAG}."
             exit 1
           fi
+
+          # Re-read and compare the DRAFT in this same shell step immediately
+          # before publication. This narrows the remaining race to the API
+          # round-trip; GitHub exposes no atomic verify-and-publish operation.
+          name="cla-bot-${RELEASE_TAG}"
+          assets=(
+            "${name}.tar.gz"
+            "${name}.tar.gz.sigstore.json"
+            "${name}.sbom.cdx.json"
+            "${name}.provenance.intoto.jsonl"
+            "${name}.sbom.intoto.jsonl"
+            SHA256SUMS
+            SHA256SUMS.sigstore.json
+          )
+          meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease --jq '[.name, .tagName, .isDraft, .isPrerelease] | join(" ")')"
+          if [ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
+            echo "::error::Draft metadata changed before publication ('${meta}'). Refusing to publish."
+            exit 1
+          fi
+          body="$(gh release view "$RELEASE_TAG" --json body --jq .body | tr -d '\r')"
+          notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
+          if [ "$body" != "$notes" ]; then
+            echo "::error::Draft release notes changed before publication. Refusing to publish."
+            exit 1
+          fi
+          rm -rf final-draft
+          mkdir final-draft
+          gh release download "$RELEASE_TAG" --dir final-draft
+          count="$(find final-draft -type f | wc -l)"
+          if [ "$count" -ne "${#assets[@]}" ]; then
+            echo "::error::Draft now holds ${count} assets, expected ${#assets[@]}. Refusing to publish."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if ! cmp -s -- "dist/${asset}" "final-draft/${asset}"; then
+              echo "::error::Draft asset ${asset} changed before publication. Refusing to publish."
+              exit 1
+            fi
+          done
+
           current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
           expected="tag ${EXPECTED_TAG_OBJECT}"
           if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
@@ -717,22 +758,22 @@ jobs:
             --predicate-type "https://cyclonedx.org/bom"
 
       # The release is already public here, so this step cannot undo anything.
-      # It exists so that a wrong RELEASE_IMMUTABILITY declaration (or a setting
-      # that was switched off later) is a red run, never a quiet downgrade of
-      # the guarantee SECURITY.md describes. The direct signal is the release's
+      # It checks that GitHub's setting matches the reviewed workflow policy.
+      # A mismatch is a red run, never a quiet downgrade of the guarantee
+      # SECURITY.md describes. The direct signal is the release's
       # own `immutable` flag (gh: isImmutable). `gh release verify` additionally
       # checks GitHub's own signed release attestation, which exists for
       # immutable releases and can take a moment to appear, hence the retries.
-      - name: Require the release to be immutable
+      - name: Check the release immutability policy
         env:
-          RELEASE_IMMUTABILITY: ${{ vars.RELEASE_IMMUTABILITY }}
+          RELEASE_IMMUTABILITY: not-required
         run: |
           set -euo pipefail
           case "${RELEASE_IMMUTABILITY:-}" in
             required) ;;
             not-required)
               state="$(gh release view "$RELEASE_TAG" --json isImmutable --jq .isImmutable || echo unknown)"
-              echo "::notice::Immutable releases are not required here (RELEASE_IMMUTABILITY=not-required); ${RELEASE_TAG} isImmutable=${state}."
+              echo "::notice::Mutable releases are allowed by the workflow policy; ${RELEASE_TAG} isImmutable=${state}."
               exit 0
               ;;
             *)
@@ -742,7 +783,7 @@ jobs:
           esac
           immutable="$(gh release view "$RELEASE_TAG" --json isImmutable --jq .isImmutable)"
           if [ "$immutable" != "true" ]; then
-            echo "::error::${RELEASE_TAG} is published, signed and verified, but GitHub reports it as NOT immutable (isImmutable=${immutable}). Turn on \"Immutable releases\" in the repository settings before the next release; see CONTRIBUTING.md. If that is deliberate, set the repository variable RELEASE_IMMUTABILITY to not-required."
+            echo "::error::${RELEASE_TAG} is published, signed and verified, but GitHub reports it as NOT immutable (isImmutable=${immutable}). The workflow policy requires immutable releases; see CONTRIBUTING.md."
             exit 1
           fi
           attempts=6
@@ -763,9 +804,9 @@ jobs:
     needs: [policy, publish]
     if: >-
       always() &&
+      needs.policy.result == 'success' &&
       (github.event_name == 'workflow_dispatch' ||
-       (needs.policy.result == 'success' &&
-        (needs.publish.result == 'success' || needs.publish.result == 'failure')))
+       (needs.publish.result == 'success' || needs.publish.result == 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -776,12 +817,14 @@ jobs:
       release-tag: ${{ steps.select.outputs.release-tag }}
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_IMMUTABILITY: ${{ vars.RELEASE_IMMUTABILITY }}
+      RELEASE_IMMUTABILITY: not-required
     steps:
       - name: Check out the release verification helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          # Bind the verifier to the exact commit that supplied this workflow.
+          # Never consume a moving default-branch script as authority for Latest.
+          ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
       - name: Install cosign to verify signed release assets

@@ -28,14 +28,27 @@ identity="https://github.com/${workflow}@refs/tags/${RELEASE_TAG}"
 temporary="$(mktemp -d)"
 trap 'rm -rf "$temporary"' EXIT
 
+case "${RELEASE_IMMUTABILITY:-}" in
+  required|not-required) ;;
+  *)
+    echo "RELEASE_IMMUTABILITY must be explicitly set to required or not-required." >&2
+    exit 1
+    ;;
+esac
+
 meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease,isImmutable --jq '[.name, .tagName, .isDraft, .isPrerelease, .isImmutable] | join(" ")')"
-if [[ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false true" && \
-      ("${RELEASE_IMMUTABILITY:-not-required}" != not-required || \
-       "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false false") ]]; then
+if [[ "$RELEASE_IMMUTABILITY" == required && \
+      "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false true" ]]; then
+  echo "Release metadata is not public, stable, correctly named, and immutable: ${meta}" >&2
+  exit 1
+fi
+if [[ "$RELEASE_IMMUTABILITY" == not-required && \
+      "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false true" && \
+      "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false false" ]]; then
   echo "Release metadata is not public, stable, and correctly named: ${meta}" >&2
   exit 1
 fi
-if [[ "${RELEASE_IMMUTABILITY:-not-required}" == required ]]; then
+if [[ "$RELEASE_IMMUTABILITY" == required ]]; then
   gh release verify "$RELEASE_TAG"
 fi
 
