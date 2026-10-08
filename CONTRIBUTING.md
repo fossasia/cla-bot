@@ -208,39 +208,32 @@ below comes **after** the workflow has finished.
 
 ### One-time setup (repository admin)
 
-The immutable-releases switch, the environment and your signing key are GitHub
-settings, not repository files. Do this once, and re-check it when something about releasing seems off:
+The release setting, environment and signing key are GitHub settings, not
+repository files. Releases are intentionally editable after publication so a
+maintainer with release rights can correct them. Do this once, and re-check it
+when something about releasing seems off:
 
-1. **Turn on "Immutable releases"** (Settings -> General -> Releases). Once a
-   release is published, its assets and its tag can never be changed or
-   removed, even by an admin. The workflow creates each release as a draft,
-   fills and verifies it, and only then publishes, precisely so this setting
-   is safe to use. Turn it on **before** the first release, then declare it
-   (step 2).
+1. **Leave "Immutable releases" off** (Settings -> General -> Releases) if
+   published releases need to remain editable. Release notes can be corrected
+   as needed. Replacing a signed asset invalidates its signatures/checksums;
+   consumers must reject it, so publish a newly signed asset under the next
+   patch version instead of silently replacing it in place.
 2. **Declare the release policy** as repository variables (Settings -> Secrets
-   and variables -> Actions -> Variables). A release does not start, and
-   nothing is built, until this is done:
-   - `RELEASE_IMMUTABILITY` = `required` once "Immutable releases" is on. The
-     workflow cannot read that setting before publishing (it needs a permission
-     no workflow token has), so you confirm it; after publishing, the workflow
-     checks the release itself and **fails the run** if it is not immutable
-     (it cannot undo the release, so a wrong declaration shows up on the first
-     release). A rehearsal fork that does not want it sets `not-required`.
-   - `RELEASE_APPROVAL`: leave it unset. The workflow then requires the
-     `release` environment (step 3) to have required reviewers, and refuses to
-     start otherwise. Set it to `not-required` only to release without any
-     approval, on purpose.
+   and variables -> Actions -> Variables):
+   - `RELEASE_IMMUTABILITY` = `not-required` while mutable releases are
+     intended. The workflow reports whether GitHub marked the published
+     release immutable; it does not fail when this variable is `not-required`.
+   - `RELEASE_APPROVAL` = `not-required` because anyone with repository release
+     rights is authorized to publish without a second-person approval.
 3. **Create the `release` environment** (Settings -> Environments -> New
-   environment). Add **required reviewers** (enable "Prevent self-review" if
-   there are enough people; the workflow notes it when it is off), and under
-   "Deployment branches and tags" allow only the selected tag pattern `v*`.
-   The `publish` job pauses on this environment, so every release becomes an
-   explicit second-person approval, a control that does not depend on `main`'s
-   review settings (there are none, by design). The `policy` job reads these
-   rules and refuses to start a release without reviewers. Note what this does
-   not do: a pull request could still edit `release.yml` (see "A change to
-   `release.yml` itself" in `SECURITY.md`).
-4. **Register a signing key on your GitHub account**, as a _Signing Key_ (not
+   environment). Under "Deployment branches and tags" allow only the selected
+   tag pattern `v*`. No required reviewers are needed. The environment keeps
+   the deployment tag restriction; it does not add an approval gate when
+   `RELEASE_APPROVAL` is `not-required`.
+4. **Import the release tag ruleset** in `.github/rulesets/release-tags.json`
+   as a repository admin. It lets writers create version tags but blocks
+   moving or deleting them after creation. A tag correction uses a new version.
+5. **Register a signing key on your GitHub account**, as a _Signing Key_ (not
    just an authentication key), and use the same address as a verified email:
    ```bash
    # SSH signing (simplest); GPG works too
@@ -262,8 +255,7 @@ change to the workflow), push a throwaway signed tag such as `v0.0.1` to a fork
 that has its own `release` environment and signing key, and watch the whole
 run, including the final "verify the published release" step. Everything here
 is tested offline (the helper script, the workflow's structure, the CLI flags),
-but signing and attesting need a real GitHub run, and with immutable releases
-a mistake on the real repository burns a version number.
+but signing and attesting need a real GitHub run.
 
 ### Cutting a release
 
@@ -286,9 +278,10 @@ a mistake on the real repository burns a version number.
    ```
    Only `vMAJOR.MINOR.PATCH` starts a release; no pre-release suffixes. A
    lightweight tag (`git tag vX.Y.Z`) or an unverified one fails the run.
-4. Watch the **Release** workflow (Actions tab). Approve the `publish` job
-   when asked. It ends by downloading the published release and verifying it
-   the way a consumer would.
+4. Watch the **Release** workflow (Actions tab). With the documented
+   `RELEASE_APPROVAL=not-required` setting, the `publish` job runs without a
+   second-person approval and ends by downloading and verifying the published
+   release the way a consumer would.
 5. **Only after it succeeded**, open
    `https://github.com/fossasia/cla-bot/releases/tag/vX.Y.Z`, run the
    verification in `SECURITY.md` once from a clean machine, and then update
@@ -301,12 +294,12 @@ a mistake on the real repository burns a version number.
 - **The `build` job failed** (tag not verified, version or changelog
   mismatch, tests, not on `main`): nothing was published. The simplest fix is
   to repair `main` and cut the **next patch version**; skipping a number costs
-  nothing. Since no release exists yet, you may instead delete the tag
-  (`git push --delete origin vX.Y.Z` and `git tag -d vX.Y.Z`), fix the cause
-  and tag again, as long as nobody has pinned that tag in the meantime. Only a
-  _published_ release is locked, and only if "Immutable releases" is on.
-- **A "no longer resolves to the signed tag object" error** means the tag was
-  moved, deleted and re-created, or re-signed after the build job verified it.
+  nothing. If the release tag ruleset is not yet applied, you may delete and
+  recreate an unpublished tag after fixing the cause. Once the ruleset is
+  active, fix the cause and use the next patch version.
+- **A "no longer resolves to the signed tag object" error** means the tag
+  changed after the build job verified it (possible only if tag updates are
+  not blocked by the release tag ruleset).
   Two cases, told apart by the message:
   - _Before publishing_ ("Refusing to release"): nothing is public. Do not
     re-run; investigate who changed the tag, then release the next patch
@@ -322,22 +315,23 @@ a mistake on the real repository burns a version number.
   differ from what was prepared) means someone or something changed the draft
   after it was created. Nothing is public. Delete the draft, find out why, and
   re-run the failed jobs.
-- **A "policy" job failure** ("Declare the immutability policy first", "The
-  'release' environment has no required reviewers", "Could not read the
-  'release' environment"): nothing was built or published. Do the one-time
+- **A "policy" job failure** (invalid immutability declaration, missing
+  reviewers when approval is required, or inability to read the `release`
+  environment): nothing was built or published. Do the one-time
   setup it names, then re-run the failed jobs.
 - **"... NOT immutable (isImmutable=false)"** at the very end: the release is
   published, signed and verified, but "Immutable releases" is off although
   `RELEASE_IMMUTABILITY` says `required`. Turn it on before the next release
   (it cannot be applied to this one), or correct the variable if opting out
   was the intent.
-- **The `publish` job failed** (Sigstore or GitHub outage, approval
-  timed out, upload error): use "Re-run failed jobs". It is safe to repeat; a
-  leftover **draft** is replaced, and a release that is already **published**
+- **The `publish` job failed** (Sigstore or GitHub outage, upload error): use
+  "Re-run failed jobs". It is safe to repeat; a leftover **draft** is
+  replaced, and a release that is already **published**
   is never overwritten (the run stops instead).
-- **A published release turns out to be wrong:** never reuse its version, and
-  with immutable releases you could not. Fix `main`, release the next patch
-  version, and say in its changelog which version it supersedes.
+- **A published release turns out to be wrong:** edit its notes for a notes
+  issue. For an asset or source correction, release the next patch version and
+  say in its changelog which version it supersedes; consumers must reject any
+  replaced asset whose signatures no longer verify.
 
 ## Local development
 

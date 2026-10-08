@@ -20,6 +20,25 @@ PR and merge it themselves the moment `Required checks pass` succeeds - no
 approval, no code-owner review, no second person required. This is a
 deliberate choice for this repository (see below), not an oversight.
 
+## Protect published release tags
+
+`release-tags.json` is a tag ruleset for `v*` release tags. It leaves tag
+creation open to repository writers (the release authorization policy) while
+blocking updates and deletions after creation. This prevents a tag from being
+moved or recreated during or after release verification. It does not make the
+GitHub Release immutable: release notes and assets remain editable by actors
+with repository write access, as described in `SECURITY.md`.
+
+Import it once as a repository admin:
+
+```bash
+gh api --method POST repos/fossasia/cla-bot/rulesets --input .github/rulesets/release-tags.json
+```
+
+Verify that the active ruleset targets `refs/tags/v*`, has both `update` and
+`deletion` rules, and has an empty bypass list. A correction that requires
+moving or deleting a version tag must be released under a new version instead.
+
 ### Branch protection has exactly one required condition, by design
 
 This repository intentionally does **not** use `CODEOWNERS` or a required

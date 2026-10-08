@@ -71,9 +71,13 @@ Out of scope:
    uploads release assets by hand. The signed tag object the build verified
    is pinned: the publish job re-checks that the tag still resolves to that
    exact object right before it creates the draft, and again in the very same
-   shell step as the publish call, so a tag moved or re-signed during the
-   approval pause or the signing is refused. (A gap of one API round trip
-   remains; see "A tag moved between verification and release" below.) The
+   shell step as the publish call. The release tag ruleset
+   (`.github/rulesets/release-tags.json`) prevents ordinary writers from
+   updating or deleting a `v*` tag once created; it must be imported in GitHub
+   settings. Without it, repeated checks only narrow the tag race. The
+   final check still has a one-API-round-trip window if an administrator
+   disables or bypasses the ruleset; see "A tag moved between verification
+   and release" below. The
    draft release is also compared with what was prepared and verified, right
    before it is published: its assets byte for byte and as a set, and its
    title, tag, notes, draft and pre-release flags.
@@ -89,12 +93,17 @@ Out of scope:
    re-checks the digests the other two reported through job outputs. `policy`,
    `build` and `checks` can only read.
 8. A release does not start unless the release policy is declared, before
-   anything is built: the repository variable `RELEASE_IMMUTABILITY` must be
-   `required` (the administrator confirms "Immutable releases" is on; it is
-   verified on the published release) or `not-required`, and the `release`
-   environment must have required reviewers (read through the API) unless
-   `RELEASE_APPROVAL` is `not-required`. These are explicit, visible
-   decisions, never silent defaults.
+   anything is built: `RELEASE_IMMUTABILITY` must be `required` or
+   `not-required`, and `RELEASE_APPROVAL` must be unset or `not-required`.
+   This project intentionally uses `not-required` for both: releases remain
+  editable, and repository actors with release rights may publish without a
+  second-person approval. These repository variables express operating
+  policy; they are not a security boundary against actors who can change
+  repository configuration. Signed assets and checksums let consumers detect
+  asset changes, but release notes and mutable metadata are not covered by
+  those asset signatures. For an asset correction, publish a new patch version;
+  consumers must reject an in-place replacement whose existing signatures no
+  longer verify.
 
 ## Verifying a release
 
@@ -123,6 +132,19 @@ TAG=vX.Y.Z                      # the release you are about to adopt
 REPO=fossasia/cla-bot
 WORKFLOW="$REPO/.github/workflows/release.yml"
 
+# gh attestation verify must be v2.102.0 or newer. Older versions have
+# verification-policy bugs in --signer-workflow and --source-ref.
+GH_VERSION="$(gh version | awk 'NR == 1 { sub(/^gh version /, ""); print $1 }')"
+if [[ ! "$GH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "Could not read the GitHub CLI version" >&2
+  exit 1
+fi
+IFS=. read -r GH_MAJOR GH_MINOR _ <<< "$GH_VERSION"
+if (( 10#$GH_MAJOR < 2 || (10#$GH_MAJOR == 2 && 10#$GH_MINOR < 102) )); then
+  echo "Upgrade GitHub CLI to v2.102.0 or newer" >&2
+  exit 1
+fi
+
 gh release download "$TAG" --repo "$REPO" --dir cla-bot-release
 cd cla-bot-release
 
@@ -140,31 +162,40 @@ for f in "cla-bot-$TAG.tar.gz" SHA256SUMS; do
 done
 
 # 3. GitHub build-provenance and SBOM attestations.
+# Resolve the tag once. The provenance check below must attest this exact
+# commit, and this same value is the only SHA to use in the consumer workflow.
+SOURCE_SHA="$(git ls-remote --tags "https://github.com/$REPO.git" "$TAG" "$TAG^{}" | awk '$2 ~ /\^\{\}$/ {print $1}')"
+if ! [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "Could not resolve an annotated release tag to a commit" >&2
+  exit 1
+fi
 gh attestation verify "cla-bot-$TAG.tar.gz" \
   --bundle "cla-bot-$TAG.provenance.intoto.jsonl" \
-  --repo "$REPO" --signer-workflow "$WORKFLOW" --source-ref "refs/tags/$TAG"
+  --repo "$REPO" --signer-workflow "$WORKFLOW" --source-ref "refs/tags/$TAG" \
+  --source-digest "$SOURCE_SHA"
 gh attestation verify "cla-bot-$TAG.tar.gz" \
   --bundle "cla-bot-$TAG.sbom.intoto.jsonl" \
   --repo "$REPO" --signer-workflow "$WORKFLOW" \
+  --source-ref "refs/tags/$TAG" --source-digest "$SOURCE_SHA" \
   --predicate-type https://cyclonedx.org/bom
 
-# 4. If "Immutable releases" is enabled (it should be), GitHub itself attests
-#    that the release and its tag were never changed after publishing.
-gh release verify "$TAG" --repo "$REPO"
-gh release verify-asset "$TAG" "cla-bot-$TAG.tar.gz" --repo "$REPO"
+# 4. GitHub's release immutability attestation is available only when the
+#    repository has "Immutable releases" enabled. Mutable releases are
+#    intentional here, so check it only when that setting is on.
+if [ "$(gh release view "$TAG" --repo "$REPO" --json isImmutable --jq .isImmutable)" = true ]; then
+  gh release verify "$TAG" --repo "$REPO"
+  gh release verify-asset "$TAG" "cla-bot-$TAG.tar.gz" --repo "$REPO"
+else
+  echo "Release is mutable; asset signatures and attestations above are the integrity checks."
+fi
 ```
 
-Then **pin the commit, not the tag**. The commit a release tag points at is
-the last line printed by:
-
-```bash
-git ls-remote --tags "https://github.com/$REPO.git" "$TAG" "$TAG^{}"
-```
-
-(the line ending in `^{}` is the commit; for an annotated tag the first line
-is the tag object, which is not what you want). Use it in your workflow as
-`uses: fossasia/cla-bot@<that full commit SHA> # vX.Y.Z`, as
-`examples/consumer-workflow.yml` shows. A tag, even a protected one, is a name
+Then **pin the exact `SOURCE_SHA` used above**, not a freshly resolved tag.
+The provenance and SBOM attestations have both been required to match that
+commit with `--source-digest`; therefore this is the verified source commit
+that must appear in `uses: fossasia/cla-bot@$SOURCE_SHA # $TAG` (as a literal
+SHA in the workflow, not a shell variable). This closes the gap between the
+verified source and the commit GitHub Actions will execute. A tag, even a protected one, is a name
 that points at a commit; a full commit SHA is the commit itself, so nothing
 that happens to this repository later can change what your workflow runs.
 Dependabot and Renovate both keep a SHA pin plus a version comment up to
@@ -178,15 +209,16 @@ What the signatures do **not** protect against, and what does:
   write access and a registered signing key can start a release. The checks
   that still apply to every release are: the commit must already be on
   `main`, the tests and the 100% coverage gate must pass on it, and the
-  tagger is identifiable from the signed tag, and the `release` environment
-  must have required reviewers (verified before anything is built), so a
-  second person approves the publish.
+  tagger is identifiable from the signed tag. This project intentionally does
+  not require a second-person approval; repository actors with release rights
+  are authorized to publish.
 - **A change to `release.yml` itself.** This repository deliberately has no
   required code review on `main` (see `.github/rulesets/README.md`), and the
   signing identity above names the workflow _file_, not its contents. A pull
   request that passes CI could therefore change `release.yml`, including
-  removing the policy checks or the `environment: release` line that makes
-  reviewers apply, and no check inside that same file can stop it. The
+  removing the policy checks or the `environment: release` line that applies
+  the environment's deployment tag restriction, and no check inside that same
+  file can stop it. The
   policy gate protects against misconfiguration and against someone who can
   push tags but not change the workflow; it is **not** a defence against a
   malicious change to the workflow. That needs a human review of changes to
@@ -198,16 +230,16 @@ What the signatures do **not** protect against, and what does:
 - **A tag moved between verification and release.** The publish job refuses
   to continue unless the tag still resolves to the exact signed tag object
   that was verified (`gh release create --verify-tag` alone would not catch
-  this; it only checks that the tag exists). The check and the publish call
-  are one shell step, back to back, so the gap is a single API round trip,
-  which no workflow can close entirely. Two different outcomes, which call for
-  different responses:
+  this; it only checks that the tag exists). Importing the tag ruleset blocks
+  updates/deletions by ordinary writers. If an administrator disables or
+  bypasses that ruleset, the final check and publish call remain separate
+  GitHub API operations, leaving one API round trip of residual race. Two
+  outcomes call for different responses:
   - _Caught before publishing_ (the normal case): the run fails with "no
     longer resolves to the signed tag object", **nothing is public**, and
     nothing needs undoing.
-  - _Caught only after publishing_ (the tag moved in the few milliseconds
-    between the last check and GitHub's publish call, or in the seconds
-    before an immutable release locks it): the run fails with "after
+  - _Caught only after publishing_ (the tag moved between the last check and
+    GitHub's publish call): the run fails with "after
     publishing ... Treat this release as compromised". **The release is
     already public.** Do not re-run it; follow "If a release run fails" in
     `CONTRIBUTING.md` (mark or remove the release if it is still editable,
@@ -221,9 +253,10 @@ What the signatures do **not** protect against, and what does:
   and fails the run loudly, and consumers who verify (above) are protected
   regardless.
 - **A tag moved or deleted after you pinned it.** Pinning the commit SHA makes
-  this irrelevant for you; "Immutable releases" additionally makes it
-  impossible for everyone else once a release is published. A tag that has no
-  published release yet is not protected.
+  this irrelevant for you. Import `.github/rulesets/release-tags.json` to
+  prevent updates and deletions of `v*` tags while still allowing authorized
+  writers to create new releases. Without that repository ruleset, the
+  workflow's repeated tag checks narrow but do not eliminate the tag race.
 
 ## Known limitations (not vulnerabilities, but worth knowing)
 
@@ -309,19 +342,13 @@ What the signatures do **not** protect against, and what does:
   installed on the signatures repo) will only surface at runtime; the
   manual test-PR walkthrough in "TESTING_GUIDE.md" is what actually
   catches those.
-- "Immutable releases" is a repository setting that cannot be turned on from
-  code. Until it is enabled, a published release's assets can in principle
-  still be replaced by an administrator; the signatures would then no
-  longer match, so a verifying consumer notices, but a non-verifying one
-  would not. The setting cannot be read from a workflow before publishing
-  (GitHub requires the `administration` permission, which no workflow token can
-  have), so the workflow does what is possible: before building anything it
-  requires the administrator to **declare** the policy (`RELEASE_IMMUTABILITY`
-  `required` or `not-required`), and after publishing it checks the release's
-  own `isImmutable` flag and GitHub's signed release attestation, FAILING the
-  run if a `required` release is not immutable. That last failure comes after
-  publishing, so it cannot undo the release: it catches a wrong declaration
-  (or a setting switched off since), the first time it happens.
+- "Immutable releases" is a repository setting that cannot be changed by the
+  workflow. This project intentionally leaves releases editable to allow
+  maintainers with release rights to correct them. When a signed asset is
+  changed, its signature and checksum no longer match; consumers must verify
+  again and reject changed assets until corrected signatures/checksums are
+  published. The workflow records whether a release is immutable, but with
+  `RELEASE_IMMUTABILITY=not-required` it does not fail for mutable releases.
 - The release SBOM lists the pinned third-party actions that `action.yml`
   runs (`runs.steps[*].uses`). It deliberately models only a composite action
   with no local `./` actions: anything else makes the release fail instead of

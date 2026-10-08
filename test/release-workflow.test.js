@@ -6,7 +6,7 @@
  * later edit cannot quietly undo one:
  *
  *  - it only runs for pushed stable-semver tags (never a PR, branch or manual
- *    trigger), serialised and never cancelled;
+ *    trigger), serialised and never cancelled, with an explicit max queue;
  *  - least privilege: workflow permissions are empty; `policy`, `build` and
  *    `checks` can only READ; only `publish` can sign/attest/write, and
  *    `publish` runs no repository or third-party code (no checkout, no
@@ -201,6 +201,88 @@ test("the only trigger is a push of stable-semver tags: no PR, no branch, no man
   for (const tag of ["1.0.0", "v1.0", "v1.0.0-rc.1", "latest", "main"]) {
     assert.ok(!filter.test(tag), `${tag} must not start a release`);
   }
+});
+
+test("release runs serialize without silently replacing pending runs", () => {
+  assert.strictEqual(wf.concurrency.group, "release");
+  assert.strictEqual(wf.concurrency.queue, "max");
+  assert.strictEqual(wf.concurrency["cancel-in-progress"], false);
+});
+
+test("both source artifacts are retained for the maximum public-repository window", () => {
+  const uploads = allSteps.filter(
+    (step) => String(step.uses ?? "").startsWith("actions/upload-artifact@"),
+  );
+  assert.strictEqual(uploads.length, 2);
+  for (const upload of uploads) {
+    assert.strictEqual(upload.with["retention-days"], 90);
+  }
+});
+
+test("release tag ruleset leaves creation open but blocks tag updates and deletions", () => {
+  const ruleset = readJson(".github", "rulesets", "release-tags.json");
+  assert.strictEqual(ruleset.target, "tag");
+  assert.strictEqual(ruleset.enforcement, "active");
+  assert.deepStrictEqual(ruleset.bypass_actors, []);
+  assert.deepStrictEqual(ruleset.conditions.ref_name.include, ["refs/tags/v*"]);
+  assert.deepStrictEqual(
+    ruleset.rules.map((rule) => rule.type).sort(),
+    ["deletion", "update"],
+  );
+  assert.ok(!ruleset.rules.some((rule) => rule.type === "creation"));
+});
+
+test("the release verifier refuses GitHub CLI versions below v2.102.0 and parses build metadata safely", () => {
+  const step = publish.steps[stepNamed(publish.steps, "Require a patched GitHub CLI")];
+  for (const version of ["2.102.0", "2.102.1", "2.110.0", "3.0.0"]) {
+    const result = runStep(step, {
+      gh: `printf '%s\\n' 'gh version ${version} (2026-10-01)'`,
+    });
+    assert.strictEqual(result.status, 0, `${version}: ${result.output}`);
+  }
+  for (const version of ["2.101.99", "1.999.0", "unknown", "2.102"]) {
+    const result = runStep(step, {
+      gh: `printf '%s\\n' 'gh version ${version} (2026-10-01)'`,
+    });
+    assert.notStrictEqual(result.status, 0, version);
+    assert.match(result.output, /require 2\.102\.0 or newer/);
+  }
+});
+
+test("published release verification fails closed on changed metadata or notes", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISHED_CHECK)];
+  const gh = [
+    'case "$*" in',
+    '  *"--json name,tagName,isDraft,isPrerelease,isLatest"*) printf "%s\\n" "$FAKE_META" ;;',
+    '  *"--json body"*) printf "%s\\n" "$FAKE_BODY" ;;',
+    '  *) exit 99 ;;',
+    "esac",
+  ].join("\n");
+  const metadata = runStep(step, {
+    gh,
+    env: {
+      FAKE_META: "v1.2.3 v1.2.3 false false false",
+      FAKE_BODY: "notes",
+    },
+  });
+  assert.notStrictEqual(metadata.status, 0);
+  assert.match(metadata.output, /expected the named release to be published, stable and latest/);
+  assert.strictEqual(metadata.calls.length, 1, "must stop before touching assets");
+
+  const notes = runStep(step, {
+    gh,
+    env: {
+      FAKE_META: "v1.2.3 v1.2.3 false false true",
+      FAKE_BODY: "altered notes",
+    },
+    setup: (dir) => {
+      fs.mkdirSync(path.join(dir, "dist"));
+      fs.writeFileSync(path.join(dir, "dist", "RELEASE_NOTES.md"), "verified notes\n");
+    },
+  });
+  assert.notStrictEqual(notes.status, 0);
+  assert.match(notes.output, /release notes differ from the verified notes/);
+  assert.strictEqual(notes.calls.length, 2, "must stop before touching assets");
 });
 
 test("the tag-filter matcher escapes everything and rejects syntax it does not model", () => {
@@ -1079,6 +1161,28 @@ test("every `gh attestation verify` pins repo, signer workflow, tag ref AND comm
     "https://cyclonedx.org/bom",
     "https://cyclonedx.org/bom",
   ]);
+  assert.strictEqual(
+    commands.filter((command) => command.includes(".provenance.intoto.jsonl")).length,
+    2,
+    "provenance uses the persisted bundle both before and after publication",
+  );
+  assert.strictEqual(
+    commands.filter((command) => command.includes(".sbom.intoto.jsonl")).length,
+    2,
+    "SBOM attestation uses the persisted bundle both before and after publication",
+  );
+});
+
+test("consumer verification pins the resolved tag commit to both attestations and reuses that SHA", () => {
+  const security = read("SECURITY.md");
+  assert.match(security, /SOURCE_SHA=.*git ls-remote/);
+  assert.strictEqual((security.match(/--source-digest "\$SOURCE_SHA"/g) ?? []).length, 2);
+  assert.match(security, /pin the exact `SOURCE_SHA` used above/);
+  assert.match(security, /not a freshly resolved tag/);
+  const example = read("examples", "consumer-workflow.yml");
+  assert.ok(example.includes("resolved ONCE during the"));
+  assert.ok(example.includes("verification procedure in SECURITY.md"));
+  assert.match(example, /Do not resolve the tag again/);
 });
 
 // --- the release policy gate (runs before anything is built) -----------------------
@@ -1540,12 +1644,12 @@ test("CHANGELOG.md keeps an [Unreleased] section for the next release", () => {
   assert.match(read("CHANGELOG.md"), /^## \[Unreleased\]$/m);
 });
 
-// --- no tag rulesets ------------------------------------------------------------------------
+// --- release tag ruleset --------------------------------------------------------------------
 
-test("no ruleset restricts who may create, move or delete release tags (main.json is the only ruleset, with no bypass)", () => {
+test("the release tag ruleset lets writers create versions but blocks moving/deleting them", () => {
   const dir = path.join(ROOT, ".github", "rulesets");
-  const rulesets = fs.readdirSync(dir).filter((f) => f.endsWith(".json"));
-  assert.deepStrictEqual(rulesets, ["main.json"]);
+  const rulesets = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
+  assert.deepStrictEqual(rulesets, ["main.json", "release-tags.json"]);
   assert.strictEqual(
     readJson(".github", "rulesets", "main.json").target,
     "branch",
@@ -1554,6 +1658,16 @@ test("no ruleset restricts who may create, move or delete release tags (main.jso
     readJson(".github", "rulesets", "main.json").bypass_actors,
     [],
   );
+  const releaseTags = readJson(".github", "rulesets", "release-tags.json");
+  assert.strictEqual(releaseTags.target, "tag");
+  assert.strictEqual(releaseTags.enforcement, "active");
+  assert.deepStrictEqual(releaseTags.bypass_actors, []);
+  assert.deepStrictEqual(releaseTags.conditions.ref_name.include, ["refs/tags/v*"]);
+  assert.deepStrictEqual(
+    releaseTags.rules.map((rule) => rule.type).sort(),
+    ["deletion", "update"],
+  );
+  assert.ok(!releaseTags.rules.some((rule) => rule.type === "creation"));
 });
 
 // --- the release is not part of the PR gate --------------------------------------------------

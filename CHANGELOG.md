@@ -19,9 +19,15 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   `SECURITY.md`.
 - The publish job pins the tag: it re-checks (before creating the release,
   before publishing, and after) that the tag still resolves to the exact
-  signed tag object the build job verified, so a tag moved during the approval
-  pause cannot be released. Every `gh attestation verify`, before and after
-  publishing, pins the repository, signer workflow, tag ref and commit digest.
+  signed tag object the build job verified. `.github/rulesets/release-tags.json`
+  blocks updates/deletions of release tags once imported. Every `gh attestation
+  verify`, before and after publishing, uses the persisted bundle and pins the
+  repository, signer workflow, tag ref and commit digest.
+- Consumer instructions resolve the tag commit once, require both attestations
+  to match it via `--source-digest`, and pin that same SHA in `uses:`. The
+  release workflow requires GitHub CLI 2.102.0 or newer for attestation
+  verification, verifies published notes/title/tag/latest metadata, retains
+  cross-job artifacts for 90 days, and explicitly queues up to 100 release runs.
 - The release helper refuses npm dependencies in every field that can pull
   code in (`dependencies`, `optionalDependencies`, `peerDependencies`,
   `bundleDependencies`/`bundledDependencies`), and reads `action.yml` as YAML
@@ -45,6 +51,7 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   immutable, instead of warning.
 - The release helper refuses a local `./` action in `action.yml` (it resolves
   against the caller's workspace and would hide dependencies from the SBOM), and
+  validates owner/repository/action path syntax and refuses extra `@` suffixes;
   its changelog parser ignores `##` lines inside fenced code blocks.
 - Third-party code no longer shares a machine with the archive. The release is
   now four jobs: `policy`, `build` (verifies the tag and builds the archive with
@@ -54,8 +61,9 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 - A release policy gate runs before anything is built: the repository
   variable `RELEASE_IMMUTABILITY` must be declared (`required` or
   `not-required`; GitHub's setting cannot be read from a workflow token), and
-  the `release` environment must have required reviewers, read through the API
-  (opt-out: `RELEASE_APPROVAL=not-required`).
+  the `release` environment must have required reviewers unless
+  `RELEASE_APPROVAL=not-required`. This project intentionally uses the opt-outs
+  to allow mutable releases and publication by any actor with release rights.
 - The last tag check and the publish call are now one shell step, so nothing
   but one API round trip sits between them.
 - Least-privilege release pipeline: the job that runs repository code can only

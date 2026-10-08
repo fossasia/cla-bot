@@ -10,12 +10,12 @@
 # release" in SECURITY.md): every release is signed, and unsigned or
 # partially-signed ones must not be used.
 #
-# Pin the action by its full commit SHA, with the version only in the trailing
-# comment. A tag is a name that can be moved to a different commit, while a
-# full commit SHA cannot be. Get the SHA of a release with:
-#   git ls-remote --tags https://github.com/fossasia/cla-bot.git vX.Y.Z "vX.Y.Z^{}"
-# (the line ending in ^{} is the commit). Dependabot / Renovate update a SHA
-# pin and its comment together.
+# Pin the action by the full commit SHA you resolved ONCE during the
+# verification procedure in SECURITY.md. That procedure passes the same SHA
+# to gh attestation verify as --source-digest, so the verified provenance must
+# match the commit this workflow will execute. Do not resolve the tag again
+# after verification. Keep the version only in the trailing comment.
+# Dependabot / Renovate update a SHA pin and its comment together.
 #
 # Full setup walkthrough (creating the GitHub App, the signatures repo,
 # secrets, etc.) is in "SETUP_GUIDE.md" in this repo.

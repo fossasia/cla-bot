@@ -62,6 +62,7 @@ const path = require("path");
 const TAG_PATTERN = /^v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const REPOSITORY_PATTERN = /^[\w.-]+\/[\w.-]+$/;
 const FULL_SHA_PATTERN = /^[0-9a-f]{40}$/;
+const ACTION_NAME_PATTERN = /^[A-Za-z0-9-]+\/[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)*$/;
 // Every package.json field through which npm can pull code in at install or
 // pack time. All must be empty for the SBOM to be complete.
 const NPM_DEPENDENCY_FIELDS = [
@@ -311,10 +312,20 @@ function listActionDependencies(actionYml) {
         `action.yml uses the local path "${target}", which the SBOM does not model (and which resolves against the caller's workspace); refusing to produce an incomplete SBOM.`,
       );
     }
-    const [name, ref] = target.split("@");
+    const separator = target.indexOf("@");
+    const name = separator === -1 ? "" : target.slice(0, separator);
+    const ref = separator === -1 ? "" : target.slice(separator + 1);
     if (!name || !FULL_SHA_PATTERN.test(ref ?? "")) {
       throw new Error(
         `action.yml uses "${target}", which is not pinned to a full commit SHA; refusing to describe a mutable dependency.`,
+      );
+    }
+    if (
+      !ACTION_NAME_PATTERN.test(name) ||
+      name.split("/").some((part) => part === "." || part === "..")
+    ) {
+      throw new Error(
+        `action.yml uses "${target}" with an invalid owner/repository/action path; refusing to produce an incomplete SBOM.`,
       );
     }
     // Keyed by the full target, so a repeated action collapses to one entry.

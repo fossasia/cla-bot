@@ -59,10 +59,12 @@ on:
 
 permissions: {}
 
-# Serialised, never cancelled: two releases racing each other (or a rerun
-# overlapping the original) must queue, not interrupt a half-published one.
+# Serialised, never cancelled: releases must queue rather than overlap or
+# interrupt a half-published one. `queue: max` preserves up to 100 pending runs;
+# without it GitHub replaces the single pending run when another arrives.
 concurrency:
   group: release
+  queue: max
   cancel-in-progress: false
 
 jobs:
@@ -228,7 +230,7 @@ jobs:
           name: release-source
           path: dist/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90
 
   checks:
     name: Tests, coverage and SBOM
@@ -287,7 +289,7 @@ jobs:
           name: release-sbom
           path: dist/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 90
 
   publish:
     name: Sign and publish
@@ -322,6 +324,24 @@ jobs:
         with:
           name: release-sbom
           path: dist
+
+      # gh is supplied by the runner image, so fail closed until it includes
+      # fixes for the signer-workflow matching and case-sensitive source-ref
+      # verification bugs (both fixed in 2.102.0).
+      - name: Require a patched GitHub CLI
+        run: |
+          set -euo pipefail
+          actual="$(gh version | awk 'NR == 1 { sub(/^gh version /, ""); print $1 }')"
+          minimum="2.102.0"
+          if [[ ! "$actual" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::GitHub CLI ${actual:-unknown} is too old for release attestation verification; require ${minimum} or newer."
+            exit 1
+          fi
+          IFS=. read -r gh_major gh_minor _ <<< "$actual"
+          if (( 10#$gh_major < 2 || (10#$gh_major == 2 && 10#$gh_minor < 102) )); then
+            echo "::error::GitHub CLI ${actual} is too old for release attestation verification; require ${minimum} or newer."
+            exit 1
+          fi
 
       # Each job passed the digest of its own output as a job OUTPUT, which does
       # not travel through the artifact store, so an altered file is caught
@@ -540,6 +560,17 @@ jobs:
       - name: Verify the published release end to end
         run: |
           set -euo pipefail
+          meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease,isLatest --jq '[.name, .tagName, .isDraft, .isPrerelease, .isLatest] | join(" ")')"
+          if [ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} false false true" ]; then
+            echo "::error::Published release metadata is '${meta}', expected the named release to be published, stable and latest."
+            exit 1
+          fi
+          body="$(gh release view "$RELEASE_TAG" --json body --jq .body | tr -d '\r')"
+          notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
+          if [ "$body" != "$notes" ]; then
+            echo "::error::Published release notes differ from the verified notes."
+            exit 1
+          fi
           current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
           if [ "$current" != "tag ${EXPECTED_TAG_OBJECT}" ]; then
             echo "::error::Tag ${RELEASE_TAG} no longer resolves to the verified tag object after publishing ('${current}'). Treat this release as compromised."
@@ -558,6 +589,7 @@ jobs:
               "published/${file}"
           done
           gh attestation verify "published/${name}.tar.gz" \
+            --bundle "published/${name}.provenance.intoto.jsonl" \
             --repo "$GITHUB_REPOSITORY" \
             --signer-workflow "$workflow" \
             --source-ref "$GITHUB_REF" \

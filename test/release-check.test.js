@@ -622,6 +622,7 @@ test("listActionDependencies fails closed on anything that is not a full-SHA pin
   for (const target of [
     "actions/checkout@v4",
     "actions/checkout@main",
+    `actions/checkout@${SHA_A}@extra`,
     `actions/checkout@${SHA_A.slice(0, 7)}`,
     "actions/checkout",
     `"@${SHA_A}"`,
@@ -816,6 +817,38 @@ test("listActionDependencies cannot be dodged by an odd trailing comment or an u
       composite(`    - uses: a/b@${SHA_A} # v1 extra words here`),
     ),
     [{ name: "a/b", ref: SHA_A, comment: "v1" }],
+  );
+});
+
+test("listActionDependencies rejects malformed owner/repository/action identifiers", () => {
+  for (const name of [
+    "/repo",
+    "owner/",
+    "owner/repo/",
+    "owner//repo",
+    "../owner/repo",
+    "owner/../repo",
+    "owner/repo/..",
+    "owner/repo?query",
+    "owner/repo name",
+  ]) {
+    assert.throws(
+      () => listActionDependencies(composite(`    - uses: ${name}@${SHA_A}`)),
+      /invalid owner\/repository\/action path/,
+      name,
+    );
+  }
+  assert.deepStrictEqual(
+    listActionDependencies(
+      composite(`    - uses: github/codeql-action/upload-sarif@${SHA_A}`),
+    ),
+    [
+      {
+        name: "github/codeql-action/upload-sarif",
+        ref: SHA_A,
+        comment: undefined,
+      },
+    ],
   );
 });
 
