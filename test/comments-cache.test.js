@@ -182,6 +182,53 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     assert.strictEqual(raw[0].id, 3);
   });
 
+  await test("a flood of marker-bearing BOT-TYPE comments is capped - the cache never grows past MAX_CACHED_COMMENTS, and the real, most recent one always survives the trim", async () => {
+    // isPossiblyBotIdentity() admits any type:"Bot" account, not just this
+    // bot's own (that's what lets anyBotIdentity survive a token rotation) -
+    // so an unrelated or compromised app posting many large marker-bearing
+    // comments must still be bounded by an explicit cap, not just identity.
+    const floodSize = 350; // > MAX_CACHED_COMMENTS (200), spans 4 pages of 100
+    const flood = Array.from({ length: floodSize }, (_, i) => ({
+      id: i,
+      body: `${MARKER}\n` + `fake message #${i} `.padEnd(2000, "x"),
+      user: { login: `rogue-bot-${i}`, type: "Bot" },
+    }));
+    // The bot's own real comment - appended LAST (so it's the most recent,
+    // since GitHub returns comments oldest-first). A correct trim keeps the
+    // most recent entries and drops the oldest, so this must survive even
+    // though it's vastly outnumbered by the flood ahead of it.
+    const real = {
+      id: 999999,
+      body: `${MARKER}\nthe real bot comment`,
+      user: BOT,
+    };
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      const all = [...flood, real];
+      const page = Number(new URL(url).searchParams.get("page")) || 1;
+      const start = (page - 1) * 100;
+      return res(200, all.slice(start, start + 100));
+    };
+    const cache = new Map();
+    const result = await getExistingBotComments(1, {
+      cache,
+      anyBotIdentity: true,
+    });
+    const raw = await cache.get(1).promise;
+    assert.ok(
+      raw.length <= 200,
+      `the cache must never exceed MAX_CACHED_COMMENTS (200), got ${raw.length}`,
+    );
+    assert.ok(
+      raw.some((c) => c.id === 999999),
+      "the real, most recently posted bot comment must survive the trim",
+    );
+    assert.ok(
+      result.some((c) => c.id === 999999),
+      "and must still be returned to the caller, despite the flood",
+    );
+  });
+
   await test("a cache is scoped per PR number - a different PR is never served from another PR's entry", async () => {
     let getCalls = 0;
     global.fetch = async (url) => {

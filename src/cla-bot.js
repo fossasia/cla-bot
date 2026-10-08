@@ -1231,10 +1231,23 @@ function isPossiblyBotIdentity(user, botLogin) {
   );
 }
 
+// isPossiblyBotIdentity() is deliberately broad (any Bot-type account, not
+// just this bot's own - that is what lets `anyBotIdentity` survive a token
+// rotation), so it does NOT by itself bound how many comments this run ever
+// retains: nothing stops some other installed app, or a compromised one,
+// from posting many large comments that happen to carry BOT_MARKER too.
+// MAX_CACHED_COMMENTS is the actual, hard bound - see where it's applied in
+// fetchAllIssueCommentsUncached() below. 200 is far more than this bot's own
+// comments ever realistically reach on one PR (dedupeIdenticalTrailingComments
+// keeps that near-zero in steady state), while still capping worst-case
+// per-PR cache memory to a small, fixed, auditable number regardless of how
+// many marker-bearing Bot-type comments a PR accumulates.
+const MAX_CACHED_COMMENTS = 200;
+
 // A public PR can carry comments from untrusted contributors in unbounded
 // number and size, so this run's cache must never hold more than the bot's
 // own small, bounded set of comments - not every human comment's full
-// GitHub payload for the whole life of the run. Two things keep it small:
+// GitHub payload for the whole life of the run. Three things keep it small:
 //
 // - Only a comment that BOTH carries BOT_MARKER AND has an authenticated
 //   identity isPossiblyBotIdentity() accepts is ever kept at all. The
@@ -1244,7 +1257,18 @@ function isPossiblyBotIdentity(user, botLogin) {
 //   GitHub from who is actually authenticated as posting, which a commenter
 //   cannot forge by editing their comment body. A spoofed marker on an
 //   ordinary human comment fails this check and is never cached - getting
-//   past it would mean already controlling the bot's own account.
+//   past it would mean already controlling some Bot-type account.
+// - MAX_CACHED_COMMENTS hard-caps what even an admitted flood can cost (see
+//   above): only the most recent MAX_CACHED_COMMENTS admitted comments are
+//   ever kept, trimmed as they come in, so this never holds more than that
+//   regardless of how many qualify in total. Trimming the OLDEST entries
+//   (GitHub returns comments oldest-first) rather than refusing new ones is
+//   what keeps this correct, not just small: every caller of this list
+//   (dedupe, the "last comment of this category" checks, the duplicate
+//   cleanup) only ever cares about the most recent matches, so a flood of
+//   old noise is exactly what should be dropped first. Every page is still
+//   read in full either way - a flood earlier in the thread can never make
+//   this stop short of a genuine, more recent bot comment later in it.
 // - Only the few fields the rest of this file ever reads from a comment
 //   (id, body, user.login, user.type) are kept, not the full GitHub object
 //   (timestamps, URLs, avatar, reactions, and so on).
@@ -1277,6 +1301,12 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
           user: { login: c.user.login, type: c.user.type },
         })),
     );
+    // Trimmed here, inside the loop, not just once at the end - otherwise a
+    // large flood could still blow up peak memory while it's being read,
+    // even if the final cached result would have ended up small.
+    if (all.length > MAX_CACHED_COMMENTS) {
+      all.splice(0, all.length - MAX_CACHED_COMMENTS);
+    }
     if (comments.length < 100) break;
     page += 1;
   }
