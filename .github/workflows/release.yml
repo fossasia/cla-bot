@@ -566,42 +566,70 @@ jobs:
             exit 1
           fi
 
-      # Draft first, publish last. A matching existing draft is left in place;
-      # the next step verifies all of its metadata, notes and assets against
-      # this run's verified files before publication. Never delete or replace
-      # an existing release: draft state can change after any separate read.
-      - name: Create the draft release if absent
+      # List releases via REST: unlike REST's get-by-tag endpoint, this endpoint
+      # includes drafts for this write-capable token. Lookup/API failures stop
+      # here; they are never treated as evidence that the release is absent.
+      - name: Find or create the draft release
+        id: draft
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
-          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
-            case "$state" in
-              true)
-                echo "An existing draft for ${RELEASE_TAG} will be reused only if the following verification matches its exact metadata, notes and assets."
-                exit 0
-                ;;
-              false)
-                echo "::error::Release ${RELEASE_TAG} is already published. Published releases are never overwritten; use a new version."
-                exit 1
-                ;;
-              *)
-                echo "::error::Unexpected draft state '${state}' for ${RELEASE_TAG}. Refusing to create or publish a release."
-                exit 1
-                ;;
-            esac
+          if ! releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"; then
+            echo "::error::Could not list releases to determine whether ${RELEASE_TAG} already exists. Refusing to create a possibly duplicate release."
+            exit 1
           fi
-          gh release create "$RELEASE_TAG" \
-            --draft \
-            --verify-tag \
-            --title "$RELEASE_TAG" \
-            --notes-file dist/RELEASE_NOTES.md \
-            "dist/${name}.tar.gz" \
-            "dist/${name}.tar.gz.sigstore.json" \
-            "dist/${name}.sbom.cdx.json" \
-            "dist/${name}.provenance.intoto.jsonl" \
-            "dist/${name}.sbom.intoto.jsonl" \
-            dist/SHA256SUMS \
-            dist/SHA256SUMS.sigstore.json
+          if ! matches="$(jq -ce --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]' <<< "$releases")"; then
+            echo "::error::The release listing response was invalid. Refusing to create or publish ${RELEASE_TAG}."
+            exit 1
+          fi
+          count="$(jq 'length' <<< "$matches")"
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Multiple releases are associated with ${RELEASE_TAG}. Refusing to choose one."
+            exit 1
+          fi
+          if [ "$count" -eq 0 ]; then
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --notes-file dist/RELEASE_NOTES.md \
+              "dist/${name}.tar.gz" \
+              "dist/${name}.tar.gz.sigstore.json" \
+              "dist/${name}.sbom.cdx.json" \
+              "dist/${name}.provenance.intoto.jsonl" \
+              "dist/${name}.sbom.intoto.jsonl" \
+              dist/SHA256SUMS \
+              dist/SHA256SUMS.sigstore.json
+            # Creation may be interrupted after GitHub has created the draft.
+            # Re-list and resolve it by ID; never infer success from CLI output.
+            if ! releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"; then
+              echo "::error::The draft create call returned, but its release ID could not be confirmed. Rerun to discover it safely."
+              exit 1
+            fi
+            if ! matches="$(jq -ce --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]' <<< "$releases")"; then
+              echo "::error::The post-create release listing response was invalid."
+              exit 1
+            fi
+            count="$(jq 'length' <<< "$matches")"
+            if [ "$count" -ne 1 ]; then
+              echo "::error::Expected exactly one release for ${RELEASE_TAG} after creation; found ${count}. Rerun to resolve safely."
+              exit 1
+            fi
+          fi
+          release_id="$(jq -er '.[0].id | select(type == "number" and . > 0)' <<< "$matches")" || {
+            echo "::error::The release listing returned an invalid release ID for ${RELEASE_TAG}."
+            exit 1
+          }
+          state="$(jq -r '.[0].draft | select(type == "boolean")' <<< "$matches")" || {
+            echo "::error::The release listing returned an invalid draft state for ${RELEASE_TAG}."
+            exit 1
+          }
+          if [ "$state" != true ]; then
+            echo "::error::Release ${RELEASE_TAG} is already published. Published releases are never overwritten; use a new version."
+            exit 1
+          fi
+          echo "release-id=${release_id}" >> "$GITHUB_OUTPUT"
+          echo "A draft exists for ${RELEASE_TAG}; the next step verifies its exact metadata, notes and assets before publication."
 
       # What GitHub now holds in the DRAFT must be exactly what was prepared
       # and verified above: the assets byte for byte and as a set (no missing
@@ -610,6 +638,8 @@ jobs:
       # diagnostic; the final publish step repeats these checks immediately
       # before the tag check and publish call.
       - name: Verify the draft's assets and metadata are exactly what was verified
+        env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
@@ -622,14 +652,14 @@ jobs:
             SHA256SUMS
             SHA256SUMS.sigstore.json
           )
-          meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease --jq '[.name, .tagName, .isDraft, .isPrerelease] | join(" ")')"
-          if [ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
+          meta="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --jq '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")')"
+          if [ "$meta" != "${EXPECTED_RELEASE_ID} ${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
             echo "::error::Draft metadata is '${meta}', expected title and tag '${RELEASE_TAG}', draft, not a pre-release. Refusing to publish."
             exit 1
           fi
           # $(...) drops trailing newlines on both sides; CRs are ignored in case
           # GitHub stores the body with CRLF line endings.
-          body="$(gh release view "$RELEASE_TAG" --json body --jq .body | tr -d '\r')"
+          body="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --jq .body | tr -d '\r')"
           notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
           if [ "$body" != "$notes" ]; then
             echo "::error::The draft's release notes differ from the notes that were generated. Refusing to publish."
@@ -655,9 +685,11 @@ jobs:
       # the round trip to GitHub's publish endpoint, which no workflow can
       # close; the post-publication checks below exist for that instant.
       - name: Re-check the tag and publish the release
+        env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
         run: |
           set -euo pipefail
-          release_id="$(gh release view "$RELEASE_TAG" --json databaseId --jq .databaseId)"
+          release_id="${EXPECTED_RELEASE_ID:-}"
           if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
             echo "::error::Could not resolve the GitHub release ID for ${RELEASE_TAG}."
             exit 1
@@ -676,12 +708,12 @@ jobs:
             SHA256SUMS
             SHA256SUMS.sigstore.json
           )
-          meta="$(gh release view "$RELEASE_TAG" --json name,tagName,isDraft,isPrerelease --jq '[.name, .tagName, .isDraft, .isPrerelease] | join(" ")')"
-          if [ "$meta" != "${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
+          meta="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")')"
+          if [ "$meta" != "${release_id} ${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
             echo "::error::Draft metadata changed before publication ('${meta}'). Refusing to publish."
             exit 1
           fi
-          body="$(gh release view "$RELEASE_TAG" --json body --jq .body | tr -d '\r')"
+          body="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" --jq .body | tr -d '\r')"
           notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
           if [ "$body" != "$notes" ]; then
             echo "::error::Draft release notes changed before publication. Refusing to publish."

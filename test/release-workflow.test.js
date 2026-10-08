@@ -203,12 +203,14 @@ function setupPublishDraft(dir, mutate = () => {}) {
   }
   mutate(path.join(dir, "served"));
 }
-const publishTagGh = (answer, { meta = "v1.2.3 v1.2.3 true false", body = "notes" } = {}) =>
+const publishTagGh = (
+  answer,
+  { meta = "123 v1.2.3 v1.2.3 true false", body = "notes" } = {},
+) =>
   [
     'case "$*" in',
-    '  *"--json databaseId"*) printf "%s\\n" 123 ;;',
-    `  *--json*name,tagName,isDraft,isPrerelease*) printf '%s\\n' '${meta}' ;;`,
-    `  *--json*body*) printf '%s\\n' '${body}' ;;`,
+    '  *"releases/123"*)',
+    `    case "$*" in *"--jq .body"*) printf '%s\\n' '${body}' ;; *) printf '%s\\n' '${meta}' ;; esac ;;`,
     '  *"release download"*) cp "$FAKE_DRAFT_DIR"/* "$5"/ ;;',
     `  *"git/ref/tags/"*) printf '%s\\n' '${answer}' ;;`,
     '  *"--method PATCH"*) exit 0 ;;',
@@ -843,7 +845,7 @@ test("sign verifies producer outputs, signs, self-verifies and uploads; publish 
 
 test("the release is created as a DRAFT bound to the pushed tag, and only a later step publishes it", () => {
   const create =
-    publish.steps[stepNamed(publish.steps, "Create the draft release if absent")].run;
+    publish.steps[stepNamed(publish.steps, "Find or create the draft release")].run;
   assert.match(create, /--draft\b/);
   assert.match(create, /--verify-tag\b/);
   assert.ok(!/--latest/.test(create), "creation must not publish");
@@ -853,34 +855,88 @@ test("the release is created as a DRAFT bound to the pushed tag, and only a late
   assert.match(publishCall, /-f make_latest=false/);
 });
 
-test("draft creation is idempotent and an existing draft is reused only for exact verification", () => {
-  const createIndex = stepNamed(publish.steps, "Create the draft release if absent");
+test("draft lookup uses the authenticated release listing and classifies lookup failures separately", () => {
+  const createIndex = stepNamed(publish.steps, "Find or create the draft release");
   const create = publish.steps[createIndex].run;
+  assert.match(create, /gh api --paginate --slurp .*releases\?per_page=100/);
+  assert.match(create, /jq -ce --arg tag "\$RELEASE_TAG"/);
   assert.match(create, /gh release create "\$RELEASE_TAG"/);
-  assert.match(create, /existing draft[\s\S]*exact metadata, notes and assets/);
-  assert.match(create, /already published/);
-  assert.ok(!/gh release delete/.test(create), "existing releases are never deleted");
+  assert.match(create, /published releases are never overwritten/i);
+  assert.doesNotMatch(create, /gh release view/);
   assert.ok(createIndex < stepNamed(publish.steps, DRAFT_CHECK));
 
-  const invoke = (viewResult) =>
-    runStep(publish.steps[createIndex], {
+  const runLookup = (
+    initial,
+    { listingFails = false, postCreateListingFails = false, duplicate = false } = {},
+  ) => {
+    const afterCreate = [[{ id: 123, tag_name: "v1.2.3", draft: true }]];
+    const initialPages = duplicate
+      ? [[
+          { id: 123, tag_name: "v1.2.3", draft: true },
+          { id: 124, tag_name: "v1.2.3", draft: true },
+        ]]
+      : initial;
+    return runStep(publish.steps[createIndex], {
       gh: [
         'case "$*" in',
-        `  *"release view"*) ${viewResult} ;;`,
-        '  *"release create"*) echo created >> create-called.txt ;;',
+        '  *"releases?per_page=100"*)',
+        '    if [ -f created.txt ]; then [ "$FAIL_POST_CREATE_LISTING" != yes ] || exit 1; cat after-create.json; else',
+        '      [ "$FAIL_LISTING" != yes ] || exit 1',
+        '      cat initial.json',
+        "    fi ;;",
+        '  *"release create"*) touch created.txt ;;',
         '  *) exit 99 ;;',
         "esac",
       ].join("\n"),
-      after: (dir) => fs.existsSync(path.join(dir, "create-called.txt")),
+      env: {
+        FAIL_LISTING: listingFails ? "yes" : "no",
+        FAIL_POST_CREATE_LISTING: postCreateListingFails ? "yes" : "no",
+        RELEASE_TAG: "v1.2.3",
+        GITHUB_REPOSITORY: "fossasia/cla-bot",
+      },
+      setup: (dir) => {
+        fs.writeFileSync(path.join(dir, "initial.json"), JSON.stringify(initialPages));
+        fs.writeFileSync(path.join(dir, "after-create.json"), JSON.stringify(afterCreate));
+      },
+      after: (dir) => fs.existsSync(path.join(dir, "created.txt")),
     });
+  };
 
-  const absent = invoke("exit 1");
+  const absent = runLookup([[]]);
   assert.strictEqual(absent.status, 0, absent.output);
   assert.strictEqual(absent.extra, true, "an absent release is created");
+  assert.match(absent.githubOutput, /release-id=123/);
 
-  const matchingDraft = invoke("printf 'true\\n'");
+  const matchingDraft = runLookup([[{ id: 123, tag_name: "v1.2.3", draft: true }]]);
   assert.strictEqual(matchingDraft.status, 0, matchingDraft.output);
   assert.strictEqual(matchingDraft.extra, false, "an existing draft is reused");
+  assert.match(matchingDraft.githubOutput, /release-id=123/);
+
+  const published = runLookup([[{ id: 123, tag_name: "v1.2.3", draft: false }]]);
+  assert.strictEqual(published.status, 1, published.output);
+  assert.match(published.output, /already published/);
+  assert.strictEqual(published.extra, false, "a published release is never recreated");
+
+  const failedLookup = runLookup([[]], { listingFails: true });
+  assert.strictEqual(failedLookup.status, 1, failedLookup.output);
+  assert.match(failedLookup.output, /Could not list releases/);
+  assert.strictEqual(failedLookup.extra, false, "API failure is not treated as absence");
+
+  const malformed = runLookup({ unexpected: "shape" });
+  assert.strictEqual(malformed.status, 1, malformed.output);
+  assert.match(malformed.output, /listing response was invalid/);
+  assert.strictEqual(malformed.extra, false, "invalid response is not treated as absence");
+
+  const postCreateFailure = runLookup([[]], { postCreateListingFails: true });
+  assert.strictEqual(postCreateFailure.status, 1, postCreateFailure.output);
+  assert.match(postCreateFailure.output, /release ID could not be confirmed/);
+  assert.strictEqual(postCreateFailure.extra, true, "the created draft remains for a safe retry");
+
+  const multiple = runLookup([[]], { duplicate: true });
+  assert.strictEqual(multiple.status, 1, multiple.output);
+  assert.match(multiple.output, /Multiple releases are associated/);
+  assert.strictEqual(multiple.extra, false);
+
   const exactDraftCheck = runDraftCheck(() => {});
   assert.strictEqual(exactDraftCheck.status, 0, exactDraftCheck.output);
   const mismatchedDraft = runDraftCheck(({ served, name }) =>
@@ -888,11 +944,6 @@ test("draft creation is idempotent and an existing draft is reused only for exac
   );
   assert.notStrictEqual(mismatchedDraft.status, 0);
   assert.match(mismatchedDraft.output, /Refusing to publish/);
-
-  const published = invoke("printf 'false\\n'");
-  assert.strictEqual(published.status, 1, published.output);
-  assert.match(published.output, /already published/);
-  assert.strictEqual(published.extra, false, "a published release is never recreated");
 });
 
 test("release creation never deletes or overwrites an existing release", () => {
@@ -901,7 +952,6 @@ test("release creation never deletes or overwrites an existing release", () => {
   assert.match(create, /gh release create "\$RELEASE_TAG"/);
   assert.doesNotMatch(create, /gh release delete/);
   assert.doesNotMatch(raw, /gh release delete/);
-  assert.match(raw, /Never delete or replace/);
   assert.ok(!/--clobber/.test(raw), "no --clobber anywhere");
 });
 
@@ -1042,6 +1092,7 @@ test("re-check (real shell, fake gh): passes only while the tag still resolves t
           : ghAnswers(`tag ${SHA_VERIFIED}`),
       env: {
         EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+        EXPECTED_RELEASE_ID: "123",
         FAKE_DRAFT_DIR: "served",
       },
       setup: name === PUBLISH_STEP ? setupPublishDraft : undefined,
@@ -1083,6 +1134,7 @@ test("re-check (real shell, fake gh): a MOVED, re-created-as-lightweight, or une
         gh: name === PUBLISH_STEP ? publishTagGh(current) : ghAnswers(current),
         env: {
           EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+          EXPECTED_RELEASE_ID: "123",
           FAKE_DRAFT_DIR: "served",
         },
         setup: name === PUBLISH_STEP ? setupPublishDraft : undefined,
@@ -1106,7 +1158,7 @@ test("re-check (real shell, fake gh): an empty expected value or a failing gh ca
     const step = publish.steps[stepNamed(publish.steps, name)];
     const noExpected = runStep(step, {
       gh: name === PUBLISH_STEP ? publishTagGh("tag ") : ghAnswers("tag "),
-      env: { EXPECTED_TAG_OBJECT: "", FAKE_DRAFT_DIR: "served" },
+      env: { EXPECTED_TAG_OBJECT: "", EXPECTED_RELEASE_ID: "123", FAKE_DRAFT_DIR: "served" },
       setup: name === PUBLISH_STEP ? setupPublishDraft : undefined,
     });
     assert.notStrictEqual(
@@ -1116,7 +1168,7 @@ test("re-check (real shell, fake gh): an empty expected value or a failing gh ca
     );
     const ghDown = runStep(step, {
       gh: "exit 1",
-      env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED },
+      env: { EXPECTED_TAG_OBJECT: SHA_VERIFIED, EXPECTED_RELEASE_ID: "123" },
       setup: name === PUBLISH_STEP ? setupPublishDraft : undefined,
     });
     assert.notStrictEqual(
@@ -1146,7 +1198,7 @@ test("final publish step rechecks the draft bytes and metadata after the earlier
       mutate: (served) => fs.writeFileSync(path.join(served, "unexpected.txt"), "extra"),
     }],
     ["metadata changed", {
-      meta: "v1.2.3 v1.2.3 false false",
+      meta: "123 v1.2.3 v1.2.3 false false",
     }],
     ["notes changed", { body: "altered notes" }],
   ]) {
@@ -1157,6 +1209,7 @@ test("final publish step rechecks the draft bytes and metadata after the earlier
       }),
       env: {
         EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+        EXPECTED_RELEASE_ID: "123",
         FAKE_DRAFT_DIR: "served",
       },
       setup: (dir) => setupPublishDraft(dir, options.mutate),
@@ -1173,7 +1226,7 @@ test("final publish step rechecks the draft bytes and metadata after the earlier
 const draftStep = publish.steps[stepNamed(publish.steps, DRAFT_CHECK)];
 function runDraftCheck(
   mutate,
-  { meta = "v1.2.3 v1.2.3 true false", body = "notes, never uploaded" } = {},
+  { meta = "123 v1.2.3 v1.2.3 true false", body = "notes, never uploaded" } = {},
 ) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "draft-check-"));
   try {
@@ -1208,9 +1261,9 @@ function runDraftCheck(
         "#!/bin/sh",
         'case "$1 $2" in',
         '  "release download") cp "$FAKE_DRAFT_DIR"/* "$5"/ ;;  # gh release download <tag> --dir <dir>',
-        '  "release view")',
+        '  "api "*)',
         '    case "$*" in',
-        '      *"--json body"*) printf \'%s\\n\' "$FAKE_BODY" ;;',
+        '      *"--jq .body"*) printf \'%s\\n\' "$FAKE_BODY" ;;',
         "      *) printf '%s\\n' \"$FAKE_META\" ;;",
         "    esac ;;",
         "  *) exit 9 ;;",
@@ -1225,6 +1278,8 @@ function runDraftCheck(
         PATH: `${path.join(dir, "bin")}:${process.env.PATH}`,
         RELEASE_TAG: "v1.2.3",
         FAKE_DRAFT_DIR: path.join(dir, "served"),
+        EXPECTED_RELEASE_ID: "123",
+        GITHUB_REPOSITORY: "fossasia/cla-bot",
         FAKE_META: meta,
         FAKE_BODY: body,
       },
@@ -1289,11 +1344,11 @@ test("draft check (real shell, fake gh): a changed byte, a swapped, missing or e
 
 test("draft check (real shell, fake gh): changed title, tag, draft/pre-release flags or notes stop the release", () => {
   for (const [label, options] of [
-    ["title changed", { meta: "v9.9.9 v1.2.3 true false" }],
-    ["tag changed", { meta: "v1.2.3 v9.9.9 true false" }],
-    ["no longer a draft", { meta: "v1.2.3 v1.2.3 false false" }],
-    ["marked as a pre-release", { meta: "v1.2.3 v1.2.3 true true" }],
-    ["extra metadata field", { meta: "v1.2.3 v1.2.3 true false extra" }],
+    ["title changed", { meta: "123 v9.9.9 v1.2.3 true false" }],
+    ["tag changed", { meta: "123 v1.2.3 v9.9.9 true false" }],
+    ["no longer a draft", { meta: "123 v1.2.3 v1.2.3 false false" }],
+    ["marked as a pre-release", { meta: "123 v1.2.3 v1.2.3 true true" }],
+    ["extra metadata field", { meta: "123 v1.2.3 v1.2.3 true false extra" }],
     ["empty metadata", { meta: "" }],
     ["notes replaced", { body: "totally different notes" }],
     [
@@ -1775,25 +1830,27 @@ test("the jq programs that ship in the workflow answer correctly on GitHub-shape
   const meta = jqProgram(
     publish,
     DRAFT_CHECK,
-    "--json name,tagName,isDraft,isPrerelease",
+    'releases/${EXPECTED_RELEASE_ID}"',
   );
   assert.strictEqual(
     evalJq(meta, {
+      id: 123,
       name: "v1.2.3",
-      tagName: "v1.2.3",
-      isDraft: true,
-      isPrerelease: false,
+      tag_name: "v1.2.3",
+      draft: true,
+      prerelease: false,
     }),
-    "v1.2.3 v1.2.3 true false",
+    "123 v1.2.3 v1.2.3 true false",
   );
   assert.strictEqual(
     evalJq(meta, {
+      id: 123,
       name: "v1.2.3",
-      tagName: "v1.2.3",
-      isDraft: true,
-      isPrerelease: true,
+      tag_name: "v1.2.3",
+      draft: true,
+      prerelease: true,
     }),
-    "v1.2.3 v1.2.3 true true",
+    "123 v1.2.3 v1.2.3 true true",
   );
 });
 
