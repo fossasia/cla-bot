@@ -22,7 +22,9 @@ FOSSASIA's projects.
    orchestration (`handleIssueComment`, `checkPR`), and
    `test/bot-identity*.test.js` for anything about how the bot resolves its
    own identity, and `test/token-expiry.test.js` for anything about the
-   signatures-repo token's lifetime (caching, refresh, 401 recovery). Run `npm test` before opening a PR - CI runs it too, on
+   signatures-repo token's lifetime (caching, refresh, 401 recovery),
+   `test/release-check.test.js` for the release helper script and
+   `test/release-workflow.test.js` for the properties of `release.yml`. Run `npm test` before opening a PR - CI runs it too, on
    Node 22 and 24.
 3. **This repo requires 100% test coverage (lines, statements, functions
    and branches) on every PR**, enforced by `.github/workflows/coverage.yml`
@@ -43,6 +45,19 @@ FOSSASIA's projects.
 5. Changes to `action.yml` inputs should stay backward compatible where
    possible; if a breaking change is unavoidable, bump the major version
    tag and note it in `CHANGELOG.md`.
+6. **When changing the release pipeline** (`.github/workflows/release.yml`,
+   `.github/scripts/release-check.js`), update its regression tests and keep
+   the documented behavior accurate. Repository writers can merge changes to
+   these files under the same PR and CI rules as every other path; there is no
+   separate team approval. `test/release-workflow.test.js` checks important
+   least-privilege, pinning and ordering properties. Every third-party action
+   there is pinned to a full commit SHA. The
+   `publish` job has `contents: write` but runs no third-party actions or
+   repository code; actions needing OIDC/signing permissions are isolated in
+   the separate `sign` job, which cannot publish releases. The shipped
+   `action.yml` may only `uses:` direct Actions pinned that way, and no local
+   `./` action (the SBOM refuses anything else rather than omitting it from
+   its direct-action inventory).
 
 ## How the coverage gate is enforced (maintainers)
 
@@ -54,19 +69,10 @@ lower a threshold, narrow `include`, point `action.yml` at an unmeasured
 script, or change the test command and still show a green check with the
 same job name.
 
-**This repository's deliberate choice**: unlike a setup that closes that
-gap with mandatory code-owner review, this repository does **not** require
-any human review on top of CI - see "Branch protection has exactly one
-required condition" in `.github/rulesets/README.md`. The 100% rule is
-therefore enforced against honest pull requests, and a pull request that
-also edits the gate's own definition is an accepted residual risk, not
-something CI can block by itself. `coverage-comment.yml` still posts a
-visible warning on the PR when a gate file is touched (see `GATE_FILES` /
-`GATE_DIR_PREFIXES` in `.github/scripts/post-coverage-comment.js`), so this
-is never silent - it just isn't a hard block. If a specific repository or
-team later wants that hard block back, see "Optional: add required review
-back" in `.github/rulesets/README.md` - it is a two-field change to
-`main.json`, nothing in `ci.yml` has to move.
+Repository writers may change the files that define the coverage gate. This is
+an accepted trust boundary: anyone with repository write access can propose
+and merge such changes when CI passes. `coverage-comment.yml` posts a visible
+warning when gate files change, but does not require reviewer or team approval.
 
 **What the code does** (CI job "Enforce 100% coverage"):
 
@@ -96,8 +102,8 @@ back" in `.github/rulesets/README.md` - it is a two-field change to
   It also fails if the tests hid an edit from git with
   `update-index --assume-unchanged` / `--skip-worktree`. This catches
   tampering with `.c8rc.json`, the scripts, `src/` or `c8` itself. It cannot
-  stop a test that forges coverage data or a PR that edits the workflow -
-  only review can.
+  stop a test that forges coverage data or a repository writer from changing
+  the workflow and its checks.
 - The comment workflow (`coverage-comment.yml`, which always runs the
   version on `main`) puts a warning at the top of the PR comment whenever a
   PR changes a gate file (`.c8rc.json`, `action.yml`, `package.json`,
@@ -112,8 +118,9 @@ back" in `.github/rulesets/README.md` - it is a two-field change to
   its temp directory, so a malicious test can write a forged file claiming
   every line of `src/` is hit and pass both `c8 check-coverage` and
   `verify-coverage.js`. Closing this needs a second trusted job that never
-  runs PR code, or signed coverage artifacts - disproportionate here. Code
-  owner review is the control.
+  runs PR code, or signed coverage artifacts - disproportionate here. This
+  limitation is accepted for repository writers; the required CI check is the
+  merge gate.
 - **Dynamic imports.** Only literal specifiers are followed:
   `require(path.join(__dirname, "../x.js"))`, `import(variable)` and
   `createRequire()` are invisible. Resolving every dynamic load statically is
@@ -126,12 +133,9 @@ actually makes the gate binding, not just a convention):
 
 Mark the single **`Required checks pass`** job of the `CI` workflow as a
 **required status check** on `main` (see `.github/rulesets/main.json`). It
-already fans in the coverage gate and every other check, so there is
-nothing else to mark required. There is deliberately **no** required
-code-owner review and **no** `CODEOWNERS` file for this - see "Branch
-protection has exactly one required condition" in
-`.github/rulesets/README.md` for the trade-off, and the note above for what
-that means for this coverage gate specifically.
+already fans in the coverage gate and every other check. No human or team
+approval is required; repository write access and the required CI status check
+are the merge controls.
 
 ## CI structure and the single required check
 
@@ -164,46 +168,211 @@ infer from the name:
   `github.workflow` deadlocks, because inside a reusable workflow that is
   the _caller's_ name. `ci.yml` owns concurrency and cancels superseded
   pull-request runs only.
-- `scorecard.yml` and `coverage-comment.yml` are deliberately outside the
-  gate: Scorecard does not run on pull requests and reports a score rather
-  than pass/fail, and the comment workflow runs after CI (`workflow_run`,
-  listening to the workflow named `CI`) only to post the coverage report.
+- `scorecard.yml`, `coverage-comment.yml` and `release.yml` are deliberately
+  outside the gate: Scorecard does not run on pull requests and reports a
+  score rather than pass/fail, the comment workflow runs after CI
+  (`workflow_run`, listening to the workflow named `CI`) only to post the
+  coverage report, and the release workflow only ever runs for a pushed tag.
+  They are still linted by `actionlint` and `zizmor` like every other file in
+  `.github/workflows/`.
 - A green `codeql` job means the analysis ran, not that there are no
   alerts. It does not block on alerts by itself (opt-in in
   `.github/rulesets/README.md`, "Optional: block on CodeQL alerts").
-- There is no required review of any kind on `main` - see
-  `.github/rulesets/README.md` for why, and how to add one back for a given
-  repository if a team wants it.
+- Repository writers can change any path and can create release tags. No
+  reviewer or team approval is required; the configured CI checks and release
+  validation still apply.
 - Merge queue is not enabled. If it ever is, add `merge_group:` to `ci.yml`
   (and confirm CodeQL and the SARIF uploads behave on that event) first,
   otherwise queued pull requests never get their checks.
 
 ## Releasing a new version
 
-Every example and setup doc in this project (`examples/consumer-workflow.yml`,
-"SETUP_GUIDE.md", this file) references a specific tag like `@vX.Y.Z`.
-**That tag has to actually exist and be pushed before anything referencing
-it will work** - a workflow pointing at a tag that isn't there yet just
-fails to resolve. When cutting a release:
+The supported release path is **signed publication by CI**. Repository actors
+with release rights can still create releases manually; this workflow does not
+prevent that. For the verified path, someone pushes a signed, annotated tag;
+`.github/workflows/release.yml` then verifies
+it, re-runs the whole test suite and the 100% coverage gate, builds the
+assets, signs and attests them with Sigstore (keyless, so there is no signing
+key to guard), publishes the release, and verifies what it published. What a
+release contains and how consumers verify it: "Verifying a release" in
+`SECURITY.md`.
 
-1. Merge your changes to `main` first.
-2. Update `CHANGELOG.md` and `package.json`'s `version` field.
-3. Tag and push:
+GitHub's `Latest` marker tracks the numerically highest published stable
+`vMAJOR.MINOR.PATCH` release that passes the pipeline's verification: signed
+annotated tag, default-branch ancestry, exact expected asset set and checksums,
+Cosign signatures, and GitHub attestations from this workflow. Manually
+published releases remain allowed for repository writers, but do not qualify
+for Latest unless they satisfy those same checks. Publishing an older valid
+version to backfill a gap does not demote a newer valid release.
+
+Latest rechecks the public stable-version maximum, tag binding, branch ancestry,
+release metadata and verified asset fingerprint immediately before changing
+the marker. If a newer stable release appears after candidate verification,
+the stale run fails without promoting its older candidate; rerun the workflow
+to verify and reconcile the current release set. GitHub has no atomic
+verify-and-promote API, so an external release can still change in the small
+interval between the final checks and the marker update. The workflow test
+suite models the newer-publication race and asserts that stale promotion is
+rejected. Since published releases are intentionally mutable, editing release
+metadata and assets are checked by the scheduled reconciliation configured
+every six hours; Actions or API delays can extend that interval. A changed
+release no longer qualifies once a reconciliation observes it, and the highest
+remaining verified stable release is selected. Latest can temporarily
+reference changed content until that run completes; if no stable release
+verifies, reconciliation fails closed and reports that no eligible candidate
+exists. For transient failures, rerun failed jobs from the original release
+run; the release workflow has no manual-dispatch trigger.
+
+Every example and setup doc in this project (`examples/consumer-workflow.yml`,
+"SETUP_GUIDE.md", this file) refers to a release as `@vX.Y.Z`. That release
+has to exist before anything referencing it works, which is why the last step
+below comes **after** the workflow has finished.
+
+### One-time setup (repository admin)
+
+The release setting, environment and signing key are GitHub settings, not
+repository files. Releases are intentionally editable after publication so a
+maintainer with release rights can correct them. Do this once, and re-check it
+when something about releasing seems off:
+
+1. **Leave "Immutable releases" off** (Settings -> General -> Releases) if
+   published releases need to remain editable. Release notes can be corrected
+   as needed. Replacing a signed asset invalidates its signatures/checksums;
+   consumers must reject it, so publish a newly signed asset under the next
+   patch version instead of silently replacing it in place.
+2. **Release authorization and mutability:** repository permissions alone
+   determine who may publish; no separate reviewer or team approval is
+   required. The workflow reads the actual `release` environment rules and
+   fails before building if required reviewers are configured. Mutability is
+   intentionally `not-required` in workflow code.
+3. **Create the `release` environment** (Settings -> Environments -> New
+   environment). Under "Deployment branches and tags", select "Selected
+   branches and tags" and add exactly one rule: tag pattern `v*` (no branch
+   rules and no additional patterns). Do not configure a wait timer or custom
+   deployment protection rule. The policy job reads the environment
+   mode and the complete paginated rules list, and fails before build if they
+   differ. Leave required reviewers empty. GitHub enforces environment
+   protection independently; the workflow checks this before building so the
+   environment cannot add an approval gate.
+4. **Import the release tag ruleset** in `.github/rulesets/release-tags.json`
+   as a repository admin. It lets writers create version tags but blocks
+   moving or deleting them after creation. The policy job checks that an
+   active effective ruleset protects exactly `refs/tags/v*` and blocks both
+   updates and deletions. Confirm in repository settings that its bypass list
+   is empty; GitHub may hide that list from the workflow's read-only token.
+   A tag correction uses a new version.
+5. **Register a signing key on your GitHub account**, as a _Signing Key_ (not
+   just an authentication key), and use the same address as a verified email:
    ```bash
-   git tag vX.Y.Z
+   # SSH signing (simplest); GPG works too
+   git config --global gpg.format ssh
+   git config --global user.signingkey ~/.ssh/id_ed25519.pub
+   ```
+   then add that public key at Settings -> SSH and GPG keys -> New SSH key ->
+   Key type **Signing Key**. The workflow refuses any tag GitHub does not
+   report as _verified_.
+5. If your organisation restricts which actions may run, allow
+   `actions/attest`, `actions/upload-artifact` and
+   `sigstore/cosign-installer` (plus the ones the CI already uses). The
+   release-writing job downloads artifacts with the runner's GitHub CLI.
+
+### Rehearse in a fork first
+
+`release.yml` only uses `github.repository`, never a hard-coded name, so it
+runs unchanged in a fork. Before the **first** real release (and after any
+change to the workflow), push a throwaway signed tag such as `v0.0.1` to a fork
+that has its own `release` environment and signing key, and watch the whole
+run, including the final "verify the published release" step. Everything here
+is tested offline (the helper script, the workflow's structure, the CLI flags),
+but signing and attesting need a real GitHub run.
+
+### Cutting a release
+
+1. Merge your changes to `main` and let CI go green. A tag on a commit that is
+   not on `main` is refused.
+2. In a pull request, rename `## [Unreleased]` in `CHANGELOG.md` to
+   `## [X.Y.Z] - YYYY-MM-DD` (leave a new, empty `## [Unreleased]` above it)
+   and bump the version:
+   ```bash
+   npm version X.Y.Z --no-git-tag-version   # updates package.json and package-lock.json
+   ```
+   The section's text becomes the release notes, and the workflow fails if
+   the tag, `package.json` and `CHANGELOG.md` disagree. Merge it. The
+   workflow publishes that text as `RELEASE_NOTES.md`, signs it alongside the
+   source archive and SBOM, and signs a `SHA256SUMS` manifest covering all
+   three payloads. Signature and attestation bundles are verified as proofs.
+3. Tag the merge commit **with a signature**, check it, and push it:
+   ```bash
+   git switch main && git pull
+   git tag -s vX.Y.Z -m "cla-bot vX.Y.Z"
+   git tag -v vX.Y.Z          # must say the signature is good
    git push origin vX.Y.Z
    ```
-4. **Only after step 3 succeeds**, update any `@vX.Y.Z` references in
-   `examples/consumer-workflow.yml` and "SETUP_GUIDE.md" to match, and
-   double-check by opening
-   `https://github.com/fossasia/cla-bot/releases/tag/vX.Y.Z` in a browser
-   (or `git ls-remote --tags origin`) to confirm it's really there, not
-   just that the push command didn't error.
+   Only `vMAJOR.MINOR.PATCH` starts a release; no pre-release suffixes. A
+   lightweight tag (`git tag vX.Y.Z`) or an unverified one fails the run.
+4. Watch the **Release** workflow (Actions tab). The `publish` job runs
+   without a second-person approval and ends by downloading and verifying the
+   published release the way a consumer would.
+5. **Only after it succeeded**, open
+   `https://github.com/fossasia/cla-bot/releases/tag/vX.Y.Z`, run the
+   verification in `SECURITY.md` once from a clean machine, and then update
+   the `@vX.Y.Z` references in `examples/consumer-workflow.yml` and
+   "SETUP_GUIDE.md". The commit SHA to pin is
+   `git ls-remote --tags origin vX.Y.Z "vX.Y.Z^{}"` (the `^{}` line).
 
-If you're reading this because an example pointed at a tag that 404s: that
-almost certainly means step 3 hasn't happened yet for the version the docs
-claim exists - go create it, or point the reference back at the last tag
-that actually does exist.
+### If a release run fails
+
+- **The `build` job failed** (tag not verified, version or changelog
+  mismatch, tests, not on `main`): nothing was published. The simplest fix is
+  to repair `main` and cut the **next patch version**; skipping a number costs
+  nothing. If the release tag ruleset is not yet applied, you may delete and
+  recreate an unpublished tag after fixing the cause. Once the ruleset is
+  active, fix the cause and use the next patch version.
+- **A "no longer resolves to the signed tag object" error** means the tag
+  changed after the build job verified it (possible only if tag updates are
+  not blocked by the release tag ruleset).
+  Two cases, told apart by the message:
+  - _Before publishing_ ("Refusing to release"): nothing is public. Do not
+    re-run; investigate who changed the tag, then release the next patch
+    version from a fresh tag.
+  - _After publishing_ ("Treat this release as compromised"): the release **is
+    public**. Do not re-run. If the release is still editable (no immutable
+    releases), mark it as a pre-release with a notice, or delete it; find out
+    who moved the tag; release the next patch version from a fresh, verified
+    tag and say in its changelog which version it supersedes. Consumers who
+    pinned a verified commit SHA are unaffected, but tell everyone else to
+    move to the new version.
+- **A draft check error** ("Refusing to publish": assets or release metadata
+  differ from what was prepared) means someone or something changed the draft
+  after it was created. Nothing is public. The workflow fails closed; inspect
+  the draft and delete it manually only after confirming it is safe, then rerun.
+- **A "policy" job failure** (invalid workflow immutability policy, required
+  reviewers configured on the `release` environment, or inability to read the
+  environment): nothing was built or published. Do the one-time
+  setup it names, then re-run the failed jobs.
+- **"... NOT immutable (isImmutable=false)"** at the very end: the release is
+  published, signed and verified, but "Immutable releases" is off although
+  the workflow policy says `required`. Turn it on before the next release
+  (it cannot be applied to this one), or change the policy in workflow code if
+  mutable releases are intended.
+- **An existing release for the tag** (draft or published) prevents creation:
+  a matching draft is reused only after its metadata, notes and every asset
+  match this run's verified files. A mismatching draft fails closed; inspect it
+  and remove it manually only after confirming it is safe. Published releases
+  are never overwritten or deleted by the workflow.
+- **The `publish` job failed** (Sigstore or GitHub outage, upload error): use
+  "Re-run failed jobs". If draft creation had completed, the retry reuses the
+  draft only when its metadata, notes and assets match exactly; it never
+  deletes or overwrites an existing release.
+  If it failed after publication, the read-only candidate verification still
+  runs when possible;
+  if that check also failed transiently, use **Re-run failed jobs** from the
+  original release run. Scheduled reconciliation retries Latest verification
+  without rebuilding or overwriting a release.
+- **A published release turns out to be wrong:** edit its notes for a notes
+  issue. For an asset or source correction, release the next patch version and
+  say in its changelog which version it supersedes; consumers must reject any
+  replaced asset whose signatures no longer verify.
 
 ## Local development
 
