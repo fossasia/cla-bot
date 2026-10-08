@@ -3,10 +3,11 @@
 ## Architecture
 
 - `fossasia/cla-bot` - this action itself (zero npm dependencies). Every
-  repo references it with `uses: fossasia/cla-bot@vX.Y.Z`. Replace `vX.Y.Z`
-  with whatever tag actually exists - see Step 1.4 below. Don't hardcode a
-  version number anywhere else in your own notes; it goes stale the moment
-  a new version ships.
+  repo references a signed release of it, pinned by the release's **full
+  commit SHA** with the version in a trailing comment:
+  `uses: fossasia/cla-bot@<full commit SHA> # vX.Y.Z`. Which release and which
+  SHA - see Step 1.4 below. Don't hardcode a version number anywhere else in
+  your own notes; it goes stale the moment a new version ships.
 - `fossasia/cla-signatures` - a private repo holding the signature record,
   `signatures/cla.json`.
 - Each project repo gets a workflow file at `.github/workflows/cla.yml`,
@@ -27,23 +28,38 @@ App token - no long-lived personal access token is stored anywhere.
 3. Run `npm test` and confirm every test passes. The count grows as the bot
    gets more features, so don't assume a specific number - just check for
    `ALL TESTS PASSED.`
-4. **Create a release tag - don't skip this, everything after this step
-   depends on it existing:**
+4. **Cut a signed release - don't skip this, everything after this step
+   depends on it existing.** Releases are built, signed and published by CI
+   from a signed tag; nobody creates one by hand. The one-time repository
+   settings (mutable releases, the
+   `release` environment and tag ruleset, and a registered signing key) and the exact steps are in CONTRIBUTING.md's
+   "Releasing a new version" section. In short:
    ```bash
-   git tag v1.0.0   # or whatever version CHANGELOG.md currently says
+   git tag -s v1.0.0 -m "cla-bot v1.0.0"   # or whatever version CHANGELOG.md says
    git push origin v1.0.0
    ```
-   Then **verify the tag actually made it to GitHub** - open
-   `https://github.com/fossasia/cla-bot/tags` in a browser, or run:
+   The **Release** workflow publishes without a second-person approval; wait
+   for its verification to finish.
+5. **Verify the release before anyone depends on it.** Open
+   `https://github.com/fossasia/cla-bot/releases` and confirm the release
+   carries `RELEASE_NOTES.md`, the signed archive and SBOM, their Cosign
+   signature bundles, the provenance and SBOM attestations, and signed
+   `SHA256SUMS`, then run the commands in SECURITY.md's "Verifying a release"
+   section. Until a release exists **and verifies**, any workflow referencing
+   it will fail to resolve or should not be trusted.
+6. **Get the commit SHA to pin** (this is what goes into every consumer
+   workflow, not the tag):
    ```bash
-   git ls-remote --tags origin
+   git ls-remote --tags https://github.com/fossasia/cla-bot.git v1.0.0 "v1.0.0^{}"
    ```
-   Until that tag genuinely shows up there, any workflow referencing
-   `uses: fossasia/cla-bot@v1.0.0` will fail to resolve. When you later
-   update the bot, tag a new version and update every reference to it.
-   Always pin to a specific, real tag - never a moving reference like `v1`
-   or `main` for anything other than testing. See CONTRIBUTING.md's
-   "Releasing a new version" section for the full checklist.
+   Use the 40-character SHA on the line ending in `^{}`. Write it as
+   `uses: fossasia/cla-bot@<that full commit SHA> # v1.0.0`. A full commit SHA
+   cannot be moved to different code later, while a tag, even a protected one,
+   is only a name for a commit. When you later release a new version, repeat
+   steps 4-6 and update every reference; Dependabot or Renovate can do the
+   update for you once the SHA-plus-comment form is in place. Never use a
+   moving reference like `v1` or `main` for anything other than testing.
+   CONTRIBUTING.md's "Releasing a new version" section has the full checklist.
 
 ## Step 2 - Create the central signatures repo
 
@@ -52,10 +68,10 @@ App token - no long-lived personal access token is stored anywhere.
    handles FOSSASIA's legal matters before treating it as final).
 3. Don't manually create `signatures/cla.json` - the bot creates it
    automatically the first time anyone signs.
-4. **Access control**: give only a small team (e.g. `fossasia/cla-admins`)
-   access to this repo. It will contain contributors' names, GitHub ids,
-   and timestamps, which is personal data - nobody else in the org should
-   be able to see it.
+4. **Privacy access control**: give access to this private repo only to the
+   people who need to manage CLA records. It contains contributors' names,
+   GitHub ids, and timestamps. This limits access to personal data; it does
+   not create an approval requirement for code changes or releases.
 
 ## Step 3 - Create a GitHub App (for cross-repo access, not a personal token)
 
@@ -102,22 +118,12 @@ tries to sign - that's when the write fails and the job errors out. After
 rolling this out, double-check the values in one repo's workflow file
 match `cla-signatures` exactly.
 
-## Step 5 - Lock down who can edit the workflow file
+## Step 5 - Repository change and release permissions
 
-1. In each repo, add a `.github/CODEOWNERS` entry making a trusted team
-   (e.g. `@fossasia/cla-admins`) the required approver for changes under
-   `.github/workflows/`.
-2. In each repo's branch protection rule (Settings → Branches, for
-   main/master), turn on **"Require review from Code Owners"**.
-3. ⚠️ **Important**: give that team **explicit write access on every
-   individual repo**. GitHub requires a team to have write access to a
-   specific repo for its CODEOWNERS entry to apply there, even if members
-   already have access some other way (org membership, another team). Skip
-   this and CODEOWNERS silently does nothing on that repo, with no warning.
-
-This stops a regular contributor, or a compromised low-trust maintainer
-account, from quietly editing `cla.yml` to leak a secret - any such change
-now needs a CLA-admin's review before it can merge.
+Repository permissions determine who can propose and merge changes, including
+workflow changes, and who can create releases. This setup requires no extra
+reviewer or team approval. Required CI checks and the release workflow's tag,
+artifact, and environment-policy validations still apply.
 
 ## Step 6 - Check the org-wide default permission (a PII leak check)
 
@@ -147,8 +153,7 @@ access control from Step 2.
 
 ## Step 8 - Roll out across the whole org
 
-Copy `examples/consumer-workflow.yml` (and, if you use one, a CODEOWNERS
-entry from Step 5) into every repo that needs the CLA check. If you're
+Copy `examples/consumer-workflow.yml` into every repo that needs the CLA check. If you're
 rolling out to many repos, a small internal script that pushes the
 workflow file via the GitHub API (skipping repos that already have a
 customized `cla.yml`) is worth writing, but that tooling isn't part of

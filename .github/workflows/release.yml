@@ -1,0 +1,1268 @@
+name: Release
+
+# Publishes a SIGNED release when a signed, annotated tag vMAJOR.MINOR.PATCH
+# is pushed. A scheduled default-branch run also re-verifies published releases
+# and repairs Latest after post-publication failures or later edits. Repository
+# actors with release rights can still create releases manually; there is no
+# manual draft step.
+# See CONTRIBUTING.md ("Releasing a new version") and SECURITY.md ("Verifying
+# a release") for setup, procedure and consumer verification.
+#
+# Deliberately NOT part of the "Required checks pass" gate in ci.yml: it
+# never runs on pull requests, so it can't be a required status check (the
+# same reason scorecard.yml is outside the gate).
+#
+# Seven jobs. The point of the split is that no job which runs code that is NOT
+# the release itself shares a machine with the archive, and no job which runs
+# any repository code can sign or publish:
+#
+#   policy   actions: read ONLY. Fails fast, before anything is built, unless
+#            release settings match policy: mutability is a workflow setting,
+#            the `release` environment has no required reviewers, its exact v*
+#            tag deployment restriction is validated, and an active effective
+#            tag ruleset blocks updates/deletions of v* tags.
+#   build    contents: read ONLY. Verifies the tag and builds the source
+#            archive and release notes with `git` and Node built-ins. It
+#            installs and executes NO third-party code (no npm), so nothing
+#            outside the commit being released can influence the archive.
+#   checks   contents: read ONLY, on a different machine from `build`. Installs
+#            the dev dependencies, runs the test suite and the 100% coverage
+#            gate, and generates the SBOM. This is where third-party code
+#            (js-yaml, c8) and the repository's own test code run. At worst
+#            it can falsify the SBOM; it cannot reach the archive.
+#   sign     contents: read, actions: read, OIDC and attestations: write. It
+#            verifies job-output digests, signs and attests, then uploads one
+#            verified artifact. It checks out and executes no repository code.
+#   publish  contents: write, actions: read ONLY. It uses the runner's GitHub
+#            CLI to download the sign job's artifact and checks its digest
+#            against the sign job output before publishing. No third-party
+#            action or repository code runs with release-write permission.
+#   latest   contents: write only. Reconciles GitHub's Latest marker after
+#            publication; globally serialized. It rechecks the public stable
+#            maximum and verified release fingerprint before writing, and
+#            fails closed if a newer stable release appeared after verification.
+#   verify-latest  contents: read only. Validates candidates' signed tags,
+#            branch ancestry, exact assets, signatures and workflow attestations.
+#            Runs after publication even if a post-publication check fails.
+#
+# Every payload is directly signed by this workflow's identity via Sigstore
+# (keyless) and listed in the signed checksum manifest. Signature bundles and
+# GitHub attestation bundles are the cryptographic proofs; consumers verify
+# those bundles instead of recursively signing proof files.
+# What every release carries:
+#   RELEASE_NOTES.md                       generated release notes, signed
+#   RELEASE_NOTES.md.sigstore.json         signature bundle for release notes
+#   cla-bot-<tag>.tar.gz                    source archive of the tagged commit
+#   cla-bot-<tag>.tar.gz.sigstore.json      cosign signature bundle
+#   cla-bot-<tag>.sbom.cdx.json             CycloneDX SBOM, signed
+#   cla-bot-<tag>.sbom.cdx.json.sigstore.json  signature bundle for the SBOM
+#   cla-bot-<tag>.provenance.intoto.jsonl   SLSA build provenance (GitHub attestation)
+#   cla-bot-<tag>.sbom.intoto.jsonl         SBOM attestation
+#   SHA256SUMS + SHA256SUMS.sigstore.json   signed checksums of notes, archive,
+#                                           and SBOM
+# The release is created as a DRAFT, filled, verified, and only then
+# published. It is published without changing the Latest marker; a final,
+# globally serialised job points Latest at the highest verified stable release.
+# Candidate assets and tag binding are rechecked immediately before the Latest
+# write. GitHub has no atomic verify-and-promote operation, so a final API race
+# remains possible; a later reconciliation repairs the marker.
+# That order matters: with "Immutable releases" enabled (see
+# CONTRIBUTING.md) a published release can never be edited, so a broken one
+# would burn its version number.
+on:
+  push:
+    tags:
+      # GitHub Actions glob only; release-check.js enforces strict stable SemVer.
+      - 'v*.*.*'
+  # Published releases are intentionally editable. Re-check their metadata and
+  # assets periodically. This event runs the default-branch workflow revision.
+  schedule:
+    - cron: '17 */6 * * *'
+
+permissions: {}
+
+# Runs for the same version are serialised and never cancelled. Different
+# versions can publish independently, so a new tag cannot replace another
+# version's pending release run in GitHub's concurrency group.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  policy:
+    name: Check the release policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read # read the `release` environment and deployment policies
+    env:
+      GH_TOKEN: ${{ github.token }}
+      # Keep the declaration in workflow code so a repository variable cannot
+      # silently change the immutability policy.
+      RELEASE_IMMUTABILITY: not-required
+    steps:
+      # GitHub's setting "Immutable releases" can only be read with the
+      # `administration` permission, which no workflow token can have, so it
+      # cannot be checked from here BEFORE publishing. The policy is therefore
+      # declared in workflow code; after publishing, the release itself is
+      # checked and the run fails if the repository setting contradicts it.
+      - name: Require the immutability policy to be declared
+        run: |
+          set -euo pipefail
+          case "${RELEASE_IMMUTABILITY:-}" in
+            required)
+              echo "Immutable releases are declared as enabled; this is verified on the published release."
+              ;;
+            not-required)
+              echo "::warning::Immutable releases are NOT required: published releases can be edited."
+              ;;
+            *)
+              echo "::error::Invalid immutability policy in the release workflow. Set RELEASE_IMMUTABILITY to required or not-required in this reviewed workflow (see CONTRIBUTING.md). Nothing has been built or published."
+              exit 1
+              ;;
+          esac
+
+      # GitHub enforces environment protection independently of workflow
+      # variables. Read the actual reviewer rules and deployment policies so
+      # the declaration cannot drift from a GitHub gate that applies to publish.
+      - name: Check the release environment approval policy
+        run: |
+          set -euo pipefail
+          if ! environment="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release")"; then
+            echo "::error::Could not read the 'release' environment approval rules. Configure the environment and grant this workflow actions:read access."
+            exit 1
+          fi
+          if ! summary="$(jq -er '
+            if (.protection_rules | type) != "array"
+            then error("protection_rules must be an array")
+            else
+              [.protection_rules[]?] as $rules |
+              [$rules[] | select(.type == "required_reviewers")] as $review_rules |
+              [$rules[] | select(.type != "required_reviewers" and .type != "branch_policy")] as $unexpected |
+              if all($review_rules[]; (.reviewers | type == "array") and (.prevent_self_review | type == "boolean"))
+              then "\($review_rules | map(.reviewers | length) | add // 0) \($unexpected | length)"
+              else error("malformed required-reviewer protection rule")
+              end
+            end
+          ' <<< "$environment")"; then
+            echo "::error::Could not parse the 'release' environment protection rules. Refusing to release."
+            exit 1
+          fi
+          read -r reviewers unexpected_rules <<< "$summary"
+          # `[ x -lt 1 ]` with a non-number is an ERROR (status 2), which `if`
+          # treats as "false". Reject anything that is not a plain number first,
+          # so an unexpected answer can never pass as "has reviewers".
+          case "${reviewers:-}" in
+            "" | *[!0-9]*)
+              echo "::error::Unexpected answer while reading the 'release' environment ('${summary}'). Refusing to release."
+              exit 1
+              ;;
+          esac
+          case "${unexpected_rules:-}" in
+            "" | *[!0-9]*)
+              echo "::error::Unexpected protection-rule summary for the 'release' environment ('${summary}'). Refusing to release."
+              exit 1
+              ;;
+          esac
+          if [ "$reviewers" -ne 0 ]; then
+            echo "::error::The 'release' environment has ${reviewers} required reviewer(s). Remove them; repository release rights are the only human authorization for publishing."
+            exit 1
+          fi
+          if [ "$unexpected_rules" -ne 0 ]; then
+            echo "::error::The 'release' environment has ${unexpected_rules} unsupported protection rule(s). Remove wait timers and other protection rules; only the v* tag deployment policy is allowed."
+            exit 1
+          fi
+          echo "No required reviewers are configured on the 'release' environment; repository release rights are the only human authorization for publishing."
+          echo "No wait-timer or other built-in protection rules are configured."
+
+          # The documented deployment restriction is exactly one custom TAG
+          # rule named v*. Verify both the environment mode and every rule;
+          # reviewer checks alone do not establish which refs may deploy.
+          if ! jq -e '
+            .deployment_branch_policy.protected_branches == false and
+            .deployment_branch_policy.custom_branch_policies == true
+          ' <<< "$environment" >/dev/null; then
+            echo "::error::The 'release' environment must use custom deployment policies with protected_branches=false and custom_branch_policies=true."
+            exit 1
+          fi
+          # `gh api --paginate` emits one JSON response per page. jq `-s`
+          # slurps those objects into an array, so .[].total_count intentionally
+          # reads the count from each page response.
+          if ! branch_policy="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/environments/release/deployment-branch-policies?per_page=100" | jq -ers '
+            [.[].branch_policies[]?] as $policies |
+            ([.[].total_count] | unique) as $counts |
+            if ($counts | length) == 1 and $counts[0] == 1 and
+               ($policies | length) == 1 and
+               $policies[0].type == "tag" and
+               $policies[0].name == "v*"
+            then "tag v*"
+            else error("expected exactly one deployment policy: tag v*")
+            end
+          ')"; then
+            echo "::error::The 'release' environment must have exactly one deployment policy, a tag pattern named v*. Remove branch, broad, or additional policies; API read or validation failed."
+            exit 1
+          fi
+          echo "Verified the 'release' environment deployment restriction: ${branch_policy}."
+          if ! custom_rules="$(gh api "repos/${GITHUB_REPOSITORY}/environments/release/deployment_protection_rules")"; then
+            echo "::error::Could not read custom deployment protection rules for the 'release' environment. Refusing to release."
+            exit 1
+          fi
+          if ! jq -e '
+            .total_count == 0 and
+            (.custom_deployment_protection_rules | type == "array") and
+            (.custom_deployment_protection_rules | length == 0)
+          ' <<< "$custom_rules" >/dev/null; then
+            echo "::error::The 'release' environment must not have custom deployment protection rules. Only the exact v* tag deployment policy is allowed."
+            exit 1
+          fi
+          echo "Verified the 'release' environment has no custom deployment protection rules."
+
+          # Check repository and inherited organization rulesets using the
+          # read-only Rules API. The list endpoint exposes IDs/names; fetch the
+          # selected ruleset by ID to validate its effective configuration.
+          # GitHub may omit bypass_actors unless the caller has write access to
+          # that ruleset, so an empty bypass list remains an admin-verified
+          # setup requirement documented in .github/rulesets/README.md.
+          if ! release_ruleset_id="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/rulesets?targets=tag&includes_parents=true&per_page=100" | jq -er '
+            if (type != "array") or any(.[]; type != "array")
+            then error("malformed paginated ruleset response")
+            else
+              [.[][] | select(.name == "Protect release tags")] as $matches |
+              if ($matches | length) == 1 and
+                 ($matches[0].id | type == "number") and
+                 ($matches[0].id > 0) and
+                 ($matches[0].id == ($matches[0].id | floor)) and
+                 ($matches[0].enforcement == "active")
+              then $matches[0].id
+              else error("expected exactly one active Protect release tags ruleset")
+              end
+            end
+          ')"; then
+            echo "::error::Could not find exactly one active effective 'Protect release tags' ruleset. Refusing to release."
+            exit 1
+          fi
+          if ! release_ruleset="$(gh api "repos/${GITHUB_REPOSITORY}/rulesets/${release_ruleset_id}?includes_parents=true")"; then
+            echo "::error::Could not read the effective 'Protect release tags' ruleset. Refusing to release."
+            exit 1
+          fi
+          if ! jq -e --argjson expected_id "$release_ruleset_id" '
+            .id == $expected_id and
+            .name == "Protect release tags" and
+            .target == "tag" and
+            .enforcement == "active" and
+            (.conditions.ref_name.include == ["refs/tags/v*"]) and
+            (.conditions.ref_name.exclude == []) and
+            (.rules | type == "array") and
+            ([.rules[].type] | sort == ["deletion", "update"]) and
+            ((has("bypass_actors") | not) or
+             (.bypass_actors | type == "array" and length == 0))
+          ' <<< "$release_ruleset" >/dev/null; then
+            echo "::error::The effective 'Protect release tags' ruleset must be active for exactly refs/tags/v* and block updates and deletions, with no exposed bypass actors. Refusing to release."
+            exit 1
+          fi
+          if jq -e 'has("bypass_actors")' <<< "$release_ruleset" >/dev/null; then
+            echo "Verified the effective release-tag ruleset and its visible empty bypass list."
+          else
+            echo "Verified the effective release-tag ruleset. GitHub did not expose its bypass list to this read-only token; confirm the empty bypass list in repository settings."
+          fi
+
+  build:
+    name: Verify the tag and build the source archive
+    needs: policy
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read # checkout, and read the tag object through the REST API
+    outputs:
+      # Digest of the archive and the release notes, recorded the moment they
+      # exist; the publish job recomputes it.
+      source-digest: ${{ steps.archive.outputs.source-digest }}
+      # SHA of the verified, signed tag OBJECT. A tag object is content-
+      # addressed (commit + signature + message), so the publish job can prove
+      # the tag was not moved or re-signed after verification.
+      tag-object-sha: ${{ steps.verify.outputs.tag-object-sha }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          # Full history: the next step needs origin/<default branch> to ask
+          # "is this commit on main?".
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Without this, anyone with write access could release code that never
+      # reached the default branch by tagging a side branch. Ancestry alone does
+      # not prove HOW a commit got there: that is the job of the default
+      # branch's ruleset (.github/rulesets/main.json: pull request plus the
+      # "Required checks pass" status check, no bypass), which must be applied.
+      - name: Require the tagged commit to be on the default branch
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" "origin/${DEFAULT_BRANCH}"; then
+            echo "::error::${GITHUB_SHA} is not on ${DEFAULT_BRANCH}. Releases may only be cut from commits that are already on the default branch."
+            exit 1
+          fi
+
+      # Caching is switched off explicitly: a release job must not restore a
+      # cache that a pull-request run could have written (cache poisoning).
+      # setup-node v7 turns it on by default whenever package.json names npm
+      # as its package manager, so omitting `cache:` alone is not enough.
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Tag is vX.Y.Z, matches package.json and CHANGELOG.md, and is an
+      # annotated tag GitHub reports as cryptographically verified. Uses Node
+      # built-ins only: this job never runs `npm`.
+      - name: Verify tag, version, changelog and tag signature
+        id: verify
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          node .github/scripts/release-check.js verify --notes dist/RELEASE_NOTES.md
+
+      # `git archive` of the exact commit (not the working tree) gives a
+      # deterministic tar (mtime = commit time, fixed umask); `gzip -n` strips
+      # the name/timestamp gzip would otherwise embed. Nothing but git, gzip
+      # and coreutils touches the archive in this job, and no third-party code
+      # runs here at all (that is what the separate `checks` job is for).
+      - name: Build the source archive
+        id: archive
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          git -c tar.umask=0022 archive --format=tar --prefix="${name}/" "$GITHUB_SHA" \
+            | gzip -9 -n > "dist/${name}.tar.gz"
+          # The publish job recomputes this over the same two files, in this order.
+          source_digest="$(sha256sum dist/RELEASE_NOTES.md "dist/${name}.tar.gz" | sha256sum | cut -d' ' -f1)"
+          echo "source-digest=${source_digest}" >> "$GITHUB_OUTPUT"
+          ls -l dist
+
+      - name: Upload the archive and notes for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-source
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+  checks:
+    name: Tests, coverage and SBOM
+    needs: policy
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    outputs:
+      sbom-digest: ${{ steps.sbom.outputs.sbom-digest }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+
+      # Installing runs no lifecycle scripts, but the packages are still third-
+      # party code that will be EXECUTED below (js-yaml by the SBOM step, c8 by
+      # the coverage step). That is why this job is a different machine from
+      # the one that builds the archive.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # The same suite and the same 100% coverage gate as pull requests. A tag
+      # that does not pass them is never released: this step fails the job, so
+      # no SBOM is generated or uploaded and publish never runs.
+      - name: Syntax check, tests and 100% coverage
+        run: |
+          set -euo pipefail
+          node --check src/cla-bot.js
+          npm run coverage
+
+      # Generate release metadata only after the test and coverage gate has
+      # passed. The SBOM inventory is the direct pinned Actions referenced by
+      # action.yml; run commands and runtime downloads are outside its scope.
+      - name: Generate the SBOM
+        id: sbom
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          mkdir -p dist
+          SOURCE_DATE_ISO="$(TZ=UTC git show -s --format=%cd --date=format-local:'%Y-%m-%dT%H:%M:%SZ' "$GITHUB_SHA")"
+          export SOURCE_DATE_ISO
+          node .github/scripts/release-check.js sbom --out "dist/${name}.sbom.cdx.json"
+          sbom_digest="$(sha256sum "dist/${name}.sbom.cdx.json" | cut -d' ' -f1)"
+          echo "sbom-digest=${sbom_digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload the SBOM for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-sbom
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+  sign:
+    name: Sign and attest release assets
+    needs: [build, checks]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      signed-digest: ${{ steps.signed-digest.outputs.digest }}
+    permissions:
+      contents: read
+      actions: read # download workflow artifacts with the runner's gh CLI
+      id-token: write # Sigstore keyless signing (OIDC)
+      attestations: write # store the GitHub attestations
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download the source archive and release notes
+        run: gh run download "$GITHUB_RUN_ID" --name release-source --dir source
+
+      - name: Download the SBOM
+        run: gh run download "$GITHUB_RUN_ID" --name release-sbom --dir sbom
+
+      - name: Assemble the release files
+        run: |
+          set -euo pipefail
+          mkdir dist
+          cp -- source/RELEASE_NOTES.md dist/
+          cp -- source/cla-bot-"${RELEASE_TAG}".tar.gz dist/
+          cp -- sbom/cla-bot-"${RELEASE_TAG}".sbom.cdx.json dist/
+
+      # gh is supplied by the runner image, so fail closed until it includes
+      # fixes for the signer-workflow matching and case-sensitive source-ref
+      # verification bugs (both fixed in 2.102.0).
+      - name: Require a patched GitHub CLI
+        run: |
+          set -euo pipefail
+          actual="$(gh version | awk 'NR == 1 { sub(/^gh version /, ""); print $1 }')"
+          minimum="2.102.0"
+          if [[ ! "$actual" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::GitHub CLI ${actual:-unknown} is too old for release attestation verification; require ${minimum} or newer."
+            exit 1
+          fi
+          IFS=. read -r gh_major gh_minor _ <<< "$actual"
+          if (( 10#$gh_major < 2 || (10#$gh_major == 2 && 10#$gh_minor < 102) )); then
+            echo "::error::GitHub CLI ${actual} is too old for release attestation verification; require ${minimum} or newer."
+            exit 1
+          fi
+
+      # Each job passed the digest of its own output as a job OUTPUT, which does
+      # not travel through the artifact store, so an altered file is caught
+      # here. SHA256SUMS is written only now, by this job (coreutils only), over
+      # files that have just been verified.
+      - name: Verify the files are exactly what build and checks produced, then write SHA256SUMS
+        env:
+          EXPECTED_SOURCE_DIGEST: ${{ needs.build.outputs.source-digest }}
+          EXPECTED_SBOM_DIGEST: ${{ needs.checks.outputs.sbom-digest }}
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          count="$(find dist -type f | wc -l)"
+          unexpected="$(find dist -mindepth 1 ! -type f -print -quit)"
+          if [ "$count" -ne 3 ] || [ -n "$unexpected" ]; then
+            echo "::error::dist/ holds ${count} files, expected exactly 3 (archive, notes, SBOM). Refusing to sign."
+            exit 1
+          fi
+          for file in dist/RELEASE_NOTES.md "dist/${name}.tar.gz" "dist/${name}.sbom.cdx.json"; do
+            if [ ! -f "$file" ]; then
+              echo "::error::Expected file ${file} is missing from the downloaded artifacts. Refusing to sign."
+              exit 1
+            fi
+          done
+          source_digest="$(sha256sum dist/RELEASE_NOTES.md "dist/${name}.tar.gz" | sha256sum | cut -d' ' -f1)"
+          sbom_digest="$(sha256sum "dist/${name}.sbom.cdx.json" | cut -d' ' -f1)"
+          if [ -z "$EXPECTED_SOURCE_DIGEST" ] || [ "$source_digest" != "$EXPECTED_SOURCE_DIGEST" ]; then
+            echo "::error::The archive or notes do not match the digest reported by the build job (expected '${EXPECTED_SOURCE_DIGEST}', got '${source_digest}'). Refusing to sign."
+            exit 1
+          fi
+          if [ -z "$EXPECTED_SBOM_DIGEST" ] || [ "$sbom_digest" != "$EXPECTED_SBOM_DIGEST" ]; then
+            echo "::error::The SBOM does not match the digest reported by the checks job (expected '${EXPECTED_SBOM_DIGEST}', got '${sbom_digest}'). Refusing to sign."
+            exit 1
+          fi
+          (cd dist && sha256sum RELEASE_NOTES.md "${name}.tar.gz" "${name}.sbom.cdx.json" > SHA256SUMS)
+
+      # cosign is pinned by version here; Dependabot bumps the installer
+      # action but not this value, so bump `cosign-release` alongside it.
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
+
+      # Each attest step writes its bundle to a path of its own choosing, so
+      # it is copied to its final name right after the step that made it.
+      - name: Attest build provenance for the assets
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-checksums: dist/SHA256SUMS
+          create-storage-record: false
+
+      - name: Keep the provenance bundle as a release asset
+        env:
+          BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+        run: cp -- "$BUNDLE" "dist/cla-bot-${RELEASE_TAG}.provenance.intoto.jsonl"
+
+      - name: Attest the SBOM
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: dist/cla-bot-${{ github.ref_name }}.tar.gz
+          sbom-path: dist/cla-bot-${{ github.ref_name }}.sbom.cdx.json
+          create-storage-record: false
+
+      - name: Keep the SBOM attestation bundle as a release asset
+        env:
+          BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+        run: cp -- "$BUNDLE" "dist/cla-bot-${RELEASE_TAG}.sbom.intoto.jsonl"
+
+      # Sign each payload independently, as well as the manifest that binds
+      # their exact bytes together. Signature and attestation bundles are
+      # verified as proofs and are not recursively signed.
+      - name: Sign every payload and the checksums with cosign (keyless)
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          cosign sign-blob --yes --bundle "dist/${name}.tar.gz.sigstore.json" "dist/${name}.tar.gz"
+          cosign sign-blob --yes --bundle "dist/${name}.sbom.cdx.json.sigstore.json" "dist/${name}.sbom.cdx.json"
+          cosign sign-blob --yes --bundle dist/RELEASE_NOTES.md.sigstore.json dist/RELEASE_NOTES.md
+          cosign sign-blob --yes --bundle "dist/SHA256SUMS.sigstore.json" dist/SHA256SUMS
+
+      # Verify what was just produced, with the exact checks a consumer is
+      # told to run, BEFORE anything becomes public.
+      - name: Verify our own signatures and attestations before publishing
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+          for file in RELEASE_NOTES.md "${name}.tar.gz" "${name}.sbom.cdx.json" SHA256SUMS; do
+            cosign verify-blob \
+              --bundle "dist/${file}.sigstore.json" \
+              --certificate-identity "https://github.com/${workflow}@${GITHUB_REF}" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              "dist/${file}"
+          done
+          gh attestation verify "dist/${name}.tar.gz" \
+            --bundle "dist/${name}.provenance.intoto.jsonl" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$workflow" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA"
+          gh attestation verify "dist/${name}.tar.gz" \
+            --bundle "dist/${name}.sbom.intoto.jsonl" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$workflow" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --predicate-type "https://cyclonedx.org/bom"
+
+      - name: Record the exact signed artifact digest
+        id: signed-digest
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          assets=(RELEASE_NOTES.md RELEASE_NOTES.md.sigstore.json "${name}.tar.gz" "${name}.tar.gz.sigstore.json" "${name}.sbom.cdx.json" "${name}.sbom.cdx.json.sigstore.json" "${name}.provenance.intoto.jsonl" "${name}.sbom.intoto.jsonl" SHA256SUMS SHA256SUMS.sigstore.json)
+          (cd dist && sha256sum "${assets[@]}" | sha256sum | awk '{print "digest=" $1}' >> "$GITHUB_OUTPUT")
+
+      - name: Upload the verified signed release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-signed
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Publish verified release
+    needs: [build, checks, sign]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Keep publication under the release environment so its tag restrictions
+    # apply. The preflight rejects required reviewers; repository rights alone
+    # authorize publishing.
+    environment:
+      name: release
+    permissions:
+      contents: write # create the release and upload assets
+      actions: read # download the signed artifact with the runner's gh CLI
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      EXPECTED_TAG_OBJECT: ${{ needs.build.outputs.tag-object-sha }}
+      EXPECTED_SIGNED_DIGEST: ${{ needs.sign.outputs.signed-digest }}
+    steps:
+      - name: Download the signed release files
+        run: gh run download "$GITHUB_RUN_ID" --name release-signed --dir dist
+
+      - name: Verify the signed artifact digest before publishing
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          assets=(RELEASE_NOTES.md RELEASE_NOTES.md.sigstore.json "${name}.tar.gz" "${name}.tar.gz.sigstore.json" "${name}.sbom.cdx.json" "${name}.sbom.cdx.json.sigstore.json" "${name}.provenance.intoto.jsonl" "${name}.sbom.intoto.jsonl" SHA256SUMS SHA256SUMS.sigstore.json)
+          count="$(find dist -maxdepth 1 -type f | wc -l)"
+          unexpected="$(find dist -mindepth 1 ! -type f -print -quit)"
+          if [ "$count" -ne "${#assets[@]}" ] || [ -n "$unexpected" ]; then
+            echo "::error::Signed artifact has ${count} files, expected ${#assets[@]}. Refusing to publish."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if [ ! -f "dist/${asset}" ]; then
+              echo "::error::Signed artifact is missing ${asset}. Refusing to publish."
+              exit 1
+            fi
+          done
+          actual="$(cd dist && sha256sum "${assets[@]}" | sha256sum | awk '{print $1}')"
+          if [ -z "$EXPECTED_SIGNED_DIGEST" ] || [ "$actual" != "$EXPECTED_SIGNED_DIGEST" ]; then
+            echo "::error::Signed artifact digest mismatch (expected '${EXPECTED_SIGNED_DIGEST}', got '${actual}'). Refusing to publish."
+            exit 1
+          fi
+
+      # gh is supplied by the runner image, so fail closed until it includes
+      # fixes for signer-workflow and case-sensitive source-ref verification.
+      - name: Require a patched GitHub CLI
+        run: |
+          set -euo pipefail
+          actual="$(gh version | awk 'NR == 1 { sub(/^gh version /, ""); print $1 }')"
+          minimum="2.102.0"
+          if [[ ! "$actual" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::GitHub CLI ${actual:-unknown} is too old; require ${minimum} or newer."
+            exit 1
+          fi
+          IFS=. read -r gh_major gh_minor _ <<< "$actual"
+          if (( 10#$gh_major < 2 || (10#$gh_major == 2 && 10#$gh_minor < 102) )); then
+            echo "::error::GitHub CLI ${actual} is too old; require ${minimum} or newer."
+            exit 1
+          fi
+
+      # `gh release create --verify-tag` only checks that the tag EXISTS. The
+      # build job verified a specific signed tag object; between that check
+      # and now there can be a long pause (environment approval, signing), so
+      # prove the tag still resolves to exactly that object right before the
+      # draft is created, again immediately before it is published (in the
+      # same step as the publish call), and once more after, as an alarm if it
+      # moved in the last instant.
+      - name: Re-check the tag before creating the release
+        run: |
+          set -euo pipefail
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
+          expected="tag ${EXPECTED_TAG_OBJECT}"
+          if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
+            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
+            exit 1
+          fi
+
+      # List releases via REST: unlike REST's get-by-tag endpoint, this endpoint
+      # includes drafts for this write-capable token. Lookup/API failures stop
+      # here; they are never treated as evidence that the release is absent.
+      - name: Find or create the draft release
+        id: draft
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          if ! releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"; then
+            echo "::error::Could not list releases to determine whether ${RELEASE_TAG} already exists. Refusing to create a possibly duplicate release."
+            exit 1
+          fi
+          if ! matches="$(jq -ce --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]' <<< "$releases")"; then
+            echo "::error::The release listing response was invalid. Refusing to create or publish ${RELEASE_TAG}."
+            exit 1
+          fi
+          count="$(jq 'length' <<< "$matches")"
+          if [ "$count" -gt 1 ]; then
+            echo "::error::Multiple releases are associated with ${RELEASE_TAG}. Refusing to choose one."
+            exit 1
+          fi
+          if [ "$count" -eq 0 ]; then
+            gh release create "$RELEASE_TAG" \
+              --draft \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --notes-file dist/RELEASE_NOTES.md \
+              dist/RELEASE_NOTES.md \
+              dist/RELEASE_NOTES.md.sigstore.json \
+              "dist/${name}.tar.gz" \
+              "dist/${name}.tar.gz.sigstore.json" \
+              "dist/${name}.sbom.cdx.json" \
+              "dist/${name}.sbom.cdx.json.sigstore.json" \
+              "dist/${name}.provenance.intoto.jsonl" \
+              "dist/${name}.sbom.intoto.jsonl" \
+              dist/SHA256SUMS \
+              dist/SHA256SUMS.sigstore.json
+            # Creation may be interrupted after GitHub has created the draft.
+            # Re-list and resolve it by ID; never infer success from CLI output.
+            if ! releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"; then
+              echo "::error::The draft create call returned, but its release ID could not be confirmed. Rerun to discover it safely."
+              exit 1
+            fi
+            if ! matches="$(jq -ce --arg tag "$RELEASE_TAG" '[.[][] | select(.tag_name == $tag)]' <<< "$releases")"; then
+              echo "::error::The post-create release listing response was invalid."
+              exit 1
+            fi
+            count="$(jq 'length' <<< "$matches")"
+            if [ "$count" -ne 1 ]; then
+              echo "::error::Expected exactly one release for ${RELEASE_TAG} after creation; found ${count}. Rerun to resolve safely."
+              exit 1
+            fi
+          fi
+          release_id="$(jq -er '.[0].id | select(type == "number" and . > 0)' <<< "$matches")" || {
+            echo "::error::The release listing returned an invalid release ID for ${RELEASE_TAG}."
+            exit 1
+          }
+          state="$(jq -r '.[0].draft | select(type == "boolean")' <<< "$matches")" || {
+            echo "::error::The release listing returned an invalid draft state for ${RELEASE_TAG}."
+            exit 1
+          }
+          if [ "$state" != true ]; then
+            echo "::error::Release ${RELEASE_TAG} is already published. Published releases are never overwritten; use a new version."
+            exit 1
+          fi
+          echo "release-id=${release_id}" >> "$GITHUB_OUTPUT"
+          echo "A draft exists for ${RELEASE_TAG}; the next step verifies its exact metadata, notes and assets before publication."
+
+      # What GitHub now holds in the DRAFT must be exactly what was prepared
+      # and verified above: the assets byte for byte and as a set (no missing
+      # and no extra asset), and the release metadata (title, tag, notes,
+      # draft and pre-release flags). This is the early failure with a clear
+      # diagnostic; the final publish step repeats these checks immediately
+      # before publishing.
+      - name: Verify the draft's assets and metadata are exactly what was verified
+        env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
+        run: |
+          set -euo pipefail
+          name="cla-bot-${RELEASE_TAG}"
+          assets=(
+            RELEASE_NOTES.md
+            RELEASE_NOTES.md.sigstore.json
+            "${name}.tar.gz"
+            "${name}.tar.gz.sigstore.json"
+            "${name}.sbom.cdx.json"
+            "${name}.sbom.cdx.json.sigstore.json"
+            "${name}.provenance.intoto.jsonl"
+            "${name}.sbom.intoto.jsonl"
+            SHA256SUMS
+            SHA256SUMS.sigstore.json
+          )
+          download_release_assets() {
+            local release_json="$1" directory="$2" expected_names asset_ids asset asset_id
+            expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s .)"
+            if ! jq -e --argjson expected "$expected_names" '
+              .assets as $release_assets
+              | [$release_assets[].name] as $names
+              | (($names | length) == ($expected | length)
+                 and ($names | unique | length) == ($expected | length)
+                 and ($names | sort) == ($expected | sort)
+                 and all($release_assets[]; .state == "uploaded" and (.id | type) == "number" and (.name | type) == "string"))
+            ' <<< "$release_json" >/dev/null; then
+              echo "::error::Release ${EXPECTED_RELEASE_ID} does not contain exactly the expected uploaded assets. Refusing to publish."
+              return 1
+            fi
+            asset_ids="$(jq -c '.assets' <<< "$release_json")"
+            for asset in "${assets[@]}"; do
+              asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+              # The asset endpoint is addressed by immutable asset ID. gh api
+              # streams the octet-stream response to stdout and follows GitHub's
+              # redirect, so the signed URL is never resolved by release tag.
+              gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                --header 'Accept: application/octet-stream' > "${directory}/${asset}"
+            done
+          }
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}")"
+          meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$release_json")"
+          if [ "$meta" != "${EXPECTED_RELEASE_ID} ${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
+            echo "::error::Draft metadata is '${meta}', expected title and tag '${RELEASE_TAG}', draft, not a pre-release. Refusing to publish."
+            exit 1
+          fi
+          # $(...) drops trailing newlines on both sides; CRs are ignored in case
+          # GitHub stores the body with CRLF line endings.
+          body="$(jq -r .body <<< "$release_json" | tr -d '\r')"
+          notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
+          if [ "$body" != "$notes" ]; then
+            echo "::error::The draft's release notes differ from the notes that were generated. Refusing to publish."
+            exit 1
+          fi
+          rm -rf draft
+          mkdir draft
+          download_release_assets "$release_json" draft
+          count="$(find draft -type f | wc -l)"
+          if [ "$count" -ne "${#assets[@]}" ]; then
+            echo "::error::The draft holds ${count} assets, expected ${#assets[@]}. Refusing to publish."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if ! cmp -s -- "dist/${asset}" "draft/${asset}"; then
+              echo "::error::Draft asset ${asset} differs from the verified file (or is missing). Refusing to publish."
+              exit 1
+            fi
+          done
+
+      # Verify the release after downloading its assets, check the tag, then
+      # read the release again as the final check before publication. This
+      # catches asset replacement during the tag lookup. GitHub has no atomic
+      # verify-and-publish operation: the tag can move during the last release
+      # read, and the release can change between that read and the publish call.
+      - name: Re-check the tag and publish the release
+        env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
+        run: |
+          set -euo pipefail
+          release_id="${EXPECTED_RELEASE_ID:-}"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not resolve the GitHub release ID for ${RELEASE_TAG}."
+            exit 1
+          fi
+
+          # Read the DRAFT in this same shell step before publication. Asset
+          # IDs identify immutable uploaded objects; same-name replacement
+          # changes the snapshot and fails closed.
+          name="cla-bot-${RELEASE_TAG}"
+          assets=(
+            RELEASE_NOTES.md
+            RELEASE_NOTES.md.sigstore.json
+            "${name}.tar.gz"
+            "${name}.tar.gz.sigstore.json"
+            "${name}.sbom.cdx.json"
+            "${name}.sbom.cdx.json.sigstore.json"
+            "${name}.provenance.intoto.jsonl"
+            "${name}.sbom.intoto.jsonl"
+            SHA256SUMS
+            SHA256SUMS.sigstore.json
+          )
+          download_release_assets() {
+            local release_json="$1" directory="$2" expected_names asset_ids asset asset_id
+            expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s .)"
+            if ! jq -e --argjson expected "$expected_names" '
+              .assets as $release_assets
+              | [$release_assets[].name] as $names
+              | (($names | length) == ($expected | length)
+                 and ($names | unique | length) == ($expected | length)
+                 and ($names | sort) == ($expected | sort)
+                 and all($release_assets[]; .state == "uploaded" and (.id | type) == "number" and (.name | type) == "string"))
+            ' <<< "$release_json" >/dev/null; then
+              echo "::error::Release ${release_id} does not contain exactly the expected uploaded assets. Refusing to publish."
+              return 1
+            fi
+            asset_ids="$(jq -c '.assets' <<< "$release_json")"
+            for asset in "${assets[@]}"; do
+              asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+              gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+                --header 'Accept: application/octet-stream' > "${directory}/${asset}"
+            done
+          }
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$release_json")"
+          if [ "$meta" != "${release_id} ${RELEASE_TAG} ${RELEASE_TAG} true false" ]; then
+            echo "::error::Draft metadata changed before publication ('${meta}'). Refusing to publish."
+            exit 1
+          fi
+          body="$(jq -r .body <<< "$release_json" | tr -d '\r')"
+          notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
+          if [ "$body" != "$notes" ]; then
+            echo "::error::Draft release notes changed before publication. Refusing to publish."
+            exit 1
+          fi
+          rm -rf final-draft
+          mkdir final-draft
+          download_release_assets "$release_json" final-draft
+          count="$(find final-draft -type f | wc -l)"
+          if [ "$count" -ne "${#assets[@]}" ]; then
+            echo "::error::Draft now holds ${count} assets, expected ${#assets[@]}. Refusing to publish."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if ! cmp -s -- "dist/${asset}" "final-draft/${asset}"; then
+              echo "::error::Draft asset ${asset} changed before publication. Refusing to publish."
+              exit 1
+            fi
+          done
+
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
+          expected="tag ${EXPECTED_TAG_OBJECT}"
+          if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
+            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
+            exit 1
+          fi
+          # Re-read the release AFTER the tag lookup. This catches removal and
+          # same-name re-upload of an asset during that request: asset IDs are
+          # immutable, so the fresh list must match the bytes checked above.
+          final_release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          final_meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$final_release_json")"
+          final_body="$(jq -r .body <<< "$final_release_json" | tr -d '\r')"
+          final_asset_ids="$(jq -c '[.assets[] | {id, name, state, size, digest: (.digest // null)}] | sort_by(.id)' <<< "$final_release_json")"
+          verified_asset_ids="$(jq -c '[.assets[] | {id, name, state, size, digest: (.digest // null)}] | sort_by(.id)' <<< "$release_json")"
+          if [ "$final_meta" != "${release_id} ${RELEASE_TAG} ${RELEASE_TAG} true false" ] || [ "$final_body" != "$notes" ] || [ "$final_asset_ids" != "$verified_asset_ids" ]; then
+            echo "::error::Draft metadata or asset objects changed while verifying immediately before publication. Refusing to publish."
+            exit 1
+          fi
+          # Keep this release from changing Latest during publication. A final
+          # globally serialized job reconciles the marker to highest SemVer.
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+            -F draft=false \
+            -f make_latest=false
+
+      # Download what users will download and verify it the way users will,
+      # with the SAME constraints as before publishing (workflow, tag, commit).
+      - name: Verify the published release end to end
+        env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
+        run: |
+          set -euo pipefail
+          release_id="${EXPECTED_RELEASE_ID:-}"
+          if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Could not resolve the GitHub release ID for ${RELEASE_TAG}."
+            exit 1
+          fi
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$release_json")"
+          if [ "$meta" != "${release_id} ${RELEASE_TAG} ${RELEASE_TAG} false false" ]; then
+            echo "::error::Published release metadata is '${meta}', expected the named release to be published and stable."
+            exit 1
+          fi
+          body="$(jq -r .body <<< "$release_json" | tr -d '\r')"
+          notes="$(tr -d '\r' < dist/RELEASE_NOTES.md)"
+          if [ "$body" != "$notes" ]; then
+            echo "::error::Published release notes differ from the verified notes."
+            exit 1
+          fi
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
+          if [ "$current" != "tag ${EXPECTED_TAG_OBJECT}" ]; then
+            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the verified tag object after publishing ('${current}'). Treat this release as compromised."
+            exit 1
+          fi
+          name="cla-bot-${RELEASE_TAG}"
+          workflow="${GITHUB_REPOSITORY}/.github/workflows/release.yml"
+          mkdir published
+          assets=(
+            RELEASE_NOTES.md
+            RELEASE_NOTES.md.sigstore.json
+            "${name}.tar.gz"
+            "${name}.tar.gz.sigstore.json"
+            "${name}.sbom.cdx.json"
+            "${name}.sbom.cdx.json.sigstore.json"
+            "${name}.provenance.intoto.jsonl"
+            "${name}.sbom.intoto.jsonl"
+            SHA256SUMS
+            SHA256SUMS.sigstore.json
+          )
+          expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s .)"
+          if ! jq -e --argjson expected "$expected_names" '
+            .assets as $release_assets
+            | [$release_assets[].name] as $names
+            | (($names | length) == ($expected | length)
+               and ($names | unique | length) == ($expected | length)
+               and ($names | sort) == ($expected | sort)
+               and all($release_assets[]; .state == "uploaded" and (.id | type) == "number" and (.name | type) == "string"))
+          ' <<< "$release_json" >/dev/null; then
+            echo "::error::Release ${release_id} does not contain exactly the expected uploaded assets."
+            exit 1
+          fi
+          asset_ids="$(jq -c '.assets' <<< "$release_json")"
+          for asset in "${assets[@]}"; do
+            asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              --header 'Accept: application/octet-stream' > "published/${asset}"
+          done
+          count="$(find published -maxdepth 1 -type f | wc -l)"
+          if [ "$count" -ne "${#assets[@]}" ]; then
+            echo "::error::Published release has ${count} assets, expected ${#assets[@]}."
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            if ! cmp -s -- "dist/${asset}" "published/${asset}"; then
+              echo "::error::Published asset ${asset} differs from the locally verified file."
+              exit 1
+            fi
+          done
+          (cd published && sha256sum --check --strict SHA256SUMS)
+          gh attestation verify "published/${name}.tar.gz" \
+            --bundle "published/${name}.provenance.intoto.jsonl" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$workflow" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA"
+          gh attestation verify "published/${name}.tar.gz" \
+            --bundle "published/${name}.sbom.intoto.jsonl" \
+            --repo "$GITHUB_REPOSITORY" \
+            --signer-workflow "$workflow" \
+            --source-ref "$GITHUB_REF" \
+            --source-digest "$GITHUB_SHA" \
+            --predicate-type "https://cyclonedx.org/bom"
+
+      # The release is already public here, so this step cannot undo anything.
+      # It checks that GitHub's setting matches the declared workflow policy.
+      # A mismatch is a red run, never a quiet downgrade of the guarantee
+      # SECURITY.md describes. The direct signal is the release's
+      # own `immutable` flag (gh: isImmutable). `gh release verify` additionally
+      # checks GitHub's own signed release attestation, which exists for
+      # immutable releases and can take a moment to appear, hence the retries.
+      - name: Check the release immutability policy
+        env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
+          RELEASE_IMMUTABILITY: not-required
+        run: |
+          set -euo pipefail
+          case "${RELEASE_IMMUTABILITY:-}" in
+            required) ;;
+            not-required)
+              state="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --jq .immutable || echo unknown)"
+              echo "::notice::Mutable releases are allowed by the workflow policy; ${RELEASE_TAG} isImmutable=${state}."
+              exit 0
+              ;;
+            *)
+              echo "::error::RELEASE_IMMUTABILITY must be required or not-required, not '${RELEASE_IMMUTABILITY:-}'."
+              exit 1
+              ;;
+          esac
+          immutable="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${EXPECTED_RELEASE_ID}" --jq .immutable)"
+          if [ "$immutable" != "true" ]; then
+            echo "::error::${RELEASE_TAG} is published, signed and verified, but GitHub reports it as NOT immutable (isImmutable=${immutable}). The workflow policy requires immutable releases; see CONTRIBUTING.md."
+            exit 1
+          fi
+          attempts=6
+          for attempt in $(seq 1 "$attempts"); do
+            if gh release verify "$RELEASE_TAG"; then
+              echo "${RELEASE_TAG} is immutable and its GitHub release attestation verifies."
+              exit 0
+            fi
+            if [ "$attempt" -lt "$attempts" ]; then
+              sleep "${RETRY_DELAY:-10}"
+            fi
+          done
+          echo "::error::${RELEASE_TAG} is immutable, but GitHub's release attestation could not be verified after ${attempts} attempts."
+          exit 1
+
+  verify-latest:
+    name: Verify releases eligible for Latest
+    needs: [policy, publish]
+    if: >-
+      always() &&
+      needs.policy.result == 'success' &&
+      (github.event_name == 'schedule' ||
+       (needs.publish.result == 'success' || needs.publish.result == 'failure'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      attestations: read
+    outputs:
+      release-id: ${{ steps.select.outputs.release-id }}
+      release-tag: ${{ steps.select.outputs.release-tag }}
+      asset-digest: ${{ steps.select.outputs.verified-asset-digest }}
+      tag-object: ${{ steps.select.outputs.verified-tag-object }}
+      commit: ${{ steps.select.outputs.verified-commit }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_IMMUTABILITY: not-required
+    steps:
+      - name: Check out the release verification helper
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Pin the helper to the exact workflow revision for this run. Never
+          # consume a moving default-branch script as Latest's authority.
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Install cosign to verify signed release assets
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: "v3.1.3"
+
+      - name: Select the highest release whose provenance verifies
+        id: select
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          releases="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100")"
+          candidates="$(jq -cr '
+            def stable_semver:
+              test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$");
+            def semver_key:
+              sub("^v"; "") | split(".") | map([length, .]);
+            [.[][]
+              | select(.draft == false and .prerelease == false)
+              | select(.tag_name | stable_semver)]
+            | sort_by(.tag_name | semver_key) | reverse[]
+            | [.id, .tag_name] | @tsv
+          ' <<< "$releases")"
+          while IFS=$'\t' read -r release_id release_tag; do
+            if [[ ! "$release_id" =~ ^[0-9]+$ ]]; then
+              echo "::warning::Ignoring release with invalid ID '${release_id}'."
+              continue
+            fi
+            if RELEASE_TAG="$release_tag" RELEASE_ID="$release_id" GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+              DEFAULT_BRANCH="$DEFAULT_BRANCH" GH_TOKEN="$GH_TOKEN" \
+              RELEASE_IMMUTABILITY="$RELEASE_IMMUTABILITY" \
+              bash .github/scripts/verify-release-candidate.sh; then
+              echo "release-id=${release_id}" >> "$GITHUB_OUTPUT"
+              echo "release-tag=${release_tag}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "::warning::${release_tag} is public but does not satisfy the release verification policy; trying the next stable version."
+          done <<< "$candidates"
+          echo "::error::No published stable release passed signed-tag, ancestry, asset, signature and attestation verification. Latest was not changed."
+          exit 1
+
+  latest:
+    name: Point Latest at the highest verified stable release
+    needs: verify-latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Global serialization prevents competing Latest writes. Candidate
+    # metadata, tag binding, ancestry and asset bytes are rechecked here before
+    # the write; a later reconciliation repairs any final API race.
+    concurrency:
+      group: release-latest-marker
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERIFIED_RELEASE_ID: ${{ needs.verify-latest.outputs.release-id }}
+      VERIFIED_RELEASE_TAG: ${{ needs.verify-latest.outputs.release-tag }}
+      VERIFIED_ASSET_DIGEST: ${{ needs.verify-latest.outputs.asset-digest }}
+      VERIFIED_TAG_OBJECT: ${{ needs.verify-latest.outputs.tag-object }}
+      VERIFIED_COMMIT: ${{ needs.verify-latest.outputs.commit }}
+      DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+    steps:
+      - name: Reconcile Latest to the highest verified stable SemVer
+        run: |
+          set -euo pipefail
+          highest_tag="${VERIFIED_RELEASE_TAG:-}"
+          highest_id="${VERIFIED_RELEASE_ID:-}"
+          if [[ ! "$highest_id" =~ ^[0-9]+$ || ! "$highest_tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ || ! "${VERIFIED_ASSET_DIGEST:-}" =~ ^[0-9a-f]{64}$ || ! "${VERIFIED_TAG_OBJECT:-}" =~ ^[0-9a-f]{40}$ || ! "${VERIFIED_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not resolve a verified stable release to promote."
+            exit 1
+          fi
+
+          # verify-latest is read-only and runs separately. Reconfirm that the
+          # same release, signed tag object, ancestry, and exact verified bytes
+          # are still public before using contents:write.
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${highest_id}")"
+          release_meta="$(jq -r '[.id, .tag_name, .draft, .prerelease] | join(" ")' <<< "$release_json")"
+          if [ "$release_meta" != "${highest_id} ${highest_tag} false false" ]; then
+            echo "::error::Verified release metadata changed before Latest reconciliation ('${release_meta}')."
+            exit 1
+          fi
+          public_highest="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/releases?per_page=100" | jq -r '
+            def stable_semver:
+              test("^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$");
+            def semver_key:
+              sub("^v"; "") | split(".") | map([length, .]);
+            [.[][] | select(.draft == false and .prerelease == false)
+              | select(.tag_name | stable_semver)]
+            | sort_by(.tag_name | semver_key) | last | .tag_name // empty
+          ')"
+          if [ "$public_highest" != "$highest_tag" ]; then
+            echo "::error::The highest public stable release changed after verification (now '${public_highest:-none}', verified '${highest_tag}'). Refusing to promote a stale candidate; rerun Latest reconciliation."
+            exit 1
+          fi
+          ref="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${highest_tag}" --jq '.object | "\(.type) \(.sha)"')"
+          if [ "$ref" != "tag ${VERIFIED_TAG_OBJECT}" ]; then
+            echo "::error::Verified tag object changed before Latest reconciliation ('${ref}')."
+            exit 1
+          fi
+          tag_commit="$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/${VERIFIED_TAG_OBJECT}" --jq '.object | "\(.type) \(.sha)"')"
+          if [ "$tag_commit" != "commit ${VERIFIED_COMMIT}" ]; then
+            echo "::error::Verified tag no longer resolves to its verified commit ('${tag_commit}')."
+            exit 1
+          fi
+          default_sha="$(gh api "repos/${GITHUB_REPOSITORY}/branches/${DEFAULT_BRANCH}" --jq .commit.sha)"
+          ancestry="$(gh api "repos/${GITHUB_REPOSITORY}/compare/${VERIFIED_COMMIT}...${default_sha}" --jq .status)"
+          if [ "$ancestry" != ahead ] && [ "$ancestry" != identical ]; then
+            echo "::error::Verified release commit is no longer an ancestor of ${DEFAULT_BRANCH} (${ancestry})."
+            exit 1
+          fi
+
+          name="cla-bot-${highest_tag}"
+          assets=(
+            RELEASE_NOTES.md
+            RELEASE_NOTES.md.sigstore.json
+            "${name}.tar.gz"
+            "${name}.tar.gz.sigstore.json"
+            "${name}.sbom.cdx.json"
+            "${name}.sbom.cdx.json.sigstore.json"
+            "${name}.provenance.intoto.jsonl"
+            "${name}.sbom.intoto.jsonl"
+            SHA256SUMS
+            SHA256SUMS.sigstore.json
+          )
+          mkdir latest-assets
+          expected_names="$(printf '%s\n' "${assets[@]}" | jq -R . | jq -s .)"
+          if ! jq -e --argjson expected "$expected_names" '
+            .assets as $release_assets
+            | [$release_assets[].name] as $names
+            | (($names | length) == ($expected | length)
+               and ($names | unique | length) == ($expected | length)
+               and ($names | sort) == ($expected | sort)
+               and all($release_assets[]; .state == "uploaded" and (.id | type) == "number" and (.name | type) == "string"))
+          ' <<< "$release_json" >/dev/null; then
+            echo "::error::Verified release ${highest_id} has a missing, extra, or incomplete asset."
+            exit 1
+          fi
+          asset_ids="$(jq -c '.assets' <<< "$release_json")"
+          for asset in "${assets[@]}"; do
+            asset_id="$(jq -er --arg name "$asset" '[.[] | select(.name == $name and .state == "uploaded")] | if length == 1 then .[0].id | select(type == "number") else error("asset is missing or ambiguous") end' <<< "$asset_ids")"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
+              --header 'Accept: application/octet-stream' > "latest-assets/${asset}"
+          done
+          release_body="$(jq -r '.body // ""' <<< "$release_json" | tr -d '\r')"
+          signed_notes="$(tr -d '\r' < latest-assets/RELEASE_NOTES.md)"
+          if [ "$release_body" != "$signed_notes" ]; then
+            echo "::error::The public release body differs from its signed RELEASE_NOTES.md asset."
+            exit 1
+          fi
+          entry_count="$(find latest-assets -mindepth 1 -maxdepth 1 | wc -l)"
+          file_count="$(find latest-assets -mindepth 1 -maxdepth 1 -type f | wc -l)"
+          if [ "$entry_count" -ne "${#assets[@]}" ] || [ "$file_count" -ne "${#assets[@]}" ]; then
+            echo "::error::Verified release asset set changed before Latest reconciliation."
+            exit 1
+          fi
+          actual_asset_digest="$(cd latest-assets && sha256sum -- "${assets[@]}" | sha256sum | awk '{print $1}')"
+          if [ "$actual_asset_digest" != "$VERIFIED_ASSET_DIGEST" ]; then
+            echo "::error::Verified release assets changed before Latest reconciliation."
+            exit 1
+          fi
+
+          # A new repository has no /releases/latest endpoint until the first
+          # stable release is marked; PATCH below establishes it.
+          if ! current_latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"; then
+            current_latest=""
+          fi
+          if [ "$current_latest" != "$highest_tag" ]; then
+            echo "GitHub Latest is ${current_latest}; promoting highest verified stable version ${highest_tag}."
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${highest_id}" \
+              -f make_latest=true
+          fi
+          confirmed_latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name)"
+          if [ "$confirmed_latest" != "$highest_tag" ]; then
+            echo "::error::GitHub Latest is ${confirmed_latest}, expected highest verified stable version ${highest_tag}."
+            exit 1
+          fi
+          echo "${highest_tag} is the highest verified stable SemVer release and GitHub Latest."

@@ -2,8 +2,8 @@
 
 `main.json` is an export-format GitHub **repository ruleset**. GitHub does not
 read it from the repo on its own, so import it once (below). Keeping it here
-means rule changes are reviewed diffs, and `test/ci-gate.test.js` checks that
-it stays consistent with `ci.yml`.
+means rule changes are tracked as repository diffs, and `test/ci-gate.test.js`
+checks that it stays consistent with `ci.yml`.
 
 ## What it enforces on the default branch
 
@@ -11,30 +11,40 @@ it stays consistent with `ci.yml`.
 | ---------------------- | ------------------------------------------------------------------------------------------------------------- |
 | Require a pull request | Changes can only land through a pull request (this also blocks direct pushes to `main`).                      |
 | Require status checks  | Only **`Required checks pass`**, from the GitHub Actions app (id `15368`); the branch need not be up to date. |
-| Reviews / code owners  | **None.** `required_approving_review_count: 0`, `require_code_owner_review: false`.                           |
+| Human approvals        | None required for any path.                                                                                     |
 | Bypass list            | Empty - nobody skips CI, including admins.                                                                    |
 
-So: **the only thing that decides whether a pull request can be merged is
-whether CI is green.** Anyone with write access to the repository can open a
-PR and merge it themselves the moment `Required checks pass` succeeds - no
-approval, no code-owner review, no second person required. This is a
-deliberate choice for this repository (see below), not an oversight.
+Anyone with repository write access can propose and merge changes once CI is
+green. No team membership or separate human approval is required for any path.
 
-### Branch protection has exactly one required condition, by design
+## Protect published release tags
 
-This repository intentionally does **not** use `CODEOWNERS` or a required
-code-owner/human review. Some setups pair a single CI gate with mandatory
-review specifically because a pull request can edit the very workflow files
-that define the gate (see the "Threat model" comment at the top of
-`coverage.yml` and "How the coverage gate is enforced" in
-`CONTRIBUTING.md`) - a required review is the one control a PR cannot grant
-itself. That trade-off is **not** adopted here: this repository's maintainers
-have chosen to keep merging frictionless for anyone with write access, and
-accept that a PR could in principle touch the gate's own definition as long
-as its own (possibly weakened) copy of the gate still reports green. If that
-trade-off ever needs tightening for this or another repository, see
-"Optional: add required review back" below - it is a small, additive change
-to `main.json`, nothing else has to move.
+`release-tags.json` is a tag ruleset for `v*` release tags. It leaves tag
+creation open to repository writers (the release authorization policy) while
+blocking updates and deletions after creation. This prevents a tag from being
+moved or recreated during or after release verification. It does not make the
+GitHub Release immutable: release notes and assets remain editable by actors
+with repository write access, as described in `SECURITY.md`.
+
+Import it once as a repository admin:
+
+This is an external repository setting: GitHub does not apply this file
+automatically. Before the first release, import it and verify the bypass list
+is empty. The release policy job queries the effective repository and inherited
+tag rulesets and checks that this active ruleset covers exactly `refs/tags/v*`
+with both update and deletion blocked. GitHub may hide `bypass_actors` from a
+read-only token, so the workflow cannot independently prove that part; an
+administrator must verify it in repository settings.
+
+```bash
+gh api --method POST repos/fossasia/cla-bot/rulesets --input .github/rulesets/release-tags.json
+```
+
+Verify that the active ruleset targets `refs/tags/v*`, has both `update` and
+`deletion` rules, and has an empty bypass list. The workflow checks the first
+two conditions before release; the administrator must verify the empty bypass
+list. A correction that requires moving or deleting a version tag must be
+released under a new version instead.
 
 Why one check: `Required checks pass` (job `required-checks-pass` in
 `ci.yml`) `needs:` every other job, so adding, removing or renaming a check
@@ -87,32 +97,12 @@ _add, verify, then remove_:
 - `gh api repos/fossasia/cla-bot/rules/branches/main` lists the
   `pull_request` and `required_status_checks` rules, and nothing else.
 - A throwaway PR that only edits `README.md`: merge box shows exactly one
-  required check, `Required checks pass`, and **no** review requirement -
-  the "Merge" button is enabled as soon as CI is green, for any contributor
-  with write access.
+  required status check, `Required checks pass`, and no review requirement.
+- A throwaway PR that edits `release.yml`: verify it has no human approval
+  requirement and remains blocked only until required CI passes.
 - Break one check on a throwaway PR (for example an actionlint error): the
   gate must go red (not skipped), and Merge must stay blocked until it is
   fixed and reruns green.
-
-## Optional: add required review back
-
-Not used by this repository today, but if a team wants a human in the loop
-later without giving up the "one required check" structure, two small,
-independent additions do that without touching `ci.yml`:
-
-- **Any reviewer, no CODEOWNERS file needed:** set
-  `required_approving_review_count` to `1` (or more) in the `pull_request`
-  rule in `main.json`, leave `require_code_owner_review: false`. Any
-  collaborator with write access can give that approval.
-- **Specific owners for specific paths:** add a `.github/CODEOWNERS` file
-  and set `require_code_owner_review: true` in addition. This is the
-  pattern the comment at the top of `coverage.yml` describes as the control
-  that closes the "a PR can edit its own gate" gap - deliberately not
-  enabled by default here (see above).
-
-Either way, `required_approving_review_count` and
-`require_code_owner_review` are the only two fields that change; the status
-check and bypass list stay exactly as they are.
 
 ## Optional: block on CodeQL alerts
 
@@ -145,8 +135,7 @@ needs `merge_group:` added to `ci.yml`). Enable it once CodeQL has run on
 
 Same pattern per repository: one `ci.yml` with a final `if: always()` job
 that `needs:` the others, and one ruleset requiring only that job's check
-name (plus, as here, a plain `pull_request` rule with zero required
-approvals if you want merges to stay review-free). An organization ruleset
+name (plus, as here, a `pull_request` rule with zero approvals). An organization ruleset
 can target many repositories with the same JSON shape - status-check names
 are not indexed above repository level, so type the name instead of picking
 it from a dropdown, and let each repository's own `ci.yml` keep `needs:` in

@@ -1279,7 +1279,6 @@ test("isGateFile matches the files that define the gate and nothing else", () =>
     "src/cla-bot.js",
     "test/logic.test.js",
     "README.md",
-    ".github/CODEOWNERS",
     ".github/dependabot.yml",
     ".github/PULL_REQUEST_TEMPLATE.md",
     "docs/package.json",
