@@ -196,6 +196,7 @@ const releasePayload = (
   meta = "123 v1.2.3 v1.2.3 true false",
   body = "notes",
   assets = releaseAssets(),
+  assetIds = {},
 ) => {
   const [id, tag_name, name, draft, prerelease] = meta.split(" ");
   return JSON.stringify({
@@ -206,9 +207,11 @@ const releasePayload = (
     prerelease: prerelease === "true",
     body,
     assets: assets.map((asset, index) => ({
-      id: 100 + index,
+      id: assetIds[asset] ?? 100 + index,
       name: asset,
       state: "uploaded",
+      size: 1,
+      digest: null,
     })),
   });
 };
@@ -233,14 +236,16 @@ const publishTagGh = (
 ) =>
   [
     'case "$*" in',
+    '  *"--method PATCH"*) exit 0 ;;',
     '  *"releases/123"*)',
-    `    printf '%s\\n' '${releasePayload(meta, body, assets)}' ;;`,
+    '    reads=0; [ ! -f release-read-count ] || reads=$(cat release-read-count); reads=$((reads + 1)); printf "%s\\n" "$reads" > release-read-count',
+    `    if [ "$reads" -gt 1 ] && [ "\${FAKE_FINAL_RELEASE_FAILURE:-}" = true ]; then exit 1; fi`,
+    `    if [ "$reads" -gt 1 ] && [ -n "\${FAKE_FINAL_RELEASE_JSON:-}" ]; then printf '%s\\n' "$FAKE_FINAL_RELEASE_JSON"; else printf '%s\\n' '${releasePayload(meta, body, assets)}'; fi ;;`,
     '  *"release download"*) printf \'wrong release 999\' > "$5/wrong-release-999" ;;',
     ...assets.map((asset, index) =>
       `  *"releases/assets/${100 + index} "*) cat "$FAKE_DRAFT_DIR/${asset}" 2>/dev/null || : ;;`,
     ),
     `  *"git/ref/tags/"*) printf '%s\\n' '${answer}' ;;`,
-    '  *"--method PATCH"*) exit 0 ;;',
     '  *) exit 99 ;;',
     "esac",
   ].join("\n");
@@ -1089,21 +1094,24 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   const editAt = script.indexOf("gh api --method PATCH");
   const finalAssetsAt = script.indexOf('releases/assets/${asset_id}');
   const finalCompareAt = script.indexOf('cmp -s -- "dist/${asset}" "final-draft/${asset}"');
+  const finalSnapshotAt = script.indexOf('final_release_json="$(gh api');
   assert.ok(
-    checkAt >= 0 && checkAt < compareAt && compareAt < editAt,
-    "look up, compare, then publish, in one script",
+    checkAt >= 0 && checkAt < compareAt && compareAt < finalSnapshotAt && finalSnapshotAt < editAt,
+    "check tag, compare bytes, re-read release state, then publish in one script",
   );
   assert.ok(
     finalAssetsAt >= 0 && finalAssetsAt < finalCompareAt &&
-      finalCompareAt < checkAt,
-    "re-read the final DRAFT and compare every asset immediately before the tag check and publish",
+      finalCompareAt < finalSnapshotAt,
+    "download and compare the exact assets before a final release snapshot check",
   );
   assert.strictEqual((script.match(/gh api --method PATCH/g) ?? []).length, 1);
   assert.match(script, /gh api --method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=false/);
-  const between = script.slice(compareAt, editAt);
+  const between = script.slice(finalSnapshotAt, editAt);
   assert.ok(
-    !/\b(gh|git|curl|sleep|npm|node)\b/.test(between),
-    "nothing else runs between the comparison and the publish call",
+    !/\b(gh|git|curl|sleep|npm|node)\b/.test(
+      between.replace(/final_release_json="\$\(gh api[^\n]+/, "").replace(/gh api --method PATCH[^\n]+/, ""),
+    ),
+    "nothing else calls an external command between the final snapshot and publish",
   );
 });
 
@@ -1323,6 +1331,117 @@ test("final publish step rechecks the draft bytes and metadata after the earlier
       `${label}: must stop before publishing`,
     );
   }
+});
+
+test("final publish detects same-name asset replacement after the verified download", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISH_STEP)];
+  const replacedIds = Object.fromEntries(
+    releaseAssets().map((asset, index) => [asset, index === 0 ? 999 : 100 + index]),
+  );
+  const replacement = releasePayload(
+    "123 v1.2.3 v1.2.3 true false",
+    "notes",
+    releaseAssets(),
+    replacedIds,
+  );
+  const result = runStep(step, {
+    gh: publishTagGh(`tag ${SHA_VERIFIED}`),
+    env: {
+      EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+      EXPECTED_RELEASE_ID: "123",
+      FAKE_DRAFT_DIR: "served",
+      FAKE_FINAL_RELEASE_JSON: replacement,
+    },
+    setup: setupPublishDraft,
+  });
+  assert.notStrictEqual(result.status, 0, result.output);
+  assert.match(result.output, /asset objects changed while verifying/);
+  assert.ok(
+    result.calls.some((call) => call.includes("releases/assets/100 ")),
+    "bytes were fetched from the asset ID in the first release snapshot",
+  );
+  assert.ok(
+    !result.calls.some((call) => call.startsWith("api --method PATCH")),
+    "a same-name replacement detected in the fresh release snapshot is never published",
+  );
+});
+
+test("final publish requires an unchanged release snapshot after downloading assets", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISH_STEP)];
+  const unchanged = releasePayload();
+  const variants = [
+    ["asset removed", releasePayload(undefined, "notes", releaseAssets().slice(1))],
+    ["asset added", releasePayload(undefined, "notes", [...releaseAssets(), "unexpected.txt"])],
+    ["asset upload state changed", unchanged.replace('"state":"uploaded"', '"state":"starter"')],
+    ["asset name changed", unchanged.replace('"name":"cla-bot-v1.2.3.tar.gz"', '"name":"replaced.tar.gz"')],
+    ["asset size changed", unchanged.replace('"size":1', '"size":2')],
+    ["asset digest changed", unchanged.replace('"digest":null', '"digest":"sha256:changed"')],
+    ["release notes changed", releasePayload(undefined, "edited notes")],
+    ["release title changed", releasePayload("123 v1.2.3 altered-title true false")],
+    ["release tag changed", releasePayload("123 v1.2.4 v1.2.3 true false")],
+    ["release ID changed", releasePayload("999 v1.2.3 v1.2.3 true false")],
+    ["release became published", releasePayload("123 v1.2.3 v1.2.3 false false")],
+    ["release became a prerelease", releasePayload("123 v1.2.3 v1.2.3 true true")],
+  ];
+  for (const [label, finalReleaseJson] of variants) {
+    const result = runStep(step, {
+      gh: publishTagGh(`tag ${SHA_VERIFIED}`),
+      env: {
+        EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+        EXPECTED_RELEASE_ID: "123",
+        FAKE_DRAFT_DIR: "served",
+        FAKE_FINAL_RELEASE_JSON: finalReleaseJson,
+      },
+      setup: setupPublishDraft,
+    });
+    assert.notStrictEqual(result.status, 0, `${label}: ${result.output}`);
+    assert.match(result.output, /metadata or asset objects changed/);
+    assert.ok(
+      !result.calls.some((call) => call.startsWith("api --method PATCH")),
+      `${label}: never publishes`,
+    );
+  }
+});
+
+test("final release snapshot API errors fail closed, while an unchanged snapshot publishes", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISH_STEP)];
+  const stableJson = releasePayload();
+  const stable = runStep(step, {
+    gh: publishTagGh(`tag ${SHA_VERIFIED}`),
+    env: {
+      EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+      EXPECTED_RELEASE_ID: "123",
+      FAKE_DRAFT_DIR: "served",
+      FAKE_FINAL_RELEASE_JSON: stableJson,
+    },
+    setup: setupPublishDraft,
+  });
+  assert.strictEqual(stable.status, 0, `${stable.output}\n${stable.calls.join("\n")}`);
+  assert.strictEqual(
+    stable.calls.filter((call) => call.startsWith("api --method PATCH")).length,
+    1,
+  );
+  assert.strictEqual(
+    stable.calls.filter((call) => call === "api repos/fossasia/cla-bot/releases/123").length,
+    2,
+    "one release read provides asset IDs; a second read confirms the objects remained attached",
+  );
+
+  const unavailable = runStep(step, {
+    gh: publishTagGh(`tag ${SHA_VERIFIED}`),
+    env: {
+      EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+      EXPECTED_RELEASE_ID: "123",
+      FAKE_DRAFT_DIR: "served",
+      FAKE_FINAL_RELEASE_FAILURE: "true",
+    },
+    setup: setupPublishDraft,
+  });
+  assert.notStrictEqual(unavailable.status, 0);
+  assert.ok(
+    !unavailable.calls.some((call) => call.startsWith("api --method PATCH")),
+    "failure to establish the final snapshot must never publish",
+  );
 });
 
 const draftStep = publish.steps[stepNamed(publish.steps, DRAFT_CHECK)];

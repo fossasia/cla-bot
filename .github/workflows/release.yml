@@ -636,7 +636,7 @@ jobs:
       # and no extra asset), and the release metadata (title, tag, notes,
       # draft and pre-release flags). This is the early failure with a clear
       # diagnostic; the final publish step repeats these checks immediately
-      # before the tag check and publish call.
+      # before publishing.
       - name: Verify the draft's assets and metadata are exactly what was verified
         env:
           EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
@@ -705,10 +705,10 @@ jobs:
             fi
           done
 
-      # The tag check and the publish call are ONE shell step, back to back:
-      # nothing, not even a step boundary, sits between them. What remains is
-      # the round trip to GitHub's publish endpoint, which no workflow can
-      # close; the post-publication checks below exist for that instant.
+      # Re-check the tag first, then verify the retained release and its exact
+      # asset objects. A second release read after downloading detects asset
+      # replacement or metadata edits during those reads. GitHub has no atomic
+      # verify-and-publish operation, so a small API race remains at PATCH.
       - name: Re-check the tag and publish the release
         env:
           EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.release-id }}
@@ -720,9 +720,16 @@ jobs:
             exit 1
           fi
 
+          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
+          expected="tag ${EXPECTED_TAG_OBJECT}"
+          if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
+            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
+            exit 1
+          fi
+
           # Re-read and compare the DRAFT in this same shell step immediately
-          # before publication. This narrows the remaining race to the API
-          # round-trip; GitHub exposes no atomic verify-and-publish operation.
+          # before publication. GitHub exposes no atomic verify-and-publish
+          # operation, so the remaining race is limited to the final API call.
           name="cla-bot-${RELEASE_TAG}"
           assets=(
             "${name}.tar.gz"
@@ -781,10 +788,16 @@ jobs:
             fi
           done
 
-          current="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --jq '.object | "\(.type) \(.sha)"')"
-          expected="tag ${EXPECTED_TAG_OBJECT}"
-          if [ -z "$EXPECTED_TAG_OBJECT" ] || [ "$current" != "$expected" ]; then
-            echo "::error::Tag ${RELEASE_TAG} no longer resolves to the signed tag object the build job verified (expected '${expected}', now '${current}'). The tag was moved or re-signed after verification. Refusing to release."
+          # Asset IDs identify immutable uploaded objects. Re-read the release
+          # after downloads and require the same metadata and asset identities;
+          # removal/re-upload under the same filename therefore fails closed.
+          final_release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}")"
+          final_meta="$(jq -r '[.id, .tag_name, .name, .draft, .prerelease] | join(" ")' <<< "$final_release_json")"
+          final_body="$(jq -r .body <<< "$final_release_json" | tr -d '\r')"
+          final_asset_ids="$(jq -c '[.assets[] | {id, name, state, size, digest: (.digest // null)}] | sort_by(.id)' <<< "$final_release_json")"
+          verified_asset_ids="$(jq -c '[.assets[] | {id, name, state, size, digest: (.digest // null)}] | sort_by(.id)' <<< "$release_json")"
+          if [ "$final_meta" != "${release_id} ${RELEASE_TAG} ${RELEASE_TAG} true false" ] || [ "$final_body" != "$notes" ] || [ "$final_asset_ids" != "$verified_asset_ids" ]; then
+            echo "::error::Draft metadata or asset objects changed while verifying immediately before publication. Refusing to publish."
             exit 1
           fi
           # Keep this release from changing Latest during publication. A final
