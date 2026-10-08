@@ -236,8 +236,8 @@ test("release.yml has seven jobs, including isolated signing, candidate verifica
   assert.ok(!Object.keys(triggers).includes("workflow_call"));
 });
 
-test("release publication is tag-push only, and manual dispatch is available for safe Latest recovery", () => {
-  assert.deepStrictEqual(Object.keys(triggers), ["push", "workflow_dispatch"]);
+test("release publication is tag-push only, while edits, schedule and manual dispatch reconcile Latest", () => {
+  assert.deepStrictEqual(Object.keys(triggers), ["push", "release", "schedule", "workflow_dispatch"]);
   assert.deepStrictEqual(Object.keys(triggers.push), ["tags"]);
   assert.strictEqual(triggers.push.tags.length, 1);
   // Keep the Actions glob deliberately simple. Do not emulate GitHub's matcher
@@ -252,6 +252,8 @@ test("release publication is tag-push only, and manual dispatch is available for
   for (const tag of ["1.0.0", "v1.0", "v1.0.0-rc.1", "latest", "main"]) {
     assert.ok(!TAG_PATTERN.test(tag), `${tag} must be rejected by strict release validation`);
   }
+  assert.deepStrictEqual(triggers.release.types, ["edited"]);
+  assert.deepStrictEqual(triggers.schedule, [{ cron: "17 */6 * * *" }]);
 });
 
 test("release runs serialize per tag without replacing another version's pending run", () => {
@@ -365,8 +367,8 @@ test("candidate verification is read-only, checks published releases after a pub
   const verifyCondition = verifyLatest.if.replace(/\s+/g, " ").trim();
   assert.match(
     verifyCondition,
-    /^always\(\) && needs\.policy\.result == 'success' && \(\(github\.event_name == 'workflow_dispatch' && github\.ref == format\('refs\/heads\/\{0\}', github\.event\.repository\.default_branch\)\) \|\| \(needs\.publish\.result == 'success' \|\| needs\.publish\.result == 'failure'\)\)$/,
-    "manual Latest recovery must use the default-branch workflow; tag-push recovery remains available after publish success/failure",
+    /^always\(\) && needs\.policy\.result == 'success' && \(\(github\.event_name == 'workflow_dispatch' && github\.ref == format\('refs\/heads\/\{0\}', github\.event\.repository\.default_branch\)\) \|\| github\.event_name == 'schedule' \|\| \(github\.event_name == 'release' && github\.event\.action == 'edited'\) \|\| \(needs\.publish\.result == 'success' \|\| needs\.publish\.result == 'failure'\)\)$/,
+    "manual recovery is default-branch-only; scheduled and release-edit reconciliation run, as does post-publish reconciliation",
   );
   assert.ok(
     verifyLatest.if.indexOf("needs.policy.result == 'success'") <

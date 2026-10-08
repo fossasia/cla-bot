@@ -73,6 +73,15 @@ on:
     tags:
       # GitHub Actions glob only; release-check.js enforces strict stable SemVer.
       - 'v*.*.*'
+  # Published releases are intentionally editable. Re-verify immediately after
+  # metadata edits; asset-only edits are covered by the scheduled reconciliation
+  # below because GitHub has no dedicated release-asset workflow event.
+  release:
+    types: [edited]
+  # Re-check mutable release assets periodically. Scheduling cannot eliminate
+  # the interval in which an edited release may still be Latest.
+  schedule:
+    - cron: '17 */6 * * *'
   workflow_dispatch:
 
 permissions: {}
@@ -1061,6 +1070,8 @@ jobs:
       needs.policy.result == 'success' &&
       ((github.event_name == 'workflow_dispatch' &&
         github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
+       github.event_name == 'schedule' ||
+       (github.event_name == 'release' && github.event.action == 'edited') ||
        (needs.publish.result == 'success' || needs.publish.result == 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 15

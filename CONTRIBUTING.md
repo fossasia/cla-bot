@@ -213,7 +213,14 @@ to verify and reconcile the current release set. GitHub has no atomic
 verify-and-promote API, so an external release can still change in the small
 interval between the final checks and the marker update. The workflow test
 suite models the newer-publication race and asserts that stale promotion is
-rejected.
+rejected. Since published releases are intentionally mutable, editing release
+metadata triggers reconciliation and a scheduled run is configured every six
+hours to check for asset-only changes; Actions or API delays can extend that
+interval. A changed release no longer qualifies once a reconciliation
+observes it, and the highest remaining verified stable release is selected.
+Latest can temporarily reference changed content until that run
+completes; if no stable release verifies, reconciliation fails closed and
+reports that no eligible candidate exists.
 
 Every example and setup doc in this project (`examples/consumer-workflow.yml`,
 "SETUP_GUIDE.md", this file) refers to a release as `@vX.Y.Z`. That release

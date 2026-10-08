@@ -101,8 +101,19 @@ Out of scope:
    set, valid checksums and Cosign signatures, and workflow attestations bound
    to the tag and commit. A manually created release can be public, but cannot
    become Latest unless it passes these same checks.
-   Reconciliation is eventually consistent: a newer release published after
-   an in-flight run selects a candidate can briefly leave Latest behind; the
+   Reconciliation is eventually consistent because published releases are
+   intentionally editable. A published release metadata edit triggers an
+   reconciliation, and a scheduled reconciliation is configured every six
+   hours to catch asset-only edits (GitHub Actions has no dedicated release-
+   asset event). Scheduler or API delays can extend that interval. Each run
+   verifies current release contents and selects the highest currently valid
+   stable release. Once a reconciliation observes a mutation, that release
+   stops being eligible and a lower valid release is promoted. A mutation can
+   leave Latest stale until the edit-triggered or next scheduled run completes; mutable
+   releases cannot provide a continuous invariant between checks. If no
+   published stable release verifies, reconciliation fails closed and reports
+   that it found no eligible candidate. A newer release published after an
+   in-flight run selects a candidate can also briefly leave Latest behind; the
    serialized run for that publication verifies the current release list and
    converges the marker. If post-publication verification fails, `verify-latest`
    independently re-verifies public candidates using the helper from the exact
