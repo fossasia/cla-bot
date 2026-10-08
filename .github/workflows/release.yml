@@ -59,12 +59,11 @@ on:
 
 permissions: {}
 
-# Serialised, never cancelled: releases must queue rather than overlap or
-# interrupt a half-published one. `queue: max` preserves up to 100 pending runs;
-# without it GitHub replaces the single pending run when another arrives.
+# Runs for the same version are serialised and never cancelled. Different
+# versions can publish independently, so a new tag cannot replace another
+# version's pending release run in GitHub's concurrency group.
 concurrency:
-  group: release
-  queue: max
+  group: release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:

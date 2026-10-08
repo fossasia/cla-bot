@@ -203,9 +203,9 @@ test("the only trigger is a push of stable-semver tags: no PR, no branch, no man
   }
 });
 
-test("release runs serialize without silently replacing pending runs", () => {
-  assert.strictEqual(wf.concurrency.group, "release");
-  assert.strictEqual(wf.concurrency.queue, "max");
+test("release runs serialize per tag without replacing another version's pending run", () => {
+  assert.strictEqual(wf.concurrency.group, "release-${{ github.ref }}");
+  assert.ok(!Object.hasOwn(wf.concurrency, "queue"));
   assert.strictEqual(wf.concurrency["cancel-in-progress"], false);
 });
 
@@ -313,8 +313,8 @@ test("workflow-level permissions are empty and jobs must opt in", () => {
   }
 });
 
-test("releases are serialised and never cancelled mid-flight", () => {
-  assert.strictEqual(wf.concurrency.group, "release");
+test("same-tag release runs are serialised and never cancelled mid-flight", () => {
+  assert.strictEqual(wf.concurrency.group, "release-${{ github.ref }}");
   assert.strictEqual(wf.concurrency["cancel-in-progress"], false);
 });
 
