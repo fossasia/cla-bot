@@ -243,9 +243,9 @@ const publishTagGh = (
     `    if [ "$reads" -gt 1 ] && [ -n "\${FAKE_FINAL_RELEASE_JSON:-}" ]; then printf '%s\\n' "$FAKE_FINAL_RELEASE_JSON"; else printf '%s\\n' '${releasePayload(meta, body, assets)}'; fi ;;`,
     '  *"release download"*) printf \'wrong release 999\' > "$5/wrong-release-999" ;;',
     ...assets.map((asset, index) =>
-      `  *"releases/assets/${100 + index} "*) cat "$FAKE_DRAFT_DIR/${asset}" 2>/dev/null || : ;;`,
+      `  *"releases/assets/${100 + index} "*) touch assets-downloaded; cat "$FAKE_DRAFT_DIR/${asset}" 2>/dev/null || : ;;`,
     ),
-    `  *"git/ref/tags/"*) printf '%s\\n' '${answer}' ;;`,
+    `  *"git/ref/tags/"*) if [ -f assets-downloaded ] && [ "\${FAKE_TAG_API_FAILURE_AFTER_ASSETS:-}" = true ]; then exit 1; elif [ -f assets-downloaded ] && [ -n "\${FAKE_TAG_AFTER_ASSETS:-}" ]; then printf '%s\\n' "$FAKE_TAG_AFTER_ASSETS"; else printf '%s\\n' '${answer}'; fi ;;`,
     '  *) exit 99 ;;',
     "esac",
   ].join("\n");
@@ -1096,8 +1096,9 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   const finalCompareAt = script.indexOf('cmp -s -- "dist/${asset}" "final-draft/${asset}"');
   const finalSnapshotAt = script.indexOf('final_release_json="$(gh api');
   assert.ok(
-    checkAt >= 0 && checkAt < compareAt && compareAt < finalSnapshotAt && finalSnapshotAt < editAt,
-    "check tag, compare bytes, re-read release state, then publish in one script",
+    finalCompareAt >= 0 && finalCompareAt < finalSnapshotAt &&
+      finalSnapshotAt < checkAt && checkAt < compareAt && compareAt < editAt,
+    "compare bytes, re-read release state, check the tag last, then publish in one script",
   );
   assert.ok(
     finalAssetsAt >= 0 && finalAssetsAt < finalCompareAt &&
@@ -1106,12 +1107,12 @@ test("the tag is re-checked right before the draft is created, and in the SAME S
   );
   assert.strictEqual((script.match(/gh api --method PATCH/g) ?? []).length, 1);
   assert.match(script, /gh api --method PATCH[\s\S]*-F draft=false[\s\S]*-f make_latest=false/);
-  const between = script.slice(finalSnapshotAt, editAt);
+  const between = script.slice(compareAt, editAt);
   assert.ok(
     !/\b(gh|git|curl|sleep|npm|node)\b/.test(
-      between.replace(/final_release_json="\$\(gh api[^\n]+/, "").replace(/gh api --method PATCH[^\n]+/, ""),
+      between.replace(/gh api --method PATCH[^\n]+/, ""),
     ),
-    "nothing else calls an external command between the final snapshot and publish",
+    "the tag comparison is followed directly by the publish call",
   );
 });
 
@@ -1441,6 +1442,57 @@ test("final release snapshot API errors fail closed, while an unchanged snapshot
   assert.ok(
     !unavailable.calls.some((call) => call.startsWith("api --method PATCH")),
     "failure to establish the final snapshot must never publish",
+  );
+});
+
+test("publication rechecks the tag after asset and release verification, catching a late tag move", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISH_STEP)];
+  const result = runStep(step, {
+    gh: publishTagGh(`tag ${SHA_VERIFIED}`),
+    env: {
+      EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+      EXPECTED_RELEASE_ID: "123",
+      FAKE_DRAFT_DIR: "served",
+      FAKE_TAG_AFTER_ASSETS: `tag ${SHA_MOVED}`,
+    },
+    setup: setupPublishDraft,
+  });
+  assert.notStrictEqual(result.status, 0, result.output);
+  assert.match(result.output, /no longer resolves to the signed tag object/);
+  const lastAssetRead = result.calls.reduce(
+    (last, call, index) => call.includes("releases/assets/") ? index : last,
+    -1,
+  );
+  const tagRead = result.calls.findIndex((call) => call.includes("git/ref/tags/"));
+  assert.ok(lastAssetRead >= 0 && lastAssetRead < tagRead, "tag is checked after every asset download");
+  const lastReleaseRead = result.calls.reduce(
+    (last, call, index) => call === "api repos/fossasia/cla-bot/releases/123" ? index : last,
+    -1,
+  );
+  assert.ok(lastReleaseRead < tagRead, "the final release snapshot precedes the final tag check");
+  assert.ok(
+    !result.calls.some((call) => call.startsWith("api --method PATCH")),
+    "a tag move during final verification prevents publication",
+  );
+});
+
+test("a failed final tag lookup after asset verification cannot publish", () => {
+  const step = publish.steps[stepNamed(publish.steps, PUBLISH_STEP)];
+  const result = runStep(step, {
+    gh: publishTagGh(`tag ${SHA_VERIFIED}`),
+    env: {
+      EXPECTED_TAG_OBJECT: SHA_VERIFIED,
+      EXPECTED_RELEASE_ID: "123",
+      FAKE_DRAFT_DIR: "served",
+      FAKE_TAG_API_FAILURE_AFTER_ASSETS: "true",
+    },
+    setup: setupPublishDraft,
+  });
+  assert.notStrictEqual(result.status, 0);
+  assert.ok(result.calls.some((call) => call.includes("git/ref/tags/")));
+  assert.ok(
+    !result.calls.some((call) => call.startsWith("api --method PATCH")),
+    "a failed final tag lookup fails closed",
   );
 });
 
