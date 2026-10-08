@@ -58,6 +58,7 @@
  * Exit codes: 0 ok, 1 a check failed, 2 bad usage.
  */
 const fs = require("fs");
+const crypto = require("node:crypto");
 const path = require("path");
 
 // Strict semver without pre-release/build metadata, no leading zeros. Only
@@ -353,6 +354,23 @@ function actionPurl({ name, ref }) {
   return subpath.length > 0 ? `${base}#${subpath.join("/")}` : base;
 }
 
+// CycloneDX permits a serialNumber to be omitted, but actions/attest's pinned
+// SBOM detector requires it. Derive a UUIDv5 from the immutable BOM identity
+// so rebuilding the same release produces the same SBOM bytes.
+function sbomSerialNumber(identity) {
+  const namespace = Buffer.from("6ba7b8119dad11d180b400c04fd430c8", "hex");
+  const hash = crypto
+    .createHash("sha1")
+    .update(namespace)
+    .update(identity, "utf8")
+    .digest();
+  hash[6] = (hash[6] & 0x0f) | 0x50;
+  hash[8] = (hash[8] & 0x3f) | 0x80;
+  const hex = hash.subarray(0, 16).toString("hex");
+  const uuid = `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  return `urn:uuid:${uuid}`;
+}
+
 function buildSbom({ packageJson, tag, repository, actionYml, timestamp }) {
   // Enforced when this scoped action-reference inventory is produced, so its
   // scope checks never depend on `verify` having run first.
@@ -395,6 +413,7 @@ function buildSbom({ packageJson, tag, repository, actionYml, timestamp }) {
   return {
     $schema: "http://cyclonedx.org/schema/bom-1.6.schema.json",
     bomFormat: "CycloneDX",
+    serialNumber: sbomSerialNumber(rootRef),
     specVersion: "1.6",
     version: 1,
     metadata,
