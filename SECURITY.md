@@ -78,9 +78,13 @@ Out of scope:
    during the final release read, and release contents can change after that
    read. The release tag ruleset (`.github/rulesets/release-tags.json`)
    prevents ordinary writers from updating or deleting a `v*` tag once
-   created; it must be imported in GitHub settings. Without it, repeated
-   checks only narrow the tag race. If an administrator disables or bypasses
-   the ruleset, the tag can move during the final release read; the release
+   created; it must be imported in GitHub settings. The policy job checks that
+   an active effective ruleset applies to exactly `refs/tags/v*` and blocks
+   both updates and deletions. GitHub can hide the ruleset's bypass list from
+   the read-only workflow token, so an administrator must separately confirm
+   that the list is empty. If the ruleset is missing or malformed, policy
+   fails before building. If an administrator disables or bypasses the ruleset,
+   the tag can move during the final release read; the release
    itself can still be edited after that read. See "A tag moved between
    verification and release" below. The
    draft release is also compared with what was prepared and verified, right
@@ -104,7 +108,9 @@ Out of scope:
    independently re-verifies public candidates using the helper from the exact
    workflow commit. It requires the policy job to pass on manual dispatch too.
    `workflow_dispatch` provides a manual recovery path without modifying
-   published assets.
+   published assets; its write-capable reconciliation path only runs when
+   dispatched from the repository's default branch, so an unmerged branch
+   cannot supply the verifier used for Latest.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The jobs

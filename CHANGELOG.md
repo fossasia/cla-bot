@@ -45,6 +45,11 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
   then reconciles it in a globally serialized job to the highest published
   stable SemVer tag. Backfilling an older version can no longer demote a newer
   release; queued reconciliation runs safely re-read the full release list.
+- The release policy now checks GitHub's effective repository and inherited
+  tag rulesets before building, requiring an active `refs/tags/v*` ruleset that
+  blocks updates and deletions. Manual Latest recovery is restricted to the
+  default branch; administrators still verify the empty ruleset bypass list
+  because GitHub may hide it from the workflow's read-only token.
 - The release helper refuses npm dependencies in every field that can pull
   code in (`dependencies`, `optionalDependencies`, `peerDependencies`,
   `bundleDependencies`/`bundledDependencies`), and reads `action.yml` as YAML

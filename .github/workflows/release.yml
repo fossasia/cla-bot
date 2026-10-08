@@ -17,8 +17,9 @@ name: Release
 #
 #   policy   actions: read ONLY. Fails fast, before anything is built, unless
 #            release settings match policy: mutability is a workflow setting,
-#            the `release` environment has no required reviewers, and its
-#            exact v* tag deployment restriction is validated through the API.
+#            the `release` environment has no required reviewers, its exact v*
+#            tag deployment restriction is validated, and an active effective
+#            tag ruleset blocks updates/deletions of v* tags.
 #   build    contents: read ONLY. Verifies the tag and builds the source
 #            archive and release notes with `git` and Node built-ins. It
 #            installs and executes NO third-party code (no npm), so nothing
@@ -211,6 +212,55 @@ jobs:
             exit 1
           fi
           echo "Verified the 'release' environment has no custom deployment protection rules."
+
+          # Check repository and inherited organization rulesets using the
+          # read-only Rules API. The list endpoint exposes IDs/names; fetch the
+          # selected ruleset by ID to validate its effective configuration.
+          # GitHub may omit bypass_actors unless the caller has write access to
+          # that ruleset, so an empty bypass list remains an admin-verified
+          # setup requirement documented in .github/rulesets/README.md.
+          if ! release_ruleset_id="$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/rulesets?targets=tag&includes_parents=true&per_page=100" | jq -er '
+            if (type != "array") or any(.[]; type != "array")
+            then error("malformed paginated ruleset response")
+            else
+              [.[][] | select(.name == "Protect release tags")] as $matches |
+              if ($matches | length) == 1 and
+                 ($matches[0].id | type == "number") and
+                 ($matches[0].id > 0) and
+                 ($matches[0].id == ($matches[0].id | floor)) and
+                 ($matches[0].enforcement == "active")
+              then $matches[0].id
+              else error("expected exactly one active Protect release tags ruleset")
+              end
+            end
+          ')"; then
+            echo "::error::Could not find exactly one active effective 'Protect release tags' ruleset. Refusing to release."
+            exit 1
+          fi
+          if ! release_ruleset="$(gh api "repos/${GITHUB_REPOSITORY}/rulesets/${release_ruleset_id}?includes_parents=true")"; then
+            echo "::error::Could not read the effective 'Protect release tags' ruleset. Refusing to release."
+            exit 1
+          fi
+          if ! jq -e --argjson expected_id "$release_ruleset_id" '
+            .id == $expected_id and
+            .name == "Protect release tags" and
+            .target == "tag" and
+            .enforcement == "active" and
+            (.conditions.ref_name.include == ["refs/tags/v*"]) and
+            (.conditions.ref_name.exclude == []) and
+            (.rules | type == "array") and
+            ([.rules[].type] | sort == ["deletion", "update"]) and
+            ((has("bypass_actors") | not) or
+             (.bypass_actors | type == "array" and length == 0))
+          ' <<< "$release_ruleset" >/dev/null; then
+            echo "::error::The effective 'Protect release tags' ruleset must be active for exactly refs/tags/v* and block updates and deletions, with no exposed bypass actors. Refusing to release."
+            exit 1
+          fi
+          if jq -e 'has("bypass_actors")' <<< "$release_ruleset" >/dev/null; then
+            echo "Verified the effective release-tag ruleset and its visible empty bypass list."
+          else
+            echo "Verified the effective release-tag ruleset. GitHub did not expose its bypass list to this read-only token; confirm the empty bypass list in repository settings."
+          fi
 
   build:
     name: Verify the tag and build the source archive
@@ -1009,7 +1059,8 @@ jobs:
     if: >-
       always() &&
       needs.policy.result == 'success' &&
-      (github.event_name == 'workflow_dispatch' ||
+      ((github.event_name == 'workflow_dispatch' &&
+        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
        (needs.publish.result == 'success' || needs.publish.result == 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 15

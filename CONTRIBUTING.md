@@ -248,7 +248,11 @@ when something about releasing seems off:
    environment cannot add an approval gate.
 4. **Import the release tag ruleset** in `.github/rulesets/release-tags.json`
    as a repository admin. It lets writers create version tags but blocks
-   moving or deleting them after creation. A tag correction uses a new version.
+   moving or deleting them after creation. The policy job checks that an
+   active effective ruleset protects exactly `refs/tags/v*` and blocks both
+   updates and deletions. Confirm in repository settings that its bypass list
+   is empty; GitHub may hide that list from the workflow's read-only token.
+   A tag correction uses a new version.
 5. **Register a signing key on your GitHub account**, as a _Signing Key_ (not
    just an authentication key), and use the same address as a verified email:
    ```bash
@@ -355,8 +359,10 @@ but signing and attesting need a real GitHub run.
   If it failed after publication, the read-only candidate verification still
   runs when possible;
   if that check also failed transiently, use **Run workflow** in Actions for
-  the Release workflow. Manual recovery re-verifies published candidates and
-  reconciles Latest without rebuilding or overwriting a release.
+  the Release workflow from the repository's default branch. Manual recovery
+  re-verifies published candidates and reconciles Latest without rebuilding
+  or overwriting a release; dispatches from other refs cannot reach the
+  write-capable reconciliation job.
 - **A published release turns out to be wrong:** edit its notes for a notes
   issue. For an asset or source correction, release the next patch version and
   say in its changelog which version it supersedes; consumers must reject any

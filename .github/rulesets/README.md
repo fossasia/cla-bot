@@ -28,17 +28,23 @@ with repository write access, as described in `SECURITY.md`.
 
 Import it once as a repository admin:
 
-This is an external repository setting: the release workflow does not query
-GitHub's effective rulesets and cannot prove this protection is active. Treat
-importing and verifying it as a required setup step before the first release.
+This is an external repository setting: GitHub does not apply this file
+automatically. Before the first release, import it and verify the bypass list
+is empty. The release policy job queries the effective repository and inherited
+tag rulesets and checks that this active ruleset covers exactly `refs/tags/v*`
+with both update and deletion blocked. GitHub may hide `bypass_actors` from a
+read-only token, so the workflow cannot independently prove that part; an
+administrator must verify it in repository settings.
 
 ```bash
 gh api --method POST repos/fossasia/cla-bot/rulesets --input .github/rulesets/release-tags.json
 ```
 
 Verify that the active ruleset targets `refs/tags/v*`, has both `update` and
-`deletion` rules, and has an empty bypass list. A correction that requires
-moving or deleting a version tag must be released under a new version instead.
+`deletion` rules, and has an empty bypass list. The workflow checks the first
+two conditions before release; the administrator must verify the empty bypass
+list. A correction that requires moving or deleting a version tag must be
+released under a new version instead.
 
 Why one check: `Required checks pass` (job `required-checks-pass` in
 `ci.yml`) `needs:` every other job, so adding, removing or renaming a check

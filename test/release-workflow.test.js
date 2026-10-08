@@ -362,7 +362,12 @@ test("candidate verification is read-only, checks published releases after a pub
   });
   assert.deepStrictEqual(verifyLatest.needs, ["policy", "publish"]);
   assert.match(verifyLatest.if, /always\(\)/);
-  assert.match(verifyLatest.if, /needs\.policy\.result == 'success'/);
+  const verifyCondition = verifyLatest.if.replace(/\s+/g, " ").trim();
+  assert.match(
+    verifyCondition,
+    /^always\(\) && needs\.policy\.result == 'success' && \(\(github\.event_name == 'workflow_dispatch' && github\.ref == format\('refs\/heads\/\{0\}', github\.event\.repository\.default_branch\)\) \|\| \(needs\.publish\.result == 'success' \|\| needs\.publish\.result == 'failure'\)\)$/,
+    "manual Latest recovery must use the default-branch workflow; tag-push recovery remains available after publish success/failure",
+  );
   assert.ok(
     verifyLatest.if.indexOf("needs.policy.result == 'success'") <
       verifyLatest.if.indexOf("github.event_name == 'workflow_dispatch'"),
@@ -616,6 +621,8 @@ test("publish uses the `release` environment and policy rejects every protection
   assert.match(runText(policy.steps), /\.type == "tag"/);
   assert.match(runText(policy.steps), /\.name == "v\*"/);
   assert.match(runText(policy.steps), /deployment_protection_rules/);
+  assert.match(runText(policy.steps), /rulesets\?targets=tag&includes_parents=true&per_page=100/);
+  assert.match(runText(policy.steps), /rulesets\/\$\{release_ruleset_id\}\?includes_parents=true/);
 });
 
 test("publish runs no repository code or third-party actions", () => {
@@ -1926,11 +1933,15 @@ test("mutable releases are the declared policy in preflight, publish, Latest and
 
 test("release setup documentation describes the exact environment policy the workflow enforces", () => {
   const contributing = read("CONTRIBUTING.md");
+  const rulesetSetup = read(".github", "rulesets", "README.md");
   assert.match(contributing, /Selected\s+branches and tags/);
   assert.match(contributing, /exactly one rule: tag pattern `v\*`/);
   assert.match(contributing, /Do not configure a wait timer or custom\s+deployment protection rule/);
   assert.match(contributing, /no branch\s+rules and no additional patterns/);
   assert.match(contributing, /complete paginated rules list/);
+  assert.match(contributing, /active effective ruleset protects exactly `refs\/tags\/v\*`/);
+  assert.match(rulesetSetup, /queries the effective repository and inherited\s+tag rulesets/);
+  assert.match(rulesetSetup, /administrator must verify the empty bypass\s+list/);
 });
 
 test("security docs explicitly define repository writers as the release trust root", () => {
@@ -1993,6 +2004,8 @@ const deploymentPolicies = (...branchPolicies) => ({
 });
 const releasePolicyGh = [
   'case "$*" in',
+  '  *"rulesets/77?includes_parents=true"*) printf "%s\\n" "$FAKE_RELEASE_RULESET_DETAIL" ;;',
+  '  *"rulesets?targets=tag&includes_parents=true&per_page=100"*) printf "%s\\n" "$FAKE_RELEASE_RULESETS" ;;',
   '  *"deployment_protection_rules"*) printf "%s\\n" "$FAKE_CUSTOM_PROTECTION_RULES" ;;',
   '  *"deployment-branch-policies"*) printf "%s\\n" "$FAKE_DEPLOYMENT_POLICIES" ;;',
   '  *"environments/release"*) printf "%s\\n" "$FAKE_RELEASE_ENVIRONMENT" ;;',
@@ -2010,6 +2023,18 @@ const validReleasePolicy = {
       total_count: 0,
       custom_deployment_protection_rules: [],
     }),
+    // --paginate --slurp wraps page arrays in an outer array.
+    FAKE_RELEASE_RULESETS: JSON.stringify([[
+      { id: 77, name: "Protect release tags", enforcement: "active" },
+    ]]),
+    FAKE_RELEASE_RULESET_DETAIL: JSON.stringify({
+      id: 77,
+      name: "Protect release tags",
+      target: "tag",
+      enforcement: "active",
+      conditions: { ref_name: { include: ["refs/tags/v*"], exclude: [] } },
+      rules: [{ type: "update" }, { type: "deletion" }],
+    }),
   },
 };
 
@@ -2023,8 +2048,12 @@ test("policy (real shell, fake gh): release environment has no required reviewer
   );
   assert.match(ok.calls[1], /--paginate repos\/fossasia\/cla-bot\/environments\/release\/deployment-branch-policies\?per_page=100/);
   assert.strictEqual(ok.calls[2], "api repos/fossasia/cla-bot/environments/release/deployment_protection_rules");
+  assert.strictEqual(ok.calls[3], "api --paginate --slurp repos/fossasia/cla-bot/rulesets?targets=tag&includes_parents=true&per_page=100");
+  assert.strictEqual(ok.calls[4], "api repos/fossasia/cla-bot/rulesets/77?includes_parents=true");
   assert.match(ok.output, /Verified the 'release' environment deployment restriction: tag v\*/);
   assert.match(ok.output, /no custom deployment protection rules/);
+  assert.match(ok.output, /Verified the effective release-tag ruleset/);
+  assert.match(ok.output, /did not expose its bypass list/);
   assert.ok(
     !/::notice::/.test(ok.output),
     "self-review is off, nothing to point out",
@@ -2113,6 +2142,117 @@ test("policy (real shell, fake gh): release environment has no required reviewer
     assert.strictEqual(result.status, 1, invalid);
     assert.match(result.output, /must not have custom deployment protection rules/);
   }
+
+  const invalidRulesetListing = runStep(step, {
+    ...validReleasePolicy,
+    env: {
+      ...validReleasePolicy.env,
+      FAKE_RELEASE_RULESETS: JSON.stringify([[
+        { id: 77, name: "Protect release tags", enforcement: "disabled" },
+      ]]),
+    },
+  });
+  assert.strictEqual(invalidRulesetListing.status, 1);
+  assert.match(invalidRulesetListing.output, /Could not find exactly one active effective/);
+  assert.strictEqual(invalidRulesetListing.calls.length, 4, "do not read a ruleset unless the effective active candidate is identified");
+
+  for (const [label, pages] of [
+    ["no matching ruleset", [[{ id: 12, name: "Other", enforcement: "active" }]]],
+    ["non-integral ID", [[{ id: 77.5, name: "Protect release tags", enforcement: "active" }]]],
+    ["duplicate matching rulesets", [[
+      { id: 77, name: "Protect release tags", enforcement: "active" },
+      { id: 78, name: "Protect release tags", enforcement: "active" },
+    ]]],
+    ["malformed paginated response", [{ id: 77, name: "Protect release tags", enforcement: "active" }]],
+  ]) {
+    const result = runStep(step, {
+      ...validReleasePolicy,
+      env: {
+        ...validReleasePolicy.env,
+        FAKE_RELEASE_RULESETS: JSON.stringify(pages),
+      },
+    });
+    assert.strictEqual(result.status, 1, `${label}: ${result.output}`);
+    assert.match(result.output, /Could not find exactly one active effective/);
+    assert.strictEqual(result.calls.length, 4, `${label}: detail endpoint must not be called`);
+  }
+
+  const paginatedRulesetListing = runStep(step, {
+    ...validReleasePolicy,
+    env: {
+      ...validReleasePolicy.env,
+      FAKE_RELEASE_RULESETS: JSON.stringify([
+        [{ id: 12, name: "Other", enforcement: "active" }],
+        [{ id: 77, name: "Protect release tags", enforcement: "active" }],
+      ]),
+    },
+  });
+  assert.strictEqual(paginatedRulesetListing.status, 0, paginatedRulesetListing.output);
+  assert.strictEqual(paginatedRulesetListing.calls.length, 5);
+
+  for (const [label, overrides] of [
+    ["wrong target", { target: "branch" }],
+    ["wrong ruleset ID", { id: 78 }],
+    ["wrong ref pattern", { conditions: { ref_name: { include: ["refs/tags/*"], exclude: [] } } }],
+    ["missing deletion rule", { rules: [{ type: "update" }] }],
+    ["unexpected extra rule", { rules: [{ type: "update" }, { type: "deletion" }, { type: "creation" }] }],
+    ["visible bypass actor", { bypass_actors: [{ actor_type: "RepositoryRole", actor_id: 5 }] }],
+  ]) {
+    const baseline = JSON.parse(validReleasePolicy.env.FAKE_RELEASE_RULESET_DETAIL);
+    const result = runStep(step, {
+      ...validReleasePolicy,
+      env: {
+        ...validReleasePolicy.env,
+        FAKE_RELEASE_RULESET_DETAIL: JSON.stringify({ ...baseline, ...overrides }),
+      },
+    });
+    assert.strictEqual(result.status, 1, `${label}: ${result.output}`);
+    assert.match(result.output, /must be active for exactly refs\/tags\/v\*/);
+  }
+
+  const visibleEmptyBypassList = runStep(step, {
+    ...validReleasePolicy,
+    env: {
+      ...validReleasePolicy.env,
+      FAKE_RELEASE_RULESET_DETAIL: JSON.stringify({
+        ...JSON.parse(validReleasePolicy.env.FAKE_RELEASE_RULESET_DETAIL),
+        bypass_actors: [],
+      }),
+    },
+  });
+  assert.strictEqual(visibleEmptyBypassList.status, 0, visibleEmptyBypassList.output);
+  assert.match(visibleEmptyBypassList.output, /visible empty bypass list/);
+
+  const unreadableRulesetList = runStep(step, {
+    ...validReleasePolicy,
+    gh: [
+      'case "$*" in',
+      '  *"rulesets?targets=tag&includes_parents=true&per_page=100"*) exit 1 ;;',
+      '  *"deployment_protection_rules"*) printf "%s\\n" "$FAKE_CUSTOM_PROTECTION_RULES" ;;',
+      '  *"deployment-branch-policies"*) printf "%s\\n" "$FAKE_DEPLOYMENT_POLICIES" ;;',
+      '  *"environments/release"*) printf "%s\\n" "$FAKE_RELEASE_ENVIRONMENT" ;;',
+      '  *) exit 9 ;;',
+      'esac',
+    ].join("\n"),
+  });
+  assert.strictEqual(unreadableRulesetList.status, 1);
+  assert.match(unreadableRulesetList.output, /Could not find exactly one active effective/);
+
+  const unreadableRuleset = runStep(step, {
+    ...validReleasePolicy,
+    gh: [
+      'case "$*" in',
+      '  *"rulesets/77?includes_parents=true"*) exit 1 ;;',
+      '  *"rulesets?targets=tag&includes_parents=true&per_page=100"*) printf "%s\\n" "$FAKE_RELEASE_RULESETS" ;;',
+      '  *"deployment_protection_rules"*) printf "%s\\n" "$FAKE_CUSTOM_PROTECTION_RULES" ;;',
+      '  *"deployment-branch-policies"*) printf "%s\\n" "$FAKE_DEPLOYMENT_POLICIES" ;;',
+      '  *"environments/release"*) printf "%s\\n" "$FAKE_RELEASE_ENVIRONMENT" ;;',
+      '  *) exit 9 ;;',
+      'esac',
+    ].join("\n"),
+  });
+  assert.strictEqual(unreadableRuleset.status, 1);
+  assert.match(unreadableRuleset.output, /Could not read the effective/);
 
   const unreadable = runStep(step, { gh: "exit 1" });
   assert.strictEqual(unreadable.status, 1);
