@@ -566,13 +566,30 @@ jobs:
             exit 1
           fi
 
-      # Draft first, publish last. Never delete an existing release: GitHub
-      # cannot atomically check its draft state and delete it, so a concurrent
-      # publisher could otherwise turn a checked draft public before deletion.
-      - name: Create the draft release
+      # Draft first, publish last. A matching existing draft is left in place;
+      # the next step verifies all of its metadata, notes and assets against
+      # this run's verified files before publication. Never delete or replace
+      # an existing release: draft state can change after any separate read.
+      - name: Create the draft release if absent
         run: |
           set -euo pipefail
           name="cla-bot-${RELEASE_TAG}"
+          if state="$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            case "$state" in
+              true)
+                echo "An existing draft for ${RELEASE_TAG} will be reused only if the following verification matches its exact metadata, notes and assets."
+                exit 0
+                ;;
+              false)
+                echo "::error::Release ${RELEASE_TAG} is already published. Published releases are never overwritten; use a new version."
+                exit 1
+                ;;
+              *)
+                echo "::error::Unexpected draft state '${state}' for ${RELEASE_TAG}. Refusing to create or publish a release."
+                exit 1
+                ;;
+            esac
+          fi
           gh release create "$RELEASE_TAG" \
             --draft \
             --verify-tag \

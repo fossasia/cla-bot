@@ -843,7 +843,7 @@ test("sign verifies producer outputs, signs, self-verifies and uploads; publish 
 
 test("the release is created as a DRAFT bound to the pushed tag, and only a later step publishes it", () => {
   const create =
-    publish.steps[runsMatching(publish.steps, /gh release create/)].run;
+    publish.steps[stepNamed(publish.steps, "Create the draft release if absent")].run;
   assert.match(create, /--draft\b/);
   assert.match(create, /--verify-tag\b/);
   assert.ok(!/--latest/.test(create), "creation must not publish");
@@ -853,12 +853,55 @@ test("the release is created as a DRAFT bound to the pushed tag, and only a late
   assert.match(publishCall, /-f make_latest=false/);
 });
 
+test("draft creation is idempotent and an existing draft is reused only for exact verification", () => {
+  const createIndex = stepNamed(publish.steps, "Create the draft release if absent");
+  const create = publish.steps[createIndex].run;
+  assert.match(create, /gh release create "\$RELEASE_TAG"/);
+  assert.match(create, /existing draft[\s\S]*exact metadata, notes and assets/);
+  assert.match(create, /already published/);
+  assert.ok(!/gh release delete/.test(create), "existing releases are never deleted");
+  assert.ok(createIndex < stepNamed(publish.steps, DRAFT_CHECK));
+
+  const invoke = (viewResult) =>
+    runStep(publish.steps[createIndex], {
+      gh: [
+        'case "$*" in',
+        `  *"release view"*) ${viewResult} ;;`,
+        '  *"release create"*) echo created >> create-called.txt ;;',
+        '  *) exit 99 ;;',
+        "esac",
+      ].join("\n"),
+      after: (dir) => fs.existsSync(path.join(dir, "create-called.txt")),
+    });
+
+  const absent = invoke("exit 1");
+  assert.strictEqual(absent.status, 0, absent.output);
+  assert.strictEqual(absent.extra, true, "an absent release is created");
+
+  const matchingDraft = invoke("printf 'true\\n'");
+  assert.strictEqual(matchingDraft.status, 0, matchingDraft.output);
+  assert.strictEqual(matchingDraft.extra, false, "an existing draft is reused");
+  const exactDraftCheck = runDraftCheck(() => {});
+  assert.strictEqual(exactDraftCheck.status, 0, exactDraftCheck.output);
+  const mismatchedDraft = runDraftCheck(({ served, name }) =>
+    fs.appendFileSync(path.join(served, `${name}.tar.gz`), "changed"),
+  );
+  assert.notStrictEqual(mismatchedDraft.status, 0);
+  assert.match(mismatchedDraft.output, /Refusing to publish/);
+
+  const published = invoke("printf 'false\\n'");
+  assert.strictEqual(published.status, 1, published.output);
+  assert.match(published.output, /already published/);
+  assert.strictEqual(published.extra, false, "a published release is never recreated");
+});
+
 test("release creation never deletes or overwrites an existing release", () => {
   const create =
     publish.steps[runsMatching(publish.steps, /gh release create/)].run;
   assert.match(create, /gh release create "\$RELEASE_TAG"/);
   assert.doesNotMatch(create, /gh release delete/);
-  assert.match(raw, /Never delete an existing release/);
+  assert.doesNotMatch(raw, /gh release delete/);
+  assert.match(raw, /Never delete or replace/);
   assert.ok(!/--clobber/.test(raw), "no --clobber anywhere");
 });
 

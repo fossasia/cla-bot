@@ -340,8 +340,8 @@ but signing and attesting need a real GitHub run.
     move to the new version.
 - **A draft check error** ("Refusing to publish": assets or release metadata
   differ from what was prepared) means someone or something changed the draft
-  after it was created. Nothing is public. Delete the draft, find out why, and
-  re-run the failed jobs.
+  after it was created. Nothing is public. The workflow fails closed; inspect
+  the draft and delete it manually only after confirming it is safe, then rerun.
 - **A "policy" job failure** (invalid workflow immutability policy, missing
   reviewers when approval is required, or inability to read the `release`
   environment): nothing was built or published. Do the one-time
@@ -352,12 +352,14 @@ but signing and attesting need a real GitHub run.
   (it cannot be applied to this one), or change the policy through a reviewed
   workflow update if mutable releases are intended.
 - **An existing release for the tag** (draft or published) prevents creation:
-  inspect it and confirm it is safe to remove before deleting it manually.
-  The workflow never deletes an existing release because its state could
-  change between a check and a delete. Then rerun the failed job.
+  a matching draft is reused only after its metadata, notes and every asset
+  match this run's verified files. A mismatching draft fails closed; inspect it
+  and remove it manually only after confirming it is safe. Published releases
+  are never overwritten or deleted by the workflow.
 - **The `publish` job failed** (Sigstore or GitHub outage, upload error): use
-  "Re-run failed jobs" only if no release already exists for the tag. The
-  workflow never deletes or overwrites an existing draft or published release.
+  "Re-run failed jobs". If draft creation had completed, the retry reuses the
+  draft only when its metadata, notes and assets match exactly; it never
+  deletes or overwrites an existing release.
   If it failed after publication, the read-only candidate verification still
   runs when possible;
   if that check also failed transiently, use **Run workflow** in Actions for
