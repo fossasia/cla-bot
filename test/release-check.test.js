@@ -927,6 +927,26 @@ test("buildSbom omits the timestamp when none is given and tolerates zero depend
   assert.deepStrictEqual(sbom.dependencies[0].dependsOn, []);
 });
 
+test("buildSbom has a stable CycloneDX UUID serialNumber required by actions/attest", () => {
+  const input = {
+    packageJson: PACKAGE,
+    tag: "v1.2.3",
+    repository: "fossasia/cla-bot",
+    actionYml: ACTION_YML,
+    timestamp: "2026-10-06T00:00:00Z",
+  };
+  const sbom = buildSbom(input);
+  const rerun = buildSbom(input);
+
+  assert.match(
+    sbom.serialNumber,
+    /^urn:uuid:[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  );
+  assert.strictEqual(rerun.serialNumber, sbom.serialNumber);
+  // Pinned actions/attest format detection requires all three fields.
+  assert.ok(sbom.bomFormat && sbom.serialNumber && sbom.specVersion);
+});
+
 test("generated SBOM validates against the official CycloneDX 1.6 JSON schema", async () => {
   const sbom = buildSbom({
     packageJson: PACKAGE,
@@ -1167,6 +1187,7 @@ test("main sbom: writes the SBOM file", async () => {
     const sbom = JSON.parse(text);
     assert.strictEqual(sbom.components.length, 2);
     assert.strictEqual(sbom.metadata.timestamp, "2026-10-06T00:00:00Z");
+    assert.match(sbom.serialNumber, /^urn:uuid:/);
     assert.match(io.out.join("\n"), /2 component\(s\)/);
   });
 });
