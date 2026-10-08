@@ -214,13 +214,14 @@ verify-and-promote API, so an external release can still change in the small
 interval between the final checks and the marker update. The workflow test
 suite models the newer-publication race and asserts that stale promotion is
 rejected. Since published releases are intentionally mutable, editing release
-metadata triggers reconciliation and a scheduled run is configured every six
-hours to check for asset-only changes; Actions or API delays can extend that
-interval. A changed release no longer qualifies once a reconciliation
-observes it, and the highest remaining verified stable release is selected.
-Latest can temporarily reference changed content until that run
-completes; if no stable release verifies, reconciliation fails closed and
-reports that no eligible candidate exists.
+metadata and assets are checked by the scheduled reconciliation configured
+every six hours; Actions or API delays can extend that interval. A changed
+release no longer qualifies once a reconciliation observes it, and the highest
+remaining verified stable release is selected. Latest can temporarily
+reference changed content until that run completes; if no stable release
+verifies, reconciliation fails closed and reports that no eligible candidate
+exists. For transient failures, rerun failed jobs from the original release
+run; the release workflow has no manual-dispatch trigger.
 
 Every example and setup doc in this project (`examples/consumer-workflow.yml`,
 "SETUP_GUIDE.md", this file) refers to a release as `@vX.Y.Z`. That release
@@ -365,11 +366,9 @@ but signing and attesting need a real GitHub run.
   deletes or overwrites an existing release.
   If it failed after publication, the read-only candidate verification still
   runs when possible;
-  if that check also failed transiently, use **Run workflow** in Actions for
-  the Release workflow from the repository's default branch. Manual recovery
-  re-verifies published candidates and reconciles Latest without rebuilding
-  or overwriting a release; dispatches from other refs cannot reach the
-  write-capable reconciliation job.
+  if that check also failed transiently, use **Re-run failed jobs** from the
+  original release run. Scheduled reconciliation retries Latest verification
+  without rebuilding or overwriting a release.
 - **A published release turns out to be wrong:** edit its notes for a notes
   issue. For an asset or source correction, release the next patch version and
   say in its changelog which version it supersedes; consumers must reject any

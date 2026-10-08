@@ -1,9 +1,10 @@
 name: Release
 
 # Publishes a SIGNED release when a signed, annotated tag vMAJOR.MINOR.PATCH
-# is pushed. Manual dispatch can also re-verify published releases and repair
-# Latest after a post-publication failure. Repository actors with release
-# rights can still create releases manually; there is no manual draft step.
+# is pushed. A scheduled default-branch run also re-verifies published releases
+# and repairs Latest after post-publication failures or later edits. Repository
+# actors with release rights can still create releases manually; there is no
+# manual draft step.
 # See CONTRIBUTING.md ("Releasing a new version") and SECURITY.md ("Verifying
 # a release") for setup, procedure and consumer verification.
 #
@@ -73,16 +74,10 @@ on:
     tags:
       # GitHub Actions glob only; release-check.js enforces strict stable SemVer.
       - 'v*.*.*'
-  # Published releases are intentionally editable. Re-verify immediately after
-  # metadata edits; asset-only edits are covered by the scheduled reconciliation
-  # below because GitHub has no dedicated release-asset workflow event.
-  release:
-    types: [edited]
-  # Re-check mutable release assets periodically. Scheduling cannot eliminate
-  # the interval in which an edited release may still be Latest.
+  # Published releases are intentionally editable. Re-check their metadata and
+  # assets periodically. This event runs the default-branch workflow revision.
   schedule:
     - cron: '17 */6 * * *'
-  workflow_dispatch:
 
 permissions: {}
 
@@ -1068,10 +1063,7 @@ jobs:
     if: >-
       always() &&
       needs.policy.result == 'success' &&
-      ((github.event_name == 'workflow_dispatch' &&
-        github.ref == format('refs/heads/{0}', github.event.repository.default_branch)) ||
-       github.event_name == 'schedule' ||
-       (github.event_name == 'release' && github.event.action == 'edited') ||
+      (github.event_name == 'schedule' ||
        (needs.publish.result == 'success' || needs.publish.result == 'failure'))
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -1091,8 +1083,8 @@ jobs:
       - name: Check out the release verification helper
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # Bind the verifier to the exact commit that supplied this workflow.
-          # Never consume a moving default-branch script as authority for Latest.
+          # Pin the helper to the exact workflow revision for this run. Never
+          # consume a moving default-branch script as Latest's authority.
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
 

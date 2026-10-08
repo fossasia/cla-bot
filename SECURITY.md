@@ -109,19 +109,19 @@ Out of scope:
    verifies current release contents and selects the highest currently valid
    stable release. Once a reconciliation observes a mutation, that release
    stops being eligible and a lower valid release is promoted. A mutation can
-   leave Latest stale until the edit-triggered or next scheduled run completes; mutable
-   releases cannot provide a continuous invariant between checks. If no
+   leave Latest stale until the next scheduled run completes; mutable releases
+   cannot provide a continuous invariant between checks. If no
    published stable release verifies, reconciliation fails closed and reports
    that it found no eligible candidate. A newer release published after an
    in-flight run selects a candidate can also briefly leave Latest behind; the
    serialized run for that publication verifies the current release list and
    converges the marker. If post-publication verification fails, `verify-latest`
    independently re-verifies public candidates using the helper from the exact
-   workflow commit. It requires the policy job to pass on manual dispatch too.
-   `workflow_dispatch` provides a manual recovery path without modifying
-   published assets; its write-capable reconciliation path only runs when
-   dispatched from the repository's default branch, so an unmerged branch
-   cannot supply the verifier used for Latest.
+   workflow commit. Scheduled runs execute on the default branch. The release
+   workflow has no manual-dispatch trigger, so an unmerged branch cannot be
+   selected for a Latest reconciliation run. After a transient verification
+   failure, rerun the failed jobs from the release run or wait for scheduled
+   reconciliation.
 7. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The jobs
@@ -277,15 +277,20 @@ What the signatures do **not** protect against, and what does:
   are authorized to publish.
 - **A change to `release.yml` itself.** Repository writers can merge any
   CI-passing change, including one that removes policy checks or the
-  `environment: release` tag restriction. The signatures and attestations
-  identify the workflow path, source ref, and source digest that produced an
-  artifact; they do not independently prove that the workflow code had a
-  separate review or was unchanged. This is the project's intentional trust
-  boundary: repository writers are trusted to change the release pipeline,
-  and no additional human or team approval is required. The policy preflight
-  catches environment drift, but cannot defend against a malicious change to
-  itself. Consumers should inspect `release.yml` and `release-check.js`
-  changes between the releases they adopt.
+  `environment: release` tag restriction. GitHub runs a workflow revision
+  associated with the triggering ref; for tag pushes, that ref is the tag.
+  Because release-tag creation is intentionally open to repository writers,
+  the workflow cannot independently prove that its own YAML came from a
+  reviewed default-branch revision. The signatures and attestations identify
+  the workflow path, source ref, and source digest that produced an artifact;
+  they do not independently prove that the workflow code had a separate
+  review or was unchanged. This is the project's intentional trust boundary:
+  repository writers are trusted to change the release pipeline, and no
+  additional human or team approval is required. A stronger guarantee would
+  require an independently protected release workflow or external enforcement;
+  a workflow cannot defend itself from a writer who can change and trigger it.
+  Consumers should inspect `release.yml` and `release-check.js` changes between
+  the releases they adopt.
 - **A tag moved between verification and release.** The publish job refuses
   to continue unless the tag still resolves to the exact signed tag object
   that was verified (`gh release create --verify-tag` alone would not catch

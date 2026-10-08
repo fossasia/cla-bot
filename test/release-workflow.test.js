@@ -5,8 +5,8 @@
  * workflow - it pins the properties that make the pipeline trustworthy, so a
  * later edit cannot quietly undo one:
  *
- *  - it publishes on stable-semver tag pushes and supports manual Latest
- *    recovery; same-tag runs serialize, and Latest reconciliation is globally
+ *  - it publishes on stable-semver tag pushes and periodically reconciles
+ *    Latest on the default branch; same-tag runs serialize, and reconciliation is globally
  *    serialized without dropping the publication of other versions;
  *  - least privilege: workflow permissions are empty; `policy`, `build` and
  *    `checks` can only READ; `sign` can sign/attest but cannot publish, and
@@ -236,8 +236,8 @@ test("release.yml has seven jobs, including isolated signing, candidate verifica
   assert.ok(!Object.keys(triggers).includes("workflow_call"));
 });
 
-test("release publication is tag-push only, while edits, schedule and manual dispatch reconcile Latest", () => {
-  assert.deepStrictEqual(Object.keys(triggers), ["push", "release", "schedule", "workflow_dispatch"]);
+test("release publication is tag-push only, and scheduled reconciliation runs on the default branch", () => {
+  assert.deepStrictEqual(Object.keys(triggers), ["push", "schedule"]);
   assert.deepStrictEqual(Object.keys(triggers.push), ["tags"]);
   assert.strictEqual(triggers.push.tags.length, 1);
   // Keep the Actions glob deliberately simple. Do not emulate GitHub's matcher
@@ -252,8 +252,8 @@ test("release publication is tag-push only, while edits, schedule and manual dis
   for (const tag of ["1.0.0", "v1.0", "v1.0.0-rc.1", "latest", "main"]) {
     assert.ok(!TAG_PATTERN.test(tag), `${tag} must be rejected by strict release validation`);
   }
-  assert.deepStrictEqual(triggers.release.types, ["edited"]);
   assert.deepStrictEqual(triggers.schedule, [{ cron: "17 */6 * * *" }]);
+  assert.ok(!Object.hasOwn(triggers, "workflow_dispatch"));
 });
 
 test("release runs serialize per tag without replacing another version's pending run", () => {
@@ -357,7 +357,7 @@ test("Latest reconciliation is globally serialized, least-privilege, and runs af
   assert.ok(!/\b(checkout|npm|node)\b/.test(runText(wf.jobs.latest.steps)));
 });
 
-test("candidate verification is read-only, checks published releases after a publish failure, and supports manual recovery", () => {
+test("candidate verification is read-only and reconciles scheduled runs plus post-publication failures", () => {
   assert.deepStrictEqual(verifyLatest.permissions, {
     contents: "read",
     attestations: "read",
@@ -367,13 +367,8 @@ test("candidate verification is read-only, checks published releases after a pub
   const verifyCondition = verifyLatest.if.replace(/\s+/g, " ").trim();
   assert.match(
     verifyCondition,
-    /^always\(\) && needs\.policy\.result == 'success' && \(\(github\.event_name == 'workflow_dispatch' && github\.ref == format\('refs\/heads\/\{0\}', github\.event\.repository\.default_branch\)\) \|\| github\.event_name == 'schedule' \|\| \(github\.event_name == 'release' && github\.event\.action == 'edited'\) \|\| \(needs\.publish\.result == 'success' \|\| needs\.publish\.result == 'failure'\)\)$/,
-    "manual recovery is default-branch-only; scheduled and release-edit reconciliation run, as does post-publish reconciliation",
-  );
-  assert.ok(
-    verifyLatest.if.indexOf("needs.policy.result == 'success'") <
-      verifyLatest.if.indexOf("github.event_name == 'workflow_dispatch'"),
-    "manual dispatch must not bypass the release policy gate",
+    /^always\(\) && needs\.policy\.result == 'success' && \(github\.event_name == 'schedule' \|\| \(needs\.publish\.result == 'success' \|\| needs\.publish\.result == 'failure'\)\)$/,
+    "scheduled reconciliation and post-publish reconciliation require a successful policy check",
   );
   assert.match(runText(verifyLatest.steps), /verify-release-candidate\.sh/);
   assert.match(runText(verifyLatest.steps), /sort_by\(.tag_name \| semver_key\) \| reverse/);
@@ -1949,9 +1944,9 @@ test("release setup documentation describes the exact environment policy the wor
 test("security docs explicitly define repository writers as the release trust root", () => {
   const security = read("SECURITY.md");
   assert.match(security, /Repository writers can merge any\s+CI-passing change/);
-  assert.match(security, /do not independently prove that the workflow code had a\s+separate review/);
+  assert.match(security, /do not independently prove that the workflow code had a\s+separate\s+review/);
   assert.match(security, /repository writers are trusted to change the release pipeline/);
-  assert.match(security, /no additional human or team approval is required/);
+  assert.match(security, /no\s+additional human or team approval is required/);
 });
 
 test("policy (real shell): the immutability policy must be declared as `required` or `not-required`, otherwise nothing is built", () => {
