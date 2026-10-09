@@ -838,15 +838,13 @@ function allOrAbort(group, promises) {
 // header and never request the URL it names. With no usable header we walk
 // one page at a time, see listCommitsBetween().
 //
-// Every read is also capped at MAX_LIST_PAGES pages, however the header or
-// the data looks. Past that we fail instead of walking on. A list of exactly
-// 10,000 items (100 full pages) is legitimate, so the limit is "more than
-// 100 pages", not "100 pages".
-//
-// A PR's COMMENTS are not read through this. They are read by
-// fetchAllIssueCommentsUncached(), which walks the pages one by one on
-// purpose: it has to keep the run's memory bounded however many comments an
-// untrusted PR carries, so it never holds the whole list at once.
+// Every read is capped at MAX_LIST_PAGES pages, regardless of what the
+// header or data says. Past that we fail instead of walking on. A list of
+// exactly 10,000 items (100 full pages) is legitimate, so the limit is "more
+// than 100 pages", not "100 pages". Comment history is also read one page at
+// a time and retains only a bounded subset of comments in memory, but its
+// compact ordering counters still require scanning every page within this
+// explicit request bound.
 // ---------------------------------------------------------------------------
 const LIST_PAGE_SIZE = 100;
 // The most pages one list read will ever fetch (10,000 items).
@@ -2112,8 +2110,10 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
   // actually needs this.
   const latestOwnBodyByCategory = Object.create(null);
   const takeId = createAscendingIdFilter();
+  const label = `issue comments for PR #${prNumber}`;
   let page = 1;
   for (;;) {
+    assertWithinPageLimit(label, page);
     // ghRead(), not gh(): this runs alongside the bot-login lookup (see
     // getExistingBotComments()), and every read that can overlap another
     // shares the one limiter. The pages themselves are still read one at a
@@ -2367,11 +2367,11 @@ async function forgetDeletedCachedComment(prNumber, commentId) {
 // only after pagination finishes, because deleting during a page-number scan
 // would shift later pages and could skip comments. This intentionally trades
 // O(number of matching IDs) temporary disk and O(number of history pages) API
-// reads for complete-history cleanup; a fixed cap would silently leave older
-// duplicates behind. The pre-post cache fetch also reads every history page
-// because pending/success ordering and latest-own-category state must remain
-// correct beyond MAX_CACHED_COMMENTS. Keep this cost explicit rather than
-// applying a limit that changes those semantics.
+// reads for complete-history cleanup within MAX_LIST_PAGES. Exceeding that
+// explicit safety bound fails the scan before any deletion begins. The
+// pre-post cache fetch follows the same bound while retaining correct
+// pending/success ordering and latest-own-category state beyond
+// MAX_CACHED_COMMENTS.
 async function findExactDuplicateComments(prNumber, body) {
   const botLogin = await resolveBotLogin();
   const tempDir = await fs.promises.mkdtemp(
@@ -2388,7 +2388,9 @@ async function findExactDuplicateComments(prNumber, body) {
     // would look like a duplicate of itself, and the cleanup would delete the
     // only copy. See createAscendingIdFilter().
     const takeId = createAscendingIdFilter();
+    const label = `issue comments for PR #${prNumber} duplicate cleanup`;
     for (;;) {
+      assertWithinPageLimit(label, page);
       const response = await gh(
         `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?sort=created&direction=asc&per_page=100&page=${page}`,
         GITHUB_TOKEN,
