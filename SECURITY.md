@@ -404,6 +404,18 @@ What the signatures do **not** protect against, and what does:
   overlapping bot runs from making decisions against competing snapshots.
   A fresh REST read would narrow, but cannot eliminate, races with unrelated
   writers because GitHub offers no atomic read-and-decide operation here.
+- Complete-history comment semantics have a corresponding resource cost.
+  GitHub's list endpoint returns at most 100 comments per page, so the cache
+  load reads every history page; after each successful dedupe-enabled post,
+  duplicate cleanup performs another fresh full-history scan. A single post
+  can therefore require roughly two sets of paginated reads when the cache is
+  cold, and multiple posts each require their own fresh cleanup scan. The
+  cleanup spools matching comment IDs to a private temporary file, so its
+  temporary disk use grows with the number of exact duplicates. These costs
+  are intentional: imposing a page or ID cap could miss an old duplicate or
+  change the history-based comment decisions. Cleanup itself is best effort,
+  but the pre-post history read can fail the post operation. See
+  `findExactDuplicateComments()` and `postComment()` in `src/cla-bot.js`.
 - The signatures file can grow past 1 MB over time. Reads use GitHub's
   `object`/`raw` media types (good up to 100 MB) instead of the default
   format (reliable only under 1 MB), so this comfortably covers realistic

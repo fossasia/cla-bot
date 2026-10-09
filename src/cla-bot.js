@@ -1566,7 +1566,13 @@ async function forgetDeletedCachedComment(prNumber, commentId) {
 // predates this post. Matching IDs are spooled to a private temporary file so
 // discovery does not retain a history-sized array in memory; deletions start
 // only after pagination finishes, because deleting during a page-number scan
-// would shift later pages and could skip comments.
+// would shift later pages and could skip comments. This intentionally trades
+// O(number of matching IDs) temporary disk and O(number of history pages) API
+// reads for complete-history cleanup; a fixed cap would silently leave older
+// duplicates behind. The pre-post cache fetch also reads every history page
+// because pending/success ordering and latest-own-category state must remain
+// correct beyond MAX_CACHED_COMMENTS. Keep this cost explicit rather than
+// applying a limit that changes those semantics.
 async function findExactDuplicateComments(prNumber, body) {
   const botLogin = await resolveBotLogin();
   const tempDir = await fs.promises.mkdtemp(
