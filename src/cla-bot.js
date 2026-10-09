@@ -859,6 +859,23 @@ function readLinkHeader(res) {
     : null;
 }
 
+// GitHub omits Link entirely when a list fits on one page. When it is
+// present, `rel="next"` is authoritative even if a page was shortened by
+// concurrent edits. Return null only for malformed metadata so callers can
+// fall back to the traditional page-size check.
+function hasNextPage(linkHeader) {
+  if (typeof linkHeader !== "string" || linkHeader.trim() === "") return false;
+  let foundValidRelation = false;
+  for (const part of linkHeader.split(/,\s*(?=<)/)) {
+    const target = /^\s*<([^>]*)>/.exec(part);
+    const rel = /;\s*rel\s*=\s*"?([^";]*)"?/i.exec(part);
+    if (!target || !rel) continue;
+    foundValidRelation = true;
+    if (rel[1].toLowerCase().split(/\s+/).includes("next")) return true;
+  }
+  return foundValidRelation ? false : null;
+}
+
 // GitHub serializes database IDs as JSON numbers. JSON.parse() rounds integer
 // tokens above Number.MAX_SAFE_INTEGER, so preserve unsafe `id` fields as
 // decimal strings on comment responses where exact IDs are used in decisions
@@ -2012,11 +2029,12 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
     // getExistingBotComments()), and every read that can overlap another
     // shares the one limiter. The pages themselves are still read one at a
     // time, see the note above.
-    const comments = await ghRead(
+    const response = await ghRead(
       `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?sort=created&direction=asc&per_page=100&page=${page}`,
       GITHUB_TOKEN,
-      { preserveUnsafeIds: true },
+      { preserveUnsafeIds: true, withLink: true },
     );
+    const { data: comments, link } = response;
     if (!comments.length) break;
     // Resolved once, reused for every page (botLogin cannot change mid-run -
     // resolveBotLogin() caches it for the whole process). Not awaited until
@@ -2054,7 +2072,10 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
     if (all.length > MAX_CACHED_COMMENTS) {
       all.splice(0, all.length - MAX_CACHED_COMMENTS);
     }
-    if (comments.length < 100) break;
+    const hasNext = hasNextPage(link);
+    if (hasNext === false || (hasNext === null && comments.length < 100)) {
+      break;
+    }
     page += 1;
   }
   return {
@@ -2279,11 +2300,12 @@ async function findExactDuplicateComments(prNumber, body) {
     // only copy. See createAscendingIdFilter().
     const takeId = createAscendingIdFilter();
     for (;;) {
-      const comments = await gh(
+      const response = await gh(
         `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?sort=created&direction=asc&per_page=100&page=${page}`,
         GITHUB_TOKEN,
-        { preserveUnsafeIds: true },
+        { preserveUnsafeIds: true, withLink: true },
       );
+      const { data: comments, link } = response;
       if (!comments.length) break;
       for (const c of comments) {
         if (
@@ -2302,7 +2324,10 @@ async function findExactDuplicateComments(prNumber, body) {
           }
         }
       }
-      if (comments.length < 100) break;
+      const hasNext = hasNextPage(link);
+      if (hasNext === false || (hasNext === null && comments.length < 100)) {
+        break;
+      }
       page += 1;
     }
     if (bufferedIds) await file.writeFile(bufferedIds);

@@ -305,8 +305,18 @@ const linkTo = (path, last) =>
     const paged = (url, items, path) => {
       const page = Number((url.match(/[&?]page=(\d+)/) || [])[1] || 1);
       const lastPage = Math.max(1, Math.ceil(items.length / 100));
-      const headers =
-        link && lastPage > 1 ? { link: linkTo(path, lastPage) } : {};
+      const links = [];
+      if (link && lastPage > 1) {
+        if (page < lastPage) {
+          links.push(
+            `<https://api.github.com${path}?per_page=100&page=${page + 1}>; rel="next"`,
+          );
+        }
+        links.push(
+          `<https://api.github.com${path}?per_page=100&page=${lastPage}>; rel="last"`,
+        );
+      }
+      const headers = links.length ? { link: links.join(", ") } : {};
       return res(200, items.slice((page - 1) * 100, page * 100), headers);
     };
     // Compare returns an object, not a bare array: { commits, total_commits }.

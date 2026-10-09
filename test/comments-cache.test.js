@@ -54,23 +54,37 @@ function res(status, jsonBody) {
   };
 }
 
-function rawRes(status, bodyText) {
+function rawRes(status, bodyText, link = null) {
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => bodyText,
-    headers: { get: () => null },
+    headers: { get: (name) => (name.toLowerCase() === "link" ? link : null) },
   };
 }
 
 // Model GitHub's numeric JSON IDs while keeping unsafe values exact in the
 // fixture. JSON.stringify() can't represent those numeric literals faithfully.
-function commentListRes(comments, status = 200) {
+function commentListRes(comments, status = 200, link = null) {
   const json = JSON.stringify(comments).replace(
     /"id":"([1-9]\d*)"/g,
     '"id":$1',
   );
-  return rawRes(status, json);
+  return rawRes(status, json, link);
+}
+
+function commentsPageLink(url, page, total) {
+  const pages = Math.ceil(total / 100);
+  if (pages <= 1) return null;
+  const base = new URL(url);
+  const link = [];
+  if (page < pages) {
+    base.searchParams.set("page", String(page + 1));
+    link.push(`<${base.href}>; rel="next"`);
+  }
+  base.searchParams.set("page", String(pages));
+  link.push(`<${base.href}>; rel="last"`);
+  return link.join(", ");
 }
 
 const BOT = { login: "github-actions[bot]" };
@@ -230,7 +244,12 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       const all = [...flood, real];
       const page = Number(new URL(url).searchParams.get("page")) || 1;
       const start = (page - 1) * 100;
-      return res(200, all.slice(start, start + 100));
+      const pageItems = all.slice(start, start + 100);
+      return commentListRes(
+        pageItems,
+        200,
+        commentsPageLink(url, page, all.length),
+      );
     };
     const cache = new Map();
     const result = await getExistingBotComments(1, {
@@ -487,7 +506,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
           // pages instead of looping forever (per_page=100 is fixed by source).
           const page = Number(parsedUrl.searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return commentListRes(ordered.slice(start, start + 100));
+          return commentListRes(
+            ordered.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, ordered.length),
+          );
         }
         if (method === "POST") {
           const { body } = JSON.parse(opts.body);
@@ -751,6 +774,29 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     );
     assert.strictEqual(gh.comments.length, 1);
     assert.match(gh.comments[0].body, /need to sign/i);
+  });
+
+  await test("full 100-comment pages stop from Link metadata without an empty follow-up GET", async () => {
+    const prior = Array.from({ length: 99 }, (_, index) => ({
+      id: index + 1,
+      body: `ordinary comment ${index}`,
+      user: { login: `user-${index}`, type: "User" },
+    }));
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+      comments: prior,
+    });
+    const getCommentReads = countCommentReads(gh);
+
+    await postComment(1, "the 100th comment");
+
+    assert.strictEqual(gh.comments.length, 100);
+    assert.strictEqual(
+      getCommentReads(),
+      2,
+      "the pre-post snapshot and fresh cleanup each read one full page; neither should request an empty page 2",
+    );
   });
 
   await test("a REAL pending flag from 250+ admitted comments ago (older than MAX_CACHED_COMMENTS) still correctly triggers a success announcement", async () => {
@@ -1048,7 +1094,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
           const all = [oldDup, ...filler, { id: 501, body: full, user: BOT }];
           const page = Number(new URL(url).searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, all.slice(start, start + 100));
+          return commentListRes(
+            all.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, all.length),
+          );
         }
         if (method === "POST")
           return res(201, { id: 501, body: full, user: BOT });
@@ -1094,7 +1144,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
           const all = [oldComment, ...filler];
           const page = Number(new URL(url).searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, all.slice(start, start + 100));
+          return commentListRes(
+            all.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, all.length),
+          );
         }
         if (method === "POST") {
           postCalls += 1;
@@ -1163,7 +1217,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
         if (method === "GET") {
           const page = Number(new URL(url).searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, comments.slice(start, start + 100));
+          return commentListRes(
+            comments.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, comments.length),
+          );
         }
         if (method === "POST") {
           const created = {
@@ -1303,7 +1361,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
         if (method === "GET") {
           const page = Number(new URL(url).searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, comments.slice(start, start + 100));
+          return commentListRes(
+            comments.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, comments.length),
+          );
         }
         if (method === "POST") {
           const created = { id: 1002, body: full, user: BOT };
