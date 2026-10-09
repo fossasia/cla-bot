@@ -1,20 +1,5 @@
 "use strict";
-/**
- * Signatures-repo token lifecycle: expiry-aware caching, proactive refresh,
- * reactive refresh on 401, shared in-flight mints, and the GITHUB_TOKEN
- * fallback - tested at three levels:
- *
- *   1. getSignaturesToken / withSignaturesToken / resolveSigTokenExpiry
- *      directly, against a fake clock (Date.now is stubbed) and a stub fetch.
- *   2. The real handlers (handleIssueComment, handlePullRequestTarget ->
- *      checkPR) against a stateful fake GitHub that ENFORCES token expiry
- *      and revocation exactly like the real API (401 "Bad credentials"), so
- *      "the token died between the write and the final read" is reproduced
- *      for real instead of being assumed.
- *   3. The real CLI (child process) against a local HTTP server.
- *
- * Run: node test/token-expiry.test.js (also included in `npm test`)
- */
+/** Tests token caching, refresh, expiry, and the GITHUB_TOKEN fallback. */
 const assert = require("assert");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -279,9 +264,7 @@ const signPayload = () => ({
 const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
 
 (async () => {
-  // =========================================================================
   // resolveSigTokenExpiry - pure
-  // =========================================================================
   await test("resolveSigTokenExpiry: a parseable expires_at inside the 1h ceiling is used as-is", async () => {
     const m = loadFresh();
     const t0 = Date.parse("2026-10-03T00:00:00Z");
@@ -322,9 +305,7 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
     });
   }
 
-  // =========================================================================
   // getSignaturesToken - cache lifecycle
-  // =========================================================================
   await test("getSignaturesToken reuses the cached token while it is comfortably valid (zero extra API calls)", async () => {
     const m = loadFresh();
     const gh = makeAppGitHub();
@@ -530,9 +511,7 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
     );
   });
 
-  // =========================================================================
   // withSignaturesToken - reactive refresh
-  // =========================================================================
   await test("withSignaturesToken passes the token to fn once and returns its result when nothing goes wrong", async () => {
     const m = loadFresh();
     const gh = makeAppGitHub();
@@ -699,9 +678,7 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
     assert.strictEqual(attempts, 1);
   });
 
-  // =========================================================================
   // Real handlers against a fake GitHub that enforces expiry / revocation
-  // =========================================================================
   await test("sign flow, baseline: one mint, no 401s, signature stored once, PR ends 'success'", async () => {
     const m = loadFresh();
     const gh = makeAppGitHub();
@@ -889,10 +866,8 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
     assert.strictEqual(successStatuses(gh).length, 1);
   });
 
-  // =========================================================================
   // Real CLI against a local HTTP server (real process, real fetch, real
   // clock) - the revoke path, since the child's clock can't be faked.
-  // =========================================================================
   await test(
     "CLI e2e: a sign-phrase run survives its installation token being revoked mid-run (re-mint + retry), exits 0, stores the signature once",
     async () => {

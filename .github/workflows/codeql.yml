@@ -1,18 +1,7 @@
 name: "CodeQL Advanced Analysis"
 
-# Reusable workflow, called from ci.yml (that is what makes it part of the
-# single "Required checks pass" gate). No push / pull_request / schedule
-# triggers of its own (they would run it twice) and no `concurrency:`
-# (inside a reusable workflow `github.workflow` is the CALLER's name, which
-# would collide with ci.yml's group and get the run cancelled).
-# `workflow_dispatch` is kept only to re-run it by hand.
-#
-# NOTE: a green job here means "the analysis ran and its results were
-# uploaded", NOT "no alerts": CodeQL does not fail the job on findings, so
-# "Required checks pass" does not block a merge on new CodeQL alerts by
-# itself. That is a deliberate default, not an oversight - see "Optional:
-# block on CodeQL alerts" in .github/rulesets/README.md for how to turn
-# that on as a separate, explicit ruleset rule.
+# Reusable CI check. A green result means analysis completed, not that there
+# are no alerts. See .github/rulesets/README.md to require a clean scan.
 on:
   workflow_call: {}
   workflow_dispatch: {}

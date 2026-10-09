@@ -1,13 +1,5 @@
 "use strict";
-/**
- * These tests stub `global.fetch` to exercise readSignatures/writeSignatures
- * against simulated GitHub API responses - no real network calls, no npm
- * mocking library. This is the layer where the actual bugs were found
- * (missing Content-Type header, TOCTOU duplicate-signature race), which the
- * pure-function tests in logic.test.js never touched.
- *
- * Run: node test/http.test.js (also included in `npm test`)
- */
+/** Tests signature reads and writes against mocked GitHub API responses. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "dummy";
@@ -439,13 +431,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
 
   // ===========================================================================
   // readSignatures' own malformed-entry warning - the test above proves a
-  // malformed entry survives a write untouched, but never actually checks
-  // the warning ITSELF: its exact message, which of the three sub-
-  // conditions (`!entry`, non-string login, empty-string login) triggers
-  // it, or that a genuinely valid entry stays silent. This drives
-  // readSignatures() directly (no write involved) with one of each shape
-  // in a single array, checked in one pass.
-  // ===========================================================================
+  // Check the exact warning for each malformed entry and silence for valid data.
   await test("readSignatures warns with the exact, specific message for each malformed signature entry shape (null, missing login, empty-string login, non-string login) and stays silent for a valid one", async () => {
     const stored = {
       version: 1,
@@ -678,13 +664,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     }
   });
 
-  // Item E: the mint request can come back 200 OK but with a body that
-  // doesn't actually carry a usable token. getSignaturesToken() now
-  // validates tokenResp.token before caching/returning it (see the
-  // "missing a usable token field" check right after the mint request) -
-  // a malformed successful response must fail loudly right here, not
-  // silently flow through as an unusable `Authorization: Bearer undefined`
-  // that only surfaces later as a confusing 401 on some unrelated request.
+  // Reject a successful mint response without a usable token.
   await test("getSignaturesToken throws a clear error (not a silently-cached undefined) when the access_tokens response body is an empty object", async () => {
     delete require.cache[require.resolve("../src/cla-bot.js")];
     const { getSignaturesToken: freshGetToken } = require("../src/cla-bot.js");
@@ -894,15 +874,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     );
   });
 
-  // Item D: the mirror image of the test above - here the response IS
-  // ok (200), so ghRaw()'s success branch (`return text ? JSON.parse(text)
-  // : null`) is what runs, and that JSON.parse is NOT wrapped in its own
-  // try/catch the way the error-body path just above is. A malformed
-  // success body (e.g. a misconfigured proxy that returns 200 with a
-  // truncated/non-JSON payload) must still surface as a clear, immediate
-  // SyntaxError - not silently produce garbage data, and not be masked by
-  // gh()'s retry loop (a SyntaxError has no `.status` and isn't named
-  // "AbortError", so it isn't "transient" and must NOT be retried).
+  // Invalid JSON on a successful response should throw without a retry.
   await test("ghRaw's success path (200 OK) throws a clear SyntaxError, without retrying, when the response body is not valid JSON", async () => {
     let calls = 0;
     global.fetch = async () => {
@@ -1066,12 +1038,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     }
   });
 
-  // Item C: the test above only exercises "hangs on every attempt, until
-  // retries run out" - the equally important, distinct case is a transient
-  // hang that clears up partway through: the first attempt(s) time out, but
-  // a later attempt within MAX_RETRIES gets a real, immediate response and
-  // the whole call succeeds cleanly, exactly like the 503/429 recovery
-  // tests below do for HTTP-level transient errors.
+  // A timeout can be transient: a later retry should still succeed.
   await test("a request that times out on its first attempt but succeeds on a later retry recovers cleanly (does not throw, does not needlessly exhaust all retries)", async () => {
     const originalSetTimeout = global.setTimeout;
     global.setTimeout = (fn) => originalSetTimeout(fn, 0);
@@ -1432,15 +1399,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     );
   });
 
-  // ---------------------------------------------------------------------
-  // Item Q: rounding out the HTTP method x transient-status retry matrix.
-  // The tests above already prove GET recovers from 503/429/Retry-After/
-  // AbortError, and that a plain POST is never auto-retried. These fill in
-  // the remaining safe-to-retry methods (PUT, DELETE) against the same
-  // transient conditions, plus the one POST case that IS retried
-  // (idempotent: true, on getSignaturesToken's token mint) all the way to
-  // exhaustion instead of just its one already-tested recovery case.
-  // ---------------------------------------------------------------------
+  // Cover retries for the remaining safe methods and idempotent POSTs.
   await test("a transient 503 on a DELETE (duplicate-comment cleanup) is retried by gh() and the cleanup succeeds silently, without ever reaching the outer per-comment warning", async () => {
     const originalSetTimeout = global.setTimeout;
     global.setTimeout = (fn) => originalSetTimeout(fn, 0);

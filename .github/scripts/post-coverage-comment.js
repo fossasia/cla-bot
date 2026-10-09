@@ -1,90 +1,11 @@
 "use strict";
-/**
- * Posts (or updates in place) the "Test Coverage" comment on a pull
- * request, using the report that coverage.yml already built and uploaded
- * as an artifact.
+/** Posts a coverage artifact as a sticky PR comment from a privileged
+ * workflow_run job. Treat the artifact as untrusted: derive the PR and tested
+ * commit from GitHub's event, check freshness before writing, and sanitize the
+ * report. Gate-file changes get a warning because coverage rules come from PR
+ * code. The workflow does not execute pull request code.
  *
- * This runs from coverage-comment.yml, a `workflow_run`-triggered workflow
- * with pull-requests:write, specifically so it can comment even on PRs
- * from forks (where the pull_request-triggered coverage.yml only ever gets
- * a read-only token, by GitHub's own design - see the comments in both
- * workflow files). It never checks out or executes anything from the PR
- * itself: the only input is the coverage report artifact, a single
- * Markdown file, not code.
- *
- * TRUST BOUNDARY. The artifact was produced by a job that ran the PR's own
- * (untrusted) test code, so NOTHING in it may decide where or whether this
- * privileged job writes. Concretely:
- *
- *  1. WHICH pull request gets the comment is derived only from the
- *     `workflow_run` event payload, which GitHub itself fills in and PR
- *     content cannot influence. The artifact carries no PR number at all
- *     (a forged number would otherwise let a malicious PR make this job
- *     comment on any other issue or PR - an IDOR).
- *       - Same-repo PR: `workflow_run.pull_requests` has exactly one entry.
- *       - Fork PR: GitHub leaves that list EMPTY, so the PR is looked up by
- *         `<head owner>:<head branch>` among ALL PRs (open or closed) at
- *         the tested commit that already existed when the run was created.
- *         Requiring "already existed" is what stops an old run from being
- *         attached to a LATER PR that merely reuses the same fork branch
- *         and commit (old PR closed, new one opened at the same SHA). If it
- *         is not exactly one such PR, or that PR is not open, we skip.
- *     Zero or several candidates means "can't tell which PR this is", and
- *     the job skips commenting rather than guess.
- *  2. WHETHER the report is still current. Checking the PR's live head
- *     against `workflow_run.head_sha` (the commit coverage.yml tested)
- *     once is NOT enough on its own: a push can land between that check
- *     and the write, and the check and the write cannot be made atomic
- *     through the REST API. So freshness is enforced in layers, each
- *     closing part of the window:
- *       a. the head SHA is checked when the PR is resolved AND again
- *          immediately before the comment is written;
- *       b. each comment carries a hidden tag with the workflow run ID and
- *          attempt (from the trusted event payload), and an older run
- *          never overwrites a comment written by a newer one, whatever
- *          order the jobs happen to finish in. The run ID is used, NOT
- *          `run_number`: run numbers are counted per workflow file, so
- *          they restart whenever a workflow is renamed or replaced (as
- *          happened when coverage.yml became part of ci.yml - a leftover
- *          "23.1" tag from the old workflow could otherwise outrank every
- *          run of the new one and freeze the comment). Run IDs are
- *          globally increasing across all workflows;
- *       c. coverage-comment.yml serialises these jobs per branch
- *          (concurrency without cancel-in-progress), so two jobs never
- *          read-then-write the same comment at once.
- *     What is left is a window of milliseconds in which an old report can
- *     be visible; it is corrected as soon as the newer run's comment job
- *     runs, because (b) lets the newer run overwrite it. The visible
- *     "measured at commit" line lets a reader spot a stale comment.
- *  2b. A run that produces NO usable report (tests failed, the checkout was
- *     modified, the job crashed ...) must not leave the previous commit's
- *     "100%" sitting on the PR as if it were current. For a run that is
- *     still current, the sticky comment is replaced by an explicit "report
- *     unavailable" notice with a link to the run. It never replaces a real
- *     report that was already posted for the SAME commit (e.g. a flaky
- *     artifact download on a re-run).
- *  3. The report TEXT is still the PR's own output shown back on its own
- *     PR, so it is treated as untrusted content: it must be a small regular
- *     file (not a symlink), @mentions are defused so a PR can't use the
- *     bot to ping people or teams, HTML comment openers are defused so it
- *     can't hide content or imitate our hidden tag, and it is
- *     length-checked against GitHub's comment limit.
- *  4. The PR can also edit the files that DEFINE the gate (.c8rc.json,
- *     package.json, action.yml, ci.yml, coverage.yml ...), because ci.yml
- *     (which calls coverage.yml) runs the PR's own copy on `pull_request`.
- *     This repository deliberately does not require a human review on top of
- *     CI (see .github/rulesets/README.md), so nothing here can
- *     *block* such a PR - the required status check is the only gate, and
- *     it would be evaluated with the PR's own, possibly weakened, rules.
- *     What this privileged job adds is visibility, not enforcement: it
- *     lists the PR's changed files via the API (not from the artifact) and
- *     puts a warning at the top of the comment when any gate file is
- *     touched, so nobody reading the PR can miss that the "100%" below was
- *     measured with the PR's own rules.
- *
- * Expected to be invoked from actions/github-script as:
- *   const script = require(`${process.env.GITHUB_WORKSPACE}/.github/scripts/post-coverage-comment.js`);
- *   await script({ github, context, core });
+ * Invoked from actions/github-script with { github, context, core }.
  */
 
 const fs = require("fs");

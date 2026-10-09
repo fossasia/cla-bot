@@ -1,8 +1,5 @@
 "use strict";
-/**
- * Offline unit tests - no network calls, no GitHub API needed.
- * Run: node test/logic.test.js (or `npm test`)
- */
+/** Offline unit tests for the bot's pure helpers. */
 const assert = require("assert");
 const crypto = require("crypto");
 
@@ -325,12 +322,8 @@ test("JWT signed with the wrong key fails verification (sanity check on the test
   assert.strictEqual(verifier.verify(otherPublicKey, sigBuf), false);
 });
 
-// Item: validateConfig's PEM-shape check is deliberately shallow (it only
-// checks for a "-----BEGIN" header, see its own comment) - a string that
-// passes that check can still be garbage between the markers (e.g. a
-// truncated or corrupted secret). createAppJWT() itself must fail there,
-// at actual signing time, with a real (if less friendly) crypto error -
-// this is the "later, inside crypto.sign()" case validateConfig's own
+// validateConfig checks only the PEM header. createAppJWT() must still reject
+// invalid key contents when it signs.
 // comment explicitly says it does NOT protect against.
 test("createAppJWT throws when given a PEM-shaped but cryptographically invalid private key (passes the shape check, fails at actual signing)", () => {
   const fakePem =
@@ -455,11 +448,8 @@ test("isSigned still ignores a well-formed signature entry with a non-string log
 });
 
 test("isSigned fails closed (returns false, never throws) on a null/non-object STORED entry", () => {
-  // readSignatures() deliberately keeps malformed/hand-edited entries in the
-  // array instead of dropping them (so a write-back can never permanently
-  // delete a real record just because it doesn't match today's shape) -
-  // which means isSigned() has to be safe against a genuinely garbage entry
-  // showing up here, not just a garbage `author` argument.
+  // Malformed stored entries are retained for write-back, so matching must
+  // handle them safely.
   const data = {
     signatures: [null, undefined, 42, "oops", [], { note: "no login field" }],
   };
@@ -860,13 +850,8 @@ test("validateConfig rejects a SIG_APP_PRIVATE_KEY that does not look like PEM",
   );
 });
 
-// The test above only exercises the FAILURE side of the PEM shape check -
-// the TRUE branch (a key that genuinely looks like PEM) was never
-// separately forced. validateConfig only checks for the "-----BEGIN"
-// header (deliberately - it's a cheap, fail-fast sanity check, not full
-// PEM parsing; genuinely invalid key *contents* are caught later, at
-// actual JWT-signing time), so a syntactically-plausible-looking string is
-// enough here without needing a real, cryptographically valid key.
+// validateConfig checks the PEM header only. A valid-looking header is
+// enough here; JWT creation checks the key contents later.
 test("validateConfig accepts a SIG_APP_PRIVATE_KEY that does look like PEM (happy path for the PEM-shape check)", () => {
   assertConfigOK({
     ...VALID_BASE_CONFIG,
@@ -880,11 +865,7 @@ test("validateConfig still requires the base presence checks (unchanged behavior
   assertConfigFails({ ...VALID_BASE_CONFIG, GITHUB_TOKEN: "" }, "GITHUB_TOKEN");
 });
 
-// Item B: the base presence loop checks 4 required values, but only
-// GITHUB_TOKEN's absence was covered above - each of the other 3 needs its
-// own dedicated test so a future refactor that drops one of them from the
-// loop (or typos its name) fails immediately and specifically, the same
-// reasoning already applied to every SIG_PATH sub-condition above.
+// Check each required configuration value independently.
 test("validateConfig rejects a missing/empty SIG_OWNER", () => {
   assertConfigFails({ ...VALID_BASE_CONFIG, SIG_OWNER: "" }, "SIG_OWNER");
 });
@@ -1075,10 +1056,7 @@ test("assertValidInstallationId's error message includes the given context strin
 });
 
 // --- assertValidUserId ----------------------------------------------------
-// Guards the one value handleIssueComment PERSISTS into the signature store
-// (comment.user.id). Same Number.isSafeInteger + > 0 bar as the two
-// validators above, but called directly (not via a JSON-serialized fetch
-// mock) so NaN/Infinity - which JSON can never carry - are genuinely covered.
+// Test ids directly so NaN and Infinity are covered too.
 test("assertValidUserId accepts an ordinary positive integer and returns it unchanged", () => {
   assert.strictEqual(assertValidUserId(12345, "ctx"), 12345);
 });
@@ -1751,14 +1729,7 @@ if (process.exitCode) {
   console.log("ALL TESTS PASSED.");
 }
 
-// ---------------------------------------------------------------------------
-// extractCoAuthors is async (it may resolve co-author noreply emails via the
-// API), so its tests run in an async IIFE after the synchronous ones above -
-// the summary printed above only covers those. This second, independent
-// summary covers this block specifically; `npm test`'s overall pass/fail for
-// this file is the logical AND of both (either block setting
-// process.exitCode fails the whole `node test/logic.test.js` run).
-// ---------------------------------------------------------------------------
+// Run async co-author tests after the synchronous helper tests.
 (async () => {
   let asyncPassed = 0;
   async function testAsync(name, fn) {
@@ -1772,15 +1743,7 @@ if (process.exitCode) {
     }
   }
 
-  // --- extractCoAuthors: defensive against non-string/empty input --------
-  // Production only ever calls this with `c.commit?.message`, which can
-  // legitimately be undefined (missing `commit` object in a malformed API
-  // response) - and the function itself does `commitMessage || ""` before
-  // matching, suggesting it was written to tolerate more than just the one
-  // real-world undefined case. Each of these documents (and locks in) that
-  // it resolves to "no co-authors found" without throwing and, just as
-  // importantly, without making any network call it doesn't need to - a
-  // stubbed fetch that throws on any call proves that.
+  // Missing or empty messages should return no co-authors without a request.
   const throwIfFetched = async (url) => {
     throw new Error(
       `extractCoAuthors must not make any network call for input with no trailer match, but called: ${url}`,

@@ -1,30 +1,5 @@
 "use strict";
-/**
- * Offline guard for the single-check, no-review gate. Branch protection
- * requires only `Required checks pass`; repository writers are not subject
- * to a reviewer or team-approval gate. This file keeps the CI fan-in and
- * ruleset from silently drifting:
- *
- *  - the gate fans in EVERY other job of ci.yml (a new job that is not in
- *    `needs:` would be unprotected), always runs, and nothing it needs can
- *    be skipped (GitHub treats a skipped required check as passing);
- *  - every reusable workflow in .github/workflows is actually called from
- *    ci.yml, and every called file exists and is reusable;
- *  - the called workflows have no triggers of their own (they would run
- *    twice) and no `concurrency:` (a group built from `github.workflow`
- *    deadlocks against the caller's and GitHub cancels the run);
- *  - coverage-comment.yml still listens to the workflow that now carries
- *    the coverage artifact;
- *  - any `astral-sh/setup-uv` step (zizmor.yml) pins an exact uv version
- *    plus its SHA-256 and disables the cache, so a compromised uv release
- *    cannot silently alter a required check;
- *  - zizmor.yml has a non-SARIF "fail on findings" run (SARIF exits 0 even
- *    with findings) and its SARIF upload is best-effort on pull_request;
- *  - the ruleset-as-code requires exactly the gate's check name and
- *    nothing else, with no human-approval requirements.
- *
- * Run: node test/ci-gate.test.js (also part of `npm test`).
- */
+/** Checks that CI jobs and the branch ruleset keep the required gate intact. */
 const assert = require("assert");
 const fs = require("fs");
 const path = require("path");

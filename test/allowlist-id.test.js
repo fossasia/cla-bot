@@ -1,22 +1,5 @@
 "use strict";
-/**
- * Regression coverage for: the allowlist used to be keyed on the (mutable,
- * reusable) login only, unlike the signature store which is keyed on the
- * immutable numeric account id. If an allowlisted login was ever released and
- * claimed by someone else, the new owner silently inherited the exemption.
- *
- * The allowlist now holds numeric account ids ONLY, matched against the id
- * GitHub itself reported for each commit author. These tests
- * drive the REAL handlePullRequestTarget -> checkPR -> listPRCommitAuthors
- * orchestration against a mocked fetch (not just the isAllowlisted() helper,
- * which has its own unit tests in test/logic.test.js) so they fail if
- * checkPR's call sites ever stop passing the full { id, login } identity.
- *
- * ALLOWLIST is parsed into a module-scope const at require time, so every
- * scenario loads a fresh copy of the module with its own ALLOWLIST value.
- *
- * Run: node test/allowlist-id.test.js (also included in `npm test`)
- */
+/** Tests that the PR flow matches allowlist entries against GitHub user ids. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "dummy-token";

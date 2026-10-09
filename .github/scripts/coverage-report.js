@@ -1,29 +1,8 @@
 #!/usr/bin/env node
 "use strict";
-/**
- * Turns c8's istanbul-format coverage output into a human-readable PR
- * comment: overall percentages plus, for anything below 100%, the exact
- * lines, functions and branches that still need a test.
- *
- * Self-written and dependency-free (only Node's own `fs`/`path`), in
- * keeping with the rest of this project - see package.json's description.
- *
- * Reads:  coverage/coverage-summary.json, coverage/coverage-final.json
- * Writes: coverage/pr-comment.md
- *
- * Run after `npm run test:coverage-nocheck` (or `npm run coverage`). This
- * script never itself changes the job's exit code because of low coverage -
- * it only formats a report from whatever c8 produced. The pass/fail gate is
- * `npm run coverage:check`.
- *
- * TRUST NOTE: this runs inside coverage.yml, in the same job that just
- * executed the PR's own test files (untrusted PR content), so everything it
- * writes must be treated as untrusted by whoever consumes it. That is why
- * it deliberately emits ONLY the Markdown body - no PR number, no commit
- * SHA, no status flag. The privileged comment workflow
- * (coverage-comment.yml / post-coverage-comment.js) works out the target
- * PR and the commit under test from GitHub's own workflow_run event data,
- * never from this job's output.
+/** Formats c8 output as a Markdown coverage report. The privileged comment
+ * workflow treats this report as untrusted and gets the PR and commit from
+ * GitHub's workflow_run event, not from the report.
  */
 
 const fs = require("fs");

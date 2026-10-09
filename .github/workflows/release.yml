@@ -1,74 +1,10 @@
 name: Release
 
-# Publishes a SIGNED release when a signed, annotated tag vMAJOR.MINOR.PATCH
-# is pushed. A scheduled default-branch run also re-verifies published releases
-# and repairs Latest after post-publication failures or later edits. Repository
-# actors with release rights can still create releases manually; there is no
-# manual draft step.
-# See CONTRIBUTING.md ("Releasing a new version") and SECURITY.md ("Verifying
-# a release") for setup, procedure and consumer verification.
-#
-# Deliberately NOT part of the "Required checks pass" gate in ci.yml: it
-# never runs on pull requests, so it can't be a required status check (the
-# same reason scorecard.yml is outside the gate).
-#
-# Seven jobs. The point of the split is that no job which runs code that is NOT
-# the release itself shares a machine with the archive, and no job which runs
-# any repository code can sign or publish:
-#
-#   policy   actions: read ONLY. Fails fast, before anything is built, unless
-#            release settings match policy: mutability is a workflow setting,
-#            the `release` environment has no required reviewers, its exact v*
-#            tag deployment restriction is validated, and an active effective
-#            tag ruleset blocks updates/deletions of v* tags.
-#   build    contents: read ONLY. Verifies the tag and builds the source
-#            archive and release notes with `git` and Node built-ins. It
-#            installs and executes NO third-party code (no npm), so nothing
-#            outside the commit being released can influence the archive.
-#   checks   contents: read ONLY, on a different machine from `build`. Installs
-#            the dev dependencies, runs the test suite and the 100% coverage
-#            gate, and generates the SBOM. This is where third-party code
-#            (js-yaml, c8) and the repository's own test code run. At worst
-#            it can falsify the SBOM; it cannot reach the archive.
-#   sign     contents: read, actions: read, OIDC and attestations: write. It
-#            verifies job-output digests, signs and attests, then uploads one
-#            verified artifact. It checks out and executes no repository code.
-#   publish  contents: write, actions: read ONLY. It uses the runner's GitHub
-#            CLI to download the sign job's artifact and checks its digest
-#            against the sign job output before publishing. No third-party
-#            action or repository code runs with release-write permission.
-#   latest   contents: write only. Reconciles GitHub's Latest marker after
-#            publication; globally serialized. It rechecks the public stable
-#            maximum and verified release fingerprint before writing, and
-#            fails closed if a newer stable release appeared after verification.
-#   verify-latest  contents: read only. Validates candidates' signed tags,
-#            branch ancestry, exact assets, signatures and workflow attestations.
-#            Runs after publication even if a post-publication check fails.
-#
-# Every payload is directly signed by this workflow's identity via Sigstore
-# (keyless) and listed in the signed checksum manifest. Signature bundles and
-# GitHub attestation bundles are the cryptographic proofs; consumers verify
-# those bundles instead of recursively signing proof files.
-# What every release carries:
-#   RELEASE_NOTES.md                       generated release notes, signed
-#   RELEASE_NOTES.md.sigstore.json         signature bundle for release notes
-#   cla-bot-<tag>.tar.gz                    source archive of the tagged commit
-#   cla-bot-<tag>.tar.gz.sigstore.json      cosign signature bundle
-#   cla-bot-<tag>.sbom.cdx.json             CycloneDX SBOM, signed
-#   cla-bot-<tag>.sbom.cdx.json.sigstore.json  signature bundle for the SBOM
-#   cla-bot-<tag>.provenance.intoto.jsonl   SLSA build provenance (GitHub attestation)
-#   cla-bot-<tag>.sbom.intoto.jsonl         SBOM attestation
-#   SHA256SUMS + SHA256SUMS.sigstore.json   signed checksums of notes, archive,
-#                                           and SBOM
-# The release is created as a DRAFT, filled, verified, and only then
-# published. It is published without changing the Latest marker; a final,
-# globally serialised job points Latest at the highest verified stable release.
-# Candidate assets and tag binding are rechecked immediately before the Latest
-# write. GitHub has no atomic verify-and-promote operation, so a final API race
-# remains possible; a later reconciliation repairs the marker.
-# That order matters: with "Immutable releases" enabled (see
-# CONTRIBUTING.md) a published release can never be edited, so a broken one
-# would burn its version number.
+# Publishes signed releases from verified annotated tags and reconciles Latest
+# to the highest verified stable version. Separate jobs build, test, sign,
+# publish, and verify artifacts with limited permissions. Repository writers
+# may still publish manually. See CONTRIBUTING.md and SECURITY.md for the
+# release process and verification steps.
 on:
   push:
     tags:

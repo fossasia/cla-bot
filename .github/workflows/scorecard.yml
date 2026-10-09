@@ -1,10 +1,7 @@
 name: Scorecard analysis
 
-# Deliberately NOT part of the "Required checks pass" gate in ci.yml: it
-# does not run on pull requests (push to main, schedule,
-# branch_protection_rule and manual only), and it reports a score rather
-# than passing/failing a change, so it would never make sense as a required
-# status check.
+# Scorecard reports a repository score and does not run on pull requests, so
+# it is not part of the required CI gate.
 on:
   push:
     branches: [main]

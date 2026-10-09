@@ -1,18 +1,4 @@
-/**
- * End-to-end smoke tests for the CLI entrypoint.
- *
- * Every other test file requires src/cla-bot.js as a module, which never
- * exercises main() or the `if (require.main === module)` guard at the
- * bottom of the file (see the comment there - the whole point is that
- * requiring the file must NOT auto-run it). Those lines were previously
- * 100% uncovered.
- *
- * This file instead spawns `node src/cla-bot.js` as a real subprocess -
- * the same way the GitHub Actions runner invokes it - pointed at a local
- * HTTP server via GITHUB_API_URL (an existing, real override the code
- * already supports; see `const GITHUB_API = process.env.GITHUB_API_URL ||
- * ...`) instead of the real GitHub API.
- */
+/** Runs the CLI in a child process against a local mock GitHub API. */
 
 const assert = require("node:assert");
 const http = require("node:http");
@@ -24,12 +10,7 @@ const path = require("node:path");
 const REPO_ROOT = path.join(__dirname, "..");
 const SCRIPT = path.join(REPO_ROOT, "src", "cla-bot.js");
 
-// A single, securely-created temp directory for this whole test run.
-// fs.mkdtempSync (unlike hand-building a path in the shared, world-writable
-// os.tmpdir() with a timestamp/random suffix) creates a directory with an
-// unguessable name and owner-only permissions (mode 0o700 on POSIX), which
-// avoids the predictable-shared-tmp-path class of issues (symlink races,
-// other local users reading/tampering with the file before we use it).
+// Keep test files in a private temporary directory.
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-e2e-"));
 process.on("exit", () => {
   fs.rmSync(TMP_DIR, { recursive: true, force: true });
@@ -56,27 +37,7 @@ function writeTempEventFile(payload) {
   return file;
 }
 
-// Runs the real CLI entrypoint as an actual subprocess (so module-level
-// consts like GITHUB_API/REPO_OWNER/REPO_NAME - computed once, at require
-// time, from that process's own env - get exercised for real), while
-// intercepting the very first fetch() call via a `-r`-preloaded module and
-// immediately failing it with a synthetic, clearly-labeled error instead
-// of ever performing real network I/O. This is what lets a test observe
-// exactly which URL a module-level `X || <default>` fallback produced
-// without needing to actually reach the real https://api.github.com (or
-// any other live endpoint) to prove it.
-// Deletes a file, tolerating it already being gone. Node guarantees a
-// spawned child's "close" event fires exactly once no matter how the
-// process ends, but a timeout path that kills the child AND rejects can
-// still race that same "close" event landing moments later - both paths
-// then try to clean up the same temp file. A plain fs.unlinkSync() would
-// throw ENOENT on whichever one runs second, and since that throw happens
-// synchronously inside an event-handler callback (not inside the promise
-// chain), nothing catches it - it becomes an uncaught exception that
-// crashes the whole test runner, not just one test. Swallowing ENOENT
-// specifically (and only ENOENT - any other error, e.g. a permissions
-// problem, still surfaces) makes repeated cleanup of the same path safe
-// regardless of which caller gets there first.
+// Ignore ENOENT so timeout and close handlers can safely clean up the same file.
 function safeUnlink(filePath) {
   try {
     fs.unlinkSync(filePath);
@@ -85,6 +46,7 @@ function safeUnlink(filePath) {
   }
 }
 
+// Run the CLI as a child and capture its first URL without making a request.
 function runScriptCapturingFirstFetchUrl(
   env,
   { timeoutMs = 10000, forceHangUntilKilled = false } = {},
@@ -106,16 +68,7 @@ function runScriptCapturingFirstFetchUrl(
       "process.on('exit', () => {",
       "  process.stderr.write('\\n__CAPTURED_FETCH_URL__:' + capturedUrl + '\\n');",
       "});",
-      // Test-only: makes the child deterministically un-killable by
-      // anything except an actual signal (SIGKILL from the timeout
-      // handler below) - see the "timeout path" regression test for why
-      // this matters. `process.exit` is overridden to a no-op so none of
-      // cla-bot.js's own error paths (fail(), an uncaught rejection
-      // reaching the top-level .catch()) can end the process, and the
-      // never-cleared interval keeps the event loop alive forever, so the
-      // process has no way to exit "naturally" at all - only a signal
-      // from outside can end it, at a time entirely of the test's
-      // choosing rather than a guess about how fast this machine runs.
+      // Keep the child alive until the timeout sends SIGKILL.
       ...(forceHangUntilKilled
         ? ["process.exit = () => {};", "setInterval(() => {}, 1 << 30);"]
         : []),
@@ -125,12 +78,7 @@ function runScriptCapturingFirstFetchUrl(
   const closed = new Promise((r) => {
     notifyClosed = r;
   });
-  // Cleanup is idempotent by construction (safeUnlink tolerates the file
-  // already being gone), so it's safe to call from more than one of the
-  // timeout/error/close paths with no ordering guarantee between them -
-  // whichever gets there first does the real unlink, the other(s) are
-  // harmless no-ops. This one function is the single place that invariant
-  // lives, rather than three separate call sites each hoping it holds.
+  // Timeout, error, and close handlers may all call cleanup.
   function cleanup() {
     safeUnlink(preload);
   }
@@ -145,11 +93,7 @@ function runScriptCapturingFirstFetchUrl(
       child.kill("SIGKILL");
       cleanup();
       const err = new Error(`script did not exit within ${timeoutMs}ms`);
-      // A caller that needs to deterministically observe the child's own,
-      // independent "close" event (and the second, idempotent cleanup
-      // pass it triggers) - rather than guessing with an arbitrary sleep -
-      // can `await err.closed`. See the dedicated regression test for
-      // exactly this.
+      // Tests can await this to observe close and cleanup completion.
       err.closed = closed;
       err.preloadPath = preload;
       reject(err);
@@ -202,22 +146,9 @@ function runScript(env, { timeoutMs = 10000 } = {}) {
   });
 }
 
-// Every environment variable src/cla-bot.js reads, explicitly defaulted to
-// "" (which every `process.env.X || fallback`/`process.env.X || ""` read in
-// the source treats the same as unset).
-//
-// Deliberately NOT `{ ...process.env, ...overrides }`: spreading the
-// parent's real environment would let anything the ambient shell/CI
-// happens to export (SIG_APP_ID, SIG_APP_PRIVATE_KEY, GITHUB_TOKEN,
-// REQUIRE_VERIFIED_COMMITS, ...) leak into the child and silently change
-// which code path it takes - e.g. a developer with SIG_APP_ID/
-// SIG_APP_PRIVATE_KEY set locally would flip the script from the plain
-// GITHUB_TOKEN path into GitHub App authentication, which calls
-// /repos/.../installation and /app/installations/.../access_tokens that
-// this test's fake server doesn't implement, causing an unrelated failure
-// that only reproduces on that one machine. Only a small, explicit
-// allowlist of OS-level variables Node itself needs to actually run is
-// passed through.
+// Pass only Node's required OS variables and this test's explicit bot config.
+// The parent environment could otherwise change which authentication path
+// the child takes.
 const OS_PASSTHROUGH_VARS = [
   "PATH",
   "HOME",
@@ -580,19 +511,7 @@ function baseEnv(apiUrl) {
     );
   });
 
-  // ---------------------------------------------------------------------
-  // This is the one path every other test in this file (and the rest of
-  // the suite) misses: `main().catch((e) => fail(e.stack || e.message))`
-  // at the very bottom of the file. Every OTHER fail() call in the source
-  // (missing config, missing event file, ...) runs INSIDE main() itself
-  // and calls process.exit(1) directly - main()'s promise never gets a
-  // chance to reject, so that top-level .catch() handler never actually
-  // runs for those cases. The only way to genuinely exercise it is an
-  // exception main() throws itself and does NOT already catch - e.g. the
-  // event file existing (so the fs.existsSync guard passes) but not being
-  // valid JSON, so JSON.parse() inside main() throws a raw, unhandled
-  // SyntaxError that only the top-level .catch() ever sees.
-  // ---------------------------------------------------------------------
+  // Invalid JSON makes main() reject and exercises its top-level catch.
   await test("the CLI entrypoint's top-level main().catch() handler fires (and fails loudly) on a genuinely malformed - not just missing - GITHUB_EVENT_PATH file", async () => {
     const eventFile = path.join(
       TMP_DIR,
@@ -633,14 +552,12 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // ---------------------------------------------------------------------
   // Real CLI entrypoint, real event file: a sign-phrase issue_comment whose
   // comment.user.id is missing must fail the run (non-zero exit, "::error::"
   // annotation naming the field) WITHOUT a single request reaching the API.
   // 127.0.0.1:1 is unroutable, so if the bot ignored the guard and tried to
   // read/write the store it would die with a connection error instead - the
   // assertion on the message below tells those two outcomes apart.
-  // ---------------------------------------------------------------------
   await test("the CLI entrypoint fails the run with a clear ::error:: (and makes no API request) when a sign-phrase issue_comment payload has no comment.user.id", async () => {
     const eventFile = path.join(
       TMP_DIR,
@@ -690,19 +607,8 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // The test above exercises the LEFT side of `e.stack || e.message` - a
-  // real thrown Error always has a `.stack`, so the RIGHT side is
-  // genuinely unreachable through any real call path in this codebase:
-  // every single `throw` here constructs a real `new Error(...)` (or
-  // rethrows one), and every real Error has a truthy `.stack`. The only
-  // honest way to exercise the fallback is to force something main()
-  // calls to reject with a non-Error value - same wrapper-script technique
-  // as the Node-version/fetch guard tests above, this time monkey-patching
-  // fs.readFileSync (which main() calls unguarded, right after the
-  // existsSync check) to throw a plain object that has a `.message` but
-  // deliberately no `.stack` at all, proving the fallback itself is wired
-  // correctly for the day something upstream ever does throw a
-  // non-Error - not proving any current code path can trigger it.
+  // Exercise the `e.message` fallback by making readFileSync reject with a
+  // plain object that has no stack.
   await test("the top-level main().catch() handler falls back to e.message when the rejection has no .stack at all (a non-Error throw)", async () => {
     const eventFile = path.join(
       TMP_DIR,
@@ -770,42 +676,10 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // ===========================================================================
-  // Two module-level `X || <default>` fallbacks, computed once at require
-  // time from that process's own env - GITHUB_API (line ~67) and
-  // REPO_OWNER/REPO_NAME (line ~184). Every other e2e test in this file
-  // always sets both GITHUB_API_URL and GITHUB_REPOSITORY explicitly (via
-  // baseEnv()), which only ever exercises the TRUTHY side of both. These
-  // four force each side of each fallback independently, using
-  // runScriptCapturingFirstFetchUrl() so the DEFAULT side (a real,
-  // unset-env misconfiguration) can be observed without ever making a real
-  // network call to the actual https://api.github.com.
-  // ===========================================================================
+  // Check both defaults by omitting GITHUB_API_URL and GITHUB_REPOSITORY.
 
-  // Regression test for runScriptCapturingFirstFetchUrl()'s own timeout
-  // handling: killing the child on timeout AND rejecting, while the
-  // child's "close" event still fires independently moments later, races
-  // two cleanup attempts against the same preload file. Before
-  // safeUnlink() existed, the second fs.unlinkSync() threw an uncaught
-  // ENOENT from inside the "close" handler - a synchronous throw with
-  // nothing to catch it, killing the entire test runner instead of
-  // failing one test.
-  //
-  // forceHangUntilKilled: true makes the child deterministically
-  // un-killable by anything except the SIGKILL below - process.exit is
-  // neutered and the event loop is kept alive forever, so there is no
-  // "natural" exit for a fast/loaded CI box to win a race against. This
-  // guarantees the timeout (not the child finishing on its own) is what
-  // ends the process, on every run, everywhere - a short but generous
-  // timeoutMs is just "wait a bit", not "hope 1ms is impossibly fast".
-  //
-  // Rather than a second arbitrary sleep to "probably" let the delayed
-  // "close" event and its cleanup pass finish, this awaits the actual
-  // `closed` signal the helper exposes on the rejection - a real
-  // synchronization primitive, not a wall-clock guess - and then checks
-  // the concrete, physical invariant that guards against: the preload
-  // temp file must be genuinely gone afterwards, not merely "didn't
-  // throw".
+  // Force a timeout, await the child's close event, and check that cleanup
+  // removed the preload file.
   await test("runScriptCapturingFirstFetchUrl's timeout path rejects cleanly, and its cleanup completes deterministically - with no temp preload file left behind - once the delayed 'close' event fires", async () => {
     let caught = null;
     try {

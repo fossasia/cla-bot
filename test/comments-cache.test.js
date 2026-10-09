@@ -1,19 +1,5 @@
 "use strict";
-/**
- * getExistingBotComments() can be asked about the same PR several times in
- * one run (checkPR()'s history check, postComment()'s dedupe check, the
- * post-write cleanup re-fetch). It now takes an optional `cache` - a plain
- * Map, created fresh per checkPR() run - so those reads share one paginated
- * fetch instead of repeating it. No `cache` passed (e.g. a direct
- * postComment() call) means no caching at all, the original always-fresh
- * behavior.
- *
- * Part 1 exercises the caching directly through the exported
- * getExistingBotComments(). Part 2 proves the savings happen for real
- * through checkPR(), the way it is actually used.
- *
- * Run: node test/comments-cache.test.js (also included in `npm test`)
- */
+/** Tests comment-history caching and its use by checkPR(). */
 const assert = require("assert");
 const fs = require("fs");
 const { Readable } = require("stream");
@@ -93,9 +79,7 @@ const BOT = { login: "github-actions[bot]" };
 const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 
 (async () => {
-  // =========================================================================
   // Part 1: getExistingBotComments() + a caller-supplied cache, in isolation.
-  // =========================================================================
 
   await test("two calls sharing a cache for the same PR fetch the comment list only once", async () => {
     let getCalls = 0;
@@ -176,10 +160,8 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
   });
 
   await test("a PUBLIC CONTRIBUTOR spoofing BOT_MARKER in their own comment body is never cached, however many times they try", async () => {
-    // The literal marker text is visible in every bot comment, so anyone can
-    // paste it into their own comment. What must stop this is the
-    // AUTHENTICATED identity on the comment (user.login/user.type, set by
-    // GitHub, not editable from the comment body) - never the marker alone.
+    // GitHub-authenticated identity, not the user-controlled marker, proves
+    // who posted the comment.
     global.fetch = async (url) => {
       if (url.endsWith("/user")) return res(404, { message: "Not Found" });
       return res(200, [
@@ -201,8 +183,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       ]);
     };
     const cache = new Map();
-    // Ask with anyBotIdentity: true, the most permissive mode there is - if
-    // a spoofed comment could ever get in, it would be here.
+    // Use the broadest identity mode to test marker spoofing.
     const result = await getExistingBotComments(1, {
       cache,
       anyBotIdentity: true,
@@ -222,20 +203,14 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
   });
 
   await test("a flood of marker-bearing BOT-TYPE comments is capped - the cache never grows past MAX_CACHED_COMMENTS, and the real, most recent one always survives the trim", async () => {
-    // isPossiblyBotIdentity() admits any type:"Bot" account, not just this
-    // bot's own (that's what lets anyBotIdentity survive a token rotation) -
-    // so an unrelated or compromised app posting many large marker-bearing
-    // comments must still be bounded by an explicit cap, not just identity.
+    // Any Bot-type account can match, so the cache also needs a size cap.
     const floodSize = 350; // > MAX_CACHED_COMMENTS (200), spans 4 pages of 100
     const flood = Array.from({ length: floodSize }, (_, i) => ({
       id: i,
       body: `${MARKER}\n` + `fake message #${i} `.padEnd(2000, "x"),
       user: { login: `rogue-bot-${i}`, type: "Bot" },
     }));
-    // The bot's own real comment - appended LAST (so it's the most recent,
-    // since GitHub returns comments oldest-first). A correct trim keeps the
-    // most recent entries and drops the oldest, so this must survive even
-    // though it's vastly outnumbered by the flood ahead of it.
+    // Keep the newest comment when trimming the older flood.
     const real = {
       id: 999999,
       body: `${MARKER}\nthe real bot comment`,
@@ -387,19 +362,15 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       }
       return res(200, [{ id: 1, body: `${MARKER}\nfresh`, user: BOT }]);
     };
-    // Starts the slow fetch and (synchronously, within this call) caches its
-    // promise - see fetchAllIssueComments: cache.set() happens before any
-    // await, so this is already true by the time this line returns.
+    // The slow fetch is cached before this call returns.
     const first = getExistingBotComments(1, { cache });
-    // A concurrent fresh:true read for the same PR, sharing the same cache,
-    // completes first and overwrites the entry the slow call set.
+    // A fresh read replaces the slow fetch and completes first.
     const second = await getExistingBotComments(1, { cache, fresh: true });
     assert.deepStrictEqual(
       second.map((c) => c.id),
       [1],
     );
-    // Now let the first, now-superseded call fail. Its cleanup must not
-    // delete the second call's still-good, newer entry.
+    // The older failure must not evict the newer successful entry.
     rejectSlowFirstCall();
     await assert.rejects(() => first);
     assert.ok(
@@ -434,9 +405,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     );
   });
 
-  // =========================================================================
   // Part 2: the real savings, through checkPR() (via the event handlers).
-  // =========================================================================
 
   function makeFakeGitHub({ commits, initialSignatures, comments = [] }) {
     const state = {
@@ -1241,10 +1210,8 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       body: "<!-- fossasia-cla-bot:v1 -->\n<!-- fossasia-cla-bot:pending -->\nold pending list",
       user: BOT,
     };
-    // 250 bot-marked "other"-category comments after it - more than
-    // MAX_CACHED_COMMENTS (200), and none of them pending or success, so a
-    // trimmed-list-based check would find neither category and (wrongly)
-    // conclude there was nothing to announce.
+    // More than 200 unrelated bot comments follow this pending comment.
+    // Trimming the list must not hide that pending state.
     const noise = Array.from({ length: 250 }, (_, i) => ({
       id: 100 + i,
       body: `${MARKER}\nunrelated bot chatter #${i}`,
@@ -1269,10 +1236,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 
     await handlePullRequestTarget({
       action: "synchronize",
-      // The event's base matches the mocked GET /pulls/1 base above exactly:
-      // these scenarios are about the comments cache, not checkPR()'s
-      // base-change retry path, so no run should take an extra,
-      // unintended re-evaluation.
+      // Match the mocked PR base to avoid a pair recheck.
       pull_request: {
         number: 1,
         head: { sha: "head-sha-abc" },
@@ -1315,10 +1279,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 
     await handlePullRequestTarget({
       action: "synchronize",
-      // The event's base matches the mocked GET /pulls/1 base above exactly:
-      // these scenarios are about the comments cache, not checkPR()'s
-      // base-change retry path, so no run should take an extra,
-      // unintended re-evaluation.
+      // Match the mocked PR base to avoid a pair recheck.
       pull_request: {
         number: 1,
         head: { sha: "head-sha-abc" },
@@ -1418,10 +1379,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       },
     });
 
-    // 250 flood comments page as 100 + 100 + 50 (3 raw GETs) for the shared
-    // pre-check, then 251 (+ the just-posted bot comment) page the same way
-    // for the forced-fresh cleanup re-fetch - 6 raw GETs total, still just
-    // the 2 logical reads from the single-postComment() case above.
+    // The pre-check and fresh cleanup each read three pages.
     assert.strictEqual(
       getCommentReads(),
       6,
@@ -1448,13 +1406,10 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
           commit: { author: { email: "alice@example.com" } },
         },
       ],
-      // Not signed yet - the sign flow below always posts (no
-      // quietIfNeverFlagged short-circuit), so the duplicate race is
-      // guaranteed to be exercised.
+      // The unsigned PR ensures the sign flow posts a comment.
       initialSignatures: { version: 1, signatures: [] },
     });
-    // Rig the mock's POST so a 2nd, identical comment (simulating a truly
-    // concurrent run) appears on GitHub the moment this run posts its own.
+    // Add a duplicate as soon as the mock accepts the post.
     const originalFetch = gh.fetch;
     gh.fetch = async (url, opts = {}) => {
       const result = await originalFetch(url, opts);
@@ -1478,9 +1433,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       },
     });
 
-    // alice is the sole author, so she gets the personalized success message
-    // rather than the generic one - either way, only one copy of it should
-    // remain once the cleanup runs.
+    // Alice completes the PR, so the cleanup targets her personalized reply.
     const matching = gh.comments.filter((c) =>
       c.body.includes("Thank you for signing the CLA"),
     );
@@ -1491,13 +1444,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     );
   });
 
-  // ===========================================================================
-  // Part 3: the duplicate cleanup and the dedupe pre-check must see the PR's
-  // ENTIRE comment history, never just the most recent MAX_CACHED_COMMENTS
-  // (200) - unlike the general-purpose cache, which is fine to cap. Each
-  // test below plants a genuine match far outside a 200-item window and
-  // proves it is still found.
-  // ===========================================================================
+  // Part 3: duplicate checks search the full comment history.
 
   await test("duplicate cleanup finds and deletes an OLD duplicate far beyond MAX_CACHED_COMMENTS (200), not just a recent one", async () => {
     const text = "dup-beyond-cap";
