@@ -4,9 +4,10 @@
 # Use a published, verified release. See "Verifying a release" in
 # SECURITY.md and the release steps in CONTRIBUTING.md.
 #
-# Pin the verified commit SHA and keep the version in the trailing comment.
-# Do not resolve the tag again after verification. Dependabot and Renovate
-# update SHA pins and their comments together.
+# Use the full commit SHA resolved ONCE during the
+# verification procedure in SECURITY.md. Keep the version in the trailing
+# comment. Do not resolve the tag again after verification. Dependabot and
+# Renovate update both together.
 #
 # See SETUP_GUIDE.md for the GitHub App, signatures repo, and secrets setup.
 

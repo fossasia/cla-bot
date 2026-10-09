@@ -36,10 +36,11 @@ gh api --method POST repos/fossasia/cla-bot/rulesets --input .github/rulesets/re
 ```
 
 Check that it targets `refs/tags/v*`, blocks updates and deletions, and has an
-empty bypass list. The release workflow checks the target and block rules.
-GitHub may hide the bypass list from its read-only token, so an administrator
-must verify it. To correct a published version, release a new version instead
-of moving or deleting its tag.
+empty bypass list. The release workflow queries the effective repository and inherited
+tag rulesets, then checks the active ruleset's target and block rules. GitHub may
+hide the bypass list from its read-only token, so an administrator must verify the empty bypass
+list. To correct a published version, release a new version
+instead of moving or deleting its tag.
 
 ## Optional CodeQL blocking
 
