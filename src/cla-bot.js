@@ -866,8 +866,8 @@ function hasNextPage(linkHeader) {
 
   // Split link-values only at commas outside both angle-bracket targets and
   // quoted parameter values. A comma inside title="..." is data, not a
-  // second link. Reject unbalanced delimiters instead of treating a partial
-  // parse as proof that no next page exists.
+  // second link. The grammar parser below rejects unbalanced delimiters, so
+  // an unterminated quote cannot make a partial parse authoritative.
   const parts = [];
   let start = 0;
   let inTarget = false;
@@ -889,7 +889,6 @@ function hasNextPage(linkHeader) {
       start = i + 1;
     }
   }
-  if (inQuote || inTarget || escaped) return null;
   parts.push(linkHeader.slice(start).trim());
   if (parts.some((part) => !part)) return null;
 
@@ -927,11 +926,13 @@ function hasNextPage(linkHeader) {
         if (part[i] === '"') {
           i += 1;
           let quoted = "";
+          let closed = false;
           while (i < part.length) {
             const char = part[i++];
             if (char === "\\") {
               quoted += part[i++];
             } else if (char === '"') {
+              closed = true;
               break;
             } else if (/[\x00-\x1f\x7f]/.test(char)) {
               return null;
@@ -939,6 +940,7 @@ function hasNextPage(linkHeader) {
               quoted += char;
             }
           }
+          if (!closed) return null;
           value = quoted;
         } else {
           const token = /^[!#$%&'*+.^_`|~0-9A-Za-z:-]+/.exec(part.slice(i));

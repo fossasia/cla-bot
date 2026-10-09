@@ -251,10 +251,13 @@ const linkTo = (path, last) =>
       null,
       undefined,
       "",
+      '<https://api.github.com/x?page=2>; rel="next',
       '<https://api.github.com/x?page=1>; rel="prev", malformed next relation',
       '<https://api.github.com/x?page=1>; rel="prev", <https://api.github.com/x?page=2>; rel="next',
       '<https://api.github.com/x?page=1>; rel="prev"; rel="next"',
       '<https://api.github.com/x?page=1>; rel="prev",',
+      '<https://api.github.com/x?page=1>; rel="prev", , <https://api.github.com/x?page=2>; rel="next"',
+      '<https://api.github.com/x?page=2; rel="next"',
       '<https://api.github.com/x bad?page=1>; rel="next"',
       '<https://api.github.com/x?page=1>; title="bad\nvalue"; rel="next"',
       '<https://api.github.com/x?page=1>; title=',
@@ -267,6 +270,16 @@ const linkTo = (path, last) =>
       bot.hasNextPage('<https://api.github.com/x?page=2>; title="next, page"; rel="next"'),
       true,
       "commas inside a quoted parameter are not Link separators",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title="a\\"b"; rel="next"'),
+      true,
+      "an escaped quote does not end a quoted parameter",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; rel="prev next"'),
+      true,
+      "a relation parameter can contain multiple relation-types",
     );
     assert.strictEqual(
       bot.hasNextPage('<https://api.github.com/x?page=2>; title=page; rel=next'),
