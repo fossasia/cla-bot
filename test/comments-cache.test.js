@@ -15,6 +15,8 @@
  * Run: node test/comments-cache.test.js (also included in `npm test`)
  */
 const assert = require("assert");
+const fs = require("fs");
+const { Readable } = require("stream");
 
 process.env.GITHUB_TOKEN = "dummy";
 process.env.GITHUB_REPOSITORY = "fossasia/testrepo";
@@ -602,6 +604,41 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     );
   });
 
+  await test("comment-history pagination falls back to page-size behavior for a partially malformed Link header", async () => {
+    const comments = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1,
+      body:
+        index === 100
+          ? `${MARKER}\n<!-- fossasia-cla-bot:pending -->\nlast-page pending`
+          : `${MARKER}\n<!-- fossasia-cla-bot:success -->\ncomment ${index}`,
+      user: BOT,
+    }));
+    const calls = [];
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        const page = Number(new URL(url).searchParams.get("page"));
+        calls.push(page);
+        const slice = comments.slice((page - 1) * 100, page * 100);
+        const link =
+          page === 1
+            ? '<https://api.github.com/x?page=1>; rel="prev", malformed next relation'
+            : '<https://api.github.com/x?page=1>; rel="prev"';
+        return commentListRes(slice, 200, link);
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+
+    const cache = new Map();
+    const result = await commentsCacheStorage.run(cache, () =>
+      getExistingBotComments(1, { anyBotIdentity: true }),
+    );
+
+    assert.deepStrictEqual(calls, [1, 2]);
+    assert.strictEqual(result.length, 101);
+    assert.ok(result.some((comment) => comment.body.includes("last-page pending")));
+  });
+
   await test("comment IDs above Number.MAX_SAFE_INTEGER stay exact in cache and chronological comparisons", async () => {
     const firstId = "9007199254740992";
     const secondId = "9007199254740993";
@@ -676,6 +713,45 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       [concurrentDuplicateId],
       "cleanup should keep the newest exact-ID comment",
     );
+  });
+
+  await test("duplicate cleanup rejects a corrupt temporary ID before sending any DELETE", async () => {
+    const body = `${MARKER}\ncorrupt spool fixture`;
+    let commentReads = 0;
+    const deletes = [];
+    const originalCreateReadStream = fs.createReadStream;
+    const originalWarn = console.warn;
+    const warnings = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        commentReads += 1;
+        const items = commentReads === 1
+          ? []
+          : [1, 2].map((id) => ({ id, body, user: BOT }));
+        return commentListRes(items);
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        return res(201, { id: 3, body, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deletes.push(url);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    fs.createReadStream = () => Readable.from(["not-a-decimal-id\n"]);
+    console.warn = (...args) => warnings.push(args.join(" "));
+
+    try {
+      await postComment(1, "corrupt spool fixture");
+      assert.deepStrictEqual(deletes, []);
+      assert.ok(warnings.some((warning) => warning.includes("invalid ID in its temporary file")));
+    } finally {
+      fs.createReadStream = originalCreateReadStream;
+      console.warn = originalWarn;
+    }
   });
 
   await test("status-only checks on successful and failing PRs make zero comment-list requests", async () => {
@@ -776,7 +852,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     assert.match(gh.comments[0].body, /need to sign/i);
   });
 
-  await test("full 100-comment pages stop from Link metadata without an empty follow-up GET", async () => {
+  await test("a full 100-comment page without Link metadata requires an empty follow-up GET", async () => {
     const prior = Array.from({ length: 99 }, (_, index) => ({
       id: index + 1,
       body: `ordinary comment ${index}`,
@@ -794,8 +870,8 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     assert.strictEqual(gh.comments.length, 100);
     assert.strictEqual(
       getCommentReads(),
-      2,
-      "the pre-post snapshot and fresh cleanup each read one full page; neither should request an empty page 2",
+      3,
+      "the pre-post snapshot reads 99 comments once, then cleanup confirms the full 100-comment page with empty page 2",
     );
   });
 

@@ -235,6 +235,56 @@ const linkTo = (path, last) =>
     }
   });
 
+  await test("hasNextPage treats a complete valid Link set as authoritative and malformed or absent metadata as unknown", () => {
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=1>; rel="prev"'),
+      false,
+      "valid relation set without next means no next page",
+    );
+    assert.strictEqual(
+      bot.hasNextPage(
+        '<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=1>; rel="prev"',
+      ),
+      true,
+    );
+    for (const malformed of [
+      null,
+      undefined,
+      "",
+      '<https://api.github.com/x?page=1>; rel="prev", malformed next relation',
+      '<https://api.github.com/x?page=1>; rel="prev", <https://api.github.com/x?page=2>; rel="next',
+      '<https://api.github.com/x?page=1>; rel="prev"; rel="next"',
+      '<https://api.github.com/x?page=1>; rel="prev",',
+      '<https://api.github.com/x bad?page=1>; rel="next"',
+      '<https://api.github.com/x?page=1>; title="bad\nvalue"; rel="next"',
+      '<https://api.github.com/x?page=1>; title=',
+      '<https://api.github.com/x?page=1> trailing text',
+      '<https://api.github.com/x?page=1>; =next',
+    ]) {
+      assert.strictEqual(bot.hasNextPage(malformed), null, String(malformed));
+    }
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title="next, page"; rel="next"'),
+      true,
+      "commas inside a quoted parameter are not Link separators",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title=page; rel=next'),
+      true,
+      "unquoted token parameter values are valid",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title="a\\\\b"; rel=next'),
+      true,
+      "quoted-string escapes are parsed without splitting the header",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=1>; title=""'),
+      false,
+      "an empty optional quoted parameter is valid metadata without next",
+    );
+  });
+
   // -------------------------------------------------------------------------
   // 3. ghRaw withLink
   // -------------------------------------------------------------------------

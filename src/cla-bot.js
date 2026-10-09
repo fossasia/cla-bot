@@ -859,21 +859,110 @@ function readLinkHeader(res) {
     : null;
 }
 
-// GitHub omits Link entirely when a list fits on one page. When it is
-// present, `rel="next"` is authoritative even if a page was shortened by
-// concurrent edits. Return null only for malformed metadata so callers can
-// fall back to the traditional page-size check.
+// GitHub omits Link entirely when a list fits on one page. A valid, complete
+// header with no `next` relation is authoritative even if a page was
+// shortened by concurrent edits. Missing or malformed metadata is unknown,
+// so callers fall back to the traditional page-size check.
 function hasNextPage(linkHeader) {
-  if (typeof linkHeader !== "string" || linkHeader.trim() === "") return false;
-  let foundValidRelation = false;
-  for (const part of linkHeader.split(/,\s*(?=<)/)) {
-    const target = /^\s*<([^>]*)>/.exec(part);
-    const rel = /;\s*rel\s*=\s*"?([^";]*)"?/i.exec(part);
-    if (!target || !rel) continue;
-    foundValidRelation = true;
-    if (rel[1].toLowerCase().split(/\s+/).includes("next")) return true;
+  if (typeof linkHeader !== "string" || linkHeader.trim() === "") return null;
+
+  // Split link-values only at commas outside both angle-bracket targets and
+  // quoted parameter values. A comma inside title="..." is data, not a
+  // second link. Reject unbalanced delimiters instead of treating a partial
+  // parse as proof that no next page exists.
+  const parts = [];
+  let start = 0;
+  let inTarget = false;
+  let inQuote = false;
+  let escaped = false;
+  for (let i = 0; i < linkHeader.length; i += 1) {
+    const char = linkHeader[i];
+    if (inQuote) {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') inQuote = false;
+      continue;
+    }
+    if (char === '"' && !inTarget) inQuote = true;
+    else if (char === "<" && !inTarget) inTarget = true;
+    else if (char === ">" && inTarget) inTarget = false;
+    else if (char === "," && !inTarget) {
+      parts.push(linkHeader.slice(start, i).trim());
+      start = i + 1;
+    }
   }
-  return foundValidRelation ? false : null;
+  if (inQuote || inTarget || escaped) return null;
+  parts.push(linkHeader.slice(start).trim());
+  if (parts.some((part) => !part)) return null;
+
+  let sawNext = false;
+  for (const part of parts) {
+    let i = 0;
+    const skipWhitespace = () => {
+      while (part[i] === " " || part[i] === "\t") i += 1;
+    };
+    skipWhitespace();
+    if (part[i] !== "<") return null;
+    const targetEnd = part.indexOf(">", i + 1);
+    if (
+      targetEnd === -1 ||
+      /[<>\s\x00-\x1f\x7f]/.test(part.slice(i + 1, targetEnd))
+    ) {
+      return null;
+    }
+    i = targetEnd + 1;
+    let relValue = null;
+    skipWhitespace();
+    while (i < part.length) {
+      if (part[i] !== ";") return null;
+      i += 1;
+      skipWhitespace();
+      const name = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+/.exec(part.slice(i));
+      if (!name) return null;
+      i += name[0].length;
+      const parameterName = name[0].toLowerCase();
+      skipWhitespace();
+      let value = null;
+      if (part[i] === "=") {
+        i += 1;
+        skipWhitespace();
+        if (part[i] === '"') {
+          i += 1;
+          let quoted = "";
+          while (i < part.length) {
+            const char = part[i++];
+            if (char === "\\") {
+              quoted += part[i++];
+            } else if (char === '"') {
+              break;
+            } else if (/[\x00-\x1f\x7f]/.test(char)) {
+              return null;
+            } else {
+              quoted += char;
+            }
+          }
+          value = quoted;
+        } else {
+          const token = /^[!#$%&'*+.^_`|~0-9A-Za-z:-]+/.exec(part.slice(i));
+          if (!token) return null;
+          value = token[0];
+          i += value.length;
+        }
+      }
+      if (parameterName === "rel") {
+        if (relValue !== null || value === null || !value.trim()) return null;
+        relValue = value;
+      }
+      skipWhitespace();
+    }
+    if (
+      relValue !== null &&
+      relValue.toLowerCase().split(/[ \t]+/).includes("next")
+    ) {
+      sawNext = true;
+    }
+  }
+  return sawNext;
 }
 
 // GitHub serializes database IDs as JSON numbers. JSON.parse() rounds integer
@@ -3070,6 +3159,7 @@ module.exports = {
   createReadGroup,
   allOrAbort,
   parseLastPage,
+  hasNextPage,
   listPRCommitAuthors,
   SignatureIndex,
   isAllowlisted,
