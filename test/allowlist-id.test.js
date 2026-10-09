@@ -67,6 +67,18 @@ function installMockGitHub({ commits, signatures = [], usersById = {} }) {
   global.fetch = async (url, opts = {}) => {
     const method = (opts.method || "GET").toUpperCase();
     const { pathname } = new URL(url);
+    if (pathname === "/graphql")
+      return res(200, {
+        data: {
+          repository: {
+            pullRequest: {
+              baseRefOid: "base-sha-abc",
+              headRefOid: "head-sha-abc",
+              comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] },
+            },
+          },
+        },
+      });
     const userById = pathname.match(/^\/user\/(\d+)$/);
     if (userById) {
       const u = usersById[userById[1]];

@@ -53,6 +53,37 @@ function res(status, jsonBody) {
 function b64(obj) {
   return Buffer.from(JSON.stringify(obj)).toString("base64");
 }
+function graphqlPRResponse(variables, comments) {
+  const nodes = comments.slice(0, 100).map((c) => ({
+    fullDatabaseId: String(c.id),
+    body: c.body,
+    author: c.user
+      ? {
+          __typename: c.user.type === "Bot" ? "Bot" : "User",
+          login: c.user.login,
+        }
+      : null,
+  }));
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          headRefOid: "head-sha",
+          baseRefOid: "base-sha-fixture",
+          comments: variables.includeComments
+            ? {
+                totalCount: comments.length,
+                nodes,
+                pageInfo: {
+                  hasNextPage: comments.length > nodes.length,
+                },
+              }
+            : undefined,
+        },
+      },
+    },
+  };
+}
 
 (async () => {
   await test("a PR blocked under an OLD bot identity still gets its recovery announced after GITHUB_TOKEN is switched to a different (PAT/App) identity", async () => {
@@ -91,6 +122,9 @@ function b64(obj) {
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/graphql")) {
+        return res(200, graphqlPRResponse(JSON.parse(opts.body).variables, state.comments));
+      }
       if (url.endsWith("/user")) {
         return res(200, { login: "new-custom-bot[bot]", type: "Bot" });
       }
@@ -196,6 +230,9 @@ function b64(obj) {
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/graphql")) {
+        return res(200, graphqlPRResponse(JSON.parse(opts.body).variables, state.comments));
+      }
       if (url.endsWith("/user")) {
         return res(200, { login: "new-custom-bot[bot]", type: "Bot" });
       }

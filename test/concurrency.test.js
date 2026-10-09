@@ -269,6 +269,415 @@ const linkTo = (path, last) =>
     });
   });
 
+  await test("fetchPRSnapshot reads refs and a complete one-page comment snapshot over GraphQL", async () => {
+    const b = freshModule();
+    const testBaseSha = "b".repeat(40);
+    const testHeadSha = "a".repeat(40);
+    let request;
+    global.fetch = async (url, options) => {
+      request = { url, options, body: JSON.parse(options.body) };
+      return res(200, {
+        data: {
+          repository: {
+            pullRequest: {
+              headRefOid: testHeadSha,
+              baseRefOid: testBaseSha,
+              comments: {
+                totalCount: 0,
+                nodes: [],
+                pageInfo: { hasNextPage: false },
+              },
+            },
+          },
+        },
+      });
+    };
+    assert.deepStrictEqual(await b.fetchPRSnapshot(1, { includeComments: true }), {
+      headSha: testHeadSha,
+      baseSha: testBaseSha,
+      commentPage: {
+        totalCount: 0,
+        nodes: [],
+        pageInfo: { hasNextPage: false },
+      },
+    });
+    assert.strictEqual(
+      request.url,
+      "https://api.github.com/graphql",
+    );
+    assert.strictEqual(request.options.method, "POST");
+    assert.deepStrictEqual(request.body.variables, {
+      owner: "fossasia",
+      name: "testrepo",
+      number: 1,
+      includeComments: true,
+    });
+    assert.match(request.body.query, /comments\(first:\s*100\)/);
+    assert.doesNotMatch(request.body.query, /orderBy|commentsAfter|endCursor/);
+  });
+
+  await test("GraphQL failures, resolver errors and missing PR data fall back to REST", async () => {
+    const b = freshModule();
+    const restUrl = "https://api.github.com/repos/fossasia/testrepo/pulls/1";
+    const failures = [
+      { errors: [{ message: "resolver failed" }], data: {} },
+      { errors: [null], data: {} },
+      { errors: [], data: null },
+      null,
+      { data: { repository: null } },
+    ];
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (message) => warnings.push(message);
+    try {
+      for (const graphBody of failures) {
+        const urls = [];
+        global.fetch = async (url) => {
+          urls.push(url);
+          if (url.endsWith("/graphql")) return res(200, graphBody);
+          return res(200, {
+            head: { sha: "a".repeat(40) },
+            base: { sha: "b".repeat(40) },
+          });
+        };
+        assert.deepStrictEqual(
+          await b.fetchPRSnapshot(1, { includeComments: true }),
+          {
+            headSha: "a".repeat(40),
+            baseSha: "b".repeat(40),
+            commentPage: null,
+          },
+        );
+        assert.ok(
+          urls.some((url) => url === restUrl),
+          "REST snapshot is the fallback",
+        );
+      }
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.strictEqual(warnings.length, failures.length);
+    assert.ok(warnings.every((message) => message.includes("falling back")));
+  });
+
+  await test("GraphQL comment completeness rejects malformed, duplicate, and incomplete pages", async () => {
+    const b = freshModule();
+    const validNode = (id) => ({
+      fullDatabaseId: String(id),
+      body: "comment",
+      author: { __typename: "User", login: "alice" },
+    });
+    const cases = [
+      null,
+      { nodes: null, totalCount: 0, pageInfo: { hasNextPage: false } },
+      { nodes: [], totalCount: 0, pageInfo: null },
+      { nodes: [], totalCount: 0, pageInfo: { hasNextPage: true } },
+      { nodes: [], totalCount: "0", pageInfo: { hasNextPage: false } },
+      { nodes: [validNode(1)], totalCount: 2, pageInfo: { hasNextPage: false } },
+      {
+        nodes: Array.from({ length: 101 }, (_, index) => validNode(index + 1)),
+        totalCount: 101,
+        pageInfo: { hasNextPage: false },
+      },
+      {
+        nodes: [validNode(1), validNode(1)],
+        totalCount: 2,
+        pageInfo: { hasNextPage: false },
+      },
+      {
+        nodes: [{ ...validNode(1), fullDatabaseId: "0" }],
+        totalCount: 1,
+        pageInfo: { hasNextPage: false },
+      },
+      {
+        nodes: [{ ...validNode(1), body: null }],
+        totalCount: 1,
+        pageInfo: { hasNextPage: false },
+      },
+      {
+        nodes: [{ ...validNode(1), author: null }],
+        totalCount: 1,
+        pageInfo: { hasNextPage: false },
+      },
+    ];
+    for (const comments of cases) {
+      global.fetch = async () =>
+        res(200, {
+          data: {
+            repository: {
+              pullRequest: {
+                headRefOid: "a".repeat(40),
+                baseRefOid: "b".repeat(40),
+                comments,
+              },
+            },
+          },
+        });
+      const snapshot = await b.fetchPRSnapshot(1, { includeComments: true });
+      assert.strictEqual(snapshot.commentPage, null);
+    }
+    await assert.rejects(
+      () =>
+        b.fetchAllIssueCommentsUncached(
+          1,
+          Promise.resolve("github-actions[bot]"),
+          { totalCount: 1, nodes: [], pageInfo: { hasNextPage: false } },
+        ),
+      /incomplete PR comments page/,
+    );
+  });
+
+  await test("single-page GraphQL history uses comment IDs for chronology, not response order", async () => {
+    const b = freshModule();
+    const marker = "<!-- fossasia-cla-bot:v1 -->";
+    const pending = `${marker}\n<!-- fossasia-cla-bot:pending -->\npending`;
+    const success = `${marker}\n<!-- fossasia-cla-bot:success -->\nsuccess`;
+    const history = await b.fetchAllIssueCommentsUncached(
+      1,
+      Promise.resolve("github-actions[bot]"),
+      {
+        totalCount: 4,
+        nodes: [
+          {
+            fullDatabaseId: "101",
+            body: success,
+            author: { __typename: "Bot", login: "github-actions[bot]" },
+          },
+          {
+            fullDatabaseId: "100",
+            body: pending,
+            author: { __typename: "Bot", login: "github-actions[bot]" },
+          },
+          {
+            fullDatabaseId: "102",
+            body: success,
+            author: { __typename: "Bot", login: "github-actions[bot]" },
+          },
+          {
+            fullDatabaseId: "99",
+            body: success,
+            author: { __typename: "Bot", login: "github-actions[bot]" },
+          },
+        ],
+        pageInfo: { hasNextPage: false },
+      },
+    );
+    assert.strictEqual(history.lastSuccessSeq, 102n);
+    assert.strictEqual(history.lastPendingSeq, 100n);
+    assert.strictEqual(history.latestOwnBodyByCategory.pending, pending);
+    assert.strictEqual(history.latestOwnBodyByCategory.success, success);
+    assert.deepStrictEqual(history.comments.map(({ id }) => id), [99, 100, 101, 102]);
+  });
+
+  await test("large GraphQL comment IDs remain exact and cached comments stay bounded and ID-sorted", async () => {
+    const b = freshModule();
+    assert.strictEqual(
+      b.mapGraphQLIssueComment({
+        fullDatabaseId: "9007199254740993",
+        body: "large-id comment",
+        author: { __typename: "User", login: "alice" },
+      }).id,
+      "9007199254740993",
+    );
+    assert.strictEqual(
+      b.mapGraphQLIssueComment({
+        fullDatabaseId: "7",
+        body: "small-id comment",
+        author: null,
+      }).id,
+      7,
+    );
+    assert.strictEqual(b.commentIdAsBigInt("not-an-id"), null);
+    assert.strictEqual(b.commentIdAsBigInt("9007199254740993"), 9007199254740993n);
+    assert.strictEqual(b.compareCommentIds("bad", 1), 0);
+    assert.strictEqual(b.compareCommentIds(1, 2), -1);
+    assert.strictEqual(b.compareCommentIds(2, 1), 1);
+    assert.strictEqual(b.compareCommentIds("2", 2), 0);
+    const comments = [{ id: 2, body: "old" }];
+    b.retainRecentComment(comments, { id: "2", body: "replacement" });
+    b.retainRecentComment(comments, { id: 1, body: "one" });
+    b.retainRecentComment(comments, { id: 3, body: "three" });
+    assert.deepStrictEqual(comments.map(({ id }) => id), [1, "2", 3]);
+    for (let id = 4; id <= 204; id += 1) {
+      b.retainRecentComment(comments, { id, body: String(id) });
+    }
+    assert.strictEqual(comments.length, 200);
+    assert.strictEqual(comments[0].id, 5);
+    assert.strictEqual(comments.at(-1).id, 204);
+  });
+
+  await test("GraphQL comment pages that need pagination are discarded for a full REST history read", async () => {
+    const b = freshModule();
+    const requested = [];
+    global.fetch = async (url) => {
+      requested.push(url);
+      if (url.endsWith("/graphql")) {
+        return res(200, {
+          data: {
+            repository: {
+              pullRequest: {
+                headRefOid: "a".repeat(40),
+                baseRefOid: "b".repeat(40),
+                comments: {
+                  totalCount: 101,
+                  nodes: Array.from({ length: 100 }, (_, index) => ({
+                    fullDatabaseId: String(index + 1),
+                    body: "comment",
+                    author: null,
+                  })),
+                  pageInfo: { hasNextPage: true },
+                },
+              },
+            },
+          },
+        });
+      }
+      return res(200, { head: { sha: "a".repeat(40) }, base: { sha: "b".repeat(40) } });
+    };
+    const snapshot = await b.fetchPRSnapshot(1, { includeComments: true });
+    assert.deepStrictEqual(snapshot, {
+      headSha: "a".repeat(40),
+      baseSha: "b".repeat(40),
+      commentPage: null,
+    });
+    const cache = new Map();
+    global.fetch = async (url) => {
+      requested.push(url);
+      if (url.includes("/issues/1/comments")) return res(200, []);
+      throw new Error(`Unexpected request ${url}`);
+    };
+    await b.getExistingBotComments(1, { cache });
+    assert.ok(requested.some((url) => url.includes("/graphql")));
+    assert.ok(requested.some((url) => url.includes("/issues/1/comments?per_page=100&page=1")));
+    assert.strictEqual(requested.filter((url) => url.includes("/graphql")).length, 1);
+  });
+
+  await test("comment ID helpers reject malformed IDs and compare valid REST IDs consistently", async () => {
+    const b = freshModule();
+    const filter = b.createAscendingIdFilter();
+    assert.strictEqual(filter(10), true);
+    assert.strictEqual(filter(11), true);
+    assert.strictEqual(filter("12"), true);
+    assert.strictEqual(filter(11), false);
+    assert.strictEqual(filter("not-an-id"), true);
+
+    assert.strictEqual(b.isUsableCommentId(12), true);
+    assert.strictEqual(b.isUsableCommentId("01"), false);
+    assert.strictEqual(b.sameCommentId(12, "12"), true);
+    assert.strictEqual(b.sameCommentId("bad", "bad"), false);
+  });
+
+  await test("fetchPRSnapshot rejects a missing or invalid base/head SHA", async () => {
+    const b = freshModule();
+    global.fetch = async () => res(200, { head: {}, base: { sha: "bad" } });
+    await assert.rejects(
+      () => b.fetchPRSnapshot(1),
+      /\.head\.sha/,
+    );
+    global.fetch = async () =>
+      res(200, { head: { sha: "a".repeat(40) }, base: {} });
+    await assert.rejects(
+      () => b.fetchPRSnapshot(1),
+      /\.base\.sha/,
+    );
+    global.fetch = async () =>
+      res(200, {
+        head: { sha: "a".repeat(40) },
+        base: { sha: "" },
+      });
+    await assert.rejects(
+      () => b.fetchPRSnapshot(1),
+      /\.base\.sha/,
+    );
+  });
+
+  await test("fetchPRSnapshot reports the SHA source used after GraphQL and REST fallback", async () => {
+    const b = freshModule();
+    const validSha = "a".repeat(40);
+
+    global.fetch = async () =>
+      res(200, {
+        data: {
+          repository: {
+            pullRequest: {
+              headRefOid: "",
+              baseRefOid: validSha,
+              comments: {
+                totalCount: 0,
+                nodes: [],
+                pageInfo: { hasNextPage: false },
+              },
+            },
+          },
+        },
+      });
+    await assert.rejects(
+      () => b.fetchPRSnapshot(1, { includeComments: true }),
+      /GitHub GraphQL response for PR #1 .*headRefOid/,
+    );
+
+    const originalWarn = console.warn;
+    console.warn = () => {};
+    try {
+      for (const restPR of [
+        { head: {}, base: { sha: validSha } },
+        { head: { sha: validSha }, base: {} },
+      ]) {
+        global.fetch = async (url) =>
+          url.endsWith("/graphql")
+            ? res(200, { errors: [{ message: "GraphQL unavailable" }] })
+            : res(200, restPR);
+        await assert.rejects(
+          () => b.fetchPRSnapshot(1, { includeComments: true }),
+          /GitHub API response for GET \/repos\/fossasia\/testrepo\/pulls\/1 .*\.(?:head|base)\.sha/,
+        );
+      }
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  await test("fetchPRSnapshot honors the configured GHES REST API base URL", async () => {
+    const testBaseSha = "b".repeat(40);
+    const testHeadSha = "a".repeat(40);
+    const previous = process.env.GITHUB_API_URL;
+    process.env.GITHUB_API_URL = "https://ghe.example.test/api/v3";
+    const b = freshModule();
+    if (previous === undefined) delete process.env.GITHUB_API_URL;
+    else process.env.GITHUB_API_URL = previous;
+
+    let requestedUrl;
+    global.fetch = async (url) => {
+      requestedUrl = url;
+      return res(200, {
+        data: {
+          repository: {
+            pullRequest: {
+              baseRefOid: testBaseSha,
+              headRefOid: testHeadSha,
+              comments: {
+                totalCount: 0,
+                nodes: [],
+                pageInfo: { hasNextPage: false },
+              },
+            },
+          },
+        },
+      });
+    };
+    const snapshot = await b.fetchPRSnapshot(1, { includeComments: true });
+    assert.strictEqual(requestedUrl, "https://ghe.example.test/api/graphql");
+    assert.deepStrictEqual(snapshot, {
+      headSha: testHeadSha,
+      baseSha: testBaseSha,
+      commentPage: {
+        totalCount: 0,
+        nodes: [],
+        pageInfo: { hasNextPage: false },
+      },
+    });
+  });
+
   // -------------------------------------------------------------------------
   // A fake GitHub for the identity / comments / checkPR tests
   // -------------------------------------------------------------------------
@@ -354,6 +763,38 @@ const linkTo = (path, last) =>
             ? res(200, { login: "my-pat-bot" })
             : res(403, { message: "Resource not accessible by integration" });
         }
+        if (path === "/graphql") {
+          const variables = JSON.parse(opts.body).variables;
+          const nodes = g.comments.slice(0, 100).map((c) => ({
+            fullDatabaseId: String(c.id),
+            body: c.body,
+            author: c.user
+              ? {
+                  __typename: c.user.type === "Bot" ? "Bot" : "User",
+                  login: c.user.login,
+                }
+              : null,
+          }));
+          return res(200, {
+            data: {
+              repository: {
+                pullRequest: {
+                  baseRefOid: baseSha,
+                  headRefOid: headSha,
+                  comments: variables.includeComments
+                    ? {
+                        totalCount: g.comments.length,
+                        nodes,
+                        pageInfo: {
+                          hasNextPage: g.comments.length > nodes.length,
+                        },
+                      }
+                    : undefined,
+                },
+              },
+            },
+          });
+        }
         if (path.startsWith(`/repos/fossasia/testrepo/compare/`)) {
           await sleep(1);
           return pagedCompare(
@@ -416,6 +857,75 @@ const linkTo = (path, last) =>
     };
     return g;
   }
+
+  await test("checkPR discards paginated GraphQL comments and scans complete REST history without cursors", async () => {
+    const b = freshModule();
+    const graphQLRequests = [];
+    const g = makeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "alice" },
+          committer: { id: 1, login: "alice" },
+          parents: [{ sha: "parent" }],
+          commit: { message: "", author: { email: "alice@example.com" } },
+        },
+      ],
+      signatures: [],
+      comments: Array.from({ length: 101 }, (_, index) => ({
+        id: index + 1,
+        body: "ordinary comment",
+        user: { login: "contributor" },
+      })),
+    });
+    const inner = g.fetch;
+    g.fetch = async (url, options = {}) => {
+      if (url.endsWith("/graphql")) {
+        const { variables } = JSON.parse(options.body);
+        graphQLRequests.push(variables);
+        if (variables.includeComments) {
+          return res(200, {
+            data: {
+              repository: {
+                pullRequest: {
+                  baseRefOid: BASE_SHA,
+                  headRefOid: DEFAULT_HEAD_SHA,
+                  comments: {
+                    totalCount: 101,
+                    nodes: Array.from({ length: 100 }, (_, index) => ({
+                      fullDatabaseId: String(index + 1),
+                      body: "ordinary comment",
+                      author: { __typename: "User", login: "contributor" },
+                    })),
+                    pageInfo: { hasNextPage: true },
+                  },
+                },
+              },
+            },
+          });
+        }
+      }
+      return inner(url, options);
+    };
+    global.fetch = g.fetch;
+    await b.checkPR(1);
+    assert.strictEqual(graphQLRequests.length, 1);
+    assert.ok(graphQLRequests[0].includeComments);
+    assert.ok(
+      g.calls.includes("GET /repos/fossasia/testrepo/issues/1/comments?per_page=100&page=1"),
+    );
+    assert.ok(
+      g.calls.includes("GET /repos/fossasia/testrepo/issues/1/comments?per_page=100&page=2"),
+      "the incomplete GraphQL page is discarded and REST restarts at page one",
+    );
+    assert.strictEqual(g.posted.length, 1);
+    assert.strictEqual(
+      g.statuses.length,
+      1,
+      "the status is published after the REST fallback completes",
+    );
+    assert.strictEqual(g.statuses[0].state, "failure");
+  });
 
   const trailer = (n, email) => `Co-authored-by: Person ${n} <${email}>`;
   const newStyle = (id, name = "someone") =>
@@ -1127,6 +1637,16 @@ const linkTo = (path, last) =>
     g.st = st;
     g.fetch = async (url, opts = {}) => {
       const path = url.replace("https://api.github.com", "");
+      if (path === "/graphql") {
+        const response = await inner(url, opts);
+        const body = JSON.parse(await response.text());
+        st.pulls += 1;
+        const r = revs[st.rev];
+        body.data.repository.pullRequest.baseRefOid = BASE_SHA;
+        body.data.repository.pullRequest.headRefOid = r.sha;
+        if (onPull) onPull(st.pulls, st);
+        return res(200, body);
+      }
       if (/^\/repos\/fossasia\/testrepo\/pulls\/1$/.test(path)) {
         st.pulls += 1;
         const r = revs[st.rev];

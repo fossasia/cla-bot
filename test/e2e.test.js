@@ -278,6 +278,19 @@ function startFakeGitHub({ authorAlreadySigned }) {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(obj === null ? "" : JSON.stringify(obj));
       };
+      if (req.url === "/graphql") {
+        return send(200, {
+          data: {
+            repository: {
+              pullRequest: {
+                baseRefOid: "e2e-base-sha",
+                headRefOid: "e2e-head-sha",
+                comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] },
+              },
+            },
+          },
+        });
+      }
       if (req.url.includes("/compare/")) {
         const commits = [
           {
