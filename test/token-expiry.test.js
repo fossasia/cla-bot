@@ -38,6 +38,7 @@ const PRIVATE_KEY = crypto
   .privateKey.export({ type: "pkcs1", format: "pem" });
 const SIGN_PHRASE = "I have read the CLA Document and I hereby sign the CLA";
 const HEAD_SHA = "a".repeat(40);
+const BASE_SHA = "b".repeat(40);
 const MIN = 60 * 1000;
 
 const BASE_ENV = {
@@ -217,12 +218,18 @@ function makeAppGitHub({
       "job-token",
       `${method} ${p} must use the job's GITHUB_TOKEN, got: ${bearer.slice(0, 20)}`,
     );
-    if (p.includes("/pulls/1/commits")) {
+    if (p.includes("/compare/")) {
       if (s.hooks.onCommits) s.hooks.onCommits(s);
-      return { status: 200, body: s.commits };
+      return {
+        status: 200,
+        body: { commits: s.commits, total_commits: s.commits.length },
+      };
     }
     if (/\/pulls\/1(?:\?|$)/.test(p)) {
-      return { status: 200, body: { head: { sha: HEAD_SHA } } };
+      return {
+        status: 200,
+        body: { head: { sha: HEAD_SHA }, base: { sha: BASE_SHA } },
+      };
     }
     if (p.includes("/statuses/")) {
       s.statuses.push(JSON.parse(rawBody));
@@ -840,7 +847,7 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
     gh.revoke("inst-tok-1"); // ...and is then killed server-side
     await m.handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: HEAD_SHA } },
+      pull_request: { number: 1, head: { sha: HEAD_SHA }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.unauthorized, 1);
     assert.strictEqual(gh.mintCount, 2);

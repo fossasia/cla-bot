@@ -34,6 +34,7 @@ const {
   signerCompletedRequirement,
   mergeSignatures,
   extractCoAuthors,
+  createLookupBudget,
   fail,
 } = require("../src/cla-bot.js");
 
@@ -1967,6 +1968,178 @@ if (process.exitCode) {
         20,
         "exactly the first 20 must still be processed - the cap stops further lookups, it doesn't discard what was already resolved",
       );
+    },
+  );
+
+  // --- createLookupBudget() / MAX_COAUTHOR_LOOKUPS_PER_RUN ----------------
+  await testAsync(
+    "createLookupBudget: admits new emails until max, then refuses new ones but keeps admitting ones already seen",
+    async () => {
+      const budget = createLookupBudget(2);
+      assert.strictEqual(budget.admit("a@x.com"), true);
+      assert.strictEqual(budget.admit("b@x.com"), true);
+      assert.strictEqual(budget.admit("c@x.com"), false, "past the cap");
+      assert.strictEqual(
+        budget.admit("a@x.com"),
+        true,
+        "already-seen email stays free, doesn't cost a new slot",
+      );
+    },
+  );
+
+  await testAsync(
+    "createLookupBudget: with no max given, everything is admitted (extractCoAuthors stays usable on its own)",
+    async () => {
+      const budget = createLookupBudget();
+      for (let i = 0; i < 50; i++) {
+        assert.strictEqual(budget.admit(`p${i}@x.com`), true);
+      }
+    },
+  );
+
+  await testAsync(
+    "extractCoAuthors: a commit within the per-commit cap (20) but past a small shared run budget flags the commit, and skips the network call for the trailer it couldn't afford",
+    async () => {
+      let calls = 0;
+      global.fetch = async (url) => {
+        calls += 1;
+        const m = url.match(/\/user\/(\d+)$/);
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ login: `p${m[1]}` }),
+          headers: { get: () => null },
+        };
+      };
+      const budget = createLookupBudget(1); // room for exactly one identity
+      const message =
+        "Fix bug\n\n" +
+        "Co-authored-by: One <7001+one@users.noreply.github.com>\n" +
+        "Co-authored-by: Two <7002+two@users.noreply.github.com>";
+      const result = await extractCoAuthors(message, budget);
+      assert.strictEqual(
+        result.hasUnresolved,
+        true,
+        "the second trailer had no budget left, so the commit is flagged for manual review",
+      );
+      assert.strictEqual(
+        result.authors.length,
+        1,
+        "the first trailer still resolves normally",
+      );
+      assert.strictEqual(
+        calls,
+        1,
+        "the over-budget trailer is never looked up - not even attempted",
+      );
+    },
+  );
+
+  await testAsync(
+    "extractCoAuthors: a budget shared across several calls (same PR, different commits) is spent across all of them, not reset each time",
+    async () => {
+      global.fetch = async (url) => {
+        const m = url.match(/\/user\/(\d+)$/);
+        return {
+          ok: true,
+          status: 200,
+          text: async () => JSON.stringify({ login: `p${m[1]}` }),
+          headers: { get: () => null },
+        };
+      };
+      const budget = createLookupBudget(1);
+      const commitA = await extractCoAuthors(
+        "Fix bug\n\nCo-authored-by: One <8001+one@users.noreply.github.com>",
+        budget,
+      );
+      const commitB = await extractCoAuthors(
+        "Fix bug\n\nCo-authored-by: Two <8002+two@users.noreply.github.com>",
+        budget,
+      );
+      assert.strictEqual(commitA.hasUnresolved, false, "first commit fits");
+      assert.strictEqual(commitA.authors.length, 1);
+      assert.strictEqual(
+        commitB.hasUnresolved,
+        true,
+        "by the second commit the shared budget is already spent",
+      );
+      assert.strictEqual(commitB.authors.length, 0);
+    },
+  );
+
+  await testAsync(
+    "createLookupBudget via extractCoAuthors: two trailers naming the SAME id with different claimed login text share one budget slot, not two",
+    async () => {
+      global.fetch = async () => ({
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({ login: "real-login" }),
+        headers: { get: () => null },
+      });
+      const budget = createLookupBudget(1); // room for exactly one identity
+      const message =
+        "Fix bug\n\n" +
+        "Co-authored-by: Claimed As Bob <9001+bob@users.noreply.github.com>\n" +
+        "Co-authored-by: Claimed As Robert <9001+robert@users.noreply.github.com>";
+      const result = await extractCoAuthors(message, budget);
+      assert.strictEqual(
+        result.hasUnresolved,
+        false,
+        "both trailers name id 9001, so they share the one slot the budget had room for",
+      );
+      assert.strictEqual(
+        result.authors.length,
+        2,
+        "both still resolve - the id is what's looked up, the login text in the trailer is ignored",
+      );
+      assert.deepStrictEqual(result.authors, [
+        { id: 9001, login: "real-login" },
+        { id: 9001, login: "real-login" },
+      ]);
+    },
+  );
+
+  await testAsync(
+    "createLookupBudget via extractCoAuthors: a new-style trailer with an id that can never be real never touches the budget either - resolveCoAuthorEmail rejects it without a request",
+    async () => {
+      let calls = 0;
+      global.fetch = async () => {
+        calls += 1;
+        throw new Error("no lookup should ever be attempted for this id");
+      };
+      const budget = createLookupBudget(0); // no room for anything
+      // 16 nines is past Number.MAX_SAFE_INTEGER, so isValidGitHubUserId
+      // rejects it - no real GitHub account could ever have this id.
+      const result = await extractCoAuthors(
+        "Fix bug\n\nCo-authored-by: Ghost <9999999999999999+ghost@users.noreply.github.com>",
+        budget,
+      );
+      assert.strictEqual(calls, 0);
+      assert.strictEqual(result.hasUnresolved, true);
+      assert.strictEqual(result.authors.length, 0);
+    },
+  );
+
+  await testAsync(
+    "createLookupBudget via extractCoAuthors: an address that isn't a noreply format never touches the budget, since resolving it never costs a request",
+    async () => {
+      let calls = 0;
+      global.fetch = async () => {
+        calls += 1;
+        throw new Error("no lookup should ever be attempted for this address");
+      };
+      const budget = createLookupBudget(0); // no room for anything
+      const result = await extractCoAuthors(
+        "Fix bug\n\nCo-authored-by: Someone <someone@example.com>",
+        budget,
+      );
+      assert.strictEqual(calls, 0);
+      assert.strictEqual(
+        result.hasUnresolved,
+        true,
+        "still flagged for manual review - just not because the budget ran out",
+      );
+      assert.strictEqual(result.authors.length, 0);
     },
   );
 

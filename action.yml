@@ -12,13 +12,13 @@ inputs:
       secrets.GITHUB_TOKEN. The calling workflow must grant it "issues: write"
       (comments and locking are Issues-API endpoints even for PRs),
       "pull-requests: read" (this action only reads PR data, never writes to
-      a PR itself), and "statuses: write". "contents" is only needed if
-      you're not using a GitHub App (app-id/app-private-key left empty) and
-      signatures-repo is the same repo running this workflow - in that
-      fallback mode this token reads and writes the signature file directly,
-      so it needs "contents: read" and "contents: write". With the normal
-      setup (a GitHub App writing to a separate signatures repo), "contents"
-      isn't needed at all.
+      a PR itself), "statuses: write", and "contents: read". "contents: read"
+      is required in every setup: the commit list comes from GitHub's Compare
+      endpoint, which GitHub only allows with Contents read. It is read-only.
+      If you're not using a GitHub App (app-id/app-private-key left empty) and
+      signatures-repo is the same repo running this workflow, this token also
+      reads and writes the signature file directly, so it needs
+      "contents: write" too.
     required: true
   signatures-owner:
     description: "Org/user owning the central signatures repo, e.g. fossasia"

@@ -68,6 +68,11 @@ function fetchThatMustNotBeCalled(url, opts) {
   );
 }
 
+// Every fake PR's base SHA. Fixed and distinct from any head SHA a test
+// uses, so a mock that forgets to wire it up fails loudly instead of
+// quietly comparing a commit against itself.
+const BASE_SHA = "base-sha-abc";
+
 // A small in-memory "GitHub" that the mocked fetch reads/writes so the test
 // reflects real cross-call state changes (comment created, signature stored).
 function makeFakeGitHub({
@@ -76,8 +81,14 @@ function makeFakeGitHub({
   users = {},
   usersById = {},
   lockShouldFail = false,
+  // Leave these out and GET /pulls/1 reports the pair that was last compared,
+  // i.e. a PR that did not move while the bot worked. Pass one to make the PR
+  // report that value no matter what.
+  headSha,
+  baseSha,
 }) {
   const state = {
+    lastCompare: null,
     signatures: initialSignatures,
     sha: "sha-0",
     comments: [],
@@ -109,18 +120,28 @@ function makeFakeGitHub({
       }
       return res(404, { message: "Not Found" });
     }
-    if (url.includes("/pulls/1/commits")) {
-      // Real pagination: slice `commits` into pages of 100 based on the
-      // `page=` query param, so tests can exercise the loop-continuation
-      // branch with a genuinely large commit list, not just a canned
-      // "page=2 -> []" shortcut.
+    if (url.includes("/compare/")) {
+      // checkPR() compares two fixed SHAs (base...head) instead of reading
+      // the PR's live commit list - see listCommitsBetween(). Real
+      // pagination: slice `commits` into pages of 100 based on the `page=`
+      // query param, so tests can exercise the loop-continuation branch
+      // with a genuinely large commit list, not just a canned shortcut.
+      const pair = /\/compare\/([^.?]+)\.\.\.([^?]+)/.exec(url);
+      if (pair) state.lastCompare = { base: pair[1], head: pair[2] };
       const pageMatch = url.match(/[&?]page=(\d+)/);
       const pageNum = pageMatch ? Number(pageMatch[1]) : 1;
       const start = (pageNum - 1) * 100;
-      return res(200, commits.slice(start, start + 100));
+      return res(200, {
+        commits: commits.slice(start, start + 100),
+        total_commits: commits.length,
+      });
     }
     if (url.includes("/pulls/1") && !url.includes("/commits")) {
-      return res(200, { head: { sha: "head-sha-abc" } });
+      const seen = state.lastCompare;
+      return res(200, {
+        head: { sha: headSha ?? (seen && seen.head) ?? "head-sha-abc" },
+        base: { sha: baseSha ?? (seen && seen.base) ?? BASE_SHA },
+      });
     }
     if (url.includes("/contents/signatures/cla.json")) {
       if (method === "GET") {
@@ -1362,7 +1383,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "closed",
-      pull_request: { number: 1, merged: true, head: { sha: "head-sha-x" } },
+      pull_request: { number: 1, merged: true, head: { sha: "head-sha-x" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1387,7 +1408,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "closed",
-      pull_request: { number: 1, merged: false, head: { sha: "head-sha-x" } },
+      pull_request: { number: 1, merged: false, head: { sha: "head-sha-x" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1408,7 +1429,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "labeled",
-      pull_request: { number: 1, merged: false, head: { sha: "x" } },
+      pull_request: { number: 1, merged: false, head: { sha: "x" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1416,8 +1437,70 @@ function makeFakeGitHub({
     assert.strictEqual(gh.statuses.length, 0);
   });
 
+  await test("handlePullRequestTarget does nothing on 'edited' when the title or body changed but the base branch didn't", async () => {
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "edited",
+      changes: { title: { from: "old title" } }, // no "base" key
+      pull_request: {
+        number: 1,
+        head: { sha: "x" },
+        base: { sha: "base-sha-fixture" },
+      },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(
+      gh.statuses.length,
+      0,
+      "a title/body edit needs no re-check - the base/head pair didn't change",
+    );
+  });
+
+  await test("handlePullRequestTarget re-checks the PR on 'edited' when payload.changes.base says the base branch itself was retargeted", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "author" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "author" }],
+      },
+      headSha: "webhook-head-sha",
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "edited",
+      // GitHub's own signal that the base branch changed, with the old base.
+      changes: { base: { sha: { from: "old-base-sha" } } },
+      pull_request: {
+        number: 1,
+        head: { sha: "webhook-head-sha" },
+        base: { sha: "new-base-sha" },
+      },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(
+      gh.statuses.length,
+      1,
+      "a genuine retarget (no new commit, so no 'synchronize') still gets evaluated against its new base",
+    );
+  });
+
   for (const action of ["opened", "synchronize", "reopened"]) {
-    await test(`handlePullRequestTarget on '${action}' checks the PR using the sha already on the webhook payload, without an extra GET /pulls lookup`, async () => {
+    await test(`handlePullRequestTarget on '${action}' checks the PR using the sha already on the webhook payload, not whatever GET /pulls/1 currently reports`, async () => {
       const gh = makeFakeGitHub({
         commits: [
           {
@@ -1431,27 +1514,43 @@ function makeFakeGitHub({
           version: 1,
           signatures: [{ id: 1, login: "author" }],
         },
+        // The PR's current base/head, read once for the base SHA. The
+        // webhook's own head.sha is what actually gets certified below -
+        // see listCommitsBetween(), which compares two fixed SHAs, never a
+        // live ref.
+        headSha: "webhook-head-sha",
       });
-      // If checkPR() ever stopped using the sha already carried on the
-      // payload and fell back to fetching the PR itself, this would throw -
-      // that's the proof the payload's own head.sha is what actually got
-      // used, not a redundant lookup.
+      let pullsReads = 0;
+      const urls = [];
       const innerFetch = gh.fetch;
       global.fetch = async (url, opts) => {
+        urls.push(url);
         if (url.includes("/pulls/1") && !url.includes("/commits")) {
-          throw new Error(
-            "must not call GET /pulls/1 when the head sha was already supplied on the webhook payload",
-          );
+          pullsReads += 1;
         }
         return innerFetch(url, opts);
       };
 
       const payload = {
         action,
-        pull_request: { number: 1, head: { sha: "webhook-head-sha" } },
+        pull_request: { number: 1, head: { sha: "webhook-head-sha" }, base: { sha: "base-sha-fixture" } },
       };
       await handlePullRequestTarget(payload);
 
+      // The webhook carries both base and head, so the evaluation starts from
+      // that pair. The PR is read once right before publishing to confirm it
+      // still is that pair, and once more right after - there's no GitHub
+      // primitive that publishes a status only if the PR is still that exact
+      // pair, so the confirmation has to happen on both sides of the write.
+      assert.strictEqual(
+        pullsReads,
+        2,
+        "one PR read before publishing, one right after to confirm it's still valid",
+      );
+      assert.ok(
+        urls.some((u) => u.includes("/compare/base-sha-fixture...webhook-head-sha")),
+        "compares the webhook's own base...head",
+      );
       assert.strictEqual(gh.statuses.length, 1);
       assert.strictEqual(gh.statuses[0].state, "success");
       assert.strictEqual(
@@ -1461,6 +1560,76 @@ function makeFakeGitHub({
       );
     });
   }
+
+  await test("handlePullRequestTarget: when GET /pulls/1 already reports a newer live head than the webhook's, nothing is published for the old head", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "author" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "author" }],
+      },
+      // A new push has already landed. The webhook told us about "old-sha",
+      // but the PR is no longer there, so that result must not be published.
+      // The event for the new head checks it.
+      headSha: "new-sha-already-pushed",
+    });
+    global.fetch = gh.fetch;
+
+    const payload = {
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "old-sha" }, base: { sha: "base-sha-fixture" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(gh.statuses.length, 0, "no status for the old head");
+    assert.strictEqual(gh.comments.length, 0, "no comment either");
+  });
+
+  await test("handlePullRequestTarget: an unmoved PR is checked once and published once, with exactly two PR reads (before and after publishing)", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "author" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "a@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "author" }],
+      },
+    });
+    let pullsReads = 0;
+    const innerFetch = gh.fetch;
+    global.fetch = async (url, opts) => {
+      if (url.includes("/pulls/1") && !url.includes("/commits")) {
+        pullsReads += 1;
+      }
+      return innerFetch(url, opts);
+    };
+
+    const payload = {
+      action: "synchronize",
+      pull_request: { number: 1, head: { sha: "old-sha" }, base: { sha: "base-sha-fixture" } },
+    };
+    await handlePullRequestTarget(payload);
+
+    assert.strictEqual(
+      pullsReads,
+      2,
+      "one PR read right before publishing, one right after to confirm the publish is still valid - no re-evaluation",
+    );
+    assert.strictEqual(gh.statuses.length, 1);
+    assert.strictEqual(gh.statuses[0].sha, "old-sha");
+  });
 
   await test("a commit whose primary author has no linked GitHub account (e.g. a privacy-enabled email) is flagged for manual review by SHA, not silently skipped", async () => {
     const gh = makeFakeGitHub({
@@ -1478,7 +1647,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1525,7 +1694,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1693,7 +1862,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1751,7 +1920,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1788,7 +1957,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1819,7 +1988,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1921,7 +2090,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -1967,7 +2136,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -2023,7 +2192,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -2035,7 +2204,7 @@ function makeFakeGitHub({
     );
   });
 
-  await test("listPRCommitAuthors terminates by fetching one genuinely empty page when the total commit count is an exact multiple of 100 (doesn't hang or keep paging forever)", async () => {
+  await test("listPRCommitAuthors terminates right at total_commits when the count is an exact multiple of 100 - no extra empty-page request needed to confirm the end", async () => {
     const commits = [];
     for (let i = 0; i < 200; i++) {
       commits.push({
@@ -2059,16 +2228,18 @@ function makeFakeGitHub({
     const innerFetch = gh.fetch;
     const pageRequests = [];
     global.fetch = async (url, opts) => {
-      const m = url.match(/\/pulls\/1\/commits\?.*[&?]page=(\d+)/);
+      const m = url.match(/\/compare\/.*[&?]page=(\d+)/);
       if (m) {
         const pageNum = Number(m[1]);
         pageRequests.push(pageNum);
-        // If the empty-page termination branch ever regresses, this turns
-        // an infinite-loop hang into an immediate, clear test failure
-        // instead of timing out the whole suite.
-        if (pageNum > 3) {
+        // total_commits (200) is already known from page 1, so the walk
+        // should stop the moment it's reached - right after page 2 - instead
+        // of fetching a 3rd, empty page just to confirm the end. If this
+        // regresses into an infinite loop, this turns it into an immediate,
+        // clear test failure instead of timing out the whole suite.
+        if (pageNum > 2) {
           throw new Error(
-            `pagination did not terminate - requested page ${pageNum}, expected it to stop right after the empty page 3`,
+            `pagination did not terminate - requested page ${pageNum}, expected it to stop right after page 2 (total_commits already reached)`,
           );
         }
       }
@@ -2077,14 +2248,14 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha-abc" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
     assert.deepStrictEqual(
       pageRequests,
-      [1, 2, 3],
-      "expected exactly 3 page requests - two full 100-item pages, then one genuinely empty page to terminate - not more and not fewer",
+      [1, 2],
+      "expected exactly 2 page requests - total_commits (200) is reached right after page 2, so no 3rd page is ever fetched",
     );
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
   });
@@ -2119,7 +2290,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha-abc" } },
+      pull_request: { number: 1, head: { sha: "head-sha-abc" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -2165,7 +2336,7 @@ function makeFakeGitHub({
     // First check (PR opened with only author-one's commit) - still silent.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.comments.length, 0);
 
@@ -2180,7 +2351,7 @@ function makeFakeGitHub({
     });
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-2" } },
+      pull_request: { number: 1, head: { sha: "sha-2" }, base: { sha: "base-sha-fixture" } },
     });
 
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
@@ -2215,7 +2386,7 @@ function makeFakeGitHub({
     // Opened with just the already-signed author - silent, as above.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.comments.length, 0);
 
@@ -2228,7 +2399,7 @@ function makeFakeGitHub({
     });
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-2" } },
+      pull_request: { number: 1, head: { sha: "sha-2" }, base: { sha: "base-sha-fixture" } },
     });
 
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
@@ -2264,7 +2435,7 @@ function makeFakeGitHub({
     // Opened while unsigned - the bot must ask.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
     assert.strictEqual(gh.comments.length, 1);
@@ -2303,7 +2474,7 @@ function makeFakeGitHub({
     // stays quiet exactly as it would have with the old generic wording.
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(
       gh.comments.length,
@@ -2341,7 +2512,7 @@ function makeFakeGitHub({
     // PR opens fully compliant - silent, as expected.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(
       gh.comments.length,
@@ -2375,7 +2546,7 @@ function makeFakeGitHub({
     // never happened - the PR itself was never blocked.
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-2" } },
+      pull_request: { number: 1, head: { sha: "sha-2" }, base: { sha: "base-sha-fixture" } },
     });
 
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
@@ -2412,7 +2583,7 @@ function makeFakeGitHub({
     // Block, then resolve - a genuine pending -> success pair.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
     await handleIssueComment({
@@ -2448,7 +2619,7 @@ function makeFakeGitHub({
     // re-announcement is due.
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-2" } },
+      pull_request: { number: 1, head: { sha: "sha-2" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(
       gh.comments.length,
@@ -2474,7 +2645,7 @@ function makeFakeGitHub({
     // Opened unsigned - genuinely blocked, bot asks.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
     assert.strictEqual(gh.comments.length, 1);
@@ -2518,7 +2689,7 @@ function makeFakeGitHub({
     // announcement.
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-2" } },
+      pull_request: { number: 1, head: { sha: "sha-2" }, base: { sha: "base-sha-fixture" } },
     });
 
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
@@ -2560,7 +2731,7 @@ function makeFakeGitHub({
     // status is set to "failure".
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
     assert.strictEqual(gh.comments.length, 1);
@@ -2624,7 +2795,7 @@ function makeFakeGitHub({
 
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
     assert.strictEqual(gh.comments.length, 1);
@@ -2672,7 +2843,7 @@ function makeFakeGitHub({
     // First block-and-resolve cycle.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
     await handleIssueComment({
@@ -2698,7 +2869,7 @@ function makeFakeGitHub({
     });
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-2" } },
+      pull_request: { number: 1, head: { sha: "sha-2" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
     assert.strictEqual(gh.comments.length, 3);
@@ -2765,7 +2936,7 @@ function makeFakeGitHub({
 
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "failure");
     assert.strictEqual(gh.comments.length, 1);
@@ -2784,7 +2955,7 @@ function makeFakeGitHub({
 
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-2" } },
+      pull_request: { number: 1, head: { sha: "sha-2" }, base: { sha: "base-sha-fixture" } },
     });
 
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
@@ -2845,7 +3016,7 @@ function makeFakeGitHub({
     // past block and announce the recovery, not silently swallow it.
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-2" } },
+      pull_request: { number: 1, head: { sha: "sha-2" }, base: { sha: "base-sha-fixture" } },
     });
 
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
@@ -2877,7 +3048,7 @@ function makeFakeGitHub({
     // PR opened silently, as expected.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.comments.length, 0);
 
@@ -2926,7 +3097,7 @@ function makeFakeGitHub({
     ]) {
       await handlePullRequestTarget({
         action,
-        pull_request: { number: 1, head: { sha } },
+        pull_request: { number: 1, head: { sha }, base: { sha: "base-sha-fixture" } },
       });
     }
 
@@ -3018,7 +3189,7 @@ function makeFakeGitHub({
             pull_request: {
               number: value,
               merged: true,
-              head: { sha: "head-sha" },
+              head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" },
             },
           }),
         (err) => {
@@ -3039,7 +3210,7 @@ function makeFakeGitHub({
         () =>
           handlePullRequestTarget({
             action: "opened",
-            pull_request: { number: value, head: { sha: "head-sha" } },
+            pull_request: { number: value, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
           }),
         (err) => {
           assert.ok(
@@ -3080,7 +3251,7 @@ function makeFakeGitHub({
         () =>
           handlePullRequestTarget({
             action: "opened",
-            pull_request: { number: 1, head: { sha: value } },
+            pull_request: { number: 1, head: { sha: value }, base: { sha: "base-sha-fixture" } },
           }),
         (err) => {
           assert.ok(
@@ -3149,7 +3320,7 @@ function makeFakeGitHub({
       if (url.includes("/pulls/1") && !url.includes("/commits")) {
         // Simulate a GitHub API response carrying a malformed head.sha -
         // checkPR() must not trust this any more than it trusts the file.
-        return res(200, { head: { sha: "bad/sha?with=unsafe#chars" } });
+        return res(200, { head: { sha: "bad/sha?with=unsafe#chars" }, base: { sha: "base-sha-fixture" } });
       }
       return innerFetch(url, opts);
     };
@@ -3235,6 +3406,7 @@ function makeFakeGitHub({
         version: 1,
         signatures: [{ id: 1, login: "author" }],
       },
+      headSha: "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4",
     });
     // makeFakeGitHub()'s router is hardcoded to PR #1's endpoints, so give
     // it a matching real-shaped sha rather than reusing PR #1's number
@@ -3255,7 +3427,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: realSha } },
+      pull_request: { number: 1, head: { sha: realSha }, base: { sha: "base-sha-fixture" } },
     };
     await assert.doesNotReject(() => handlePullRequestTarget(payload));
 
@@ -3274,11 +3446,12 @@ function makeFakeGitHub({
   // reach fetch().
   // ---------------------------------------------------------------------
   await test("checkPR percent-encodes a validator-legal but URL-significant sha (containing '&') before it ever reaches fetch(), so it can't inject or override a query parameter", async () => {
+    const trickySha = "abc&page=999&per_page=1";
     const gh = makeFakeGitHub({
       commits: [],
       initialSignatures: { version: 1, signatures: [] },
+      headSha: trickySha,
     });
-    const trickySha = "abc&page=999&per_page=1";
     assert.doesNotThrow(
       () => assertValidSha(trickySha, "sanity check"),
       "this test only proves something if the tricky value is legal input to begin with",
@@ -3293,7 +3466,7 @@ function makeFakeGitHub({
 
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: trickySha } },
+      pull_request: { number: 1, head: { sha: trickySha }, base: { sha: "base-sha-fixture" } },
     };
     await assert.doesNotReject(() => handlePullRequestTarget(payload));
 
@@ -3446,7 +3619,7 @@ function makeFakeGitHub({
     // Opened unsigned - the bot asks.
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(gh.comments.length, 1);
 
@@ -3476,7 +3649,7 @@ function makeFakeGitHub({
     // second, generic "All contributors have signed" comment on top of it.
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "sha-1" } },
+      pull_request: { number: 1, head: { sha: "sha-1" }, base: { sha: "base-sha-fixture" } },
     });
     assert.strictEqual(
       gh.comments.length,
@@ -3526,9 +3699,13 @@ function makeFakeGitHub({
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
-      if (url.includes("/pulls/1/commits")) return res(200, commits);
+      if (url.includes("/compare/"))
+        return res(200, { commits, total_commits: commits.length });
       if (url.includes("/pulls/1") && !url.includes("/commits")) {
-        return res(200, { head: { sha: "head-sha-abc" } });
+        return res(200, {
+          head: { sha: "head-sha-abc" },
+          base: { sha: "base-sha-abc" },
+        });
       }
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
@@ -3665,9 +3842,13 @@ function makeFakeGitHub({
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
-      if (url.includes("/pulls/1/commits")) return res(200, commits);
+      if (url.includes("/compare/"))
+        return res(200, { commits, total_commits: commits.length });
       if (url.includes("/pulls/1") && !url.includes("/commits")) {
-        return res(200, { head: { sha: "head-sha-abc" } });
+        return res(200, {
+          head: { sha: "head-sha-abc" },
+          base: { sha: "base-sha-abc" },
+        });
       }
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
@@ -4335,7 +4516,7 @@ function makeFakeGitHub({
     global.fetch = gh.fetch;
     const payload = {
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     };
     await handlePullRequestTarget(payload);
 
@@ -4565,6 +4746,7 @@ function makeFakeGitHub({
   // ===========================================================================
   await test("checkPR({statusOnly: true}) on a still-failing PR updates the status but posts no comment at all", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-x",
       commits: [
         {
           sha: "c1",
@@ -4587,6 +4769,7 @@ function makeFakeGitHub({
 
   await test("checkPR({statusOnly: true}) on an already-fully-signed PR updates the status to success but posts no comment", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-y",
       commits: [
         {
           sha: "c1",
@@ -4612,6 +4795,7 @@ function makeFakeGitHub({
 
   await test("checkPR with a signer, where the only remaining problem is an unresolved commit (zero missing signers), still posts the personal thank-you AND the manual-review warning", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-z",
       commits: [
         {
           sha: "c1",
@@ -4656,6 +4840,7 @@ function makeFakeGitHub({
 
   await test("checkPR with a signer who is NOT the only one still missing posts the personal thank-you AND still lists the OTHER genuinely-missing signer(s)", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-w",
       commits: [
         {
           sha: "c1",
@@ -4692,6 +4877,7 @@ function makeFakeGitHub({
 
   await test("checkPR given a `signer` who ISN'T actually one of the PR's own commit authors, on a PR that happens to be fully signed by everyone else, uses the generic success message - not a personal thank-you", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-v",
       commits: [
         {
           sha: "c1",
@@ -5130,6 +5316,7 @@ function makeFakeGitHub({
   // ===========================================================================
   await test("a commit with no `parents` field at all is treated as a normal (non-merge) commit - its author is still required to sign, not silently skipped", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-parentless",
       commits: [
         {
           sha: "c1",
@@ -5159,6 +5346,7 @@ function makeFakeGitHub({
   // ===========================================================================
   await test("a commit whose author object is present but has no login at all is treated as unresolved (needs manual review), not silently skipped or crashed on", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-no-login",
       commits: [
         {
           sha: "no-login-sha",
@@ -5182,6 +5370,7 @@ function makeFakeGitHub({
 
   await test("a commit whose author has a login but a non-numeric id is treated as unresolved (needs manual review), not silently skipped or crashed on", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-bad-id",
       commits: [
         {
           sha: "bad-id-sha",
@@ -5364,6 +5553,7 @@ function makeFakeGitHub({
   // ===========================================================================
   await test("quietIfNeverFlagged stays silent even when the single most recent bot comment is an unrelated 'other'-classified one, trailing after an already-resolved pending/success pair", async () => {
     const gh = makeFakeGitHub({
+      headSha: "sha-quiet-trailing-other",
       commits: [
         {
           sha: "c1",

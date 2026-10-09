@@ -421,9 +421,14 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     state.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
       if (url.endsWith("/user")) return res(404, { message: "Not Found" });
-      if (url.includes("/pulls/1/commits")) return res(200, commits);
-      if (url.includes("/pulls/1") && !url.includes("/commits")) {
-        return res(200, { head: { sha: "head-sha-abc" } });
+      if (url.includes("/compare/")) {
+        return res(200, { commits, total_commits: commits.length });
+      }
+      if (url.includes("/pulls/1")) {
+        return res(200, {
+          head: { sha: "head-sha-abc" },
+          base: { sha: "base-sha-abc" },
+        });
       }
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
@@ -525,7 +530,15 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "head-sha-abc" } },
+      // The event's base matches the mocked GET /pulls/1 base above exactly:
+      // these scenarios are about the comments cache, not checkPR()'s
+      // base-change retry path, so no run should take an extra,
+      // unintended re-evaluation.
+      pull_request: {
+        number: 1,
+        head: { sha: "head-sha-abc" },
+        base: { sha: "base-sha-abc" },
+      },
     });
 
     assert.ok(
@@ -563,7 +576,15 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "head-sha-abc" } },
+      // The event's base matches the mocked GET /pulls/1 base above exactly:
+      // these scenarios are about the comments cache, not checkPR()'s
+      // base-change retry path, so no run should take an extra,
+      // unintended re-evaluation.
+      pull_request: {
+        number: 1,
+        head: { sha: "head-sha-abc" },
+        base: { sha: "base-sha-abc" },
+      },
     });
 
     assert.strictEqual(

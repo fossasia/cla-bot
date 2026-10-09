@@ -72,9 +72,13 @@ function installMockGitHub({ commits, signatures = [], usersById = {} }) {
       const u = usersById[userById[1]];
       return u ? res(200, u) : res(404, { message: "Not Found" });
     }
-    if (pathname.endsWith("/pulls/1/commits")) return res(200, commits);
+    if (pathname.startsWith("/repos/fossasia/testrepo/compare/"))
+      return res(200, { commits, total_commits: commits.length });
     if (pathname.endsWith("/pulls/1")) {
-      return res(200, { head: { sha: "head-sha-abc" } });
+      return res(200, {
+        head: { sha: "head-sha-abc" },
+        base: { sha: "base-sha-abc" },
+      });
     }
     if (pathname.includes("/contents/signatures/cla.json")) {
       if (method === "GET") {
@@ -121,7 +125,11 @@ const commitBy = (id, login, message = "change") => ({
 const runAutomaticCheck = (bot) =>
   bot.handlePullRequestTarget({
     action: "opened",
-    pull_request: { number: 1, head: { sha: "head-sha-abc" } },
+    // Matches the mocked GET /pulls/1 base above exactly: this scenario is
+    // testing the allowlist, not checkPR()'s base-change retry path, so the
+    // event's base must already agree with the live PR - otherwise every run
+    // here would silently go through one extra, unintended re-evaluation.
+    pull_request: { number: 1, head: { sha: "head-sha-abc" }, base: { sha: "base-sha-abc" } },
   });
 
 const lastStatus = (state) => state.statuses[state.statuses.length - 1];
