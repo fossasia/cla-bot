@@ -1264,6 +1264,94 @@ const linkTo = (path, last) =>
     );
   });
 
+  await test("listCommitsBetween: pagination handles page boundaries with Link metadata", async () => {
+    const b = freshModule();
+    for (const total of [0, 1, 100, 101, 199, 200, 201]) {
+      const commits = Array.from({ length: total }, (_, i) =>
+        commit(i, i + 1, `author${i}`),
+      );
+      const expectedPages = Math.ceil(total / 100);
+      const calls = [];
+      global.fetch = async (url) => {
+        const page = Number((url.match(/[&?]page=(\d+)/) || [])[1] || 1);
+        calls.push(page);
+        const path = url.replace("https://api.github.com", "").split("?")[0];
+        return res(
+          200,
+          {
+            commits: commits.slice((page - 1) * 100, page * 100),
+            total_commits: total,
+          },
+          expectedPages > 1 ? { link: linkTo(path, expectedPages) } : {},
+        );
+      };
+
+      const got = await b.listCommitsBetween(BASE_SHA, DEFAULT_HEAD_SHA, "t");
+      assert.deepStrictEqual(
+        got.map((c) => c.sha),
+        commits.map((c) => c.sha),
+        `${total} commits`,
+      );
+      assert.deepStrictEqual(
+        calls.sort((a, b) => a - b),
+        Array.from({ length: Math.max(1, expectedPages) }, (_, i) => i + 1),
+        `${total} commits: requests exactly the expected pages`,
+      );
+    }
+  });
+
+  await test("listCommitsBetween: total_commits controls the page range when Link is missing, malformed, low, or high", async () => {
+    const b = freshModule();
+    const cases = [
+      { total: 201, link: null, pages: 3, name: "missing Link" },
+      { total: 201, link: "not a Link header", pages: 3, name: "malformed Link" },
+      {
+        total: 201,
+        link: '<https://api.github.com/r/compare?page=2>; rel="last"',
+        pages: 3,
+        name: "under-reported last page",
+      },
+      {
+        total: 101,
+        link: '<https://api.github.com/r/compare?page=3>; rel="last"',
+        pages: 2,
+        name: "over-reported last page",
+      },
+      {
+        total: 100,
+        link: '<https://api.github.com/r/compare?page=101>; rel="last"',
+        pages: 1,
+        name: "oversized last page contradicted by count",
+      },
+    ];
+    for (const c of cases) {
+      const commits = Array.from({ length: c.total }, (_, i) =>
+        commit(i, i + 1, `author${i}`),
+      );
+      const calls = [];
+      global.fetch = async (url) => {
+        const page = Number((url.match(/[&?]page=(\d+)/) || [])[1] || 1);
+        calls.push(page);
+        return res(
+          200,
+          {
+            commits: commits.slice((page - 1) * 100, page * 100),
+            total_commits: c.total,
+          },
+          c.link ? { link: c.link } : {},
+        );
+      };
+
+      const got = await b.listCommitsBetween(BASE_SHA, DEFAULT_HEAD_SHA, "t");
+      assert.strictEqual(got.length, c.total, c.name);
+      assert.deepStrictEqual(
+        calls.sort((a, b) => a - b),
+        Array.from({ length: c.pages }, (_, i) => i + 1),
+        `${c.name}: fetch only count-derived pages`,
+      );
+    }
+  });
+
   await test("checkPR: a PR move during a paginated compare cannot mix revisions or publish the old pair", async () => {
     const b = freshModule();
     const A = "a1".repeat(20);
@@ -1467,7 +1555,11 @@ const linkTo = (path, last) =>
   await test("listCommitsBetween: a compare that needs more than 100 pages fails after one request, whether total_commits or the Link header says so", async () => {
     for (const [total, header, why] of [
       [10001, null, "total_commits"],
-      [500, '<https://api.github.com/x?page=101>; rel="last"', "Link header"],
+      [
+        10001,
+        '<https://api.github.com/x?page=101>; rel="last"',
+        "total_commits and Link header",
+      ],
     ]) {
       const calls = [];
       global.fetch = async (url) => {
@@ -1500,6 +1592,33 @@ const linkTo = (path, last) =>
       100,
       "total_commits already says there are exactly 10,000, so page 101 is never requested",
     );
+  });
+
+  await test("listCommitsBetween: the 9,999 and 10,000 commit boundaries agree with a valid Link last page", async () => {
+    for (const total of [9999, 10000]) {
+      const expectedPages = Math.ceil(total / 100);
+      const calls = [];
+      global.fetch = async (url) => {
+        const page = Number(url.match(/[&?]page=(\d+)/)[1]);
+        calls.push(page);
+        const path = url.replace("https://api.github.com", "").split("?")[0];
+        return res(
+          200,
+          {
+            commits: Array(Math.min(100, total - (page - 1) * 100)).fill({}),
+            total_commits: total,
+          },
+          page === 1 ? { link: linkTo(path, expectedPages) } : {},
+        );
+      };
+      const got = await bot.listCommitsBetween(BASE_SHA, DEFAULT_HEAD_SHA, "t");
+      assert.strictEqual(got.length, total, `${total} commits`);
+      assert.deepStrictEqual(
+        calls.sort((a, b) => a - b),
+        Array.from({ length: expectedPages }, (_, i) => i + 1),
+        `${total} commits: Link and total agree through the final page`,
+      );
+    }
   });
 
   await test("listCommitsBetween: with no usable header, the walk stops as soon as total_commits is reached - more items than promised is still caught as a mismatch, not silently accepted", async () => {

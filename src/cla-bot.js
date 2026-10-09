@@ -921,31 +921,29 @@ async function listCommitsBetween(baseSha, headSha, token) {
   const items = asList(first.data && first.data.commits);
 
   const label = `compare ${baseSha}...${headSha}`;
-  // Both numbers are checked up front, so an oversized compare fails before
-  // any fan-out.
-  assertWithinPageLimit(label, Math.ceil(totalCommits / LIST_PAGE_SIZE));
+  // total_commits determines how many pages are required and is checked
+  // before any fan-out. The Link header is only a pagination hint: if its
+  // last-page value disagrees with the count, walk the count-derived range
+  // sequentially rather than trusting either an under-reported or an
+  // over-reported page count.
+  const expectedPages = Math.ceil(totalCommits / LIST_PAGE_SIZE);
+  assertWithinPageLimit(label, expectedPages);
   const lastPage = parseLastPage(first.link);
-  if (lastPage !== null) assertWithinPageLimit(label, lastPage);
-  if (lastPage !== null && lastPage > 1) {
+  if (lastPage === expectedPages && expectedPages > 1) {
     const group = createReadGroup();
     const rest = await allOrAbort(
       group,
-      Array.from({ length: lastPage - 1 }, (_, i) => i + 2).map(async (n) =>
+      Array.from({ length: expectedPages - 1 }, (_, i) => i + 2).map(async (n) =>
         asList((await group.read(pageUrl(n), token)).commits),
       ),
     );
     for (const pageItems of rest) items.push(...pageItems);
-  } else if (lastPage === null) {
-    // No usable Link header, but total_commits (checked above) already told
-    // us the exact count, so we stop exactly there instead of guessing from
-    // whether a page happens to be full. That guess is what breaks at the
-    // page-100 boundary: a page full of 100 items looks the same whether the
-    // list has exactly that many commits or many more, so walking "while the
-    // last page is full" would reject a legitimate 10,000-commit compare.
-    // Stopping once we have totalCommits items avoids the question entirely.
-    // A short page still ends the walk early too (there's nothing more to
-    // fetch), same as before - the final total_commits check below catches
-    // either case coming up short.
+  } else if (expectedPages > 1) {
+    // With no usable Link header, or a Link/count disagreement, total_commits
+    // gives the exact expected range. Stop at that count rather than guessing
+    // from whether a page is full: a full page 100 is ambiguous at the
+    // 10,000-commit boundary. A short page ends early; the final total check
+    // below rejects that incomplete read.
     let page = 1;
     let lastPageSize = items.length;
     while (items.length < totalCommits && lastPageSize === LIST_PAGE_SIZE) {
