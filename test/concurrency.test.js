@@ -1629,11 +1629,11 @@ const linkTo = (path, last) =>
     const b = freshModule();
     const A = "a1".repeat(20);
     const H = "c3".repeat(20);
-    const bases = ["b1", "b2", "b3", "b4"].map((x) => x.repeat(20));
+    const bases = [A, ...["b1", "b2", "b3"].map((x) => x.repeat(20))];
     const g = makeMovingBase((n) => ({ head: H, base: bases[n - 1] }));
     global.fetch = g.fetch;
     await assert.rejects(
-      () => b.checkPR(1, H, { statusOnly: true, eventBaseSha: A }),
+      () => b.checkPR(1, H, { statusOnly: true }),
       /kept changing.*3 attempts/,
     );
     assert.strictEqual(
