@@ -45,12 +45,12 @@ async function test(name, fn) {
   }
 }
 
-function res(status, jsonBody) {
+function res(status, jsonBody, headers = {}) {
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
-    headers: { get: () => null },
+    headers: { get: (name) => headers[name.toLowerCase()] || null },
   };
 }
 function b64(obj) {
@@ -179,7 +179,20 @@ function makeFakeGitHub({
         const pageMatch = url.match(/[&?]page=(\d+)/);
         const pageNum = pageMatch ? Number(pageMatch[1]) : 1;
         const start = (pageNum - 1) * 100;
-        return res(200, state.comments.slice(start, start + 100));
+        const pageCount = Math.ceil(state.comments.length / 100);
+        let link = null;
+        if (pageCount > 1) {
+          const base = new URL(url);
+          const parts = [];
+          if (pageNum < pageCount) {
+            base.searchParams.set("page", String(pageNum + 1));
+            parts.push(`<${base.href}>; rel="next"`);
+          }
+          base.searchParams.set("page", String(pageCount));
+          parts.push(`<${base.href}>; rel="last"`);
+          link = parts.join(", ");
+        }
+        return res(200, state.comments.slice(start, start + 100), { link });
       }
       if (method === "POST") {
         const { body } = JSON.parse(opts.body);
