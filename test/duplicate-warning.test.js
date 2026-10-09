@@ -11,8 +11,6 @@
  * Run: node test/duplicate-warning.test.js (also included in `npm test`)
  */
 const assert = require("assert");
-const fs = require("fs");
-const { Readable } = require("stream");
 
 process.env.GITHUB_TOKEN = "dummy";
 process.env.GITHUB_REPOSITORY = "fossasia/testrepo";
@@ -44,15 +42,6 @@ function res(status, jsonBody) {
   };
 }
 
-function resText(status, text) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    text: async () => text,
-    headers: { get: () => null },
-  };
-}
-
 const BOT = { login: "github-actions[bot]" };
 const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 
@@ -62,23 +51,13 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 // small real delay to each DELETE so overlapping ones are actually
 // observable, and the result reports the highest number seen in flight at
 // once. Returns what was observed.
-async function run({
-  extraIds,
-  postedId = 100,
-  failDeleteIds = [],
-  trackConcurrency = false,
-  corruptSpool = false,
-}) {
+async function run({ extraIds, failDeleteIds = [], trackConcurrency = false }) {
   const text = "dup-warning-body";
   const full = `${MARKER}\n${text}`;
   const warnings = [];
   const deleted = [];
   const originalWarn = console.warn;
-  const originalCreateReadStream = fs.createReadStream;
   console.warn = (msg) => warnings.push(String(msg));
-  if (corruptSpool) {
-    fs.createReadStream = () => Readable.from(["not-a-comment-id"]);
-  }
   let getCount = 0;
   let inFlightDeletes = 0;
   let maxInFlightDeletes = 0;
@@ -88,26 +67,16 @@ async function run({
       if (method === "GET") {
         getCount += 1;
         if (getCount === 1) return res(200, []); // pre-check: nothing yet
-        const history = [
+        return res(200, [
           ...extraIds.map((id) => ({ id, body: full, user: BOT })),
-          { id: postedId, body: full, user: BOT }, // the one just posted: newest
-        ];
-        // Model REST's numeric JSON ID tokens, including values that JSON.parse
-        // would normally round. The production request opts into lossless ID
-        // parsing for this endpoint.
-        const json = JSON.stringify(history).replace(
-          /("id":")([1-9]\d{15,})(")/g,
-          (_match, prefix, decimalId) => `${prefix.slice(0, -1)}${decimalId}`,
-        );
-        return resText(200, json);
+          { id: 100, body: full, user: BOT }, // the one just posted: newest
+        ]);
       }
       if (method === "POST")
-        return res(201, { id: postedId, body: full, user: BOT });
+        return res(201, { id: 100, body: full, user: BOT });
     }
     if (url.includes("/issues/comments/") && method === "DELETE") {
-      const rawId = url.split("/issues/comments/")[1];
-      const numericId = Number(rawId);
-      const id = Number.isSafeInteger(numericId) ? numericId : rawId;
+      const id = Number(url.split("/issues/comments/")[1]);
       inFlightDeletes += 1;
       maxInFlightDeletes = Math.max(maxInFlightDeletes, inFlightDeletes);
       if (trackConcurrency) await new Promise((r) => setTimeout(r, 5));
@@ -123,15 +92,10 @@ async function run({
     await postComment(7, text);
   } finally {
     console.warn = originalWarn;
-    fs.createReadStream = originalCreateReadStream;
   }
   return {
     warnings,
-    deleted: deleted.sort((a, b) => {
-      const left = BigInt(a);
-      const right = BigInt(b);
-      return left < right ? -1 : left > right ? 1 : 0;
-    }),
+    deleted: deleted.sort((a, b) => a - b),
     maxInFlightDeletes,
   };
 }
@@ -154,33 +118,6 @@ const isDupSummary = (w) => w.includes("duplicate bot comment(s)");
     );
     assert.ok(summary[0].includes("Found 2 duplicate"), summary[0]);
     assert.ok(summary[0].includes("PR #7"), summary[0]);
-  });
-
-  await test("duplicate cleanup preserves unsafe comment IDs exactly through REST parsing, spool replay, and DELETE", async () => {
-    const largeDuplicateIds = ["9007199254740993", "9007199254740994"];
-    const { deleted, warnings } = await run({
-      extraIds: largeDuplicateIds,
-      postedId: "9007199254740995",
-    });
-    assert.deepStrictEqual(
-      deleted,
-      largeDuplicateIds,
-      JSON.stringify({ deleted, warnings }),
-    );
-  });
-
-  await test("duplicate cleanup refuses malformed IDs read from its private spool", async () => {
-    const { deleted, warnings } = await run({
-      extraIds: [98, 99],
-      corruptSpool: true,
-    });
-    assert.deepStrictEqual(deleted, []);
-    assert.ok(
-      warnings.some((warning) =>
-        warning.includes("invalid ID in its temporary file"),
-      ),
-      JSON.stringify(warnings),
-    );
   });
 
   await test("the warning points the maintainer at the concurrency group", async () => {

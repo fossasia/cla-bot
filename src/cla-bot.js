@@ -112,15 +112,6 @@ if (NODE_MAJOR < 22 || typeof fetch !== "function") {
 // Config (all values come from env vars set by action.yml)
 // ---------------------------------------------------------------------------
 const GITHUB_API = process.env.GITHUB_API_URL || "https://api.github.com";
-const GITHUB_GRAPHQL_API = (() => {
-  const api = new URL(GITHUB_API);
-  if (/\/api\/v3\/?$/.test(api.pathname)) {
-    api.pathname = api.pathname.replace(/\/api\/v3\/?$/, "/api/graphql");
-  } else {
-    api.pathname = `${api.pathname.replace(/\/$/, "")}/graphql`;
-  }
-  return api.toString().replace(/\/$/, "");
-})();
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const SIG_APP_ID = process.env.SIG_APP_ID || "";
 const SIG_APP_PRIVATE_KEY = process.env.SIG_APP_PRIVATE_KEY || "";
@@ -677,19 +668,8 @@ async function ghRaw(path, token, options = {}) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
-    const useGraphQL = options.graphql === true;
-    const endpoint =
-      useGraphQL === true ? GITHUB_GRAPHQL_API : `${GITHUB_API}${path}`;
-    // The event file is GitHub's documented action input; this client sends
-    // selected fields only to the runner-configured GitHub API.
-    // codeql[js/file-access-to-http] The event cannot choose the request destination.
-    const res = await fetch(endpoint, {
-      // Forward only the method and structured body; the remaining fetch
-      // options are built here.
-      method: options.method,
-      // Request bodies are structured API payloads, not arbitrary file bytes.
-      // codeql[js/file-access-to-http] Only selected webhook fields and API data are serialized here.
-      body: options.body,
+    const res = await fetch(`${GITHUB_API}${path}`, {
+      ...options,
       signal: controller.signal,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -723,35 +703,12 @@ async function ghRaw(path, token, options = {}) {
     }
     // Raw media-type requests (see readSignatures) return plain text.
     if (options.raw) return text;
-    const jsonText = options.preserveUnsafeIds
-      ? preserveUnsafeJsonIds(text)
-      : text;
-    const data = jsonText ? JSON.parse(jsonText) : null;
+    const data = text ? JSON.parse(text) : null;
     // Only list calls ask for the Link header (see listCommitsBetween()).
     return options.withLink ? { data, link: readLinkHeader(res) } : data;
   } finally {
     clearTimeout(timeout);
   }
-}
-
-// GitHub's REST API serializes database IDs as JSON numbers. JSON.parse()
-// rounds integers above Number.MAX_SAFE_INTEGER, so preserve unsafe `id`
-// tokens as decimal strings for comment-list responses that use those IDs.
-// This lexical replacement only touches JSON object properties named `id`;
-// escaped text inside JSON strings cannot match the `{`/`,` property prefix.
-function preserveUnsafeJsonIds(jsonText) {
-  const maxSafeId = String(Number.MAX_SAFE_INTEGER);
-  return jsonText.replace(
-    /([,{]\s*)"id"(\s*:\s*)([1-9]\d*)(?=\s*[,}\]])/g,
-    (match, prefix, separator, decimalId) => {
-      const isUnsafe =
-        decimalId.length > maxSafeId.length ||
-        (decimalId.length === maxSafeId.length && decimalId > maxSafeId);
-      return isUnsafe
-        ? `${prefix}"id"${separator}${JSON.stringify(decimalId)}`
-        : match;
-    },
-  );
 }
 
 async function gh(path, token, options = {}, attempt = 1) {
@@ -835,33 +792,6 @@ const limitReads = createLimiter(GITHUB_READ_CONCURRENCY);
 // overlap (like the signatures file) can call gh() directly.
 const ghRead = (path, token, options) =>
   limitReads(() => gh(path, token, options));
-
-// GraphQL queries are POST requests but have no side effects, so retries are
-// safe. GraphQL can report resolver failures with HTTP 200; reject those here
-// instead of accepting partial data for a CLA or comment-history decision.
-async function ghGraphQL(query, variables, token) {
-  const response = await limitReads(() =>
-    gh("/graphql", token, {
-      method: "POST",
-      graphql: true,
-      idempotent: true,
-      body: JSON.stringify({ query, variables }),
-    }),
-  );
-  if (response && Array.isArray(response.errors) && response.errors.length) {
-    const details = response.errors
-      .map((error) => error && error.message)
-      .filter((message) => typeof message === "string" && message.length)
-      .join("; ");
-    throw new Error(
-      `GitHub GraphQL query failed${details ? `: ${details}` : " with resolver errors"}.`,
-    );
-  }
-  if (!response || !response.data) {
-    throw new Error("GitHub GraphQL returned no data.");
-  }
-  return response.data;
-}
 
 // A set of reads that belong together (the pages of one list). If one of them
 // fails, abort() stops the rest from starting: reads already in flight finish,
@@ -1812,68 +1742,21 @@ async function fetchBotLogin() {
 // read. Such an entry must not count: a repeat would be read as a second copy
 // of that comment, and dedupeIdenticalTrailingComments() would then delete
 // one of the "two" - which is the only one. So an entry counts only if its id
-// is above every id taken so far. This filter is for REST's creation-ordered
-// list; GraphQL's update-time order is handled by retaining and sorting IDs.
+// is above every id taken so far.
 //
 // Returns a function to call once per entry, in listing order: true to take
 // the entry, false to skip a repeat or an out-of-order one. It keeps one
 // number, so it is as cheap on a huge history as on a small one (the readers
 // below stream the history on purpose, and must not start holding it). An
-// entry whose id is neither a safe integer nor a positive decimal string
-// can't be judged and is taken as is.
+// entry whose id is not a safe integer can't be judged and is taken as is.
 function createAscendingIdFilter() {
-  let last = null;
+  let last = -Infinity;
   return (id) => {
-    let comparable;
-    if (Number.isSafeInteger(id) && id > 0) comparable = BigInt(id);
-    else if (typeof id === "string" && /^[1-9]\d*$/.test(id)) {
-      comparable = BigInt(id);
-    } else {
-      return true;
-    }
-    if (last !== null && comparable <= last) return false;
-    last = comparable;
+    if (!Number.isSafeInteger(id)) return true;
+    if (id <= last) return false;
+    last = id;
     return true;
   };
-}
-
-function isUsableCommentId(id) {
-  return (
-    (Number.isSafeInteger(id) && id > 0) ||
-    (typeof id === "string" && /^[1-9]\d*$/.test(id))
-  );
-}
-
-function sameCommentId(left, right) {
-  return (
-    isUsableCommentId(left) &&
-    isUsableCommentId(right) &&
-    String(left) === String(right)
-  );
-}
-
-function commentIdAsBigInt(id) {
-  if (!isUsableCommentId(id)) return null;
-  return BigInt(id);
-}
-
-function compareCommentIds(left, right) {
-  const leftId = commentIdAsBigInt(left);
-  const rightId = commentIdAsBigInt(right);
-  if (leftId === null || rightId === null) return 0;
-  return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
-}
-
-function retainRecentComment(comments, comment) {
-  const existingIndex = comments.findIndex((cached) =>
-    sameCommentId(cached.id, comment.id),
-  );
-  if (existingIndex !== -1) comments.splice(existingIndex, 1);
-  comments.push(comment);
-  comments.sort((left, right) => compareCommentIds(left.id, right.id));
-  if (comments.length > MAX_CACHED_COMMENTS) {
-    comments.splice(0, comments.length - MAX_CACHED_COMMENTS);
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1944,10 +1827,9 @@ const commentsCacheStorage = new AsyncLocalStorage();
 
 async function fetchAllIssueComments(
   prNumber,
-  { fresh = false, cache, botLoginPromise, initialPage = null },
+  { fresh = false, cache, botLoginPromise },
 ) {
-  if (!cache)
-    return fetchAllIssueCommentsUncached(prNumber, botLoginPromise, initialPage);
+  if (!cache) return fetchAllIssueCommentsUncached(prNumber, botLoginPromise);
   if (!fresh) {
     const entry = cache.get(prNumber);
     if (entry !== undefined) return entry.promise;
@@ -1959,11 +1841,7 @@ async function fetchAllIssueComments(
   // without changing what's actually being asked: "is this still MY fetch,
   // or did a newer one already replace it?"
   const entry = {
-    promise: fetchAllIssueCommentsUncached(
-      prNumber,
-      botLoginPromise,
-      initialPage,
-    ),
+    promise: fetchAllIssueCommentsUncached(prNumber, botLoginPromise),
   };
   cache.set(prNumber, entry);
   try {
@@ -2062,25 +1940,16 @@ const MAX_CACHED_COMMENTS = 200;
 // safe for exact-duplicate lookups, but would silently give the wrong
 // answer here if an old, still-unresolved pending comment ever aged out of
 // the window. So these two are never trimmed and never hold a comment or
-// its body at all - just where the most recent "pending" and "success"
-// comments were created. REST reads store sequence positions; GraphQL reads
-// store exact IDs so update-time pagination cannot lose creation chronology.
-// This stays O(1), regardless of how many comments a PR has accumulated.
-async function fetchAllIssueCommentsUncached(
-  prNumber,
-  botLoginPromise,
-  initialPage = null,
-) {
+// its body at all - just which admission-order position ("seq") the most
+// recent "pending" and the most recent "success" were last seen at, each
+// overwritten in place as a later one of the same category comes along.
+// That is two integers, genuinely O(1) regardless of how many comments a PR
+// has ever accumulated - correct at any scale, not just within a cap.
+async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
   const all = [];
-  const graphqlMode = Boolean(initialPage);
-  if (graphqlMode && !isCompleteGraphQLCommentPage(initialPage)) {
-    throw new Error(
-      "GitHub GraphQL returned an incomplete PR comments page; a full REST read is required.",
-    );
-  }
   let seq = 0;
-  let lastPendingSeq = graphqlMode ? null : -1;
-  let lastSuccessSeq = graphqlMode ? null : -1;
+  let lastPendingSeq = -1;
+  let lastSuccessSeq = -1;
   // Latest comment BODY per category, for the CURRENT (strict) identity
   // only - never the broader anyBotIdentity match. Same reasoning and same
   // "just overwrite it, never trim it" technique as lastPendingSeq /
@@ -2089,39 +1958,27 @@ async function fetchAllIssueCommentsUncached(
   // how many comments the PR has - see latestOwnCommentBody() below for who
   // actually needs this.
   const latestOwnBodyByCategory = Object.create(null);
-  const latestOwnIdByCategory = Object.create(null);
   const takeId = createAscendingIdFilter();
-  let page = initialPage;
-  let restPage = 1;
+  let page = 1;
   for (;;) {
-    let comments;
-    if (graphqlMode) {
-      const connection = page;
-      page = null;
-      comments = connection.nodes;
-    } else {
-      // REST's creation-ordered pages keep existing comments in place when
-      // their bodies are edited. GraphQL is only used for a validated single
-      // page; larger histories start at REST page one.
-      comments = await ghRead(
-        `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?per_page=100&page=${restPage}`,
-        GITHUB_TOKEN,
-        { preserveUnsafeIds: true },
-      );
-      if (!comments.length) break;
-    }
+    // ghRead(), not gh(): this runs alongside the bot-login lookup (see
+    // getExistingBotComments()), and every read that can overlap another
+    // shares the one limiter. The pages themselves are still read one at a
+    // time, see the note above.
+    const comments = await ghRead(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?per_page=100&page=${page}`,
+      GITHUB_TOKEN,
+    );
+    if (!comments.length) break;
     // Resolved once, reused for every page (botLogin cannot change mid-run -
     // resolveBotLogin() caches it for the whole process). Not awaited until
     // here so the caller can start this fetch and resolveBotLogin() at the
     // same time instead of one after the other.
     const botLogin = await botLoginPromise;
-    for (const node of comments) {
-      const c = graphqlMode ? mapGraphQLIssueComment(node) : node;
-      // REST comments are ordered by ascending ID, so this filter drops a
-      // duplicate or out-of-order entry. GraphQL comments are ordered by
-      // UPDATED_AT, which can differ from creation order after an edit; keep
-      // those entries and derive chronological metadata from their IDs.
-      if (!graphqlMode && !takeId(c.id)) continue;
+    for (const c of comments) {
+      // A repeat (or out-of-order entry) from a list that changed mid-read
+      // is not a second comment - see createAscendingIdFilter().
+      if (!takeId(c.id)) continue;
       if (
         !c.user ||
         !c.body ||
@@ -2131,55 +1988,26 @@ async function fetchAllIssueCommentsUncached(
         continue;
       }
       const category = classifyBotComment(c.body);
-      const commentId = graphqlMode ? commentIdAsBigInt(c.id) : null;
-      if (category === "pending") {
-        if (
-          !graphqlMode ||
-          lastPendingSeq === null ||
-          commentId > lastPendingSeq
-        )
-          lastPendingSeq = graphqlMode ? commentId : seq;
-      } else if (category === "success") {
-        if (
-          !graphqlMode ||
-          lastSuccessSeq === null ||
-          commentId > lastSuccessSeq
-        ) {
-          lastSuccessSeq = graphqlMode ? commentId : seq;
-        }
-      }
+      if (category === "pending") lastPendingSeq = seq;
+      else if (category === "success") lastSuccessSeq = seq;
       seq += 1;
       if (c.user.login === botLogin) {
-        const previousId = latestOwnIdByCategory[category];
-        if (
-          !graphqlMode ||
-          previousId === undefined ||
-          commentId > previousId
-        ) {
-          latestOwnBodyByCategory[category] = c.body;
-          if (graphqlMode) latestOwnIdByCategory[category] = commentId;
-        }
+        latestOwnBodyByCategory[category] = c.body;
       }
-      const retained = {
+      all.push({
         id: c.id,
         body: c.body,
         user: { login: c.user.login, type: c.user.type },
-      };
-      if (graphqlMode) retainRecentComment(all, retained);
-      else all.push(retained);
+      });
     }
     // Trimmed here, inside the loop, not just once at the end - otherwise a
     // large flood could still blow up peak memory while it's being read,
     // even if the final cached result would have ended up small.
-    if (!graphqlMode && all.length > MAX_CACHED_COMMENTS) {
+    if (all.length > MAX_CACHED_COMMENTS) {
       all.splice(0, all.length - MAX_CACHED_COMMENTS);
     }
-    if (graphqlMode) break;
-    else {
-      if (comments.length < 100) break;
-      restPage += 1;
-      continue;
-    }
+    if (comments.length < 100) break;
+    page += 1;
   }
   return {
     comments: all,
@@ -2187,7 +2015,6 @@ async function fetchAllIssueCommentsUncached(
     lastSuccessSeq,
     nextSeq: seq,
     latestOwnBodyByCategory,
-    graphqlMode,
   };
 }
 
@@ -2207,10 +2034,7 @@ async function pendingIsNewerThanSuccess(prNumber) {
     prNumber,
     { cache, botLoginPromise },
   );
-  return (
-    lastPendingSeq !== null &&
-    (lastSuccessSeq === null || lastPendingSeq > lastSuccessSeq)
-  );
+  return lastPendingSeq > lastSuccessSeq;
 }
 
 // The current bot identity's own latest comment body for `category` (or
@@ -2310,31 +2134,26 @@ async function rememberOwnPostedComment(prNumber, category, body, comment) {
   const history = await entry.promise;
   const { comments, latestOwnBodyByCategory } = history;
   latestOwnBodyByCategory[category] = body;
-  if (!comment || !isUsableCommentId(comment.id)) {
+  if (!comment || !Number.isSafeInteger(comment.id)) {
     // Without the API's comment ID we cannot safely patch the list. Force the
     // next read to fetch GitHub instead of returning a known-stale snapshot.
     if (cache.get(prNumber) === entry) cache.delete(prNumber);
     return;
   }
-  if (comments.some((cached) => sameCommentId(cached.id, comment.id))) return;
-  const commentId = history.graphqlMode
-    ? commentIdAsBigInt(comment.id)
-    : history.nextSeq;
-  if (category === "pending") history.lastPendingSeq = commentId;
-  else if (category === "success") history.lastSuccessSeq = commentId;
+  if (comments.some((cached) => cached.id === comment.id)) return;
+  if (category === "pending") history.lastPendingSeq = history.nextSeq;
+  else if (category === "success") history.lastSuccessSeq = history.nextSeq;
   history.nextSeq += 1;
   const botLogin = await resolveBotLogin();
-  const retained = {
+  comments.push({
     id: comment.id,
     body,
     user: {
       login: (comment.user && comment.user.login) || botLogin,
       type: comment.user && comment.user.type,
     },
-  };
-  if (history.graphqlMode) retainRecentComment(comments, retained);
-  else comments.push(retained);
-  if (!history.graphqlMode && comments.length > MAX_CACHED_COMMENTS) {
+  });
+  if (comments.length > MAX_CACHED_COMMENTS) {
     comments.splice(0, comments.length - MAX_CACHED_COMMENTS);
   }
 }
@@ -2349,10 +2168,9 @@ async function rememberOwnPostedComment(prNumber, category, body, comment) {
 const MAX_CONCURRENT_DELETES = 10;
 
 async function deleteDuplicateComment(prNumber, dup) {
-  const commentId = String(dup && dup.id);
   try {
     await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${encodeURIComponent(commentId)}`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/comments/${encodeURIComponent(dup.id)}`,
       GITHUB_TOKEN,
       { method: "DELETE" },
     );
@@ -2377,7 +2195,7 @@ async function forgetDeletedCachedComment(prNumber, commentId) {
   const entry = cache && cache.get(prNumber);
   if (!entry) return;
   const { comments } = await entry.promise;
-  const index = comments.findIndex((comment) => sameCommentId(comment.id, commentId));
+  const index = comments.findIndex((comment) => comment.id === commentId);
   if (index !== -1) comments.splice(index, 1);
 }
 
@@ -2413,7 +2231,6 @@ async function findExactDuplicateComments(prNumber, body) {
       const comments = await gh(
         `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?sort=created&direction=asc&per_page=100&page=${page}`,
         GITHUB_TOKEN,
-        { preserveUnsafeIds: true },
       );
       if (!comments.length) break;
       for (const c of comments) {
@@ -2421,10 +2238,9 @@ async function findExactDuplicateComments(prNumber, body) {
           c.user &&
           c.user.login === botLogin &&
           c.body === body &&
-          isUsableCommentId(c.id) &&
           takeId(c.id)
         ) {
-          bufferedIds += `${String(c.id)}\n`;
+          bufferedIds += `${c.id}\n`;
           count += 1;
           // Keep the write buffer fixed-size even for pathological histories.
           if (count % 1000 === 0) {
@@ -2470,12 +2286,7 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
       let previousId;
       let batch = [];
       for await (const line of lines) {
-        const id = line;
-        if (!isUsableCommentId(id)) {
-          throw new Error(
-            "Duplicate comment cleanup encountered an invalid ID in its temporary file.",
-          );
-        }
+        const id = Number(line);
         if (previousId !== undefined) {
           batch.push({ id: previousId });
           if (batch.length === MAX_CONCURRENT_DELETES) {
@@ -2541,170 +2352,21 @@ async function lockPR(prNumber) {
   }
 }
 
-const PR_SNAPSHOT_GRAPHQL = `
-  query ClaBotPullRequestSnapshot(
-    $owner: String!, $name: String!, $number: Int!,
-    $includeComments: Boolean!
-  ) {
-    repository(owner: $owner, name: $name) {
-      pullRequest(number: $number) {
-        baseRefOid
-        headRefOid
-        comments(first: 100) @include(if: $includeComments) {
-          totalCount
-          pageInfo { hasNextPage }
-          nodes {
-            fullDatabaseId
-            body
-            author {
-              __typename
-              ... on User { login }
-              ... on Bot { login }
-            }
-          }
-        }
-      }
-    }
-  }
-`;
-
-async function fetchPRGraphQLSnapshot(
-  prNumber,
-  { includeComments = true } = {},
-) {
-  const data = await ghGraphQL(
-    PR_SNAPSHOT_GRAPHQL,
-    {
-      owner: REPO_OWNER,
-      name: REPO_NAME,
-      number: prNumber,
-      includeComments,
-    },
+// Reads the PR's current head and base SHA in one request.
+async function fetchPRSnapshot(prNumber) {
+  const pr = await ghRead(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}`,
     GITHUB_TOKEN,
   );
-  const pr = data.repository && data.repository.pullRequest;
-  if (!pr) {
-    throw new Error(
-      `GitHub GraphQL returned no pull request #${prNumber} in ${REPO_OWNER}/${REPO_NAME}.`,
-    );
-  }
-  return pr;
-}
-
-// A GraphQL comment response is safe to use as a complete history only when
-// it fits in this one response and every identity is present exactly once.
-// A comments connection can change while a cursor scan is running, so never
-// follow its cursors for a CLA history decision. Larger or incomplete
-// connections fall back to the creation-ordered REST list from page one.
-function isCompleteGraphQLCommentPage(connection) {
-  if (
-    !connection ||
-    !Array.isArray(connection.nodes) ||
-    !connection.pageInfo ||
-    connection.pageInfo.hasNextPage !== false ||
-    !Number.isSafeInteger(connection.totalCount) ||
-    connection.totalCount !== connection.nodes.length ||
-    connection.nodes.length > 100
-  ) {
-    return false;
-  }
-  const seen = new Set();
-  try {
-    for (const node of connection.nodes) {
-      const comment = mapGraphQLIssueComment(node);
-      if (!comment.user || !comment.user.login) return false;
-      const key = String(comment.id);
-      if (seen.has(key)) return false;
-      seen.add(key);
-    }
-  } catch {
-    return false;
-  }
-  return true;
-}
-
-function mapGraphQLIssueComment(comment) {
-  const rawId = comment && comment.fullDatabaseId;
-  const id =
-    typeof rawId === "string" && /^[1-9]\d*$/.test(rawId)
-      ? Number.isSafeInteger(Number(rawId))
-        ? Number(rawId)
-        : rawId
-      : rawId;
-  if (!isUsableCommentId(id) || typeof (comment && comment.body) !== "string") {
-    throw new Error(
-      "GitHub GraphQL returned a PR comment without a usable database id or body.",
-    );
-  }
-  const author = comment.author;
-  return {
-    id,
-    body: comment.body,
-    user:
-      author && typeof author.login === "string"
-        ? {
-            login: author.login,
-            type: author.__typename === "Bot" ? "Bot" : "User",
-          }
-        : null,
-  };
-}
-
-// Reads the PR's current head and base SHA in one request. When comments are
-// needed before publishing, their first page is selected in the same GraphQL
-// request and passed into the run-scoped comments cache after the status lands.
-async function fetchPRSnapshot(prNumber, { includeComments = false } = {}) {
-  let head;
-  let base;
-  let commentPage = null;
-  let shaSource = includeComments ? "graphql" : "rest";
-  if (includeComments) {
-    try {
-      const pr = await fetchPRGraphQLSnapshot(prNumber, { includeComments: true });
-      head = pr.headRefOid;
-      base = pr.baseRefOid;
-      if (isCompleteGraphQLCommentPage(pr.comments)) commentPage = pr.comments;
-    } catch {
-      // GraphQL is an optional read optimization. Keep GitHub Enterprise
-      // installs and transient GraphQL failures working through REST. Make
-      // the fallback visible so a broken GraphQL query does not silently hide
-      // that the optimization is no longer being used.
-      console.warn(
-        `::warning::Could not read PR #${prNumber} snapshot through GraphQL; falling back to the REST API.`,
-      );
-      head = undefined;
-      base = undefined;
-    }
-  }
-  if (head === undefined || base === undefined) {
-    const pr = await ghRead(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}`,
-      GITHUB_TOKEN,
-    );
-    head = pr.head && pr.head.sha;
-    base = pr.base && pr.base.sha;
-    commentPage = null;
-    shaSource = "rest";
-  }
-  const shaContext =
-    shaSource === "graphql"
-      ? {
-          head: `GitHub GraphQL response for PR #${prNumber} (.headRefOid)`,
-          base: `GitHub GraphQL response for PR #${prNumber} (.baseRefOid)`,
-        }
-      : {
-          head: `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.head.sha)`,
-          base: `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.base.sha)`,
-        };
   const headSha = assertValidSha(
-    head,
-    shaContext.head,
+    pr.head.sha,
+    `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.head.sha)`,
   );
   const baseSha = assertValidSha(
-    base,
-    shaContext.base,
+    pr.base.sha,
+    `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.base.sha)`,
   );
-  return { headSha, baseSha, commentPage };
+  return { headSha, baseSha };
 }
 
 // How many times checkPR() re-evaluates when the PR's base or head moves
@@ -3013,9 +2675,7 @@ async function checkPRInner(
       // event for the new head when the caller pinned one. A moved base has
       // no event of its own, so the pair is evaluated again instead of
       // leaving the PR with no status.
-      const beforePublish = await fetchPRSnapshot(prNumber, {
-        includeComments: !statusOnly,
-      });
+      const beforePublish = await fetchPRSnapshot(prNumber);
       if (pinnedHead && beforePublish.headSha !== pinnedHead) {
         console.log(
           `::notice::PR #${prNumber} is now at ${beforePublish.headSha}, not ${pinnedHead}. Not publishing for ${pinnedHead}: the event for the current head checks it.`,
@@ -3048,20 +2708,6 @@ async function checkPRInner(
           onStatusPublished: () => {
             everPublished = true;
             lastPublishedHeadSha = pair.headSha;
-            if (beforePublish.commentPage) {
-              const cache = commentsCacheStorage.getStore();
-              if (cache && !cache.has(prNumber)) {
-                const seeded = fetchAllIssueComments(prNumber, {
-                  cache,
-                  botLoginPromise: resolveBotLogin(),
-                  initialPage: beforePublish.commentPage,
-                });
-                // publishEvaluation will consume this same cached promise
-                // immediately after the status write; attach a handler now
-                // so a fast page failure is not reported as unhandled first.
-                seeded.catch(() => {});
-              }
-            }
           },
         },
       );
@@ -3391,14 +3037,4 @@ module.exports = {
   fetchPRSnapshot,
   listCommitsBetween,
   commentsCacheStorage,
-  // Internal helpers exported only so edge cases that are difficult to reach
-  // through a live multi-page check can still receive direct unit coverage.
-  createAscendingIdFilter,
-  isUsableCommentId,
-  sameCommentId,
-  commentIdAsBigInt,
-  compareCommentIds,
-  retainRecentComment,
-  fetchAllIssueCommentsUncached,
-  mapGraphQLIssueComment,
 };

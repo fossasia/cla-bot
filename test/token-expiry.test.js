@@ -218,22 +218,6 @@ function makeAppGitHub({
       "job-token",
       `${method} ${p} must use the job's GITHUB_TOKEN, got: ${bearer.slice(0, 20)}`,
     );
-    if (p === "/graphql") {
-      return {
-        status: 200,
-        body: {
-          data: {
-            repository: {
-              pullRequest: {
-                baseRefOid: BASE_SHA,
-                headRefOid: HEAD_SHA,
-                comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] },
-              },
-            },
-          },
-        },
-      };
-    }
     if (p.includes("/compare/")) {
       if (s.hooks.onCommits) s.hooks.onCommits(s);
       return {

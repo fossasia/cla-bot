@@ -55,15 +55,6 @@ function fakeResponse(status, jsonBody, headers = {}) {
   };
 }
 
-function fakeTextResponse(status, text, headers = {}) {
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    text: async () => text,
-    headers: { get: (h) => headers[h.toLowerCase()] || null },
-  };
-}
-
 (async () => {
   await test("readSignatures returns an empty store on 404 (file does not exist yet)", async () => {
     global.fetch = async () => fakeResponse(404, { message: "Not Found" });
@@ -2045,24 +2036,6 @@ function fakeTextResponse(status, text, headers = {}) {
     });
     const result = await ghRaw("/some/path", "tok");
     assert.deepStrictEqual(result, { hello: "world" });
-  });
-
-  await test("ghRaw preserves unsafe JSON id integers as exact decimal strings when requested", async () => {
-    const hugeId = "9".repeat(100);
-    const responseBody = `[
-      {"id":9007199254740993,"user":{"id":9007199254740995,"login":"alice"},"body":"text containing \\\"id\\\":9007199254740997"},
-      {"id":42},
-      {"id":${hugeId}}
-    ]`;
-    global.fetch = async () => fakeTextResponse(200, responseBody);
-    const comments = await ghRaw("/comments", "tok", {
-      preserveUnsafeIds: true,
-    });
-    assert.strictEqual(comments[0].id, "9007199254740993");
-    assert.strictEqual(comments[0].user.id, "9007199254740995");
-    assert.strictEqual(comments[0].body, 'text containing "id":9007199254740997');
-    assert.strictEqual(comments[1].id, 42);
-    assert.strictEqual(comments[2].id, hugeId);
   });
 
   // ===========================================================================

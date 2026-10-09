@@ -422,38 +422,6 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     state.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
       if (url.endsWith("/user")) return res(404, { message: "Not Found" });
-      if (url.endsWith("/graphql")) {
-        const variables = JSON.parse(opts.body).variables;
-        const nodes = state.comments.slice(0, 100).map((c) => ({
-          fullDatabaseId: String(c.id),
-          body: c.body,
-          author: c.user
-            ? {
-                __typename: c.user.type === "Bot" ? "Bot" : "User",
-                login: c.user.login,
-              }
-            : null,
-        }));
-        return res(200, {
-          data: {
-            repository: {
-              pullRequest: {
-                baseRefOid: "base-sha-abc",
-                headRefOid: "head-sha-abc",
-                comments: variables.includeComments
-                  ? {
-                      totalCount: state.comments.length,
-                      nodes,
-                      pageInfo: {
-                        hasNextPage: state.comments.length > nodes.length,
-                      },
-                    }
-                  : undefined,
-              },
-            },
-          },
-        });
-      }
       if (url.includes("/compare/")) {
         return res(200, { commits, total_commits: commits.length });
       }
@@ -512,55 +480,34 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     return state;
   }
 
-  // Count both REST comment pages and GraphQL requests that select the PR's
-  // comments connection.
+  // Wraps a fake GitHub's fetch so GET /issues/1/comments calls are counted.
   function countCommentReads(gh) {
     let count = 0;
     const inner = gh.fetch;
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
       if (method === "GET" && url.includes("/issues/1/comments")) count += 1;
-      if (
-        method === "POST" &&
-        url.endsWith("/graphql") &&
-        JSON.parse(opts.body).variables.includeComments
-      ) {
-        count += 1;
-      }
       return inner(url, opts);
     };
     return () => count;
   }
 
   await test("status-only checks on successful and failing PRs make zero comment-list requests", async () => {
+    const commit = {
+      sha: "c1",
+      author: { id: 1, login: "alice" },
+      parents: [{ sha: "p1" }],
+      commit: { author: { email: "alice@example.com" } },
+    };
     for (const scenario of [
       {
         name: "already signed",
-        commits: [
-          {
-            sha: "c1",
-            author: { id: 1, login: "alice" },
-            parents: [{ sha: "p1" }],
-            commit: { author: { email: "alice@example.com" } },
-          },
-        ],
         signatures: { version: 1, signatures: [{ id: 1, login: "alice" }] },
       },
-      {
-        name: "still missing a signature",
-        commits: [
-          {
-            sha: "c1",
-            author: { id: 1, login: "alice" },
-            parents: [{ sha: "p1" }],
-            commit: { author: { email: "alice@example.com" } },
-          },
-        ],
-        signatures: { version: 1, signatures: [] },
-      },
+      { name: "still missing a signature", signatures: { version: 1, signatures: [] } },
     ]) {
       const gh = makeFakeGitHub({
-        commits: scenario.commits,
+        commits: [commit],
         initialSignatures: scenario.signatures,
       });
       const getCommentReads = countCommentReads(gh);
@@ -576,7 +523,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     }
   });
 
-  await test("quiet clean success reads history once to preserve the prior-block announcement rule", async () => {
+  await test("quiet clean success reads history once and does not refresh after deciding not to post", async () => {
     const gh = makeFakeGitHub({
       commits: [
         {
@@ -605,10 +552,42 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     assert.strictEqual(
       getCommentReads(),
       1,
-      "the quiet decision needs one history read, and must not do a second read when it decides not to post",
+      "the prior-block decision needs one history read; a read-only quiet result must not force-refresh it",
     );
     assert.strictEqual(gh.comments.length, 0);
     assert.strictEqual(gh.statuses.at(-1).state, "success");
+  });
+
+  await test("a first pending post uses one cached pre-check plus one fresh cleanup scan", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    const getCommentReads = countCommentReads(gh);
+
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: {
+        number: 1,
+        head: { sha: "head-sha-abc" },
+        base: { sha: "base-sha-abc" },
+      },
+    });
+
+    assert.strictEqual(
+      getCommentReads(),
+      2,
+      "one cached list for dedupe and one forced-fresh scan after the successful post",
+    );
+    assert.strictEqual(gh.comments.length, 1);
+    assert.match(gh.comments[0].body, /need to sign/i);
   });
 
   await test("a REAL pending flag from 250+ admitted comments ago (older than MAX_CACHED_COMMENTS) still correctly triggers a success announcement", async () => {
@@ -664,59 +643,6 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     assert.ok(
       gh.comments.some((c) => c.body.includes("All contributors")),
       "the success comment must still be posted - the old pending flag must not be lost to the cap",
-    );
-  });
-
-  await test("GraphQL update-time ordering keeps an older pending comment when its ID follows newer comments", async () => {
-    const gh = makeFakeGitHub({
-      commits: [
-        {
-          sha: "c1",
-          author: { id: 1, login: "alice" },
-          parents: [{ sha: "p1" }],
-          commit: { author: { email: "alice@example.com" } },
-        },
-      ],
-      initialSignatures: {
-        version: 1,
-        signatures: [{ id: 1, login: "alice" }],
-      },
-      // GraphQL orders by updated_at. Editing comment 100 can place it after
-      // comments 101 and 102 even though its creation ID is older. History
-      // must still see the pending flag; filtering IDs as if the connection
-      // were creation-ordered would drop it and incorrectly keep this run quiet.
-      comments: [
-        {
-          id: 101,
-          body: `${MARKER}\nunrelated bot history`,
-          user: BOT,
-        },
-        {
-          id: 102,
-          body: `${MARKER}\nunrelated bot history`,
-          user: BOT,
-        },
-        {
-          id: 100,
-          body: `${MARKER}\n<!-- fossasia-cla-bot:pending -->\nmissing signatures`,
-          user: BOT,
-        },
-      ],
-    });
-    countCommentReads(gh);
-
-    await handlePullRequestTarget({
-      action: "synchronize",
-      pull_request: {
-        number: 1,
-        head: { sha: "head-sha-abc" },
-        base: { sha: "base-sha-abc" },
-      },
-    });
-
-    assert.ok(
-      gh.comments.some((comment) => comment.body.includes("All contributors")),
-      "the edited older pending comment must remain visible to history evaluation",
     );
   });
 
@@ -858,8 +784,8 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     // the 2 logical reads from the single-postComment() case above.
     assert.strictEqual(
       getCommentReads(),
-      7,
-      "one combined snapshot attempt plus 3 REST pages for the shared pre-check and 3 for forced-fresh cleanup",
+      6,
+      "3 paginated GETs for the shared pre-check + 3 for the forced-fresh cleanup, despite the flood",
     );
     assert.ok(
       gh.comments.some((c) => c.body.includes("Thank you for signing the CLA")),

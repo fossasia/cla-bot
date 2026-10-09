@@ -100,40 +100,6 @@ function makeFakeGitHub({
   state.fetch = async (url, opts = {}) => {
     const method = (opts.method || "GET").toUpperCase();
 
-    if (url.endsWith("/graphql")) {
-      const { variables } = JSON.parse(opts.body);
-      const nodes = state.comments.slice(0, 100).map((c) => ({
-        fullDatabaseId: String(c.id),
-        body: c.body,
-        author: c.user
-          ? {
-              __typename: c.user.type === "Bot" ? "Bot" : "User",
-              login: c.user.login,
-            }
-          : null,
-      }));
-      const seen = state.lastCompare;
-      return res(200, {
-        data: {
-          repository: {
-            pullRequest: {
-              headRefOid: headSha ?? (seen && seen.head) ?? "head-sha-abc",
-              baseRefOid: baseSha ?? (seen && seen.base) ?? BASE_SHA,
-              comments: variables.includeComments
-                ? {
-                    totalCount: state.comments.length,
-                    nodes,
-                    pageInfo: {
-                      hasNextPage: state.comments.length > nodes.length,
-                    },
-                  }
-                : undefined,
-            },
-          },
-        },
-      });
-    }
-
     if (url.includes("/users/")) {
       // Resolves the old-style noreply co-author format (no id embedded in
       // the email) via GET /users/{login}. `users` maps login -> user object
@@ -1562,12 +1528,6 @@ function makeFakeGitHub({
         if (url.includes("/pulls/1") && !url.includes("/commits")) {
           pullsReads += 1;
         }
-        if (
-          url.endsWith("/graphql") &&
-          JSON.parse(opts.body).variables.includeComments
-        ) {
-          pullsReads += 1;
-        }
         return innerFetch(url, opts);
       };
 
@@ -1578,14 +1538,14 @@ function makeFakeGitHub({
       await handlePullRequestTarget(payload);
 
       // The webhook carries both base and head, so the evaluation starts from
-      // that pair. The combined PR/comments read before publishing confirms it
-      // still is that pair, and another read follows - there's no GitHub
+      // that pair. The PR is read once right before publishing to confirm it
+      // still is that pair, and once more right after - there's no GitHub
       // primitive that publishes a status only if the PR is still that exact
       // pair, so the confirmation has to happen on both sides of the write.
       assert.strictEqual(
         pullsReads,
         2,
-        "one combined PR/comments read before publishing, one PR read after",
+        "one PR read before publishing, one right after to confirm it's still valid",
       );
       assert.ok(
         urls.some((u) => u.includes("/compare/base-sha-fixture...webhook-head-sha")),
@@ -1653,12 +1613,6 @@ function makeFakeGitHub({
       if (url.includes("/pulls/1") && !url.includes("/commits")) {
         pullsReads += 1;
       }
-      if (
-        url.endsWith("/graphql") &&
-        JSON.parse(opts.body).variables.includeComments
-      ) {
-        pullsReads += 1;
-      }
       return innerFetch(url, opts);
     };
 
@@ -1671,7 +1625,7 @@ function makeFakeGitHub({
     assert.strictEqual(
       pullsReads,
       2,
-      "one combined PR/comments read before publishing and one PR read after - no re-evaluation",
+      "one PR read right before publishing, one right after to confirm the publish is still valid - no re-evaluation",
     );
     assert.strictEqual(gh.statuses.length, 1);
     assert.strictEqual(gh.statuses[0].sha, "old-sha");
@@ -3745,23 +3699,6 @@ function makeFakeGitHub({
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
-      if (url.endsWith("/graphql")) {
-        return res(200, {
-          data: {
-            repository: {
-              pullRequest: {
-                headRefOid: "head-sha-abc",
-                baseRefOid: "base-sha-abc",
-                comments: {
-                  totalCount: 0,
-                  nodes: [],
-                  pageInfo: { hasNextPage: false },
-                },
-              },
-            },
-          },
-        });
-      }
       if (url.includes("/compare/"))
         return res(200, { commits, total_commits: commits.length });
       if (url.includes("/pulls/1") && !url.includes("/commits")) {
@@ -3905,23 +3842,6 @@ function makeFakeGitHub({
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
-      if (url.endsWith("/graphql")) {
-        return res(200, {
-          data: {
-            repository: {
-              pullRequest: {
-                headRefOid: "head-sha-abc",
-                baseRefOid: "base-sha-abc",
-                comments: {
-                  totalCount: 0,
-                  nodes: [],
-                  pageInfo: { hasNextPage: false },
-                },
-              },
-            },
-          },
-        });
-      }
       if (url.includes("/compare/"))
         return res(200, { commits, total_commits: commits.length });
       if (url.includes("/pulls/1") && !url.includes("/commits")) {

@@ -90,18 +90,6 @@ function b64(obj) {
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
-      if (url.endsWith("/graphql"))
-        return res(200, {
-          data: {
-            repository: {
-              pullRequest: {
-                baseRefOid: "base-sha-abc",
-                headRefOid: "head-sha-abc",
-                comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] },
-              },
-            },
-          },
-        });
       // No explicit handler for bare /user (bot-identity resolution) -
       // left unhandled on purpose, same as test/integration.test.js: the
       // resulting throw is swallowed by resolveBotLogin()'s own try/catch,
@@ -215,18 +203,6 @@ function b64(obj) {
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
-      if (url.endsWith("/graphql"))
-        return res(200, {
-          data: {
-            repository: {
-              pullRequest: {
-                baseRefOid: "base-sha-abc",
-                headRefOid: "head-sha-abc",
-                comments: { totalCount: 0, pageInfo: { hasNextPage: false }, nodes: [] },
-              },
-            },
-          },
-        });
       if (url.includes("/compare/"))
         return res(200, { commits, total_commits: commits.length });
       if (url.includes("/pulls/1") && !url.includes("/commits")) {
