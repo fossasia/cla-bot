@@ -59,7 +59,17 @@ Out of scope:
    GitHub itself reports, exactly like the signature store.
 5. This action never checks out or executes code from the pull request - it
    only reads PR/commit metadata via the API.
-6. A release can only be created by `.github/workflows/release.yml`, from a
+6. CLA comment history treats a comment as bot state only when it contains
+   this action's marker and GitHub reports its author as the configured bot,
+   a GitHub `Bot` account, or the default bot login. Accepting any GitHub
+   `Bot` account is intentional: it lets pending/success history survive a
+   switch between this action's GitHub App and `GITHUB_TOKEN` identities.
+   GitHub supplies the author identity; PR authors cannot forge another
+   account's `user.type`. This means a different or compromised GitHub App
+   with permission to comment can influence the bot-history calculation if
+   it deliberately posts the marker. Do not grant comment permissions to
+   untrusted GitHub Apps on repositories that rely on this action.
+7. A release can only be created by `.github/workflows/release.yml`, from a
    signed, annotated `vMAJOR.MINOR.PATCH` tag that GitHub reports as
    verified and whose own signed name is that same version (so a valid
    signed tag for another version cannot be replayed under a new name), on a
@@ -122,7 +132,7 @@ Out of scope:
    selected for a Latest reconciliation run. After a transient verification
    failure, rerun the failed jobs from the release run or wait for scheduled
    reconciliation.
-7. Release signing uses no long-lived key. Assets are signed with Sigstore
+8. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The jobs
    are split by what they run: `build` creates the archive with `git` and
@@ -140,7 +150,7 @@ Out of scope:
    job has only `contents: write`, runs shell commands without checkout or
    repository code, and uses that permission only to reconcile GitHub's Latest
    marker.
-8. A release does not start unless the workflow's immutability policy is
+9. A release does not start unless the workflow's immutability policy is
    explicit and the `release` environment has no required reviewers. Mutability
    is intentionally `not-required` in workflow code. Repository release rights
    are the only human authorization for publishing. GitHub's actual environment
@@ -382,6 +392,30 @@ What the signatures do **not** protect against, and what does:
     example workflow, which queues overlapping runs for the same PR instead
     of racing them. The in-code mitigations are a backstop for when that
     group is missing, not a substitute for it.
+- The comment-history cache is an invocation snapshot. Within one `checkPR()`
+  run, successful comments posted or deleted by that run are written through;
+  comment changes made by another process are not incorporated automatically.
+  This is safe for the production reads because the automatic quiet-success
+  check reads pending/success comments as historical events (removing an old
+  comment does not undo that the PR was previously blocked), and it is the
+  first comment-history read on that path. Comment dedupe is an optimization;
+  its post-write fresh scan repairs duplicates after a post. The consumer
+  workflow's per-PR `concurrency:` group is therefore required to prevent
+  overlapping bot runs from making decisions against competing snapshots.
+  A fresh REST read would narrow, but cannot eliminate, races with unrelated
+  writers because GitHub offers no atomic read-and-decide operation here.
+- Complete-history comment semantics have a corresponding resource cost.
+  GitHub's list endpoint returns at most 100 comments per page, so the cache
+  load reads every history page; after each successful dedupe-enabled post,
+  duplicate cleanup performs another fresh full-history scan. A single post
+  can therefore require roughly two sets of paginated reads when the cache is
+  cold, and multiple posts each require their own fresh cleanup scan. The
+  cleanup spools matching comment IDs to a private temporary file, so its
+  temporary disk use grows with the number of exact duplicates. These costs
+  are intentional: imposing a page or ID cap could miss an old duplicate or
+  change the history-based comment decisions. Cleanup itself is best effort,
+  but the pre-post history read can fail the post operation. See
+  `findExactDuplicateComments()` and `postComment()` in `src/cla-bot.js`.
 - The signatures file can grow past 1 MB over time. Reads use GitHub's
   `object`/`raw` media types (good up to 100 MB) instead of the default
   format (reliable only under 1 MB), so this comfortably covers realistic
