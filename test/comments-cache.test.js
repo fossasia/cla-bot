@@ -28,6 +28,7 @@ const {
   handlePullRequestTarget,
   handleIssueComment,
   postComment,
+  pendingIsNewerThanSuccess,
   commentsCacheStorage,
 } = require("../src/cla-bot.js");
 
@@ -908,6 +909,50 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
         cached.map((comment) => comment.id),
         [2, 3],
         "the cache must include the newly created comment and remove the duplicate deleted during cleanup",
+      );
+    });
+  });
+
+  await test("write-through updates whole-history pending/success sequence metadata", async () => {
+    let nextId = 1;
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") return res(200, []);
+        if (method === "POST") {
+          const created = {
+            id: nextId++,
+            body: JSON.parse(opts.body).body,
+            user: BOT,
+          };
+          return res(201, created);
+        }
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    const cache = new Map();
+    await commentsCacheStorage.run(cache, async () => {
+      await getExistingBotComments(1); // establish an empty cached history
+      await postComment(
+        1,
+        "<!-- fossasia-cla-bot:pending -->\nPlease sign the CLA",
+      );
+      assert.strictEqual(
+        await pendingIsNewerThanSuccess(1),
+        true,
+        "a pending comment written during this run must immediately set the pending-after-success history state",
+      );
+
+      await postComment(
+        1,
+        "<!-- fossasia-cla-bot:success -->\nAll contributors have signed the CLA",
+      );
+      assert.strictEqual(
+        await pendingIsNewerThanSuccess(1),
+        false,
+        "a later success comment written during this run must close the pending history state",
       );
     });
   });

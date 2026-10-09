@@ -1361,6 +1361,7 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
     comments: all,
     lastPendingSeq,
     lastSuccessSeq,
+    nextSeq: seq,
     latestOwnBodyByCategory,
   };
 }
@@ -1478,7 +1479,8 @@ async function rememberOwnPostedComment(prNumber, category, body, comment) {
   const cache = commentsCacheStorage.getStore();
   const entry = cache && cache.get(prNumber);
   if (!entry) return;
-  const { comments, latestOwnBodyByCategory } = await entry.promise;
+  const history = await entry.promise;
+  const { comments, latestOwnBodyByCategory } = history;
   latestOwnBodyByCategory[category] = body;
   if (!comment || !Number.isSafeInteger(comment.id)) {
     // Without the API's comment ID we cannot safely patch the list. Force the
@@ -1487,6 +1489,9 @@ async function rememberOwnPostedComment(prNumber, category, body, comment) {
     return;
   }
   if (comments.some((cached) => cached.id === comment.id)) return;
+  if (category === "pending") history.lastPendingSeq = history.nextSeq;
+  else if (category === "success") history.lastSuccessSeq = history.nextSeq;
+  history.nextSeq += 1;
   const botLogin = await resolveBotLogin();
   comments.push({
     id: comment.id,
@@ -2057,6 +2062,7 @@ module.exports = {
   extractCoAuthors,
   fail,
   getExistingBotComments,
+  pendingIsNewerThanSuccess,
   resolveUserIdByLogin,
   resolveLoginById,
   setStatus,
