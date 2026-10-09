@@ -960,6 +960,27 @@ async function listCommitsBetween(baseSha, headSha, token) {
       `GitHub reported ${totalCommits} commit(s) between ${baseSha} and ${headSha}, but pagination returned ${items.length}.`,
     );
   }
+
+  // A matching item count alone does not prove the pages contain distinct
+  // commits: a repeated page could hide another contributor while preserving
+  // the count. Commit SHAs are the stable identities across pages, so require
+  // each item to carry one and reject duplicates before authors are derived.
+  const seenShas = new Set();
+  for (const item of items) {
+    const sha = item && typeof item.sha === "string" ? item.sha : "";
+    if (!sha || sha.trim() !== sha) {
+      throw new Error(
+        `GitHub returned a commit without a valid SHA between ${baseSha} and ${headSha}, so the commit list cannot be verified as complete.`,
+      );
+    }
+    const identity = sha.toLowerCase();
+    if (seenShas.has(identity)) {
+      throw new Error(
+        `GitHub returned duplicate commit SHA ${sha} between ${baseSha} and ${headSha}, so the commit list cannot be verified as complete.`,
+      );
+    }
+    seenShas.add(identity);
+  }
   return items;
 }
 

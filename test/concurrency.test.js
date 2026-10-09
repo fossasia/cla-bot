@@ -1483,6 +1483,79 @@ const linkTo = (path, last) =>
     }
   });
 
+  await test("listCommitsBetween: a matching count is rejected when commit SHAs are missing or repeated", async () => {
+    const b = freshModule();
+    const firstPage = Array.from({ length: 100 }, (_, i) =>
+      commit(i, i + 1, `author${i}`),
+    );
+    const cases = [
+      {
+        name: "duplicate within one page",
+        total: 2,
+        pages: [[commit(1, 1, "a"), commit(1, 1, "a")]],
+        error: /duplicate commit SHA/,
+      },
+      {
+        name: "duplicate across pages replaces an omitted commit",
+        total: 101,
+        pages: [firstPage, [commit(0, 1, "author0")]],
+        error: /duplicate commit SHA/,
+      },
+      {
+        name: "SHA comparison is case-insensitive",
+        total: 2,
+        pages: [[commit(1, 1, "a"), commit(1, 1, "a", "", { sha: "C1" })]],
+        error: /duplicate commit SHA/,
+      },
+      {
+        name: "missing SHA",
+        total: 2,
+        pages: [[commit(1, 1, "a"), { author: { id: 2, login: "b" } }]],
+        error: /without a valid SHA/,
+      },
+      {
+        name: "empty SHA",
+        total: 2,
+        pages: [[commit(1, 1, "a"), commit(2, 2, "b", "", { sha: "" })]],
+        error: /without a valid SHA/,
+      },
+      {
+        name: "non-string SHA",
+        total: 2,
+        pages: [[commit(1, 1, "a"), commit(2, 2, "b", "", { sha: 2 })]],
+        error: /without a valid SHA/,
+      },
+      {
+        name: "whitespace-padded SHA",
+        total: 2,
+        pages: [[commit(1, 1, "a"), commit(2, 2, "b", "", { sha: " c2 " })]],
+        error: /without a valid SHA/,
+      },
+    ];
+
+    for (const c of cases) {
+      const calls = [];
+      global.fetch = async (url) => {
+        const page = Number((url.match(/[&?]page=(\d+)/) || [])[1] || 1);
+        calls.push(page);
+        const path = url.replace("https://api.github.com", "").split("?")[0];
+        return res(
+          200,
+          { commits: c.pages[page - 1] || [], total_commits: c.total },
+          c.pages.length > 1 && page === 1
+            ? { link: linkTo(path, c.pages.length) }
+            : {},
+        );
+      };
+      await assert.rejects(
+        () => b.listCommitsBetween(BASE_SHA, DEFAULT_HEAD_SHA, "t"),
+        c.error,
+        c.name,
+      );
+      assert.strictEqual(calls.length, c.pages.length, `${c.name}: all expected pages read`);
+    }
+  });
+
   await test("listCommitsBetween: a response with no total_commits is a failed read, never a list passed on trust", async () => {
     const b = freshModule();
     global.fetch = async (url) => {
@@ -1582,8 +1655,12 @@ const linkTo = (path, last) =>
   await test("listCommitsBetween: with no usable header, exactly 10,000 commits (total_commits says so) is accepted and stops right at page 100", async () => {
     const calls = [];
     global.fetch = async (url) => {
-      calls.push(Number(url.match(/[&?]page=(\d+)/)[1]));
-      return res(200, { commits: Array(100).fill({}), total_commits: 10000 });
+      const page = Number(url.match(/[&?]page=(\d+)/)[1]);
+      calls.push(page);
+      return res(200, {
+        commits: Array.from({ length: 100 }, (_, i) => ({ sha: `page-${page}-commit-${i}` })),
+        total_commits: 10000,
+      });
     };
     const got = await bot.listCommitsBetween(BASE_SHA, DEFAULT_HEAD_SHA, "t");
     assert.strictEqual(got.length, 10000);
@@ -1605,7 +1682,10 @@ const linkTo = (path, last) =>
         return res(
           200,
           {
-            commits: Array(Math.min(100, total - (page - 1) * 100)).fill({}),
+            commits: Array.from(
+              { length: Math.min(100, total - (page - 1) * 100) },
+              (_, i) => ({ sha: `page-${page}-commit-${i}` }),
+            ),
             total_commits: total,
           },
           page === 1 ? { link: linkTo(path, expectedPages) } : {},
