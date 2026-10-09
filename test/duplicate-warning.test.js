@@ -47,8 +47,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 
 // Runs postComment(PR 7, text) where the cleanup re-fetch (the 2nd GET) shows
 // `extraIds` as byte-identical duplicates next to the comment just posted
-// (id 100). `failDeleteIds` get a 403 on DELETE. Returns what was observed.
-async function run({ extraIds, failDeleteIds = [] }) {
+// (id 100). `failDeleteIds` get a 403 on DELETE. `trackConcurrency` adds a
+// small real delay to each DELETE so overlapping ones are actually
+// observable, and the result reports the highest number seen in flight at
+// once. Returns what was observed.
+async function run({ extraIds, failDeleteIds = [], trackConcurrency = false }) {
   const text = "dup-warning-body";
   const full = `${MARKER}\n${text}`;
   const warnings = [];
@@ -56,6 +59,8 @@ async function run({ extraIds, failDeleteIds = [] }) {
   const originalWarn = console.warn;
   console.warn = (msg) => warnings.push(String(msg));
   let getCount = 0;
+  let inFlightDeletes = 0;
+  let maxInFlightDeletes = 0;
   global.fetch = async (url, opts = {}) => {
     const method = (opts.method || "GET").toUpperCase();
     if (url.includes("/issues/7/comments")) {
@@ -72,7 +77,11 @@ async function run({ extraIds, failDeleteIds = [] }) {
     }
     if (url.includes("/issues/comments/") && method === "DELETE") {
       const id = Number(url.split("/issues/comments/")[1]);
+      inFlightDeletes += 1;
+      maxInFlightDeletes = Math.max(maxInFlightDeletes, inFlightDeletes);
+      if (trackConcurrency) await new Promise((r) => setTimeout(r, 5));
       deleted.push(id);
+      inFlightDeletes -= 1;
       return failDeleteIds.includes(id)
         ? res(403, { message: "Forbidden" })
         : res(204, null);
@@ -84,7 +93,11 @@ async function run({ extraIds, failDeleteIds = [] }) {
   } finally {
     console.warn = originalWarn;
   }
-  return { warnings, deleted: deleted.sort((a, b) => a - b) };
+  return {
+    warnings,
+    deleted: deleted.sort((a, b) => a - b),
+    maxInFlightDeletes,
+  };
 }
 
 const isDupSummary = (w) => w.includes("duplicate bot comment(s)");
@@ -139,6 +152,27 @@ const isDupSummary = (w) => w.includes("duplicate bot comment(s)");
     assert.ok(
       warnings.some((w) => w.includes("Could not delete duplicate comment 98")),
       `got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  await test("many duplicates are still all deleted, but in batches of at most MAX_CONCURRENT_DELETES at once", async () => {
+    const extraIds = Array.from({ length: 25 }, (_, i) => i + 1); // needs 3 batches (10/10/5)
+    const { deleted, maxInFlightDeletes } = await run({
+      extraIds,
+      trackConcurrency: true,
+    });
+    assert.deepStrictEqual(
+      deleted,
+      extraIds,
+      "every duplicate must still be deleted, not just the first batch",
+    );
+    assert.ok(
+      maxInFlightDeletes <= 10,
+      `at most 10 deletes should ever be in flight at once, saw ${maxInFlightDeletes}`,
+    );
+    assert.ok(
+      maxInFlightDeletes >= 2,
+      "this assertion is pointless unless deletes actually overlapped within a batch",
     );
   });
 
