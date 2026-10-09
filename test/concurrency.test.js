@@ -259,6 +259,7 @@ const linkTo = (path, last) =>
       '<https://api.github.com/x?page=1>; rel="prev", , <https://api.github.com/x?page=2>; rel="next"',
       '<https://api.github.com/x?page=2; rel="next"',
       '<https://api.github.com/x bad?page=1>; rel="next"',
+      '<https://api.github.com/x bad?page=1>; rel="prev", <https://api.github.com/x?page=2>; rel="next"',
       '<https://api.github.com/x?page=1>; title="bad\nvalue"; rel="next"',
       '<https://api.github.com/x?page=1>; title=',
       '<https://api.github.com/x?page=1> trailing text',
@@ -275,6 +276,16 @@ const linkTo = (path, last) =>
       bot.hasNextPage('<https://api.github.com/x?page=2>; title="a\\"b"; rel="next"'),
       true,
       "an escaped quote does not end a quoted parameter",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title="a\\\\"; rel=next'),
+      true,
+      "an escaped backslash immediately before the closing quote is valid",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title=page; rel=next; type="text/html"'),
+      true,
+      "parameters before and after rel are accepted",
     );
     assert.strictEqual(
       bot.hasNextPage('<https://api.github.com/x?page=2>; rel="prev next"'),

@@ -973,6 +973,88 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     );
   });
 
+  await test("mixed safe and unsafe comment IDs stay exact through cache, pagination, spool, and deletion", async () => {
+    const safeId = Number.MAX_SAFE_INTEGER;
+    const firstUnsafeId = "9007199254740992";
+    const oldDuplicateId = "9007199254740993";
+    const concurrentDuplicateId = "9007199254740994";
+    const createdId = "9007199254740995";
+    const target = "mixed-ID duplicate race";
+    const full = `${MARKER}\n${target}`;
+    let commentReads = 0;
+    const deleteUrls = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        commentReads += 1;
+        if (commentReads === 1) {
+          // These JSON number tokens deliberately straddle MAX_SAFE_INTEGER,
+          // repeat the unsafe ID, then move backwards. Parsing and cache
+          // admission must retain only the two unique IDs in exact order.
+          const older = `${MARKER}\\nolder comment`;
+          return commentListRes([
+            { id: safeId, body: older, user: BOT },
+            { id: firstUnsafeId, body: older, user: BOT },
+            { id: firstUnsafeId, body: `${MARKER}\\nduplicate ID`, user: BOT },
+            { id: safeId, body: `${MARKER}\\nout of order`, user: BOT },
+          ]);
+        }
+        const page = Number(new URL(url).searchParams.get("page"));
+        const pageItems = page === 1
+          ? [
+              { id: oldDuplicateId, body: full, user: BOT },
+              { id: concurrentDuplicateId, body: full, user: BOT },
+            ]
+          : [
+              // A repeated/out-of-order ID must not count as another copy.
+              { id: concurrentDuplicateId, body: full, user: BOT },
+              { id: createdId, body: full, user: BOT },
+              { id: oldDuplicateId, body: full, user: BOT },
+            ];
+        const link = page === 1
+          ? '<https://api.github.com/x?page=2>; rel="next"'
+          : '<https://api.github.com/x?page=1>; rel="prev"';
+        return commentListRes(pageItems, 200, link);
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        return res(201, { id: createdId, body: full, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deleteUrls.push(url);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    await commentsCacheStorage.run(new Map(), async () => {
+      const cachedBeforePost = await getExistingBotComments(1);
+      assert.deepStrictEqual(
+        cachedBeforePost.map((comment) => comment.id),
+        [safeId, firstUnsafeId],
+        "safe numeric and unsafe decimal-string IDs remain distinct and ordered in the cache",
+      );
+
+      await postComment(1, target);
+
+      const cachedAfterPost = await getExistingBotComments(1);
+      assert.ok(
+        cachedAfterPost.some((comment) => comment.id === createdId),
+        "the post write-through keeps the exact unsafe response ID in the cache",
+      );
+    });
+
+    assert.strictEqual(commentReads, 3, "one cache read and a two-page fresh cleanup scan");
+    assert.deepStrictEqual(
+      deleteUrls,
+      [
+        `https://api.github.com/repos/fossasia/testrepo/issues/comments/${oldDuplicateId}`,
+        `https://api.github.com/repos/fossasia/testrepo/issues/comments/${concurrentDuplicateId}`,
+      ],
+      "the spool round-trip and DELETE URLs preserve both adjacent unsafe decimal IDs exactly",
+    );
+  });
+
   await test("duplicate cleanup rejects a corrupt temporary ID before sending any DELETE", async () => {
     const body = `${MARKER}\ncorrupt spool fixture`;
     let commentReads = 0;
