@@ -2674,11 +2674,11 @@ async function checkPRInner(
       // The pair was confirmed fresh immediately before this. Publish it,
       // then read the PR once more: there is no REST primitive that
       // publishes a status only if the PR is still this exact pair, so this
-      // is the closest we can get. A few milliseconds inside the publish
-      // call itself can never be fully closed this way - but every attempt
-      // that lands here starts from a pair that was just re-confirmed, same
-      // as the pre-publish check above, so the window left open is the same
-      // irreducible one, not a wider one.
+      // is the closest we can get. A change can still land after that read,
+      // including after this run finishes. There is no bounded time guarantee
+      // for how long a status can remain stale; that depends on when another
+      // check is triggered. Every attempt that lands here starts from a pair
+      // just re-confirmed, which is the strongest guarantee this API allows.
       await publishEvaluation(
         prNumber,
         { ...result, headSha: pair.headSha },

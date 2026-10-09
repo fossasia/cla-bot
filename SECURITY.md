@@ -467,10 +467,14 @@ What the signatures do **not** protect against, and what does:
     rather than trusting whatever was last written. If the head itself moved
     on instead, nothing more is done for the old head - a status is bound to
     one exact SHA, so it cannot satisfy anything checking the PR's new head,
-    and the event for that new head covers it on its own. The one window
-    that truly cannot be closed this way is a change landing in the handful
-    of milliseconds between the post-publish read and the read after that -
-    `recheck` asks for another pass if this is ever suspected.
+    and the event for that new head covers it on its own. The post-publish
+    read confirms the pair only at the instant of that read. A base retarget
+    immediately afterward is outside this run's observation window: the run
+    can finish with a status that was valid for the old base but is stale for
+    the new one. That status can remain until a later relevant event or
+    manual `recheck` evaluates the new pair. There is no bounded
+    “milliseconds” guarantee for this residual window; its length depends on
+    when another check is triggered.
   - All of the above is about a change happening *while* one run is working.
     A base retarget landing cleanly *after* a run has already finished is a
     different problem, and not one `checkPR()` can detect on its own - by
