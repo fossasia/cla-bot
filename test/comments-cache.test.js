@@ -639,12 +639,90 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     assert.ok(result.some((comment) => comment.body.includes("last-page pending")));
   });
 
+  await test("comment-history pagination follows a valid next relation after a short page", async () => {
+    const comments = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1,
+      body: `${MARKER}\n<!-- fossasia-cla-bot:pending -->\ncomment ${index}`,
+      user: BOT,
+    }));
+    const calls = [];
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        const page = Number(new URL(url).searchParams.get("page"));
+        calls.push(page);
+        const slice = page === 1 ? comments.slice(0, 99) : comments.slice(99);
+        const link =
+          page === 1
+            ? '<https://api.github.com/x?page=2>; rel="next"'
+            : '<https://api.github.com/x?page=1>; rel="prev"';
+        return commentListRes(slice, 200, link);
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+
+    const result = await commentsCacheStorage.run(new Map(), () =>
+      getExistingBotComments(1, { anyBotIdentity: true }),
+    );
+
+    assert.deepStrictEqual(calls, [1, 2]);
+    assert.strictEqual(result.length, 101);
+    assert.ok(result.some((comment) => comment.body.includes("comment 100")));
+  });
+
+  await test("duplicate cleanup follows valid next metadata after a short page", async () => {
+    const body = `${MARKER}\nconcurrent duplicate from next page`;
+    const firstPage = Array.from({ length: 99 }, (_, index) => ({
+      id: index + 1,
+      body: `ordinary comment ${index}`,
+      user: { login: `user-${index}`, type: "User" },
+    }));
+    let posted = false;
+    const deleteUrls = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        const page = Number(new URL(url).searchParams.get("page"));
+        const items = page === 1
+          ? firstPage
+          : posted
+            ? [
+                { id: 100, body, user: BOT },
+                { id: 101, body, user: BOT },
+              ]
+            : [];
+        const link = page === 1
+          ? '<https://api.github.com/x?page=2>; rel="next"'
+          : '<https://api.github.com/x?page=1>; rel="prev"';
+        return commentListRes(items, 200, link);
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        posted = true;
+        return res(201, { id: 101, body, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deleteUrls.push(url);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    await postComment(1, "concurrent duplicate from next page");
+
+    assert.deepStrictEqual(deleteUrls, [
+      "https://api.github.com/repos/fossasia/testrepo/issues/comments/100",
+    ]);
+  });
+
   await test("comment IDs above Number.MAX_SAFE_INTEGER stay exact in cache and chronological comparisons", async () => {
     const firstId = "9007199254740992";
     const secondId = "9007199254740993";
     const payload =
       `[{"id":${firstId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:success -->\nold success`)},"user":{"login":"github-actions[bot]","type":"Bot"}},` +
-      `{"id":${secondId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:pending -->\nnew pending`)},"user":{"login":"github-actions[bot]","type":"Bot"}}]`;
+      `{"id":${secondId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:pending -->\nnew pending`)},"user":{"login":"github-actions[bot]","type":"Bot"}},` +
+      `{"id":${secondId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:success -->\nduplicate id`)},"user":{"login":"github-actions[bot]","type":"Bot"}},` +
+      `{"id":${firstId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:success -->\nout of order id`)},"user":{"login":"github-actions[bot]","type":"Bot"}}]`;
     global.fetch = async (url) => {
       if (url.endsWith("/user")) return res(404, { message: "Not Found" });
       if (url.includes("/issues/1/comments")) return rawRes(200, payload);
