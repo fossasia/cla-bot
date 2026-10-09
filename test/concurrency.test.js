@@ -235,6 +235,80 @@ const linkTo = (path, last) =>
     }
   });
 
+  await test("hasNextPage treats a complete valid Link set as authoritative and malformed or absent metadata as unknown", () => {
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=1>; rel="prev"'),
+      false,
+      "valid relation set without next means no next page",
+    );
+    assert.strictEqual(
+      bot.hasNextPage(
+        '<https://api.github.com/x?page=2>; rel="next", <https://api.github.com/x?page=1>; rel="prev"',
+      ),
+      true,
+    );
+    for (const malformed of [
+      null,
+      undefined,
+      "",
+      '<https://api.github.com/x?page=2>; rel="next',
+      '<https://api.github.com/x?page=1>; rel="prev", malformed next relation',
+      '<https://api.github.com/x?page=1>; rel="prev", <https://api.github.com/x?page=2>; rel="next',
+      '<https://api.github.com/x?page=1>; rel="prev"; rel="next"',
+      '<https://api.github.com/x?page=1>; rel="prev",',
+      '<https://api.github.com/x?page=1>; rel="prev", , <https://api.github.com/x?page=2>; rel="next"',
+      '<https://api.github.com/x?page=2; rel="next"',
+      '<https://api.github.com/x bad?page=1>; rel="next"',
+      '<https://api.github.com/x bad?page=1>; rel="prev", <https://api.github.com/x?page=2>; rel="next"',
+      '<https://api.github.com/x?page=1>; title="bad\nvalue"; rel="next"',
+      '<https://api.github.com/x?page=1>; title=',
+      '<https://api.github.com/x?page=1> trailing text',
+      '<https://api.github.com/x?page=1>; =next',
+    ]) {
+      assert.strictEqual(bot.hasNextPage(malformed), null, String(malformed));
+    }
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title="next, page"; rel="next"'),
+      true,
+      "commas inside a quoted parameter are not Link separators",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title="a\\"b"; rel="next"'),
+      true,
+      "an escaped quote does not end a quoted parameter",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title="a\\\\"; rel=next'),
+      true,
+      "an escaped backslash immediately before the closing quote is valid",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title=page; rel=next; type="text/html"'),
+      true,
+      "parameters before and after rel are accepted",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; rel="prev next"'),
+      true,
+      "a relation parameter can contain multiple relation-types",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title=page; rel=next'),
+      true,
+      "unquoted token parameter values are valid",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=2>; title="a\\\\b"; rel=next'),
+      true,
+      "quoted-string escapes are parsed without splitting the header",
+    );
+    assert.strictEqual(
+      bot.hasNextPage('<https://api.github.com/x?page=1>; title=""'),
+      false,
+      "an empty optional quoted parameter is valid metadata without next",
+    );
+  });
+
   // -------------------------------------------------------------------------
   // 3. ghRaw withLink
   // -------------------------------------------------------------------------
@@ -305,8 +379,18 @@ const linkTo = (path, last) =>
     const paged = (url, items, path) => {
       const page = Number((url.match(/[&?]page=(\d+)/) || [])[1] || 1);
       const lastPage = Math.max(1, Math.ceil(items.length / 100));
-      const headers =
-        link && lastPage > 1 ? { link: linkTo(path, lastPage) } : {};
+      const links = [];
+      if (link && lastPage > 1) {
+        if (page < lastPage) {
+          links.push(
+            `<https://api.github.com${path}?per_page=100&page=${page + 1}>; rel="next"`,
+          );
+        }
+        links.push(
+          `<https://api.github.com${path}?per_page=100&page=${lastPage}>; rel="last"`,
+        );
+      }
+      const headers = links.length ? { link: links.join(", ") } : {};
       return res(200, items.slice((page - 1) * 100, page * 100), headers);
     };
     // Compare returns an object, not a bare array: { commits, total_commits }.
@@ -1780,7 +1864,7 @@ const linkTo = (path, last) =>
     );
   });
 
-  await test("getExistingBotComments: an entry whose id is not a safe integer cannot be judged, so it is taken as is and does not disturb the ids around it", async () => {
+  await test("getExistingBotComments: an entry without a usable id is skipped without disturbing valid ids around it", async () => {
     const b = freshModule();
     const noId = { ...pagedBotComment(0, "pending"), id: undefined };
     global.fetch = async (url) => {
@@ -1794,7 +1878,7 @@ const linkTo = (path, last) =>
     };
     assert.deepStrictEqual(
       (await b.getExistingBotComments(1)).map((c) => c.id),
-      [10, undefined, 20],
+      [10, 20],
     );
   });
 

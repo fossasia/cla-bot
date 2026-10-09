@@ -15,6 +15,8 @@
  * Run: node test/comments-cache.test.js (also included in `npm test`)
  */
 const assert = require("assert");
+const fs = require("fs");
+const { Readable } = require("stream");
 
 process.env.GITHUB_TOKEN = "dummy";
 process.env.GITHUB_REPOSITORY = "fossasia/testrepo";
@@ -25,6 +27,7 @@ process.env.ALLOWLIST = "";
 
 const {
   getExistingBotComments,
+  checkPR,
   handlePullRequestTarget,
   handleIssueComment,
   postComment,
@@ -51,6 +54,39 @@ function res(status, jsonBody) {
     text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
     headers: { get: () => null },
   };
+}
+
+function rawRes(status, bodyText, link = null) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => bodyText,
+    headers: { get: (name) => (name.toLowerCase() === "link" ? link : null) },
+  };
+}
+
+// Model GitHub's numeric JSON IDs while keeping unsafe values exact in the
+// fixture. JSON.stringify() can't represent those numeric literals faithfully.
+function commentListRes(comments, status = 200, link = null) {
+  const json = JSON.stringify(comments).replace(
+    /"id":"([1-9]\d*)"/g,
+    '"id":$1',
+  );
+  return rawRes(status, json, link);
+}
+
+function commentsPageLink(url, page, total) {
+  const pages = Math.ceil(total / 100);
+  if (pages <= 1) return null;
+  const base = new URL(url);
+  const link = [];
+  if (page < pages) {
+    base.searchParams.set("page", String(page + 1));
+    link.push(`<${base.href}>; rel="next"`);
+  }
+  base.searchParams.set("page", String(pages));
+  link.push(`<${base.href}>; rel="last"`);
+  return link.join(", ");
 }
 
 const BOT = { login: "github-actions[bot]" };
@@ -210,7 +246,12 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       const all = [...flood, real];
       const page = Number(new URL(url).searchParams.get("page")) || 1;
       const start = (page - 1) * 100;
-      return res(200, all.slice(start, start + 100));
+      const pageItems = all.slice(start, start + 100);
+      return commentListRes(
+        pageItems,
+        200,
+        commentsPageLink(url, page, all.length),
+      );
     };
     const cache = new Map();
     const result = await getExistingBotComments(1, {
@@ -451,12 +492,27 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       }
       if (url.includes("/issues/1/comments")) {
         if (method === "GET") {
-          // Real GitHub pagination, so a flood of comments actually exercises
-          // multiple pages instead of looping forever (per_page=100 is fixed
-          // by the source, only `page` varies here).
-          const page = Number(new URL(url).searchParams.get("page")) || 1;
+          // GitHub defaults issue-comment lists to newest-first. Honor an
+          // explicit created/ascending request, and model that default when
+          // callers omit it so ordering assumptions are tested.
+          const parsedUrl = new URL(url);
+          const ascending =
+            parsedUrl.searchParams.get("sort") === "created" &&
+            parsedUrl.searchParams.get("direction") === "asc";
+          const ordered = [...state.comments].sort((left, right) => {
+            const a = BigInt(String(left.id));
+            const b = BigInt(String(right.id));
+            return a === b ? 0 : (a < b) === ascending ? -1 : 1;
+          });
+          // Real GitHub pagination, so a flood of comments exercises multiple
+          // pages instead of looping forever (per_page=100 is fixed by source).
+          const page = Number(parsedUrl.searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, state.comments.slice(start, start + 100));
+          return commentListRes(
+            ordered.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, ordered.length),
+          );
         }
         if (method === "POST") {
           const { body } = JSON.parse(opts.body);
@@ -490,6 +546,689 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     };
     return () => count;
   }
+
+  await test("comment-history pagination requests created/ascending order and keeps chronology across pages", async () => {
+    const comments = [
+      {
+        id: 1,
+        body: `${MARKER}\n<!-- fossasia-cla-bot:success -->\nold success`,
+        user: BOT,
+      },
+      ...Array.from({ length: 99 }, (_, index) => ({
+        id: index + 2,
+        body: `ordinary comment ${index}`,
+        user: { login: `user-${index}`, type: "User" },
+      })),
+      {
+        id: 101,
+        body: `${MARKER}\n<!-- fossasia-cla-bot:pending -->\nnew pending`,
+        user: BOT,
+      },
+      { id: 102, body: `${MARKER}\nunrelated latest bot comment`, user: BOT },
+    ];
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+      comments,
+    });
+    const requestedUrls = [];
+    const inner = gh.fetch;
+    global.fetch = async (url, opts = {}) => {
+      if (url.includes("/issues/1/comments")) requestedUrls.push(url);
+      return inner(url, opts);
+    };
+
+    const cache = new Map();
+    const pendingIsNewer = await commentsCacheStorage.run(cache, async () => {
+      const listed = await getExistingBotComments(1, { anyBotIdentity: true });
+      assert.deepStrictEqual(
+        listed.map((comment) => comment.id),
+        [1, 101, 102],
+        "all admitted bot comments must remain in ascending creation order despite the API's descending default",
+      );
+      return pendingIsNewerThanSuccess(1);
+    });
+
+    assert.strictEqual(
+      pendingIsNewer,
+      true,
+      "a newer pending comment must remain newer than success even when an unrelated bot comment follows it",
+    );
+    assert.deepStrictEqual(
+      requestedUrls.map((url) => {
+        const parsed = new URL(url);
+        return [parsed.searchParams.get("sort"), parsed.searchParams.get("direction")];
+      }),
+      [ ["created", "asc"], ["created", "asc"] ],
+      "every comment-history page must explicitly request created/ascending order",
+    );
+  });
+
+  await test("comment-history pagination falls back to page-size behavior for a partially malformed Link header", async () => {
+    const comments = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1,
+      body:
+        index === 100
+          ? `${MARKER}\n<!-- fossasia-cla-bot:pending -->\nlast-page pending`
+          : `${MARKER}\n<!-- fossasia-cla-bot:success -->\ncomment ${index}`,
+      user: BOT,
+    }));
+    const calls = [];
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        const page = Number(new URL(url).searchParams.get("page"));
+        calls.push(page);
+        const slice = comments.slice((page - 1) * 100, page * 100);
+        const link =
+          page === 1
+            ? '<https://api.github.com/x?page=1>; rel="prev", malformed next relation'
+            : '<https://api.github.com/x?page=1>; rel="prev"';
+        return commentListRes(slice, 200, link);
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+
+    const cache = new Map();
+    const result = await commentsCacheStorage.run(cache, () =>
+      getExistingBotComments(1, { anyBotIdentity: true }),
+    );
+
+    assert.deepStrictEqual(calls, [1, 2]);
+    assert.strictEqual(result.length, 101);
+    assert.ok(result.some((comment) => comment.body.includes("last-page pending")));
+  });
+
+  await test("comment-history pagination follows a valid next relation after a short page", async () => {
+    const comments = Array.from({ length: 101 }, (_, index) => ({
+      id: index + 1,
+      body: `${MARKER}\n<!-- fossasia-cla-bot:pending -->\ncomment ${index}`,
+      user: BOT,
+    }));
+    const calls = [];
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        const page = Number(new URL(url).searchParams.get("page"));
+        calls.push(page);
+        const slice = page === 1 ? comments.slice(0, 99) : comments.slice(99);
+        const link =
+          page === 1
+            ? '<https://api.github.com/x?page=2>; rel="next"'
+            : '<https://api.github.com/x?page=1>; rel="prev"';
+        return commentListRes(slice, 200, link);
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+
+    const result = await commentsCacheStorage.run(new Map(), () =>
+      getExistingBotComments(1, { anyBotIdentity: true }),
+    );
+
+    assert.deepStrictEqual(calls, [1, 2]);
+    assert.strictEqual(result.length, 101);
+    assert.ok(result.some((comment) => comment.body.includes("comment 100")));
+  });
+
+  await test("comment-history pagination accepts exactly MAX_LIST_PAGES and stops on a valid no-next relation", async () => {
+    const calls = [];
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        const page = Number(new URL(url).searchParams.get("page"));
+        calls.push(page);
+        const comments = Array.from({ length: 100 }, (_, index) => ({
+          id: (page - 1) * 100 + index + 1,
+          body: `${MARKER}\npage ${page}`,
+          user: BOT,
+        }));
+        const link =
+          page < 100
+            ? `<https://api.github.com/x?page=${page + 1}>; rel="next"`
+            : '<https://api.github.com/x?page=99>; rel="prev"';
+        return commentListRes(comments, 200, link);
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+
+    const result = await commentsCacheStorage.run(new Map(), () =>
+      getExistingBotComments(1, { anyBotIdentity: true }),
+    );
+
+    assert.deepStrictEqual(
+      calls,
+      Array.from({ length: 100 }, (_, i) => i + 1),
+    );
+    assert.strictEqual(
+      result.length,
+      200,
+      "history retention stays bounded at MAX_CACHED_COMMENTS",
+    );
+  });
+
+  await test("comment-history pagination fails before requesting page 101 when next persists at the limit", async () => {
+    const calls = [];
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        const page = Number(new URL(url).searchParams.get("page"));
+        calls.push(page);
+        const comments = Array.from({ length: 100 }, (_, index) => ({
+          id: (page - 1) * 100 + index + 1,
+          body: `${MARKER}\npage ${page}`,
+          user: BOT,
+        }));
+        return commentListRes(
+          comments,
+          200,
+          `<https://api.github.com/x?page=${page + 1}>; rel="next"`,
+        );
+      }
+      throw new Error(`unexpected call: ${url}`);
+    };
+
+    await assert.rejects(
+      commentsCacheStorage.run(new Map(), () =>
+        getExistingBotComments(1, { anyBotIdentity: true }),
+      ),
+      /issue comments for PR #1: needs more than 100 pages of 100/,
+    );
+    assert.deepStrictEqual(
+      calls,
+      Array.from({ length: 100 }, (_, i) => i + 1),
+    );
+  });
+
+  await test("duplicate cleanup stops at MAX_LIST_PAGES and never deletes from an incomplete scan", async () => {
+    const body = `${MARKER}\nconcurrent duplicate at pagination limit`;
+    let commentReads = 0;
+    let postCalls = 0;
+    const deletes = [];
+    const warnings = [];
+    const originalWarn = console.warn;
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        commentReads += 1;
+        // The first read is postComment()'s dedupe pre-check. The following
+        // 100 reads are the fresh cleanup scan after the post.
+        if (commentReads === 1) return commentListRes([]);
+        const page = Number(new URL(url).searchParams.get("page"));
+        const comments = Array.from({ length: 100 }, (_, index) => ({
+          id: (page - 1) * 100 + index + 1,
+          body,
+          user: BOT,
+        }));
+        return commentListRes(
+          comments,
+          200,
+          `<https://api.github.com/x?page=${page + 1}>; rel="next"`,
+        );
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        postCalls += 1;
+        return res(201, { id: 10001, body, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deletes.push(url);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    console.warn = (...args) => warnings.push(args.join(" "));
+    try {
+      await postComment(1, "concurrent duplicate at pagination limit");
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    assert.strictEqual(
+      postCalls,
+      1,
+      "posting is retained even when best-effort cleanup cannot complete",
+    );
+    assert.strictEqual(
+      commentReads,
+      101,
+      "one pre-check plus exactly 100 cleanup pages",
+    );
+    assert.deepStrictEqual(
+      deletes,
+      [],
+      "cleanup must not delete until the complete scan succeeds",
+    );
+    assert.ok(warnings.some((warning) => warning.includes("needs more than 100 pages")));
+  });
+
+  await test("duplicate cleanup completes at exactly MAX_LIST_PAGES before deleting duplicates", async () => {
+    const body = `${MARKER}\nconcurrent duplicate at pagination boundary`;
+    let commentReads = 0;
+    const deletes = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        commentReads += 1;
+        if (commentReads === 1) return commentListRes([]);
+        const page = Number(new URL(url).searchParams.get("page"));
+        const comments = Array.from({ length: 100 }, (_, index) => {
+          const id = (page - 1) * 100 + index + 1;
+          return {
+            id,
+            body: id <= 2 ? body : `ordinary comment ${id}`,
+            user: id <= 2 ? BOT : { login: `user-${id}`, type: "User" },
+          };
+        });
+        const link =
+          page < 100
+            ? `<https://api.github.com/x?page=${page + 1}>; rel="next"`
+            : '<https://api.github.com/x?page=99>; rel="prev"';
+        return commentListRes(comments, 200, link);
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        return res(201, { id: 10001, body, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deletes.push(url);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    await postComment(1, "concurrent duplicate at pagination boundary");
+
+    assert.strictEqual(
+      commentReads,
+      101,
+      "one pre-check plus exactly 100 cleanup pages",
+    );
+    assert.deepStrictEqual(
+      deletes,
+      ["https://api.github.com/repos/fossasia/testrepo/issues/comments/1"],
+      "the older matching comment is deleted only after the full allowed scan succeeds",
+    );
+  });
+
+  await test("duplicate cleanup follows valid next metadata after a short page", async () => {
+    const body = `${MARKER}\nconcurrent duplicate from next page`;
+    const firstPage = Array.from({ length: 99 }, (_, index) => ({
+      id: index + 1,
+      body: `ordinary comment ${index}`,
+      user: { login: `user-${index}`, type: "User" },
+    }));
+    let posted = false;
+    const deleteUrls = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        const page = Number(new URL(url).searchParams.get("page"));
+        const items = page === 1
+          ? firstPage
+          : posted
+            ? [
+                { id: 100, body, user: BOT },
+                { id: 101, body, user: BOT },
+              ]
+            : [];
+        const link = page === 1
+          ? '<https://api.github.com/x?page=2>; rel="next"'
+          : '<https://api.github.com/x?page=1>; rel="prev"';
+        return commentListRes(items, 200, link);
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        posted = true;
+        return res(201, { id: 101, body, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deleteUrls.push(url);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    await postComment(1, "concurrent duplicate from next page");
+
+    assert.deepStrictEqual(deleteUrls, [
+      "https://api.github.com/repos/fossasia/testrepo/issues/comments/100",
+    ]);
+  });
+
+  await test("comment IDs above Number.MAX_SAFE_INTEGER stay exact in cache and chronological comparisons", async () => {
+    const firstId = "9007199254740992";
+    const secondId = "9007199254740993";
+    const payload =
+      `[{"id":${firstId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:success -->\nold success`)},"user":{"login":"github-actions[bot]","type":"Bot"}},` +
+      `{"id":${secondId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:pending -->\nnew pending`)},"user":{"login":"github-actions[bot]","type":"Bot"}},` +
+      `{"id":${secondId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:success -->\nduplicate id`)},"user":{"login":"github-actions[bot]","type":"Bot"}},` +
+      `{"id":${firstId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:success -->\nout of order id`)},"user":{"login":"github-actions[bot]","type":"Bot"}}]`;
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) return rawRes(200, payload);
+      throw new Error(`unexpected call: ${url}`);
+    };
+
+    const cache = new Map();
+    const result = await commentsCacheStorage.run(cache, async () => {
+      const comments = await getExistingBotComments(1, {
+        anyBotIdentity: true,
+      });
+      return {
+        ids: comments.map((comment) => comment.id),
+        pendingIsNewer: await pendingIsNewerThanSuccess(1),
+      };
+    });
+
+    assert.deepStrictEqual(result.ids, [firstId, secondId]);
+    assert.strictEqual(result.pendingIsNewer, true);
+  });
+
+  await test("duplicate cleanup deletes the exact decimal comment ID above Number.MAX_SAFE_INTEGER", async () => {
+    const createdId = "9007199254740993";
+    const concurrentDuplicateId = "9007199254740994";
+    const comments = [];
+    const deleteUrls = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        return commentListRes(
+          [...comments].sort((left, right) =>
+            BigInt(String(left.id)) < BigInt(String(right.id)) ? -1 : 1,
+          ),
+        );
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        const body = JSON.parse(opts.body).body;
+        const created = { id: createdId, body, user: BOT };
+        comments.push(created, {
+          id: concurrentDuplicateId,
+          body,
+          user: BOT,
+        });
+        return commentListRes(created, 201);
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deleteUrls.push(url);
+        const id = url.slice(url.lastIndexOf("/") + 1);
+        const index = comments.findIndex((comment) => String(comment.id) === id);
+        if (index !== -1) comments.splice(index, 1);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    await postComment(1, "large-id duplicate race");
+
+    assert.deepStrictEqual(
+      deleteUrls,
+      [`https://api.github.com/repos/fossasia/testrepo/issues/comments/${createdId}`],
+      "the old duplicate's exact decimal ID must be used in the DELETE URL, never a rounded Number",
+    );
+    assert.deepStrictEqual(
+      comments.map((comment) => comment.id),
+      [concurrentDuplicateId],
+      "cleanup should keep the newest exact-ID comment",
+    );
+  });
+
+  await test("mixed safe and unsafe comment IDs stay exact through cache, pagination, spool, and deletion", async () => {
+    const safeId = Number.MAX_SAFE_INTEGER;
+    const firstUnsafeId = "9007199254740992";
+    const oldDuplicateId = "9007199254740993";
+    const concurrentDuplicateId = "9007199254740994";
+    const createdId = "9007199254740995";
+    const target = "mixed-ID duplicate race";
+    const full = `${MARKER}\n${target}`;
+    let commentReads = 0;
+    const deleteUrls = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        commentReads += 1;
+        if (commentReads === 1) {
+          // These JSON number tokens deliberately straddle MAX_SAFE_INTEGER,
+          // repeat the unsafe ID, then move backwards. Parsing and cache
+          // admission must retain only the two unique IDs in exact order.
+          const older = `${MARKER}\\nolder comment`;
+          return commentListRes([
+            { id: safeId, body: older, user: BOT },
+            { id: firstUnsafeId, body: older, user: BOT },
+            { id: firstUnsafeId, body: `${MARKER}\\nduplicate ID`, user: BOT },
+            { id: safeId, body: `${MARKER}\\nout of order`, user: BOT },
+          ]);
+        }
+        const page = Number(new URL(url).searchParams.get("page"));
+        const pageItems = page === 1
+          ? [
+              { id: oldDuplicateId, body: full, user: BOT },
+              { id: concurrentDuplicateId, body: full, user: BOT },
+            ]
+          : [
+              // A repeated/out-of-order ID must not count as another copy.
+              { id: concurrentDuplicateId, body: full, user: BOT },
+              { id: createdId, body: full, user: BOT },
+              { id: oldDuplicateId, body: full, user: BOT },
+            ];
+        const link = page === 1
+          ? '<https://api.github.com/x?page=2>; rel="next"'
+          : '<https://api.github.com/x?page=1>; rel="prev"';
+        return commentListRes(pageItems, 200, link);
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        return res(201, { id: createdId, body: full, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deleteUrls.push(url);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    await commentsCacheStorage.run(new Map(), async () => {
+      const cachedBeforePost = await getExistingBotComments(1);
+      assert.deepStrictEqual(
+        cachedBeforePost.map((comment) => comment.id),
+        [safeId, firstUnsafeId],
+        "safe numeric and unsafe decimal-string IDs remain distinct and ordered in the cache",
+      );
+
+      await postComment(1, target);
+
+      const cachedAfterPost = await getExistingBotComments(1);
+      assert.ok(
+        cachedAfterPost.some((comment) => comment.id === createdId),
+        "the post write-through keeps the exact unsafe response ID in the cache",
+      );
+    });
+
+    assert.strictEqual(commentReads, 3, "one cache read and a two-page fresh cleanup scan");
+    assert.deepStrictEqual(
+      deleteUrls,
+      [
+        `https://api.github.com/repos/fossasia/testrepo/issues/comments/${oldDuplicateId}`,
+        `https://api.github.com/repos/fossasia/testrepo/issues/comments/${concurrentDuplicateId}`,
+      ],
+      "the spool round-trip and DELETE URLs preserve both adjacent unsafe decimal IDs exactly",
+    );
+  });
+
+  await test("duplicate cleanup rejects a corrupt temporary ID before sending any DELETE", async () => {
+    const body = `${MARKER}\ncorrupt spool fixture`;
+    let commentReads = 0;
+    const deletes = [];
+    const originalCreateReadStream = fs.createReadStream;
+    const originalWarn = console.warn;
+    const warnings = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        commentReads += 1;
+        const items = commentReads === 1
+          ? []
+          : [1, 2].map((id) => ({ id, body, user: BOT }));
+        return commentListRes(items);
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        return res(201, { id: 3, body, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deletes.push(url);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    fs.createReadStream = () => Readable.from(["not-a-decimal-id\n"]);
+    console.warn = (...args) => warnings.push(args.join(" "));
+
+    try {
+      await postComment(1, "corrupt spool fixture");
+      assert.deepStrictEqual(deletes, []);
+      assert.ok(warnings.some((warning) => warning.includes("invalid ID in its temporary file")));
+    } finally {
+      fs.createReadStream = originalCreateReadStream;
+      console.warn = originalWarn;
+    }
+  });
+
+  await test("status-only checks on successful and failing PRs make zero comment-list requests", async () => {
+    const commit = {
+      sha: "c1",
+      author: { id: 1, login: "alice" },
+      parents: [{ sha: "p1" }],
+      commit: { author: { email: "alice@example.com" } },
+    };
+    for (const scenario of [
+      {
+        name: "already signed",
+        signatures: { version: 1, signatures: [{ id: 1, login: "alice" }] },
+        expectedStatus: "success",
+      },
+      {
+        name: "still missing a signature",
+        signatures: { version: 1, signatures: [] },
+        expectedStatus: "failure",
+      },
+    ]) {
+      const gh = makeFakeGitHub({
+        commits: [commit],
+        initialSignatures: scenario.signatures,
+      });
+      const getCommentReads = countCommentReads(gh);
+
+      await checkPR(1, "head-sha-abc", { statusOnly: true });
+
+      assert.strictEqual(
+        getCommentReads(),
+        0,
+        `${scenario.name} status-only evaluation must not fetch PR comments`,
+      );
+      assert.strictEqual(gh.comments.length, 0);
+      assert.strictEqual(
+        gh.statuses.length,
+        1,
+        `${scenario.name} status-only evaluation must publish one status`,
+      );
+      assert.strictEqual(
+        gh.statuses[0].state,
+        scenario.expectedStatus,
+        `${scenario.name} scenario must publish the expected state`,
+      );
+    }
+  });
+
+  await test("quiet clean success reads history once and does not refresh after deciding not to post", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+      ],
+      initialSignatures: {
+        version: 1,
+        signatures: [{ id: 1, login: "alice" }],
+      },
+    });
+    const getCommentReads = countCommentReads(gh);
+
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: {
+        number: 1,
+        head: { sha: "head-sha-abc" },
+        base: { sha: "base-sha-abc" },
+      },
+    });
+
+    assert.strictEqual(
+      getCommentReads(),
+      1,
+      "the prior-block decision needs one history read; a read-only quiet result must not force-refresh it",
+    );
+    assert.strictEqual(gh.comments.length, 0);
+    assert.strictEqual(gh.statuses.at(-1).state, "success");
+  });
+
+  await test("a first pending post uses one cached pre-check plus one fresh cleanup scan", async () => {
+    const gh = makeFakeGitHub({
+      commits: [
+        {
+          sha: "c1",
+          author: { id: 1, login: "alice" },
+          parents: [{ sha: "p1" }],
+          commit: { author: { email: "alice@example.com" } },
+        },
+      ],
+      initialSignatures: { version: 1, signatures: [] },
+    });
+    const getCommentReads = countCommentReads(gh);
+
+    await handlePullRequestTarget({
+      action: "synchronize",
+      pull_request: {
+        number: 1,
+        head: { sha: "head-sha-abc" },
+        base: { sha: "base-sha-abc" },
+      },
+    });
+
+    assert.strictEqual(
+      getCommentReads(),
+      2,
+      "one cached list for dedupe and one forced-fresh scan after the successful post",
+    );
+    assert.strictEqual(gh.comments.length, 1);
+    assert.match(gh.comments[0].body, /need to sign/i);
+  });
+
+  await test("a full 100-comment page without Link metadata requires an empty follow-up GET", async () => {
+    const prior = Array.from({ length: 99 }, (_, index) => ({
+      id: index + 1,
+      body: `ordinary comment ${index}`,
+      user: { login: `user-${index}`, type: "User" },
+    }));
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+      comments: prior,
+    });
+    const getCommentReads = countCommentReads(gh);
+
+    await postComment(1, "the 100th comment");
+
+    assert.strictEqual(gh.comments.length, 100);
+    assert.strictEqual(
+      getCommentReads(),
+      3,
+      "the pre-post snapshot reads 99 comments once, then cleanup confirms the full 100-comment page with empty page 2",
+    );
+  });
 
   await test("a REAL pending flag from 250+ admitted comments ago (older than MAX_CACHED_COMMENTS) still correctly triggers a success announcement", async () => {
     // Proves the capped comments LIST (MAX_CACHED_COMMENTS) is never used to
@@ -786,7 +1525,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
           const all = [oldDup, ...filler, { id: 501, body: full, user: BOT }];
           const page = Number(new URL(url).searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, all.slice(start, start + 100));
+          return commentListRes(
+            all.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, all.length),
+          );
         }
         if (method === "POST")
           return res(201, { id: 501, body: full, user: BOT });
@@ -832,7 +1575,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
           const all = [oldComment, ...filler];
           const page = Number(new URL(url).searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, all.slice(start, start + 100));
+          return commentListRes(
+            all.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, all.length),
+          );
         }
         if (method === "POST") {
           postCalls += 1;
@@ -901,7 +1648,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
         if (method === "GET") {
           const page = Number(new URL(url).searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, comments.slice(start, start + 100));
+          return commentListRes(
+            comments.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, comments.length),
+          );
         }
         if (method === "POST") {
           const created = {
@@ -1041,7 +1792,11 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
         if (method === "GET") {
           const page = Number(new URL(url).searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, comments.slice(start, start + 100));
+          return commentListRes(
+            comments.slice(start, start + 100),
+            200,
+            commentsPageLink(url, page, comments.length),
+          );
         }
         if (method === "POST") {
           const created = { id: 1002, body: full, user: BOT };
