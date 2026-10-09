@@ -400,9 +400,20 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     const state = {
       signatures: initialSignatures,
       sha: "sig-sha-0",
-      comments,
+      _comments: comments,
       statuses: [],
     };
+    // Tests inspect the live fake-GitHub state after DELETE requests replace
+    // the backing array, so never expose a stale reference to the initial one.
+    Object.defineProperty(state, "comments", {
+      configurable: true,
+      get() {
+        return this._comments;
+      },
+      set(value) {
+        this._comments = value;
+      },
+    });
     function b64(obj) {
       return Buffer.from(JSON.stringify(obj)).toString("base64");
     }

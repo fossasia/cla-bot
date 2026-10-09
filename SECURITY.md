@@ -59,7 +59,17 @@ Out of scope:
    GitHub itself reports, exactly like the signature store.
 5. This action never checks out or executes code from the pull request - it
    only reads PR/commit metadata via the API.
-6. A release can only be created by `.github/workflows/release.yml`, from a
+6. CLA comment history treats a comment as bot state only when it contains
+   this action's marker and GitHub reports its author as the configured bot,
+   a GitHub `Bot` account, or the default bot login. Accepting any GitHub
+   `Bot` account is intentional: it lets pending/success history survive a
+   switch between this action's GitHub App and `GITHUB_TOKEN` identities.
+   GitHub supplies the author identity; PR authors cannot forge another
+   account's `user.type`. This means a different or compromised GitHub App
+   with permission to comment can influence the bot-history calculation if
+   it deliberately posts the marker. Do not grant comment permissions to
+   untrusted GitHub Apps on repositories that rely on this action.
+7. A release can only be created by `.github/workflows/release.yml`, from a
    signed, annotated `vMAJOR.MINOR.PATCH` tag that GitHub reports as
    verified and whose own signed name is that same version (so a valid
    signed tag for another version cannot be replayed under a new name), on a
@@ -122,7 +132,7 @@ Out of scope:
    selected for a Latest reconciliation run. After a transient verification
    failure, rerun the failed jobs from the release run or wait for scheduled
    reconciliation.
-7. Release signing uses no long-lived key. Assets are signed with Sigstore
+8. Release signing uses no long-lived key. Assets are signed with Sigstore
    keyless signing, bound to the identity of that workflow run through
    GitHub's OIDC token, and recorded in a public transparency log. The jobs
    are split by what they run: `build` creates the archive with `git` and
@@ -140,7 +150,7 @@ Out of scope:
    job has only `contents: write`, runs shell commands without checkout or
    repository code, and uses that permission only to reconcile GitHub's Latest
    marker.
-8. A release does not start unless the workflow's immutability policy is
+9. A release does not start unless the workflow's immutability policy is
    explicit and the `release` environment has no required reviewers. Mutability
    is intentionally `not-required` in workflow code. Repository release rights
    are the only human authorization for publishing. GitHub's actual environment

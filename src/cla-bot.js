@@ -42,6 +42,9 @@
 "use strict";
 
 const fs = require("fs");
+const os = require("os");
+const path = require("path");
+const readline = require("readline");
 const crypto = require("crypto");
 const { AsyncLocalStorage } = require("node:async_hooks");
 
@@ -1500,71 +1503,98 @@ async function deleteDuplicateComment(prNumber, dup) {
   }
 }
 
-// Finds every existing comment, for the CURRENT bot identity only, whose
-// body is an EXACT match for `body` - what dedupeIdenticalTrailingComments()
-// below needs, over the PR's entire comment history. This is deliberately
-// its own fetch, separate from the general cache above: it must see
-// GitHub's real state right now regardless of anything cached before this
-// run's own post (same reason getExistingBotComments()'s own `fresh: true`
-// exists), and unlike that general-purpose list, this one is never capped.
-// That is safe, not reckless: what gets kept is filtered by an EXACT string
-// match as it streams page by page, so what's actually retained is bounded
-// by how many true duplicates of ONE already-known, specific message exist
-// - not by how many comments the PR has in total. Every other comment,
-// however many there are, is compared and discarded as it streams, never
-// accumulated.
+// Finds exact matches for the CURRENT bot identity across the full history.
+// The complete fresh scan is needed because the regular cache is capped and
+// predates this post. Matching IDs are spooled to a private temporary file so
+// discovery does not retain a history-sized array in memory; deletions start
+// only after pagination finishes, because deleting during a page-number scan
+// would shift later pages and could skip comments.
 async function findExactDuplicateComments(prNumber, body) {
   const botLogin = await resolveBotLogin();
-  const matches = [];
-  let page = 1;
-  for (;;) {
-    const comments = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?per_page=100&page=${page}`,
-      GITHUB_TOKEN,
-    );
-    if (!comments.length) break;
-    for (const c of comments) {
-      if (c.user && c.user.login === botLogin && c.body === body) {
-        matches.push({ id: c.id });
+  const tempDir = await fs.promises.mkdtemp(
+    path.join(os.tmpdir(), "cla-bot-dedupe-"),
+  );
+  const idsPath = path.join(tempDir, "matching-comment-ids.txt");
+  let file;
+  try {
+    file = await fs.promises.open(idsPath, "w", 0o600);
+    let page = 1;
+    let count = 0;
+    let bufferedIds = "";
+    for (;;) {
+      const comments = await gh(
+        `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?sort=created&direction=asc&per_page=100&page=${page}`,
+        GITHUB_TOKEN,
+      );
+      if (!comments.length) break;
+      for (const c of comments) {
+        if (c.user && c.user.login === botLogin && c.body === body) {
+          bufferedIds += `${c.id}\n`;
+          count += 1;
+          // Keep the write buffer fixed-size even for pathological histories.
+          if (count % 1000 === 0) {
+            await file.writeFile(bufferedIds);
+            bufferedIds = "";
+          }
+        }
       }
+      if (comments.length < 100) break;
+      page += 1;
     }
-    if (comments.length < 100) break;
-    page += 1;
+    if (bufferedIds) await file.writeFile(bufferedIds);
+    await file.close();
+    file = undefined;
+    return { tempDir, idsPath, count };
+  } catch (error) {
+    if (file) await file.close().catch(() => {});
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
+    throw error;
   }
-  return matches;
 }
 
 // The "no matching comment yet, so post" check in postComment() is two HTTP
 // calls with nothing atomic between them, so two concurrent runs can both
-// post. This cannot prevent that, but it cleans up right after: it finds the
-// bot comments with the same body and deletes all but the newest. Running it
-// twice, or deleting an already deleted comment (404), is harmless. The
-// `concurrency:` group in the consumer workflow is what really closes the
-// race. This is the backstop for when it is missing.
+// post. The fresh full-history scan is the backstop for that race. GitHub
+// returns issue comments oldest-first, so keep the final (newest) match and
+// delete all earlier exact matches in bounded batches.
 async function dedupeIdenticalTrailingComments(prNumber, body) {
-  const matching = (await findExactDuplicateComments(prNumber, body)).sort(
-    (a, b) => a.id - b.id,
+  const { tempDir, idsPath, count } = await findExactDuplicateComments(
+    prNumber,
+    body,
   );
-  // Keep the newest (highest id), delete the rest.
-  const duplicates = matching.slice(0, -1);
-  if (duplicates.length > 0) {
-    // Only for visibility, so a workflow without a proper `concurrency:` group
-    // does not go unnoticed. Logged before the deletes so it also shows when a
-    // delete fails. Contains the count and PR number only.
-    console.warn(
-      `::warning::Found ${duplicates.length} duplicate bot comment(s) on PR #${prNumber} and removing them - two runs likely posted the same comment at the same time. If this keeps happening, check that the consuming workflow sets the \`concurrency:\` group shown in examples/consumer-workflow.yml (see SECURITY.md).`,
-    );
-  }
-  // In batches of MAX_CONCURRENT_DELETES - every delete in a batch is
-  // independent of the others, so each batch itself still runs in
-  // parallel; deleteDuplicateComment() catches its own error, so one
-  // failing delete can never stop the rest of a batch or the batches
-  // after it.
-  for (let i = 0; i < duplicates.length; i += MAX_CONCURRENT_DELETES) {
-    const batch = duplicates.slice(i, i + MAX_CONCURRENT_DELETES);
-    await Promise.all(
-      batch.map((dup) => deleteDuplicateComment(prNumber, dup)),
-    );
+  const duplicateCount = Math.max(0, count - 1);
+  try {
+    if (duplicateCount > 0) {
+      console.warn(
+        `::warning::Found ${duplicateCount} duplicate bot comment(s) on PR #${prNumber} and removing them - two runs likely posted the same comment at the same time. If this keeps happening, check that the consuming workflow sets the \`concurrency:\` group shown in examples/consumer-workflow.yml (see SECURITY.md).`,
+      );
+      const lines = readline.createInterface({
+        input: fs.createReadStream(idsPath),
+        crlfDelay: Infinity,
+      });
+      let previousId;
+      let batch = [];
+      for await (const line of lines) {
+        const id = Number(line);
+        if (previousId !== undefined) {
+          batch.push({ id: previousId });
+          if (batch.length === MAX_CONCURRENT_DELETES) {
+            await Promise.all(
+              batch.map((dup) => deleteDuplicateComment(prNumber, dup)),
+            );
+            batch = [];
+          }
+        }
+        previousId = id;
+      }
+      if (batch.length) {
+        await Promise.all(
+          batch.map((dup) => deleteDuplicateComment(prNumber, dup)),
+        );
+      }
+    }
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true });
   }
 }
 
