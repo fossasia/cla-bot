@@ -667,9 +667,11 @@ async function ghRaw(path, token, options = {}) {
   consumeGitHubTokenRequest(token, { emergency: options.emergency === true });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const fetchOptions = { ...options };
+  delete fetchOptions.preserveUnsafeIds;
   try {
     const res = await fetch(`${GITHUB_API}${path}`, {
-      ...options,
+      ...fetchOptions,
       signal: controller.signal,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -703,7 +705,10 @@ async function ghRaw(path, token, options = {}) {
     }
     // Raw media-type requests (see readSignatures) return plain text.
     if (options.raw) return text;
-    const data = text ? JSON.parse(text) : null;
+    const jsonText = options.preserveUnsafeIds
+      ? preserveUnsafeJsonIds(text)
+      : text;
+    const data = jsonText ? JSON.parse(jsonText) : null;
     // Only list calls ask for the Link header (see listCommitsBetween()).
     return options.withLink ? { data, link: readLinkHeader(res) } : data;
   } finally {
@@ -852,6 +857,46 @@ function readLinkHeader(res) {
   return res.headers && typeof res.headers.get === "function"
     ? res.headers.get("link")
     : null;
+}
+
+// GitHub serializes database IDs as JSON numbers. JSON.parse() rounds integer
+// tokens above Number.MAX_SAFE_INTEGER, so preserve unsafe `id` fields as
+// decimal strings on comment responses where exact IDs are used in decisions
+// or DELETE URLs. This only changes numeric `id` properties, never JSON text
+// inside string values.
+function preserveUnsafeJsonIds(jsonText) {
+  const maxSafeId = String(Number.MAX_SAFE_INTEGER);
+  return jsonText.replace(
+    /([,{]\s*)"id"(\s*:\s*)([1-9]\d*)(?=\s*[,}\]])/g,
+    (match, prefix, separator, decimalId) => {
+      const unsafe =
+        decimalId.length > maxSafeId.length ||
+        (decimalId.length === maxSafeId.length && decimalId > maxSafeId);
+      return unsafe
+        ? `${prefix}"id"${separator}${JSON.stringify(decimalId)}`
+        : match;
+    },
+  );
+}
+
+function isUsableCommentId(id) {
+  return (
+    (Number.isSafeInteger(id) && id > 0) ||
+    (typeof id === "string" && /^[1-9]\d*$/.test(id))
+  );
+}
+
+function commentIdAsBigInt(id) {
+  if (!isUsableCommentId(id)) return null;
+  return BigInt(id);
+}
+
+function sameCommentId(left, right) {
+  return (
+    isUsableCommentId(left) &&
+    isUsableCommentId(right) &&
+    String(left) === String(right)
+  );
 }
 
 // The last page number from a `Link` header, or null if it's missing or not a
@@ -1736,8 +1781,8 @@ async function fetchBotLogin() {
   return DEFAULT_BOT_LOGIN;
 }
 
-// GitHub lists a PR's comments by ascending id, and a comment's id never
-// changes. A list read over several pages can still hand back the same
+// Comment history is requested explicitly in creation/id ascending order; a
+// comment's id never changes. A list read over several pages can still hand back the same
 // comment twice, or out of order, when the list changes while it is being
 // read. Such an entry must not count: a repeat would be read as a second copy
 // of that comment, and dedupeIdenticalTrailingComments() would then delete
@@ -1746,15 +1791,17 @@ async function fetchBotLogin() {
 //
 // Returns a function to call once per entry, in listing order: true to take
 // the entry, false to skip a repeat or an out-of-order one. It keeps one
-// number, so it is as cheap on a huge history as on a small one (the readers
+// BigInt, so it is as cheap on a huge history as on a small one (the readers
 // below stream the history on purpose, and must not start holding it). An
-// entry whose id is not a safe integer can't be judged and is taken as is.
+// entry with an invalid or untrustworthy id is skipped.
 function createAscendingIdFilter() {
-  let last = -Infinity;
+  let last = null;
   return (id) => {
-    if (!Number.isSafeInteger(id)) return true;
-    if (id <= last) return false;
-    last = id;
+    const comparable = commentIdAsBigInt(id);
+    if (comparable === null || (last !== null && comparable <= last)) {
+      return false;
+    }
+    last = comparable;
     return true;
   };
 }
@@ -1966,8 +2013,9 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
     // shares the one limiter. The pages themselves are still read one at a
     // time, see the note above.
     const comments = await ghRead(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?per_page=100&page=${page}`,
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?sort=created&direction=asc&per_page=100&page=${page}`,
       GITHUB_TOKEN,
+      { preserveUnsafeIds: true },
     );
     if (!comments.length) break;
     // Resolved once, reused for every page (botLogin cannot change mid-run -
@@ -2099,6 +2147,7 @@ async function postComment(prNumber, body, dedupe = true) {
     GITHUB_TOKEN,
     {
       method: "POST",
+      preserveUnsafeIds: true,
       body: JSON.stringify({ body: full }),
     },
   );
@@ -2134,13 +2183,13 @@ async function rememberOwnPostedComment(prNumber, category, body, comment) {
   const history = await entry.promise;
   const { comments, latestOwnBodyByCategory } = history;
   latestOwnBodyByCategory[category] = body;
-  if (!comment || !Number.isSafeInteger(comment.id)) {
+  if (!comment || !isUsableCommentId(comment.id)) {
     // Without the API's comment ID we cannot safely patch the list. Force the
     // next read to fetch GitHub instead of returning a known-stale snapshot.
     if (cache.get(prNumber) === entry) cache.delete(prNumber);
     return;
   }
-  if (comments.some((cached) => cached.id === comment.id)) return;
+  if (comments.some((cached) => sameCommentId(cached.id, comment.id))) return;
   if (category === "pending") history.lastPendingSeq = history.nextSeq;
   else if (category === "success") history.lastSuccessSeq = history.nextSeq;
   history.nextSeq += 1;
@@ -2195,7 +2244,9 @@ async function forgetDeletedCachedComment(prNumber, commentId) {
   const entry = cache && cache.get(prNumber);
   if (!entry) return;
   const { comments } = await entry.promise;
-  const index = comments.findIndex((comment) => comment.id === commentId);
+  const index = comments.findIndex((comment) =>
+    sameCommentId(comment.id, commentId),
+  );
   if (index !== -1) comments.splice(index, 1);
 }
 
@@ -2231,6 +2282,7 @@ async function findExactDuplicateComments(prNumber, body) {
       const comments = await gh(
         `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?sort=created&direction=asc&per_page=100&page=${page}`,
         GITHUB_TOKEN,
+        { preserveUnsafeIds: true },
       );
       if (!comments.length) break;
       for (const c of comments) {
@@ -2238,9 +2290,10 @@ async function findExactDuplicateComments(prNumber, body) {
           c.user &&
           c.user.login === botLogin &&
           c.body === body &&
+          isUsableCommentId(c.id) &&
           takeId(c.id)
         ) {
-          bufferedIds += `${c.id}\n`;
+          bufferedIds += `${String(c.id)}\n`;
           count += 1;
           // Keep the write buffer fixed-size even for pathological histories.
           if (count % 1000 === 0) {
@@ -2286,7 +2339,12 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
       let previousId;
       let batch = [];
       for await (const line of lines) {
-        const id = Number(line);
+        const id = line;
+        if (!isUsableCommentId(id)) {
+          throw new Error(
+            "Duplicate comment cleanup encountered an invalid ID in its temporary file.",
+          );
+        }
         if (previousId !== undefined) {
           batch.push({ id: previousId });
           if (batch.length === MAX_CONCURRENT_DELETES) {

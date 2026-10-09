@@ -1780,7 +1780,7 @@ const linkTo = (path, last) =>
     );
   });
 
-  await test("getExistingBotComments: an entry whose id is not a safe integer cannot be judged, so it is taken as is and does not disturb the ids around it", async () => {
+  await test("getExistingBotComments: an entry without a usable id is skipped without disturbing valid ids around it", async () => {
     const b = freshModule();
     const noId = { ...pagedBotComment(0, "pending"), id: undefined };
     global.fetch = async (url) => {
@@ -1794,7 +1794,7 @@ const linkTo = (path, last) =>
     };
     assert.deepStrictEqual(
       (await b.getExistingBotComments(1)).map((c) => c.id),
-      [10, undefined, 20],
+      [10, 20],
     );
   });
 

@@ -54,6 +54,25 @@ function res(status, jsonBody) {
   };
 }
 
+function rawRes(status, bodyText) {
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => bodyText,
+    headers: { get: () => null },
+  };
+}
+
+// Model GitHub's numeric JSON IDs while keeping unsafe values exact in the
+// fixture. JSON.stringify() can't represent those numeric literals faithfully.
+function commentListRes(comments, status = 200) {
+  const json = JSON.stringify(comments).replace(
+    /"id":"([1-9]\d*)"/g,
+    '"id":$1',
+  );
+  return rawRes(status, json);
+}
+
 const BOT = { login: "github-actions[bot]" };
 const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 
@@ -452,12 +471,23 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       }
       if (url.includes("/issues/1/comments")) {
         if (method === "GET") {
-          // Real GitHub pagination, so a flood of comments actually exercises
-          // multiple pages instead of looping forever (per_page=100 is fixed
-          // by the source, only `page` varies here).
-          const page = Number(new URL(url).searchParams.get("page")) || 1;
+          // GitHub defaults issue-comment lists to newest-first. Honor an
+          // explicit created/ascending request, and model that default when
+          // callers omit it so ordering assumptions are tested.
+          const parsedUrl = new URL(url);
+          const ascending =
+            parsedUrl.searchParams.get("sort") === "created" &&
+            parsedUrl.searchParams.get("direction") === "asc";
+          const ordered = [...state.comments].sort((left, right) => {
+            const a = BigInt(String(left.id));
+            const b = BigInt(String(right.id));
+            return a === b ? 0 : (a < b) === ascending ? -1 : 1;
+          });
+          // Real GitHub pagination, so a flood of comments exercises multiple
+          // pages instead of looping forever (per_page=100 is fixed by source).
+          const page = Number(parsedUrl.searchParams.get("page")) || 1;
           const start = (page - 1) * 100;
-          return res(200, state.comments.slice(start, start + 100));
+          return commentListRes(ordered.slice(start, start + 100));
         }
         if (method === "POST") {
           const { body } = JSON.parse(opts.body);
@@ -491,6 +521,139 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     };
     return () => count;
   }
+
+  await test("comment-history pagination requests created/ascending order and keeps chronology across pages", async () => {
+    const comments = [
+      {
+        id: 1,
+        body: `${MARKER}\n<!-- fossasia-cla-bot:success -->\nold success`,
+        user: BOT,
+      },
+      ...Array.from({ length: 99 }, (_, index) => ({
+        id: index + 2,
+        body: `ordinary comment ${index}`,
+        user: { login: `user-${index}`, type: "User" },
+      })),
+      {
+        id: 101,
+        body: `${MARKER}\n<!-- fossasia-cla-bot:pending -->\nnew pending`,
+        user: BOT,
+      },
+      { id: 102, body: `${MARKER}\nunrelated latest bot comment`, user: BOT },
+    ];
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+      comments,
+    });
+    const requestedUrls = [];
+    const inner = gh.fetch;
+    global.fetch = async (url, opts = {}) => {
+      if (url.includes("/issues/1/comments")) requestedUrls.push(url);
+      return inner(url, opts);
+    };
+
+    const cache = new Map();
+    const pendingIsNewer = await commentsCacheStorage.run(cache, async () => {
+      const listed = await getExistingBotComments(1, { anyBotIdentity: true });
+      assert.deepStrictEqual(
+        listed.map((comment) => comment.id),
+        [1, 101, 102],
+        "all admitted bot comments must remain in ascending creation order despite the API's descending default",
+      );
+      return pendingIsNewerThanSuccess(1);
+    });
+
+    assert.strictEqual(
+      pendingIsNewer,
+      true,
+      "a newer pending comment must remain newer than success even when an unrelated bot comment follows it",
+    );
+    assert.deepStrictEqual(
+      requestedUrls.map((url) => {
+        const parsed = new URL(url);
+        return [parsed.searchParams.get("sort"), parsed.searchParams.get("direction")];
+      }),
+      [ ["created", "asc"], ["created", "asc"] ],
+      "every comment-history page must explicitly request created/ascending order",
+    );
+  });
+
+  await test("comment IDs above Number.MAX_SAFE_INTEGER stay exact in cache and chronological comparisons", async () => {
+    const firstId = "9007199254740992";
+    const secondId = "9007199254740993";
+    const payload =
+      `[{"id":${firstId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:success -->\nold success`)},"user":{"login":"github-actions[bot]","type":"Bot"}},` +
+      `{"id":${secondId},"body":${JSON.stringify(`${MARKER}\n<!-- fossasia-cla-bot:pending -->\nnew pending`)},"user":{"login":"github-actions[bot]","type":"Bot"}}]`;
+    global.fetch = async (url) => {
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) return rawRes(200, payload);
+      throw new Error(`unexpected call: ${url}`);
+    };
+
+    const cache = new Map();
+    const result = await commentsCacheStorage.run(cache, async () => {
+      const comments = await getExistingBotComments(1, {
+        anyBotIdentity: true,
+      });
+      return {
+        ids: comments.map((comment) => comment.id),
+        pendingIsNewer: await pendingIsNewerThanSuccess(1),
+      };
+    });
+
+    assert.deepStrictEqual(result.ids, [firstId, secondId]);
+    assert.strictEqual(result.pendingIsNewer, true);
+  });
+
+  await test("duplicate cleanup deletes the exact decimal comment ID above Number.MAX_SAFE_INTEGER", async () => {
+    const createdId = "9007199254740993";
+    const concurrentDuplicateId = "9007199254740994";
+    const comments = [];
+    const deleteUrls = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments") && method === "GET") {
+        return commentListRes(
+          [...comments].sort((left, right) =>
+            BigInt(String(left.id)) < BigInt(String(right.id)) ? -1 : 1,
+          ),
+        );
+      }
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        const body = JSON.parse(opts.body).body;
+        const created = { id: createdId, body, user: BOT };
+        comments.push(created, {
+          id: concurrentDuplicateId,
+          body,
+          user: BOT,
+        });
+        return commentListRes(created, 201);
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deleteUrls.push(url);
+        const id = url.slice(url.lastIndexOf("/") + 1);
+        const index = comments.findIndex((comment) => String(comment.id) === id);
+        if (index !== -1) comments.splice(index, 1);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    await postComment(1, "large-id duplicate race");
+
+    assert.deepStrictEqual(
+      deleteUrls,
+      [`https://api.github.com/repos/fossasia/testrepo/issues/comments/${createdId}`],
+      "the old duplicate's exact decimal ID must be used in the DELETE URL, never a rounded Number",
+    );
+    assert.deepStrictEqual(
+      comments.map((comment) => comment.id),
+      [concurrentDuplicateId],
+      "cleanup should keep the newest exact-ID comment",
+    );
+  });
 
   await test("status-only checks on successful and failing PRs make zero comment-list requests", async () => {
     const commit = {
