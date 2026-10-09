@@ -94,7 +94,18 @@ function b64(obj) {
       if (url.endsWith("/user")) {
         return res(200, { login: "new-custom-bot[bot]", type: "Bot" });
       }
-      if (url.includes("/pulls/1/commits")) return res(200, commits);
+      if (url.includes("/compare/"))
+        return res(200, { commits, total_commits: commits.length });
+      // checkPR() reads base/head once and compares the two SHAs - this is
+      // unrelated to the bot-identity switch this file tests, so just echo
+      // back the same base and head the webhook already carried (otherwise
+      // this would silently exercise checkPR()'s base-change retry path
+      // instead of the simple, unmoving-PR path this file means to test).
+      if (/\/pulls\/1$/.test(url))
+        return res(200, {
+          head: { sha: "head-sha" },
+          base: { sha: "base-sha-fixture" },
+        });
       if (url.includes("/contents/signatures/cla.json") && method === "GET") {
         return res(200, {
           sha: state.sha,
@@ -135,7 +146,7 @@ function b64(obj) {
     // quiet-by-default pull_request_target trigger.
     await handlePullRequestTarget({
       action: "synchronize",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     });
 
     assert.strictEqual(
@@ -188,7 +199,18 @@ function b64(obj) {
       if (url.endsWith("/user")) {
         return res(200, { login: "new-custom-bot[bot]", type: "Bot" });
       }
-      if (url.includes("/pulls/1/commits")) return res(200, commits);
+      if (url.includes("/compare/"))
+        return res(200, { commits, total_commits: commits.length });
+      // checkPR() reads base/head once and compares the two SHAs - this is
+      // unrelated to the bot-identity switch this file tests, so just echo
+      // back the same base and head the webhook already carried (otherwise
+      // this would silently exercise checkPR()'s base-change retry path
+      // instead of the simple, unmoving-PR path this file means to test).
+      if (/\/pulls\/1$/.test(url))
+        return res(200, {
+          head: { sha: "head-sha" },
+          base: { sha: "base-sha-fixture" },
+        });
       if (url.includes("/contents/signatures/cla.json") && method === "GET") {
         return res(200, {
           sha: state.sha,
@@ -223,7 +245,7 @@ function b64(obj) {
 
     await handlePullRequestTarget({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "head-sha" } },
+      pull_request: { number: 1, head: { sha: "head-sha" }, base: { sha: "base-sha-fixture" } },
     });
 
     assert.strictEqual(

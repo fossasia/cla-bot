@@ -278,8 +278,8 @@ function startFakeGitHub({ authorAlreadySigned }) {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(obj === null ? "" : JSON.stringify(obj));
       };
-      if (req.url.includes("/pulls/1/commits")) {
-        return send(200, [
+      if (req.url.includes("/compare/")) {
+        const commits = [
           {
             sha: "e2e-commit-sha",
             author: { id: 42, login: "e2e-author" },
@@ -290,10 +290,14 @@ function startFakeGitHub({ authorAlreadySigned }) {
               verification: { verified: false },
             },
           },
-        ]);
+        ];
+        return send(200, { commits, total_commits: commits.length });
       }
       if (req.url.includes("/pulls/1") && !req.url.includes("/commits")) {
-        return send(200, { head: { sha: "e2e-head-sha" } });
+        return send(200, {
+          head: { sha: "e2e-head-sha" },
+          base: { sha: "e2e-base-sha" },
+        });
       }
       if (req.url.includes("/contents/signatures/cla.json")) {
         if (req.method === "GET") {
@@ -391,7 +395,7 @@ function baseEnv(apiUrl) {
     const server = await startFakeGitHub({ authorAlreadySigned: true });
     const eventFile = writeTempEventFile({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "e2e-head-sha" } },
+      pull_request: { number: 1, head: { sha: "e2e-head-sha" }, base: { sha: "base-sha-fixture" } },
     });
     try {
       const { code, stderr } = await runScript({
@@ -866,7 +870,7 @@ function baseEnv(apiUrl) {
   await test("GITHUB_API defaults to https://api.github.com when GITHUB_API_URL is unset", async () => {
     const eventFile = writeTempEventFile({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "test-sha" } },
+      pull_request: { number: 1, head: { sha: "test-sha" }, base: { sha: "base-sha-fixture" } },
     });
     try {
       const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
@@ -894,7 +898,7 @@ function baseEnv(apiUrl) {
   await test("GITHUB_API uses GITHUB_API_URL verbatim when it's set, instead of the default host", async () => {
     const eventFile = writeTempEventFile({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "test-sha" } },
+      pull_request: { number: 1, head: { sha: "test-sha" }, base: { sha: "base-sha-fixture" } },
     });
     try {
       const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
@@ -924,7 +928,7 @@ function baseEnv(apiUrl) {
   await test('REPO_OWNER/REPO_NAME fall back to empty strings (via the "/" default) when GITHUB_REPOSITORY is unset - a real, if unlikely, misconfiguration', async () => {
     const eventFile = writeTempEventFile({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "test-sha" } },
+      pull_request: { number: 1, head: { sha: "test-sha" }, base: { sha: "base-sha-fixture" } },
     });
     try {
       const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
@@ -942,7 +946,7 @@ function baseEnv(apiUrl) {
         GITHUB_EVENT_PATH: eventFile,
       });
       assert.ok(
-        capturedUrl && capturedUrl.includes("/repos///pulls/"),
+        capturedUrl && capturedUrl.includes("/repos///compare/"),
         `expected empty owner and repo segments (three consecutive slashes) from the "/" fallback, got: ${capturedUrl}`,
       );
     } finally {
@@ -953,7 +957,7 @@ function baseEnv(apiUrl) {
   await test('REPO_OWNER/REPO_NAME parse normally from a genuine "owner/repo" GITHUB_REPOSITORY', async () => {
     const eventFile = writeTempEventFile({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "test-sha" } },
+      pull_request: { number: 1, head: { sha: "test-sha" }, base: { sha: "base-sha-fixture" } },
     });
     try {
       const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
@@ -970,7 +974,7 @@ function baseEnv(apiUrl) {
       });
       assert.ok(
         capturedUrl &&
-          capturedUrl.includes("/repos/some-owner/some-repo/pulls/"),
+          capturedUrl.includes("/repos/some-owner/some-repo/compare/"),
         `expected REPO_OWNER="some-owner" and REPO_NAME="some-repo" to be parsed out correctly, got: ${capturedUrl}`,
       );
     } finally {
@@ -1133,7 +1137,7 @@ function baseEnv(apiUrl) {
     const server = await startFakeGitHub({ authorAlreadySigned: true });
     const eventFile = writeTempEventFile({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "e2e-head-sha" } },
+      pull_request: { number: 1, head: { sha: "e2e-head-sha" }, base: { sha: "base-sha-fixture" } },
     });
     const previousAppId = process.env.SIG_APP_ID;
     const previousAppKey = process.env.SIG_APP_PRIVATE_KEY;

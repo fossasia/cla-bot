@@ -392,6 +392,15 @@ What the signatures do **not** protect against, and what does:
     example workflow, which queues overlapping runs for the same PR instead
     of racing them. The in-code mitigations are a backstop for when that
     group is missing, not a substitute for it.
+  - The group alone isn't quite enough, though: GitHub's default queue holds
+    only one pending run per group, and a run that's already pending is
+    replaced - not queued behind - by a newer one that arrives before it
+    starts. A signing comment's run records a real state change (the
+    signature itself), not just a status re-check, so losing it this way
+    would mean the comment stays on the PR but the signature is silently
+    never written. `queue: max` on the group (see the example workflow) is
+    what closes this: every event waits its actual turn instead of a third
+    one discarding a still-pending second one.
 - The comment-history cache is an invocation snapshot. Within one `checkPR()`
   run, successful comments posted or deleted by that run are written through;
   comment changes made by another process are not incorporated automatically.
@@ -420,6 +429,222 @@ What the signatures do **not** protect against, and what does:
   `object`/`raw` media types (good up to 100 MB) instead of the default
   format (reliable only under 1 MB), so this comfortably covers realistic
   growth.
+- Independent GitHub reads (co-author lookups, pages of commits, and the
+  bot-login lookup that runs next to the first page of comments) run at the
+  same time, but never more than 8 at once, through one shared limiter.
+  Anything that changes state goes one request at a time. A big PR costs
+  about the same number of requests as before, just with less waiting. The
+  pages of a PR's comment history are still read one after another (see
+  below).
+- `checkPR()` always certifies one base and head pair, and only after
+  confirming the PR still is that pair. An automatic `pull_request_target`
+  run starts from the pair in its own webhook payload. Other runs read the PR
+  once and use its base and head together. The commit list is built with the
+  Compare endpoint (`base...head`) for those two commit SHAs, so a later push
+  cannot change the list being read. Right before anything is published, the
+  PR is read once more:
+  - If a head was named and the PR has moved on, nothing is published. The
+    event for the new head checks it.
+  - If only the base moved (no event is sent for that), the new pair is
+    checked instead, up to `MAX_PAIR_ATTEMPTS` (3) times. If the PR keeps
+    moving, the run fails and publishes nothing; `recheck` tries again.
+    A status is only ever written to the head SHA of the pair that was checked.
+    This re-check is a plain equality check on base and head, so it catches
+    ANY difference - a base moving backward or being retargeted to an
+    unrelated branch counts exactly the same as one moving forward, and
+    triggers the same re-evaluation.
+  - There is no REST call that publishes a status only if the PR is still
+    this exact pair, so "confirm, then publish" can never be made fully
+    atomic against a change in the last few milliseconds before the write
+    lands. `checkPR()` closes as much of that window as a second HTTP call
+    can: right after publishing, it reads the PR once more. If the base
+    moved onto the very same head during or immediately after the write, the
+    status just published is now known to be stale (it certified the old
+    base), so it is **not** left standing - the new pair is evaluated and
+    published instead, going through the same `MAX_PAIR_ATTEMPTS`-bounded
+    loop as the pre-publish check. If attempts run out while a status is
+    known to be stale, the head is overwritten with a conservative failure
+    rather than trusting whatever was last written. If the head itself moved
+    on instead, nothing more is done for the old head - a status is bound to
+    one exact SHA, so it cannot satisfy anything checking the PR's new head,
+    and the event for that new head covers it on its own. The one window
+    that truly cannot be closed this way is a change landing in the handful
+    of milliseconds between the post-publish read and the read after that -
+    `recheck` asks for another pass if this is ever suspected.
+  - All of the above is about a change happening *while* one run is working.
+    A base retarget landing cleanly *after* a run has already finished is a
+    different problem, and not one `checkPR()` can detect on its own - by
+    then it has already returned. The fix lives one level up, in which
+    webhook actions trigger a run at all: a retarget with no new commit on
+    it fires neither `synchronize` (no new head) nor `closed`/`reopened`, so
+    without also listening for `edited`, nothing re-evaluates the PR against
+    its new base, and a status published for the old base stays attached to
+    the unchanged head indefinitely. `pull_request_target`'s `edited` action
+    also fires for a plain title or body edit, which needs no re-check, so
+    `handlePullRequestTarget()` only acts on it when the payload's own
+    `changes.base` is present - GitHub's signal that the base branch itself
+    changed, not just its description. The shipped example workflow
+    subscribes to `edited` for exactly this; a consumer workflow that omits
+    it reintroduces this gap.
+  - `changes.base` only fires when the PR's base is pointed at a *different*
+    branch. It says nothing about the base *branch's own tip* moving while
+    the PR keeps targeting the same branch - an ordinary push to `main`
+    doesn't deliver any `pull_request_target` event at all, retarget or
+    otherwise, since the PR object itself didn't change. For a branch that
+    only ever moves forward (an ordinary fast-forward push, the normal case
+    for a protected branch), this is a staleness window rather than a
+    correctness problem: the Compare API only ever returns commits reachable
+    from the head but not the base, so a base moving forward can only shrink
+    that set, never add an unvetted commit to it - a status published
+    against the old base stays at least as conservative against the new one.
+    A base branch that can be force-pushed or reset is a different story:
+    the new comparison can be materially different from the one that was
+    actually checked, while the old status stays on the unchanged head.
+    Closing that fully needs something outside a single PR event entirely -
+    a scheduled reconciliation pass, or a `push`-triggered recheck of every
+    open PR targeting the pushed branch - which is a real feature addition,
+    not a fix to this run's own logic, and not one this project ships by
+    default. The specific risk only exists for repositories that allow
+    force-pushes to a branch PRs target, which is already outside GitHub's
+    own recommended branch-protection configuration; protecting the base
+    branch from force-pushes closes this at the source and is the
+    recommended mitigation for repositories that need a stronger guarantee
+    here than the staleness window above.
+  - This isn't limited to a stale pair. Once a status has landed this run,
+    the run tracks that fact (and which head it's for) the instant the write
+    itself succeeds - not after everything that follows it, like the
+    comment, also succeeds. If anything after that point throws for real -
+    another attempt's evaluation, a re-read, the comment write, hitting the
+    request budget above - the run does not just let that error propagate
+    past a status that was never re-confirmed: it fails the head closed
+    first (a best-effort overwrite to `failure`; a further failure in that
+    overwrite itself is logged, not thrown, so it can't mask the original
+    problem), then re-raises the original error so the run is still visibly
+    a failure. See `failClosedStatus()`.
+- Comment history (used to avoid repeat comments) is read page by page, and
+  GitHub does not give a consistent snapshot across pages - this is an
+  offset-based `page=`/`per_page=` API, not a cursor or a snapshot, so a list
+  that changes mid-walk can shift what lands on which page while the walk is
+  reading them. It never decides who has signed, only whether a comment is
+  posted again or a success announcement is skipped. GitHub lists comments by
+  ascending id, so both comment readers (the cache load and the duplicate
+  cleanup scan) take an entry only if its id is above every id they already
+  took, and skip anything else as a repeat. That keeps a shifted page boundary
+  from making the bot see one comment twice - which would make the cleanup
+  treat it as a duplicate of itself and delete the only copy. It keeps
+  just one number, so it holds for a history of any size.
+  A comment *deleted* mid-walk is a different, still-open gap: deleting an
+  item shifts every later item back by one position, so the item that shifts
+  into what was already-read page N's boundary is never re-read, and is
+  missed. Closing that fully would mean re-reading every earlier page too, on
+  every walk, for a purely cosmetic concern. The actual exposure is also
+  narrow: aside from the bot's own duplicate-cleanup, comments on an open PR
+  are essentially never deleted by anyone else, and even when this does
+  happen, the worst outcome is one repeated or skipped bot comment,
+  self-correcting on whatever event triggers the next check.
+- The commit comparison (`listCommitsBetween`) stops at 100 pages (10,000
+  commits), and this is an exact limit: exactly 10,000 commits succeeds,
+  10,001 fails. A longer list, or a `Link` header claiming one, makes the run
+  fail instead of being trusted partly. GitHub's own `total_commits` says the
+  exact count up front, so the walk stops exactly there instead of guessing
+  from page fullness. Comment history has no page cap on purpose (see the
+  complete-history note above); it is bounded only by the run-wide request
+  budget below, which fails the run rather than let it read without limit.
+- Co-author identity lookups (Co-authored-by trailers) are capped twice: at
+  most 20 distinct trailers per commit, and at most `MAX_COAUTHOR_LOOKUPS_PER_RUN`
+  (300) distinct identities looked up across one whole run, however many
+  commits, trailers, or re-evaluation attempts there are. One budget is
+  created once per `checkPR()` run and threaded through every attempt - it is
+  never recreated per attempt, since a PR whose base keeps moving can be
+  re-evaluated up to `MAX_PAIR_ATTEMPTS` times and a fresh budget each time
+  would multiply the real ceiling. Without the per-commit cap, a PR with many
+  commits, each carrying the per-commit maximum, could queue a huge number of
+  identity lookups behind the shared limiter - a real availability problem,
+  not just a slow run. The run-wide budget also has to leave headroom under
+  the default `GITHUB_TOKEN`'s 1,000 requests/hour per-repository limit for
+  the rest of the run's own traffic (paging the compare, paging comments,
+  reading and writing the status, reading the PR), which is why it is well
+  under 1,000, not just under it. Trailers past either cap are flagged for
+  manual review instead of looked up. The budget is keyed by the parsed
+  identity (an account id for `id+login@users.noreply.github.com`, or a
+  lowercased login for the older `login@users.noreply.github.com` format),
+  not by the raw trailer address: two different trailers *in the same
+  format* that happen to name the same account - say, the same id with
+  different claimed login text in each - share one slot instead of two.
+  This is a real but partial improvement, not a full account-level budget:
+  the same real account named once through each format (an old-style
+  `login@...` trailer on one commit, a new-style `id+login@...` trailer for
+  the same person on another) still produces two different keys (`login:x`
+  vs `id:n`) and so still costs two slots, because which account a login
+  resolves to is exactly the fact the budget exists to avoid looking up
+  speculatively - there is no way to know the two keys name the same account
+  without doing the very lookup being budgeted. In practice this can only
+  ever double-count, never let an over-the-cap PR through uncounted, and
+  doing so requires the same contributor's co-author trailer to appear in
+  both formats within one PR, which is uncommon; it is flagged here for
+  accuracy rather than fixed, since a real fix would have to spend the
+  lookups it exists to bound. An address that isn't either noreply format
+  never touches the budget, since resolving it never costs a request in the
+  first place.
+  This identity count is a cheap, early filter, not the actual request
+  ceiling: `gh()` transparently retries a transient failure (see
+  `MAX_RETRIES`), so one admitted identity can cost more than one real
+  request. The actual ceiling is `MAX_GITHUB_TOKEN_REQUESTS_PER_RUN` (700),
+  enforced underneath everything in `ghRaw()` - it counts every real
+  `GITHUB_TOKEN` request this event's processing makes, retries included,
+  from every source (identity lookups, compare pagination, comment
+  pagination, the PR itself, status writes, a signature read/write), and
+  refuses to send another once it's spent. A separate, small
+  `GITHUB_TOKEN_EMERGENCY_RESERVE` (10) is carved *out of* that same 700, not
+  added on top of it, so the total across both pools genuinely never exceeds
+  it; the reserve is spent only by `failClosedStatus()`'s own recovery write
+  (see below) - without it, the exact exhaustion that makes a fail-closed
+  overwrite necessary could also be the thing that blocks sending it,
+  deterministically defeating the safety net the moment it's needed most.
+  The budget covers the whole event, not just `checkPR()`'s own work:
+  `handleIssueComment()` and `handlePullRequestTarget()` each start one for
+  their entire call (see `runWithGitHubTokenRequestBudget()`), since a
+  signing comment reads and writes the signature store - with `GITHUB_TOKEN`
+  itself, whenever no separate App installation token is configured - before
+  `checkPR()` is ever reached; leaving that traffic uncounted would make
+  "run-wide" not actually mean the whole run. `checkPR()` also starts its
+  own budget, for any caller that reaches it some other way (every test does
+  this, and it's an exported function, so a future caller might too); when
+  it's called from inside one of the two handlers above, it transparently
+  reuses that outer budget instead of starting a nested, independent one.
+  `checkPR()` runs under this budget via an `AsyncLocalStorage` store, not a
+  plain shared variable: two overlapping top-level calls in the same process
+  - `checkPR()`, `handleIssueComment()`, and `handlePullRequestTarget()` are
+  all exported and async, so nothing rules this out for a future caller,
+  even though today's single-event Action process never does it - each get
+  their own isolated budget, correctly followed through their own call's
+  entire async chain regardless of how the two interleave. A shared mutable
+  counter would let one call's completion reset a budget still in use by the
+  other, or let two calls silently share one ceiling instead of each getting
+  their own; nothing like that is possible here. A token that isn't
+  `GITHUB_TOKEN` (the signatures repo's own installation token, when
+  configured) has its own separate rate limit on GitHub's side and is
+  deliberately not counted against this one.
+  What this budget does NOT do: guarantee the repository's real, GitHub-side
+  `GITHUB_TOKEN` limit (1,000 requests/hour, shared by every workflow run in
+  the repository - not a separate 1,000 per run) is respected. 700 is a
+  per-event safety budget against one event's own runaway consumption (a
+  pathologically large PR, a list that won't stop growing); several events
+  landing in the same hour each get their own fresh 700, and can still add
+  up past 1,000 on GitHub's side even though none of them individually went
+  over its own ceiling. There's no in-process fix for that - each event runs
+  in its own separate process, with nothing in common to track a shared
+  count in, short of committing state somewhere external and accepting that
+  store's own consistency and cost problems for a failure mode that's
+  already self-limiting: going over GitHub's real limit makes GitHub itself
+  start refusing requests, which is already treated as a hard failure here,
+  not something to silently route around - it fails the run loudly rather
+  than risk the CLA decision.
+- Old-style noreply co-author addresses (`login@users.noreply.github.com`)
+  have no account id, so a renamed account can't be found. Those commits are
+  flagged for manual review. If someone else now owns the old login, they would
+  be treated as the co-author. Use `id+login@...` addresses (GitHub's default
+  today) to avoid this.
 - The signatures repo must never have branch protection that blocks direct
   API commits to its default branch, or the bot's writes will fail. If
   branch protection is ever added there, add the bot's GitHub App to the
@@ -432,16 +657,13 @@ What the signatures do **not** protect against, and what does:
   commenter's relationship to the repository, not to the specific PR. A
   collaborator unrelated to a given PR can still force a recheck on it -
   that's intentional, since maintainers should be able to recheck any PR.
-- GitHub's "list commits on a pull request" endpoint only returns the first
-  250 commits. A PR with more than that would silently miss signers past
-  the 250th commit. This is an unlikely scenario for normal contributions
-  and a constraint of the underlying API, not something this bot can work
-  around.
-- The example workflow grants `issues: write` and `pull-requests: read`
-  (not `write`), since this action only ever reads PR data. `contents`
-  isn't granted at all in the normal setup, since a GitHub App handles the
-  signatures repo separately. See `action.yml`'s `github-token` description
-  for the one case (no GitHub App configured) where `contents` is needed.
+- The example workflow grants `contents: read`, `pull-requests: read`,
+  `issues: write` and `statuses: write`, and nothing that writes repository
+  contents. `contents: read` is required because the commit list comes from
+  the Compare endpoint, which GitHub gates behind Contents read. The
+  signatures repo is still handled by a GitHub App. See `action.yml`'s
+  `github-token` description for the one case (no GitHub App, same repo)
+  where `contents: write` is also needed.
 - Test coverage is offline/mocked - no real GitHub API calls in CI. A
   config or credentials mistake in a real deployment (wrong App ID, App not
   installed on the signatures repo) will only surface at runtime; the

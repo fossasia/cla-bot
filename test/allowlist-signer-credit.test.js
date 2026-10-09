@@ -96,9 +96,13 @@ function b64(obj) {
       // which falls back to DEFAULT_BOT_LOGIN ("github-actions[bot]") -
       // exactly matching the login the POST handler below attributes new
       // comments to.
-      if (url.includes("/pulls/1/commits")) return res(200, commits);
+      if (url.includes("/compare/"))
+        return res(200, { commits, total_commits: commits.length });
       if (url.includes("/pulls/1") && !url.includes("/commits")) {
-        return res(200, { head: { sha: "head-sha-abc" } });
+        return res(200, {
+          head: { sha: "head-sha-abc" },
+          base: { sha: "base-sha-abc" },
+        });
       }
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
@@ -199,9 +203,13 @@ function b64(obj) {
 
     global.fetch = async (url, opts = {}) => {
       const method = (opts.method || "GET").toUpperCase();
-      if (url.includes("/pulls/1/commits")) return res(200, commits);
+      if (url.includes("/compare/"))
+        return res(200, { commits, total_commits: commits.length });
       if (url.includes("/pulls/1") && !url.includes("/commits")) {
-        return res(200, { head: { sha: "head-sha-abc" } });
+        return res(200, {
+          head: { sha: "head-sha-abc" },
+          base: { sha: "base-sha-abc" },
+        });
       }
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {

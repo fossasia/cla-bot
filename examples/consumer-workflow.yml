@@ -26,15 +26,22 @@ on:
   issue_comment:
     types: [created]
   pull_request_target:
-    types: [opened, synchronize, reopened, closed]
+    # "edited" also covers a title/body change; the bot itself checks
+    # payload.changes.base and only re-runs the CLA check when this PR was
+    # actually retargeted to a different base branch - see
+    # handlePullRequestTarget(). Without "edited" here, a retarget with no
+    # new commit on it (so no "synchronize") is never re-evaluated against
+    # its new base at all.
+    types: [opened, synchronize, reopened, closed, edited]
 
 # See action.yml's github-token input for exactly why each of these is
-# needed. In short: "pull-requests: read" is enough since this action only
-# reads PR/commit metadata; "issues: write" covers both comments and locking
-# (both are Issues-API endpoints even on a PR); "contents" isn't granted
-# here because the normal setup (a GitHub App writing to a separate
-# signatures repo) never touches this repo's contents.
+# needed. In short: "pull-requests: read" covers the PR read; "contents: read"
+# is needed for the commit list, which comes from GitHub's Compare endpoint
+# (GitHub gates it behind Contents read); "issues: write" covers both comments
+# and locking (both are Issues-API endpoints even on a PR); "statuses: write"
+# sets the CLA status. Nothing here writes to the repo's contents.
 permissions:
+  contents: read
   pull-requests: read
   issues: write
   statuses: write
@@ -45,9 +52,19 @@ permissions:
 # stale "not signed" status after a faster run already posted "signed".
 # This queues overlapping runs instead, so each one sees the up-to-date
 # result of the one before it.
+#
+# `queue: max` matters as much as the group itself: GitHub's default
+# concurrency queue holds only ONE pending run at a time, and a third event
+# arriving while a run is already queued behind the one in progress REPLACES
+# that pending run rather than adding to a line. A signing comment is a
+# state-changing write (it records the signature), not just a re-check, so
+# losing it this way would mean the comment stays on the PR but the
+# signature is never actually recorded. `queue: max` makes every event wait
+# its turn (up to 100 at once) instead of being discarded this way.
 concurrency:
   group: cla-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   cla-check:
