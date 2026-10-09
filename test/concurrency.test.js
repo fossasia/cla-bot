@@ -1264,6 +1264,63 @@ const linkTo = (path, last) =>
     );
   });
 
+  await test("checkPR: a PR move during a paginated compare cannot mix revisions or publish the old pair", async () => {
+    const b = freshModule();
+    const A = "a1".repeat(20);
+    const B = "b2".repeat(20);
+    const H = "c3".repeat(20);
+    const commitsA = Array.from({ length: 101 }, (_, i) =>
+      commit(i, i + 1, "alice"),
+    );
+    const commitsB = [
+      ...commitsA.slice(0, 100),
+      commit(100, 101, "bob"),
+    ];
+    const g = makeGitHub({
+      headSha: H,
+      baseSha: A,
+      signatures: [{ id: 1, login: "alice" }],
+    });
+    const inner = g.fetch;
+    let currentBase = A;
+    let moved = false;
+    const compareRequests = [];
+    g.fetch = async (url, opts = {}) => {
+      const path = url.replace("https://api.github.com", "");
+      if (path.startsWith("/repos/fossasia/testrepo/compare/")) {
+        const pair = decodeURIComponent(path.split("/compare/")[1].split("?")[0]);
+        const page = Number((path.match(/[&?]page=(\d+)/) || [])[1] || 1);
+        compareRequests.push({ pair, page });
+        const rows = pair === `${A}...${H}` ? commitsA : commitsB;
+        if (pair === `${A}...${H}` && page === 1 && !moved) {
+          moved = true;
+          currentBase = B;
+        }
+        return res(200, {
+          commits: rows.slice((page - 1) * 100, page * 100),
+          total_commits: rows.length,
+        }, linkTo(path.split("?")[0], 2));
+      }
+      if (/^\/repos\/fossasia\/testrepo\/pulls\/1$/.test(path)) {
+        return res(200, { head: { sha: H }, base: { sha: currentBase } });
+      }
+      return inner(url, opts);
+    };
+    global.fetch = g.fetch;
+
+    await b.checkPR(1, undefined, { statusOnly: true });
+
+    assert.deepStrictEqual(compareRequests, [
+      { pair: `${A}...${H}`, page: 1 },
+      { pair: `${A}...${H}`, page: 2 },
+      { pair: `${B}...${H}`, page: 1 },
+      { pair: `${B}...${H}`, page: 2 },
+    ]);
+    assert.strictEqual(g.statuses.length, 1, "only the confirmed pair is published");
+    assert.strictEqual(g.statuses[0].sha, H);
+    assert.strictEqual(g.statuses[0].state, "failure", "bob on B is unsigned");
+  });
+
   await test("listCommitsBetween: when one page fails, the pages still queued are never sent (a failed list stops spending requests)", async () => {
     const calls = [];
     global.fetch = async (url) => {
@@ -1897,6 +1954,45 @@ const linkTo = (path, last) =>
       1,
       "only the first (A's success) write actually landed on GitHub",
     );
+  });
+
+  await test("checkPR: a failed post-publish PR re-read overwrites the uncertain status and surfaces the read error", async () => {
+    const b = freshModule();
+    const A = "a1".repeat(20);
+    const H = "c3".repeat(20);
+    const g = makeGitHub({
+      commits: [commit(1, 1, "alice")],
+      signatures: [{ id: 1, login: "alice" }],
+      headSha: H,
+      baseSha: A,
+    });
+    const inner = g.fetch;
+    let pulls = 0;
+    g.fetch = async (url, opts = {}) => {
+      const path = url.replace("https://api.github.com", "");
+      if (/^\/repos\/fossasia\/testrepo\/pulls\/1$/.test(path)) {
+        pulls += 1;
+        if (pulls === 2) {
+          return res(400, { message: "Simulated post-publish read failure" });
+        }
+      }
+      return inner(url, opts);
+    };
+    global.fetch = g.fetch;
+
+    await assert.rejects(
+      () => b.checkPR(1, H, { statusOnly: true, eventBaseSha: A }),
+      (error) =>
+        error.status === 400 &&
+        /Simulated post-publish read failure/.test(error.message),
+    );
+    assert.strictEqual(pulls, 2);
+    assert.deepStrictEqual(
+      g.statuses.map((status) => status.state),
+      ["success", "failure"],
+      "the unconfirmed success is overwritten with a fail-closed result",
+    );
+    assert.ok(g.statuses.every((status) => status.sha === H));
   });
 
   await test("checkPR: when the main budget's OWN exhaustion is what triggers the catch, failClosedStatus()'s recovery write still gets out - the emergency reserve is what makes that possible, not luck", async () => {
