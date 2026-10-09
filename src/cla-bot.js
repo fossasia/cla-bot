@@ -1166,8 +1166,22 @@ async function fetchBotLogin() {
 // so callers that overlap share one fetch, and a failed fetch evicts itself
 // so the next caller gets a real retry instead of a cached error.
 // After that snapshot resolves, successful writes and deletes made by this
-// run are applied to it (write-through). Changes made by other processes are
-// not reflected until a fresh read; callers needing that must use fresh:true.
+// run are applied to it (write-through). This is intentionally an invocation
+// snapshot, not a linearizable view of GitHub: external edits/deletes do not
+// rewrite history already observed, and an external comment added mid-run may
+// not be seen. Production callers are safe under the required consumer
+// workflow concurrency group (documented in SECURITY.md):
+// - pendingIsNewerThanSuccess() reads the append-only history of whether this
+//   PR was previously blocked; deleting a comment does not undo that event.
+//   On the automatic path it is the first comment-history read in checkPR(),
+//   immediately before the quiet/success decision.
+// - latestOwnCommentBody() is only a dedupe optimization. It sees this run's
+//   own writes through the cache; a concurrent run is serialized by the
+//   workflow group, and the fresh post-write scan repairs duplicates if a
+//   post actually occurs.
+// A consumer that omits the concurrency group accepts stale decisions across
+// overlapping runs; a fresh read would only narrow that race, not make the
+// multi-request REST decision atomic.
 //
 // `fresh: true` always hits GitHub and replaces the cache entry, for a
 // direct caller of getExistingBotComments() that wants to bypass whatever

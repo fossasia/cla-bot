@@ -392,6 +392,18 @@ What the signatures do **not** protect against, and what does:
     example workflow, which queues overlapping runs for the same PR instead
     of racing them. The in-code mitigations are a backstop for when that
     group is missing, not a substitute for it.
+- The comment-history cache is an invocation snapshot. Within one `checkPR()`
+  run, successful comments posted or deleted by that run are written through;
+  comment changes made by another process are not incorporated automatically.
+  This is safe for the production reads because the automatic quiet-success
+  check reads pending/success comments as historical events (removing an old
+  comment does not undo that the PR was previously blocked), and it is the
+  first comment-history read on that path. Comment dedupe is an optimization;
+  its post-write fresh scan repairs duplicates after a post. The consumer
+  workflow's per-PR `concurrency:` group is therefore required to prevent
+  overlapping bot runs from making decisions against competing snapshots.
+  A fresh REST read would narrow, but cannot eliminate, races with unrelated
+  writers because GitHub offers no atomic read-and-decide operation here.
 - The signatures file can grow past 1 MB over time. Reads use GitHub's
   `object`/`raw` media types (good up to 100 MB) instead of the default
   format (reliable only under 1 MB), so this comfortably covers realistic
