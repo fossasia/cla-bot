@@ -37,6 +37,56 @@
  * 11. Allowlist ids are matched against the id GitHub reports for the author,
  *     never against what a commit or trailer claims. A non-numeric entry fails
  *     validateConfig().
+ * 12. The author list for a PR comes from comparing two fixed commit SHAs
+ *     (base...head), never from the PR's live, mutable commit list. A commit
+ *     SHA can't change once it exists, so a force-push after the SHAs are
+ *     read can't mix revisions into the list. See listCommitsBetween() and
+ *     checkPR().
+ * 13. Nothing is published until the PR is read once more and still has the
+ *     pair that was checked. A moved head is skipped, a moved base is
+ *     checked again. No REST call makes "confirm, then publish" atomic, so
+ *     the PR is also read once more right AFTER publishing: a base that
+ *     moved onto the same head during the write is caught there too, and the
+ *     stale status is corrected rather than left standing. See checkPR().
+ * 14. The co-author lookup budget is created once per checkPR() run and
+ *     passed through every re-evaluation attempt, so the cap applies once
+ *     per run, not once per attempt. It is keyed by the parsed identity (id
+ *     or login), not the raw trailer address, so two trailers in the SAME
+ *     format naming the same account share a slot instead of each costing
+ *     one; the same account named once in each of the two formats still
+ *     costs two, since telling them apart without a lookup is exactly what
+ *     the budget exists to avoid - see SECURITY.md for why that's accepted.
+ *     See createLookupBudget(), coAuthorLookupKey() and MAX_COAUTHOR_LOOKUPS_PER_RUN.
+ * 15. That identity cap counts distinct accounts, not HTTP requests - gh()
+ *     can retry a single one of them. A separate, hard ceiling on actual
+ *     GITHUB_TOKEN requests (retries included) is enforced underneath it in
+ *     ghRaw(), so the real request count this run makes is always bounded
+ *     regardless of retries, pagination, or anything else. See
+ *     MAX_GITHUB_TOKEN_REQUESTS_PER_RUN and consumeGitHubTokenRequest().
+ * 16. If a status has already been published this run and anything after
+ *     that - another attempt, a re-read, a comment write - then throws, the
+ *     thrown error does not just propagate past a status that was never
+ *     re-confirmed: checkPR() fails it closed first (best-effort, logging
+ *     rather than throwing if that overwrite itself fails), then re-throws
+ *     the original error so the run still visibly fails. See
+ *     failClosedStatus() and checkPRInner().
+ * 17. The request budget in point 15 lives in an AsyncLocalStorage store,
+ *     one per checkPR() call, not a shared variable - two overlapping calls
+ *     in the same process (checkPR() is exported and async; nothing but
+ *     today's single-event call pattern rules this out) each get their own,
+ *     with no risk of one finishing and clearing or overwriting the other's.
+ *     See runWithGitHubTokenRequestBudget().
+ * 18. failClosedStatus()'s own recovery write draws from a small separate
+ *     reserve (GITHUB_TOKEN_EMERGENCY_RESERVE) before ever touching the main
+ *     budget, so the exact exhaustion that can trigger a fail-closed
+ *     overwrite is never also what blocks it from being sent.
+ * 19. A base retarget with no new commit fires neither "synchronize" nor
+ *     "closed"/"reopened", so handlePullRequestTarget() also reacts to
+ *     "edited" - but only when payload.changes.base is present, GitHub's own
+ *     signal that the base branch itself changed, not just the title or
+ *     body. Without this, a status published for the old base could stay on
+ *     the unchanged head indefinitely once a run finishes, since nothing
+ *     inside one checkPR() run can detect a change landing after it returns.
  */
 
 "use strict";
@@ -142,6 +192,91 @@ const MAX_RETRIES = 3;
 // Trailers past the cap flag the commit for manual review. See
 // extractCoAuthors().
 const MAX_COAUTHOR_TRAILERS_PER_COMMIT = 20;
+// The per-commit cap above still leaves the total unbounded: a PR can have up
+// to 10,000 commits (see MAX_LIST_PAGES), so a malicious one could carry up
+// to 10,000 * 20 = 200,000 distinct co-author trailers, each costing an
+// identity lookup. That is a real availability problem (the shared limiter
+// would just queue all of it), not a slow run. This caps how many DISTINCT
+// identities one checkPR() run will ever look up in total; past it, the
+// remaining trailers are flagged for manual review instead of queued. See
+// createLookupBudget() and listPRCommitAuthors().
+//
+// One checkPR() run can re-evaluate the same PR up to MAX_PAIR_ATTEMPTS times
+// (the base can move under it, see checkPR()), so a single budget instance is
+// created once per run and threaded through every attempt - it must NOT be
+// recreated per attempt, or the real ceiling becomes MAX_PAIR_ATTEMPTS times
+// this number.
+//
+// The default GITHUB_TOKEN GitHub gives an Actions job is rate-limited to
+// 1,000 REST requests/hour per repository. 300 leaves comfortable room under
+// that for a single run's other traffic (paging the commit compare, paging
+// comments, reading/writing the status, reading the PR itself) while still
+// covering realistic co-author counts; past it a human reviews the rest.
+//
+// This counts distinct identities admitted, not HTTP requests - gh()
+// transparently retries a transient failure (see MAX_RETRIES), so one
+// admitted identity can cost more than one actual request. That gap is what
+// MAX_GITHUB_TOKEN_REQUESTS_PER_RUN below closes: it is a hard ceiling on
+// every actual GITHUB_TOKEN request this run makes, retries included, and is
+// what actually keeps the run under GitHub's 1,000/hour, regardless of how
+// this number or anything else adds up. Keep this one for what it's good at
+// instead - an early, cheap filter that avoids spending any requests at all
+// on a pathologically large PR - rather than trying to make it a request
+// count itself.
+const MAX_COAUTHOR_LOOKUPS_PER_RUN = 300;
+
+// Hard ceiling on actual GITHUB_TOKEN HTTP requests for one event's
+// processing, counted in ghRaw() - every attempt counts, including retries,
+// so this is a real request count, not a logical one. Once it's spent, gh()
+// refuses to make another GITHUB_TOKEN request rather than let this one
+// event's processing blow past a sane bound - see consumeGitHubTokenRequest().
+//
+// This is a genuinely hard ceiling - total consumption, normal traffic and
+// the emergency reserve below combined, can never exceed this number for
+// ONE event; it is not "700 plus a bit more for emergencies". See
+// runWithGitHubTokenRequestBudget().
+//
+// What this is NOT: a guarantee that the repository's real, GitHub-side
+// GITHUB_TOKEN limit (1,000 requests/hour, shared by every workflow run in
+// the repository, not per-run) is respected. 700 comfortably covers one
+// event's own worst case with headroom to spare, but each event gets its
+// own fresh 700 - several events landing in the same hour (several PRs each
+// getting pushed to, say) can still add up past 1,000 on GitHub's side even
+// though no single one of them ever went over its own 700. There is no
+// in-process fix for that: each event is a separate workflow run in a
+// separate process, so nothing here can see what another run has already
+// spent. A real repository-wide guarantee would need state shared across
+// processes (committed to a file, a cache, some external store) with its
+// own consistency and cost problems, for a failure mode that is already
+// self-limiting: going over the real limit makes GitHub itself start
+// refusing requests, which this bot already treats as a hard failure rather
+// than something to work around - it fails the run, not the CLA decision.
+// 700 is a per-event safety budget against one event's own runaway
+// consumption (a pathologically large PR, a list that won't stop growing),
+// not a repository-wide rate-limit guarantee.
+//
+// handleIssueComment() and handlePullRequestTarget() each start one of these
+// for their own entire call, not just for checkPR() - a signing comment
+// reads and writes the signature store, and does so with GITHUB_TOKEN
+// whenever no separate App installation token is configured (see
+// mintSignaturesToken()), before checkPR() is even reached, so leaving that
+// traffic out would make "one event's processing" not actually mean the
+// whole event. checkPR() also starts its own budget too, for any caller that
+// reaches it some other way (every test does, and it's an exported
+// function, so a future caller might too) - see
+// runWithGitHubTokenRequestBudget()'s reentrancy. The signatures repo's own
+// token (an installation token, when one is configured) is a separate
+// credential with its own separate quota, so it is not counted here.
+const MAX_GITHUB_TOKEN_REQUESTS_PER_RUN = 700;
+
+// A small slice carved OUT of the budget above, set aside purely for
+// failClosedStatus()'s own recovery write - never spent by normal operation,
+// so the one write that exists specifically to fail a run closed can't
+// itself be the thing the budget blocks. Without this, the run can hit the
+// ceiling on a request that happens to follow a successful publish, and the
+// recovery write - needing a request of its own - would be refused for
+// exactly the same reason, deterministically: see failClosedStatus().
+const GITHUB_TOKEN_EMERGENCY_RESERVE = 10;
 
 const [REPO_OWNER, REPO_NAME] = (process.env.GITHUB_REPOSITORY || "/").split(
   "/",
@@ -191,12 +326,20 @@ function assertValidInstallationId(value, context) {
   return value;
 }
 
+// True for exactly what a real GitHub account id looks like: a positive
+// integer that survives Number without losing precision. Shared by
+// assertValidUserId() (throws) and resolveCoAuthorEmail() (fails closed
+// instead of throwing, since a bad trailer must never crash the run).
+function isValidGitHubUserId(value) {
+  return Number.isSafeInteger(value) && value > 0;
+}
+
 // This id is written to the signature store, and isSigned() matches by id
 // only when both sides are numbers. A bad id would not be rejected later, it
 // would just never match, and JSON.stringify drops an undefined id without
 // any sign. So fail before anything is written.
 function assertValidUserId(value, context) {
-  if (!Number.isSafeInteger(value) || value <= 0) {
+  if (!isValidGitHubUserId(value)) {
     throw new Error(
       `${context}: expected a positive integer GitHub user id, got ${JSON.stringify(value)} (${typeof value}) - refusing to record a signature that could only be matched by login.`,
     );
@@ -433,11 +576,95 @@ function validateConfig() {
 }
 
 // ---------------------------------------------------------------------------
+// Run-wide GITHUB_TOKEN request budget - see MAX_GITHUB_TOKEN_REQUESTS_PER_RUN.
+//
+// This is carried in an AsyncLocalStorage store, not a plain module-level
+// variable: checkPR() is an exported, async, re-entrant function, so two
+// overlapping calls (in the same process, from a caller that doesn't await
+// one before starting the next) are a real possibility the implementation
+// has to hold up under, not just the one-call-per-process shape this Action
+// happens to use today. A single shared counter would let one run's
+// completion (resetting it to null) blow away another still-in-flight run's
+// remaining budget, or let two runs silently share one 700-request ceiling
+// instead of each getting their own. AsyncLocalStorage gives every call to
+// runWithGitHubTokenRequestBudget() its own store, correctly followed
+// through every `await` in that call's entire async chain regardless of how
+// it interleaves with any other call's chain - no manual threading of a
+// budget object through every function between checkPR() and ghRaw() is
+// needed to get that isolation.
+//
+// getStore() returns undefined outside any such call - every other entry
+// point, and every test that calls ghRead/listCommitsBetween/etc. directly, is
+// unaffected, same as before.
+// ---------------------------------------------------------------------------
+const _githubTokenRequestBudget = new AsyncLocalStorage();
+
+// Runs fn() with its own fresh, isolated GITHUB_TOKEN request budget - see
+// checkPR(). The store is a plain mutable object specifically so nested
+// calls within the same async chain (there are none today, but nothing
+// stops a future one) share the one store AsyncLocalStorage hands them,
+// rather than each creating another nested layer.
+// Reentrant: if a budget is already active (an outer handleIssueComment() or
+// handlePullRequestTarget() call already started one - see those functions),
+// this just runs fn() under that SAME store rather than starting a nested,
+// fresh one. That's what lets the budget cover a whole event's real
+// GITHUB_TOKEN traffic (including a signature read/write that happens before
+// checkPR() is ever called) while checkPR() itself still gets its own
+// self-contained budget on any OTHER path that calls it directly, without
+// going through either handler - tests do this throughout, and it's exactly
+// the guarantee a direct caller of this exported function should get.
+//
+// emergencyReserve is carved OUT of max, not added on top: total consumption
+// across both pools can never exceed max - "max is the hard ceiling" is then
+// literally true, not an approximation that needs a footnote.
+function runWithGitHubTokenRequestBudget(max, emergencyReserve, fn) {
+  if (_githubTokenRequestBudget.getStore()) return fn();
+  return _githubTokenRequestBudget.run(
+    { remaining: max - emergencyReserve, emergencyReserve },
+    fn,
+  );
+}
+
+// Called once per actual HTTP attempt made with GITHUB_TOKEN specifically -
+// see ghRaw(). A token that isn't GITHUB_TOKEN (the signatures repo's own
+// installation token, when configured) has its own separate rate limit and
+// is deliberately not counted here.
+//
+// emergency is for failClosedStatus()'s own recovery write only (see
+// GITHUB_TOKEN_EMERGENCY_RESERVE): it draws from the reserve first, so it
+// can never be blocked by the very exhaustion that made it necessary: only
+// once the reserve is also gone does it fall back to competing for whatever
+// is left of the main budget, same as any other request.
+function consumeGitHubTokenRequest(token, { emergency = false } = {}) {
+  if (token !== GITHUB_TOKEN) return;
+  const store = _githubTokenRequestBudget.getStore();
+  if (!store) return; // not tracking - no active run, or a direct call/test
+  if (emergency && store.emergencyReserve > 0) {
+    store.emergencyReserve -= 1;
+    return;
+  }
+  if (store.remaining <= 0) {
+    const err = new Error(
+      `This run's GITHUB_TOKEN request budget (${MAX_GITHUB_TOKEN_REQUESTS_PER_RUN}) is exhausted - refusing to send more requests this run, to stay within GitHub's 1,000 requests/hour/repository limit. This is a hard safety ceiling and is not expected in normal operation; comment \`recheck\` to try again.`,
+    );
+    err.budgetExhausted = true;
+    throw err;
+  }
+  store.remaining -= 1;
+}
+
+// ---------------------------------------------------------------------------
 // HTTP helper: timeout, JSON handling and a retry for transient failures
 // (rate limits, brief 5xx). 409 conflicts on writes are handled in
 // writeSignatures(), since they need a re-read, not a blind retry.
 // ---------------------------------------------------------------------------
 async function ghRaw(path, token, options = {}) {
+  // Counted here, not in gh(), so every actual attempt is counted once -
+  // gh()'s retry calls ghRaw() again per attempt (options, emergency
+  // included, passed through unchanged each time), this never double-counts
+  // a single attempt, and a caller that bypasses gh() and calls ghRaw()
+  // directly still can't evade the budget.
+  consumeGitHubTokenRequest(token, { emergency: options.emergency === true });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   try {
@@ -476,7 +703,9 @@ async function ghRaw(path, token, options = {}) {
     }
     // Raw media-type requests (see readSignatures) return plain text.
     if (options.raw) return text;
-    return text ? JSON.parse(text) : null;
+    const data = text ? JSON.parse(text) : null;
+    // Only list calls ask for the Link header (see listCommitsBetween()).
+    return options.withLink ? { data, link: readLinkHeader(res) } : data;
   } finally {
     clearTimeout(timeout);
   }
@@ -510,6 +739,249 @@ async function gh(path, token, options = {}, attempt = 1) {
     }
     throw e;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Reads that can run side by side
+//
+// A PR can need lots of independent reads: one lookup per co-author, one
+// request per page of commits, and the bot's own login and the first page of
+// comments, which are asked for together. One at a time is slow, and all at
+// once can trip GitHub's secondary rate limits. So they share one limiter and
+// only 8 are in flight at any moment.
+//
+// Only reads use it. Writes (comments, statuses, locks, deletes, signature
+// updates) stay one at a time: GitHub asks for a pause between them, and
+// people can see the order of the comments.
+//
+// A slot is held for the whole gh() call, retries included, so a rate-limited
+// run slows down instead of piling on. A task is a single request, so tasks
+// never wait on each other and this can't deadlock.
+// ---------------------------------------------------------------------------
+const GITHUB_READ_CONCURRENCY = 8;
+
+// Gives back run(task). A task starts when fewer than `maxConcurrent` are
+// running, in the order they were added. A task that throws counts as a
+// rejection.
+function createLimiter(maxConcurrent) {
+  let active = 0;
+  const queue = [];
+  const pump = () => {
+    while (active < maxConcurrent && queue.length > 0) {
+      const { task, resolve, reject } = queue.shift();
+      active += 1;
+      Promise.resolve()
+        .then(task)
+        .then(resolve, reject)
+        .finally(() => {
+          active -= 1;
+          pump();
+        });
+    }
+  };
+  return (task) =>
+    new Promise((resolve, reject) => {
+      queue.push({ task, resolve, reject });
+      pump();
+    });
+}
+
+const limitReads = createLimiter(GITHUB_READ_CONCURRENCY);
+
+// Use this for any read that might overlap with another one. Reads that never
+// overlap (like the signatures file) can call gh() directly.
+const ghRead = (path, token, options) =>
+  limitReads(() => gh(path, token, options));
+
+// A set of reads that belong together (the pages of one list). If one of them
+// fails, abort() stops the rest from starting: reads already in flight finish,
+// but queued ones fail without sending a request, so a failed list doesn't keep
+// spending GitHub calls on a result we will throw away.
+function createReadGroup() {
+  let aborted = false;
+  return {
+    read: (path, token, options) =>
+      limitReads(() => {
+        if (aborted) throw new Error("read cancelled: an earlier read failed");
+        // Mark the group as failed right away, inside the task, so the next
+        // queued read sees it before it starts (not after Promise.all settles).
+        return gh(path, token, options).catch((err) => {
+          aborted = true;
+          throw err;
+        });
+      }),
+    abort: () => {
+      aborted = true;
+    },
+  };
+}
+
+// Runs all the reads in the group together. If one fails, the group is aborted
+// and the first error is rethrown.
+function allOrAbort(group, promises) {
+  return Promise.all(promises).catch((err) => {
+    group.abort();
+    throw err;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Paginated reads of the commits between two SHAs
+//
+// Page 1's `Link` header names the last page, so we can fetch the rest at the
+// same time and join them in order. We only take the page *number* from the
+// header and never request the URL it names. With no usable header we walk
+// one page at a time, see listCommitsBetween().
+//
+// Every read is also capped at MAX_LIST_PAGES pages, however the header or
+// the data looks. Past that we fail instead of walking on. A list of exactly
+// 10,000 items (100 full pages) is legitimate, so the limit is "more than
+// 100 pages", not "100 pages".
+//
+// A PR's COMMENTS are not read through this. They are read by
+// fetchAllIssueCommentsUncached(), which walks the pages one by one on
+// purpose: it has to keep the run's memory bounded however many comments an
+// untrusted PR carries, so it never holds the whole list at once.
+// ---------------------------------------------------------------------------
+const LIST_PAGE_SIZE = 100;
+// The most pages one list read will ever fetch (10,000 items).
+const MAX_LIST_PAGES = 100;
+
+// Real responses always have headers; this just avoids a crash on a bare one.
+function readLinkHeader(res) {
+  return res.headers && typeof res.headers.get === "function"
+    ? res.headers.get("link")
+    : null;
+}
+
+// The last page number from a `Link` header, or null if it's missing or not a
+// plain page number. Never throws. It does not apply MAX_LIST_PAGES, see
+// assertWithinPageLimit(): a huge value is a reason to fail, not to ignore
+// the header.
+function parseLastPage(linkHeader) {
+  if (typeof linkHeader !== "string") return null;
+  for (const part of linkHeader.split(/,\s*(?=<)/)) {
+    const target = /^\s*<([^>]*)>/.exec(part);
+    const rel = /;\s*rel\s*=\s*"?([^";]*)"?/i.exec(part);
+    if (!target || !rel) continue;
+    if (!rel[1].toLowerCase().split(/\s+/).includes("last")) continue;
+    let rawPage;
+    try {
+      rawPage = new URL(target[1], GITHUB_API).searchParams.get("page");
+    } catch {
+      return null; // not a URL at all
+    }
+    if (rawPage === null || !/^[1-9][0-9]*$/.test(rawPage)) return null;
+    const page = Number(rawPage);
+    return Number.isSafeInteger(page) ? page : null;
+  }
+  return null;
+}
+
+// Fails when a read would need more than MAX_LIST_PAGES pages. Used for both
+// a page count the server claims and the page we are about to walk to.
+function assertWithinPageLimit(label, pages) {
+  if (pages > MAX_LIST_PAGES) {
+    throw new Error(
+      `${label}: needs more than ${MAX_LIST_PAGES} pages of ${LIST_PAGE_SIZE}, which is more than we read, so the list cannot be trusted.`,
+    );
+  }
+}
+
+// A response that isn't a list counts as an empty page.
+const asList = (value) => (Array.isArray(value) ? value : []);
+
+// ---------------------------------------------------------------------------
+// Commits between two fixed, immutable SHAs (the "Compare two commits"
+// endpoint)
+//
+// `/pulls/{n}/commits` tracks the PR's CURRENT head - a moving target that
+// can change mid-read, and capped at 250 commits. Compare instead takes two
+// exact commit objects and returns `git log base..head` for THOSE two
+// objects. A commit's SHA never changes once it's made, so once base and
+// head are pinned, this read cannot be mixed by a force-push that happens
+// afterwards - there's nothing left to race, because we're no longer
+// reading a live ref. Paginating also removes the 250-commit cap, since
+// that cap only applies to an unpaginated request. See checkPR().
+// ---------------------------------------------------------------------------
+async function listCommitsBetween(baseSha, headSha, token) {
+  const basehead = `${encodeURIComponent(baseSha)}...${encodeURIComponent(headSha)}`;
+  const pageUrl = (page) =>
+    `/repos/${REPO_OWNER}/${REPO_NAME}/compare/${basehead}?per_page=${LIST_PAGE_SIZE}&page=${page}`;
+  const first = await ghRead(pageUrl(1), token, { withLink: true });
+  // This list decides who signed, so it must be provably complete. GitHub's
+  // own total is the check, and it has to be a real count: a whole number, not
+  // negative. Anything else fails before we page any further.
+  const totalCommits = first.data ? first.data.total_commits : undefined;
+  if (!Number.isSafeInteger(totalCommits) || totalCommits < 0) {
+    throw new Error(
+      `GitHub returned no valid total_commits (${String(totalCommits)}) between ${baseSha} and ${headSha}, so the commit list cannot be verified as complete.`,
+    );
+  }
+  const items = asList(first.data && first.data.commits);
+
+  const label = `compare ${baseSha}...${headSha}`;
+  // total_commits determines how many pages are required and is checked
+  // before any fan-out. The Link header is only a pagination hint: if its
+  // last-page value disagrees with the count, walk the count-derived range
+  // sequentially rather than trusting either an under-reported or an
+  // over-reported page count.
+  const expectedPages = Math.ceil(totalCommits / LIST_PAGE_SIZE);
+  assertWithinPageLimit(label, expectedPages);
+  const lastPage = parseLastPage(first.link);
+  if (lastPage === expectedPages && expectedPages > 1) {
+    const group = createReadGroup();
+    const rest = await allOrAbort(
+      group,
+      Array.from({ length: expectedPages - 1 }, (_, i) => i + 2).map(async (n) =>
+        asList((await group.read(pageUrl(n), token)).commits),
+      ),
+    );
+    for (const pageItems of rest) items.push(...pageItems);
+  } else if (expectedPages > 1) {
+    // With no usable Link header, or a Link/count disagreement, total_commits
+    // gives the exact expected range. Stop at that count rather than guessing
+    // from whether a page is full: a full page 100 is ambiguous at the
+    // 10,000-commit boundary. A short page ends early; the final total check
+    // below rejects that incomplete read.
+    let page = 1;
+    let lastPageSize = items.length;
+    while (items.length < totalCommits && lastPageSize === LIST_PAGE_SIZE) {
+      page += 1;
+      assertWithinPageLimit(label, page);
+      const pageItems = asList((await ghRead(pageUrl(page), token)).commits);
+      items.push(...pageItems);
+      lastPageSize = pageItems.length;
+    }
+  }
+
+  if (items.length !== totalCommits) {
+    throw new Error(
+      `GitHub reported ${totalCommits} commit(s) between ${baseSha} and ${headSha}, but pagination returned ${items.length}.`,
+    );
+  }
+
+  // A matching item count alone does not prove the pages contain distinct
+  // commits: a repeated page could hide another contributor while preserving
+  // the count. Commit SHAs are the stable identities across pages, so require
+  // each item to carry one and reject duplicates before authors are derived.
+  const seenShas = new Set();
+  for (const item of items) {
+    const sha = item && typeof item.sha === "string" ? item.sha : "";
+    if (!sha || sha.trim() !== sha) {
+      throw new Error(
+        `GitHub returned a commit without a valid SHA between ${baseSha} and ${headSha}, so the commit list cannot be verified as complete.`,
+      );
+    }
+    const identity = sha.toLowerCase();
+    if (seenShas.has(identity)) {
+      throw new Error(
+        `GitHub returned duplicate commit SHA ${sha} between ${baseSha} and ${headSha}, so the commit list cannot be verified as complete.`,
+      );
+    }
+    seenShas.add(identity);
+  }
+  return items;
 }
 
 // ---------------------------------------------------------------------------
@@ -936,23 +1408,36 @@ function classifyBotComment(body) {
 //   - ID+USERNAME@users.noreply.github.com (accounts created after 18 Jul
 //     2017): the id is in the address.
 //   - USERNAME@users.noreply.github.com (older accounts): needs one lookup.
-const NEW_NOREPLY = /^(\d+)\+([^@]+)@users\.noreply\.github\.com$/i;
+//
+// The id part must look exactly like a real GitHub account id: no leading
+// zero (GitHub never pads one) and short enough that it can't overflow
+// Number's safe range. `[1-9][0-9]{0,15}` already rules out "0" and
+// anything with a leading zero; isValidGitHubUserId() below does the final
+// Number.isSafeInteger check, same as every other id in this file.
+const NEW_NOREPLY =
+  /^([1-9][0-9]{0,15})\+([^@]+)@users\.noreply\.github\.com$/i;
 const OLD_NOREPLY = /^([^@+]+)@users\.noreply\.github\.com$/i;
 
 // ---------------------------------------------------------------------------
-// Identity lookups (login to id, id to login, and the bot's own login)
+// Identity lookups (login -> id, id -> login, and the bot's own login)
 //
-// The caches hold the promise, not the finished value, and it is stored
-// synchronously before the request is awaited. A caller that asks while a
-// lookup is running gets the same promise, so each key costs exactly one
-// request per run. Nothing calls these concurrently today, but this keeps it
-// safe if listPRCommitAuthors() is ever parallelized.
+// The caches hold the promise, stored before the request is awaited, so two
+// callers asking for the same key share one request. That matters now that
+// listPRCommitAuthors() looks things up in parallel.
 //
-// The fetchers never reject. They catch every failure and resolve to a
-// fallback (null, or the default bot login). Failed lookups are cached on
-// purpose: an unresolvable co-author costs one request per run, and an
-// unresolved id is flagged for manual review, so it fails closed. A fetcher
-// that can reject must also evict its own cache entry.
+// The fetchers never reject: any failure becomes null (or the default bot
+// login). Failures are cached on purpose, so a bad co-author costs one request
+// per run, and null is flagged for manual review, so it fails closed. A
+// fetcher that can reject must also remove its own cache entry.
+//
+// These caches live exactly as long as the process: there's no eviction or
+// TTL. That's intentional for how this is actually deployed - one GitHub
+// Actions job handles exactly one event and exits, so the cache never
+// outlives the run it was built for (see main()). It would be the wrong
+// choice for a long-lived process serving many events over time, where a
+// renamed or deleted account could go stale in the cache - this module
+// isn't meant to run that way, and nothing here should be read as a
+// guarantee that it's safe to.
 // ---------------------------------------------------------------------------
 const _userIdLookups = new Map(); // login (lowercased) -> Promise<id | null>
 async function resolveUserIdByLogin(login) {
@@ -967,7 +1452,10 @@ async function resolveUserIdByLogin(login) {
 
 async function fetchUserIdByLogin(login) {
   try {
-    const user = await gh(`/users/${encodeURIComponent(login)}`, GITHUB_TOKEN);
+    const user = await ghRead(
+      `/users/${encodeURIComponent(login)}`,
+      GITHUB_TOKEN,
+    );
     if (user && typeof user.id === "number") return user.id;
   } catch {
     // 404 or a transient failure: the caller treats it as unresolved.
@@ -989,7 +1477,7 @@ async function resolveLoginById(id) {
 
 async function fetchLoginById(id) {
   try {
-    const user = await gh(`/user/${encodeURIComponent(id)}`, GITHUB_TOKEN);
+    const user = await ghRead(`/user/${encodeURIComponent(id)}`, GITHUB_TOKEN);
     if (user && typeof user.login === "string" && user.login.length > 0) {
       return user.login;
     }
@@ -999,16 +1487,18 @@ async function fetchLoginById(id) {
   return null;
 }
 
-// Reads the Co-authored-by trailers of a commit message. A trailer is free
-// text that GitHub never authenticates, so for the new noreply format the
-// login is looked up by id instead of trusted (see security property 10).
-// Other email formats cannot be resolved reliably and are flagged for manual
-// review, like an unresolved primary author. The raw email is never returned,
-// because it can be personal data and the result ends up in PR comments and
+// Reads the Co-authored-by trailers of a commit message. GitHub doesn't check
+// them, so for the new noreply format we look the login up by id instead of
+// trusting the text. Anything we can't resolve is flagged for manual review.
+// The raw email is never returned: it can be personal data and ends up in
 // logs.
-async function extractCoAuthors(commitMessage) {
-  const authors = [];
-  let hasUnresolved = false;
+//
+// parseCoAuthorEmails() picks which trailers count (no repeats, at most
+// MAX_COAUTHOR_TRAILERS_PER_COMMIT). extractCoAuthors() looks them all up at
+// once and keeps the trailer order.
+function parseCoAuthorEmails(commitMessage) {
+  const emails = [];
+  let capped = false;
   const trailerRegex = /^co-authored-by:\s*.+?<([^>]+)>\s*$/gim;
   const seen = new Set();
   let match;
@@ -1018,93 +1508,210 @@ async function extractCoAuthors(commitMessage) {
     if (seen.has(key)) continue; // repeated trailer, skip the second lookup
     if (seen.size >= MAX_COAUTHOR_TRAILERS_PER_COMMIT) {
       // Past the cap: stop looking up and flag the commit for a human.
-      hasUnresolved = true;
+      capped = true;
       break;
     }
     seen.add(key);
+    emails.push(email);
+  }
+  return { emails, capped };
+}
 
-    const newStyle = email.match(NEW_NOREPLY);
-    if (newStyle) {
-      const claimedId = Number(newStyle[1]);
+// One trailer address to { id, login }, or null when it cannot be resolved to
+// a GitHub account (the caller flags the commit for manual review).
+async function resolveCoAuthorEmail(email) {
+  const newStyle = email.match(NEW_NOREPLY);
+  if (newStyle) {
+    const claimedId = Number(newStyle[1]);
+    // NEW_NOREPLY's own pattern already blocks "0" and a leading zero, but
+    // the safe-integer check still matters: the regex allows up to 16
+    // digits so a 20-digit id doesn't silently pass, and a 16-digit one can
+    // still land past Number.MAX_SAFE_INTEGER. A trailer that fails this
+    // is never a real GitHub id, so skip the lookup and fall through to
+    // unresolved instead of asking the API about a number we can't trust.
+    if (isValidGitHubUserId(claimedId)) {
       // Ignore the login text in the trailer and ask GitHub for the real one.
       const authoritativeLogin = await resolveLoginById(claimedId);
       if (authoritativeLogin !== null) {
-        authors.push({ id: claimedId, login: authoritativeLogin });
-        continue;
+        return { id: claimedId, login: authoritativeLogin };
       }
       // The id matches no current account, so fall through.
     }
-
-    const oldStyle = email.match(OLD_NOREPLY);
-    if (oldStyle) {
-      const login = oldStyle[1];
-      const id = await resolveUserIdByLogin(login);
-      if (id !== null) {
-        authors.push({ id, login });
-        continue;
-      }
-      // The lookup failed (for example a deleted account), so fall through.
-    }
-
-    hasUnresolved = true;
   }
-  return { authors, hasUnresolved };
+
+  // Old format: `login@users.noreply...`, with no account id in it. If that
+  // person renamed their account the login won't resolve (GitHub doesn't
+  // redirect old usernames) and no API maps it to an id, so it ends up
+  // unresolved and a maintainer checks the commit. If someone else took the
+  // old login, it resolves to them and we can't tell. The new format
+  // (`id+login@...`) doesn't have this problem, it is looked up by id.
+  const oldStyle = email.match(OLD_NOREPLY);
+  if (oldStyle) {
+    const login = oldStyle[1];
+    const id = await resolveUserIdByLogin(login);
+    if (id !== null) return { id, login };
+    // The lookup failed (for example a deleted account), so fall through.
+  }
+
+  return null;
 }
 
-async function listPRCommitAuthors(prNumber) {
-  // Keyed by numeric id, so someone who is author on one commit and co-author
+// Tracks how many distinct lookup KEYS one run is willing to admit in total,
+// across every commit. A key already admitted stays free to admit again (it
+// costs nothing extra, the id/login caches dedupe it); a new one is only
+// admitted while there's room left in the budget. No `max` means no limit,
+// so extractCoAuthors() stays usable on its own in tests.
+//
+// The caller decides what a "key" is - see coAuthorLookupKey() below. It is
+// deliberately not the raw trailer email: two different noreply addresses
+// can still name the same GitHub account (the new id-based format and the
+// old login-based one resolve through different lookups but can point at one
+// person), so keying on the raw address would let one account burn more than
+// one slot of the budget and push an otherwise-ordinary PR into manual
+// review. Keying on the parsed (id or login) identity instead means the
+// budget tracks accounts, not trailer spellings.
+function createLookupBudget(max = Infinity) {
+  const seen = new Set();
+  return {
+    admit(key) {
+      if (seen.has(key)) return true;
+      if (seen.size >= max) return false;
+      seen.add(key);
+      return true;
+    },
+  };
+}
+
+// The budget key for one trailer address, or null when the address is never
+// going to cost a lookup in the first place (see resolveCoAuthorEmail(): it
+// only ever calls the API for the two noreply formats below, anything else
+// resolves to null with no request at all). Keying by the parsed id/login
+// rather than the raw address also means two trailers that both name the
+// same account - say, the same id with a different claimed login text in
+// each - share one slot instead of two, since resolveLoginById() looks them
+// up the same way regardless of what the trailer's login text says.
+function coAuthorLookupKey(email) {
+  const newStyle = email.match(NEW_NOREPLY);
+  if (newStyle) {
+    const claimedId = Number(newStyle[1]);
+    // An id that can never be real costs no lookup (see resolveCoAuthorEmail),
+    // so it needs no budget slot either.
+    return isValidGitHubUserId(claimedId) ? `id:${claimedId}` : null;
+  }
+  const oldStyle = email.match(OLD_NOREPLY);
+  if (oldStyle) {
+    // Logins are case-insensitive on GitHub, same normalization as the
+    // resolver's own cache (_userIdLookups).
+    return `login:${oldStyle[1].toLowerCase()}`;
+  }
+  return null;
+}
+
+async function extractCoAuthors(commitMessage, budget = createLookupBudget()) {
+  const { emails, capped } = parseCoAuthorEmails(commitMessage);
+  // Trailers past the per-commit cap are already excluded by parseCoAuthorEmails
+  // above (capped=true). Here we additionally drop whatever the shared,
+  // per-run budget has no room left for - same effect (flag for manual
+  // review instead of looking it up), different reason.
+  const admitted = [];
+  let budgetExceeded = false;
+  for (const email of emails) {
+    const key = coAuthorLookupKey(email);
+    if (key === null) {
+      // Doesn't match a format resolveCoAuthorEmail can look up, so it costs
+      // no request either way - let it through without touching the budget.
+      admitted.push(email);
+      continue;
+    }
+    if (budget.admit(key)) {
+      admitted.push(email);
+    } else {
+      budgetExceeded = true;
+    }
+  }
+  // The resolvers never reject (see the note on the identity lookups), and
+  // the shared limiter keeps the number of requests in flight bounded.
+  const resolved = await Promise.all(admitted.map(resolveCoAuthorEmail));
+  return {
+    authors: resolved.filter((a) => a !== null),
+    hasUnresolved: capped || budgetExceeded || resolved.includes(null),
+  };
+}
+
+// A merge commit is skipped: whoever merged did not write the change.
+function isMergeCommit(c) {
+  return Array.isArray(c.parents) && c.parents.length > 1;
+}
+
+// baseSha and headSha must both be exact commit SHAs, already pinned by the
+// caller (see checkPR()), not branch names - that's what makes this read
+// immune to anything that happens on the PR branch after they're read.
+//
+// lookupBudget defaults to a fresh MAX_COAUTHOR_LOOKUPS_PER_RUN budget so this
+// stays usable on its own (directly, or in tests). checkPR() must NOT rely on
+// that default: it creates one budget per run and passes it in explicitly on
+// every call, including every re-evaluation attempt, so the cap applies once
+// per run - not once per attempt. See checkPR() and MAX_COAUTHOR_LOOKUPS_PER_RUN.
+async function listPRCommitAuthors(
+  baseSha,
+  headSha,
+  lookupBudget = createLookupBudget(MAX_COAUTHOR_LOOKUPS_PER_RUN),
+) {
+  // Keyed by account id, so someone who is author on one commit and co-author
   // on another counts once.
   const authors = new Map();
-  // Commits flagged for manual review, by SHA only. A SHA is already public on
-  // the PR's Commits tab and holds no personal data, unlike an email.
+  // Commits flagged for manual review, by SHA only (public, no personal data).
   const unresolvedShas = new Set();
-  let page = 1;
-  for (;;) {
-    const commits = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}/commits?per_page=100&page=${page}`,
-      GITHUB_TOKEN,
-    );
-    if (!commits.length) break;
-    for (const c of commits) {
-      // Skip merge commits. Whoever merged did not write the change.
-      if (Array.isArray(c.parents) && c.parents.length > 1) continue;
+  const commits = await listCommitsBetween(baseSha, headSha, GITHUB_TOKEN);
+  // Look up all the co-authors at once. The limiter keeps it to 8 at a time,
+  // and an account credited on several commits is only looked up once. The
+  // results are applied below in commit order, so names come out in the same
+  // order as before. One budget is shared across every commit in this run
+  // (not one per commit), so it caps the run's total identity lookups, not
+  // just each commit's: see MAX_COAUTHOR_LOOKUPS_PER_RUN.
+  const coAuthorResults = await Promise.all(
+    commits.map((c) =>
+      isMergeCommit(c)
+        ? null
+        : extractCoAuthors(c.commit?.message, lookupBudget),
+    ),
+  );
+  commits.forEach((c, i) => {
+    if (isMergeCommit(c)) return;
 
-      if (c.author && c.author.login && typeof c.author.id === "number") {
-        const verified = !!(
-          c.commit &&
-          c.commit.verification &&
-          c.commit.verification.verified
-        );
-        // `verified` says nothing about the author, because GitHub verifies
-        // only the committer (see security property 9). Trust the author only
-        // when the same account is also the verified committer.
-        const committerIsSameAccount =
-          c.committer &&
-          typeof c.committer.id === "number" &&
-          c.committer.id === c.author.id;
-        const authorAttributionTrusted =
-          !REQUIRE_VERIFIED_COMMITS || (verified && committerIsSameAccount);
-        if (!authorAttributionTrusted) {
-          unresolvedShas.add(c.sha);
-        } else {
-          authors.set(c.author.id, { id: c.author.id, login: c.author.login });
-        }
-      } else {
-        // The commit email is not linked to a GitHub account. Flag it.
-        unresolvedShas.add(c.sha);
-      }
-
-      // Co-authors have to sign too.
-      const { authors: coAuthors, hasUnresolved } = await extractCoAuthors(
-        c.commit?.message,
+    if (c.author && c.author.login && typeof c.author.id === "number") {
+      const verified = !!(
+        c.commit &&
+        c.commit.verification &&
+        c.commit.verification.verified
       );
-      coAuthors.forEach((a) => authors.set(a.id, a));
-      if (hasUnresolved) unresolvedShas.add(c.sha);
+      // `verified` says nothing about the author, because GitHub verifies
+      // only the committer (see security property 9). Trust the author only
+      // when the same account is also the verified committer.
+      const committerIsSameAccount =
+        c.committer &&
+        typeof c.committer.id === "number" &&
+        c.committer.id === c.author.id;
+      const authorAttributionTrusted =
+        !REQUIRE_VERIFIED_COMMITS || (verified && committerIsSameAccount);
+      if (!authorAttributionTrusted) {
+        unresolvedShas.add(c.sha);
+      } else {
+        authors.set(c.author.id, { id: c.author.id, login: c.author.login });
+      }
+    } else {
+      // The commit email is not linked to a GitHub account. Flag it.
+      unresolvedShas.add(c.sha);
     }
-    if (commits.length < 100) break;
-    page += 1;
-  }
-  return { authors: [...authors.values()], unresolved: [...unresolvedShas] };
+
+    const { authors: coAuthors, hasUnresolved } = coAuthorResults[i];
+    coAuthors.forEach((a) => authors.set(a.id, a));
+    if (hasUnresolved) unresolvedShas.add(c.sha);
+  });
+  return {
+    authors: [...authors.values()],
+    unresolved: [...unresolvedShas],
+  };
 }
 
 // One lookup per run, shared by every caller. Same promise caching as the
@@ -1121,12 +1728,35 @@ async function fetchBotLogin() {
     // Works for a PAT or a user-scoped token. The standard GITHUB_TOKEN is
     // neither, so this normally fails and the default is used. It matters
     // only when a consumer passes another kind of token.
-    const me = await gh("/user", GITHUB_TOKEN);
+    const me = await ghRead("/user", GITHUB_TOKEN);
     if (me && me.login) return me.login;
   } catch {
     // Expected for the standard GITHUB_TOKEN.
   }
   return DEFAULT_BOT_LOGIN;
+}
+
+// GitHub lists a PR's comments by ascending id, and a comment's id never
+// changes. A list read over several pages can still hand back the same
+// comment twice, or out of order, when the list changes while it is being
+// read. Such an entry must not count: a repeat would be read as a second copy
+// of that comment, and dedupeIdenticalTrailingComments() would then delete
+// one of the "two" - which is the only one. So an entry counts only if its id
+// is above every id taken so far.
+//
+// Returns a function to call once per entry, in listing order: true to take
+// the entry, false to skip a repeat or an out-of-order one. It keeps one
+// number, so it is as cheap on a huge history as on a small one (the readers
+// below stream the history on purpose, and must not start holding it). An
+// entry whose id is not a safe integer can't be judged and is taken as is.
+function createAscendingIdFilter() {
+  let last = -Infinity;
+  return (id) => {
+    if (!Number.isSafeInteger(id)) return true;
+    if (id <= last) return false;
+    last = id;
+    return true;
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -1328,9 +1958,14 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
   // how many comments the PR has - see latestOwnCommentBody() below for who
   // actually needs this.
   const latestOwnBodyByCategory = Object.create(null);
+  const takeId = createAscendingIdFilter();
   let page = 1;
   for (;;) {
-    const comments = await gh(
+    // ghRead(), not gh(): this runs alongside the bot-login lookup (see
+    // getExistingBotComments()), and every read that can overlap another
+    // shares the one limiter. The pages themselves are still read one at a
+    // time, see the note above.
+    const comments = await ghRead(
       `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?per_page=100&page=${page}`,
       GITHUB_TOKEN,
     );
@@ -1341,6 +1976,9 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
     // same time instead of one after the other.
     const botLogin = await botLoginPromise;
     for (const c of comments) {
+      // A repeat (or out-of-order entry) from a list that changed mid-read
+      // is not a second comment - see createAscendingIdFilter().
+      if (!takeId(c.id)) continue;
       if (
         !c.user ||
         !c.body ||
@@ -1585,6 +2223,10 @@ async function findExactDuplicateComments(prNumber, body) {
     let page = 1;
     let count = 0;
     let bufferedIds = "";
+    // A comment the listing returns twice must not be counted twice: it
+    // would look like a duplicate of itself, and the cleanup would delete the
+    // only copy. See createAscendingIdFilter().
+    const takeId = createAscendingIdFilter();
     for (;;) {
       const comments = await gh(
         `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?sort=created&direction=asc&per_page=100&page=${page}`,
@@ -1592,7 +2234,12 @@ async function findExactDuplicateComments(prNumber, body) {
       );
       if (!comments.length) break;
       for (const c of comments) {
-        if (c.user && c.user.login === botLogin && c.body === body) {
+        if (
+          c.user &&
+          c.user.login === botLogin &&
+          c.body === body &&
+          takeId(c.id)
+        ) {
           bufferedIds += `${c.id}\n`;
           count += 1;
           // Keep the write buffer fixed-size even for pathological histories.
@@ -1662,7 +2309,12 @@ async function dedupeIdenticalTrailingComments(prNumber, body) {
   }
 }
 
-async function setStatus(sha, state, description) {
+// emergency: true marks this write as the one failClosedStatus() makes to
+// recover from an already-published, now-uncertain status - see
+// GITHUB_TOKEN_EMERGENCY_RESERVE and consumeGitHubTokenRequest(). Every
+// other caller leaves it false and competes for the normal budget like any
+// other request.
+async function setStatus(sha, state, description, { emergency = false } = {}) {
   await gh(
     `/repos/${REPO_OWNER}/${REPO_NAME}/statuses/${encodeURIComponent(sha)}`,
     GITHUB_TOKEN,
@@ -1671,6 +2323,7 @@ async function setStatus(sha, state, description) {
       // GitHub shows only the latest status per context, so a repeat is
       // harmless and gh() may retry.
       idempotent: true,
+      emergency,
       body: JSON.stringify({
         state,
         description: description.slice(0, 140),
@@ -1699,95 +2352,48 @@ async function lockPR(prNumber) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Core: evaluate one PR and bring its status and comment up to date
-//
-// Options:
-//
-// quietIfNeverFlagged (passed as true only by the automatic
-// pull_request_target handler). When the PR is fully signed, post a comment
-// only if the PR was blocked at some point:
-//   - A new PR whose authors had all signed already gets no comment. The
-//     status is still set to success, because merge protection reads that.
-//   - If a "pending" comment was ever posted, the move to fully signed is
-//     announced. This compares the latest "pending" comment with the latest
-//     "success" one, so a second block and resolve cycle is announced again
-//     and an unchanged result stays quiet.
-//   - A personal reply such as "you already signed" does not count as a block.
-// A human trigger (the sign phrase or `recheck`) always gets an answer, so
-// those callers leave this off. The usual same-category dedupe in
-// postComment() still applies.
-//
-// signer ({ id, login }, passed only by handleIssueComment right after it
-// recorded a new signature). It changes who the bot addresses, not the
-// pass/fail logic:
-//   - PR still not clear: a separate "@signer Thank you for signing" comment
-//     comes first, then the pending list.
-//   - PR now fully signed and the signer is one of its required authors: the
-//     signer is thanked by name instead of the generic success message.
-//   - PR fully signed but the signer is allowlisted or has no commit on the
-//     PR: the generic success message. Crediting them would be misleading.
-//
-// statusOnly (passed only for the "already signed" reply). Update the status
-// check and return without any comment. That person's other PR may have a
-// stale status from before they signed, but a full check would also post a
-// new pending or success comment each time they resend the phrase.
-//
-// knownSignatures (passed only by handleIssueComment, with what
-// writeSignatures() just returned). It is merged with checkPR()'s own fresh
-// read, see mergeSignatures(). The fresh read alone can miss the write that
-// just happened, and the snapshot alone can miss a signature written by
-// another run meanwhile.
-// ---------------------------------------------------------------------------
-async function checkPR(
-  prNumber,
-  headSha,
-  {
-    quietIfNeverFlagged = false,
-    signer = null,
-    statusOnly = false,
-    knownSignatures = null,
-  } = {},
-) {
-  assertValidPRNumber(prNumber, "checkPR(prNumber)");
-  // One run, one comments cache: see the comment above commentsCacheStorage
-  // for what this buys and why it is scoped this way, not at module level.
-  // Everything this run calls - postComment(), getExistingBotComments(), the
-  // cleanup inside it - picks this same Map up on its own.
-  return commentsCacheStorage.run(new Map(), () =>
-    checkPRBody(prNumber, headSha, {
-      quietIfNeverFlagged,
-      signer,
-      statusOnly,
-      knownSignatures,
-    }),
+// Reads the PR's current head and base SHA in one request.
+async function fetchPRSnapshot(prNumber) {
+  const pr = await ghRead(
+    `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}`,
+    GITHUB_TOKEN,
   );
+  const headSha = assertValidSha(
+    pr.head.sha,
+    `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.head.sha)`,
+  );
+  const baseSha = assertValidSha(
+    pr.base.sha,
+    `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.base.sha)`,
+  );
+  return { headSha, baseSha };
 }
 
-async function checkPRBody(
-  prNumber,
-  headSha,
-  { quietIfNeverFlagged, signer, statusOnly, knownSignatures },
-) {
-  if (!headSha) {
-    const pr = await gh(
-      `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}`,
-      GITHUB_TOKEN,
-    );
-    headSha = assertValidSha(
-      pr.head.sha,
-      `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.head.sha)`,
-    );
-  } else {
-    assertValidSha(headSha, "checkPR(headSha)");
-  }
+// How many times checkPR() re-evaluates when the PR's base or head moves
+// under it before giving up.
+const MAX_PAIR_ATTEMPTS = 3;
 
-  // listPRCommitAuthors() can be slow on a big PR, so the store is read after
-  // it, when it is most likely to have changed. This narrows the race with
-  // other runs but does not close it. The consumer workflow's `concurrency:`
-  // group does. The read is needed even with `knownSignatures`, see
-  // mergeSignatures().
-  const { authors, unresolved } = await listPRCommitAuthors(prNumber);
+// Who is on the commits between this exact pair, and who of them still has to
+// sign. Publishes nothing.
+//
+// lookupBudget is created once by the caller (checkPR()) and passed in here
+// unchanged on every attempt, so the co-author lookup cap applies across the
+// whole run rather than resetting each time this is called. It falls back to
+// a fresh budget only so evaluatePair() stays directly callable (e.g. tests).
+async function evaluatePair(
+  pair,
+  knownSignatures,
+  lookupBudget = createLookupBudget(MAX_COAUTHOR_LOOKUPS_PER_RUN),
+) {
+  const { authors, unresolved } = await listPRCommitAuthors(
+    pair.baseSha,
+    pair.headSha,
+    lookupBudget,
+  );
+  // The signatures file is read after the commit list so it is as fresh as
+  // possible. That narrows the race with other runs; the workflow's
+  // `concurrency:` group is what closes it. We read it even with
+  // `knownSignatures`, see mergeSignatures().
   const { data: freshData, index: freshIndex } = await withSignaturesToken(
     (sigToken) => readSignatures(sigToken),
   );
@@ -1800,6 +2406,46 @@ async function checkPRBody(
   const missing = authors.filter(
     (a) => !isAllowlisted(a) && !isSigned(signed, a),
   );
+  return { authors, unresolved, missing };
+}
+
+// Best-effort only: used after something has already gone wrong and a status
+// that was published earlier can no longer be trusted (see checkPR()). A
+// further failure here is logged, not thrown - the original problem is what
+// should surface and fail the run, not a secondary issue with this safety
+// net overwriting it.
+async function failClosedStatus(headSha, description) {
+  try {
+    // emergency: true - this write exists specifically to recover from a
+    // status that's already published and now uncertain, so it must not be
+    // blocked by the very budget exhaustion that may have triggered it. See
+    // GITHUB_TOKEN_EMERGENCY_RESERVE.
+    await setStatus(headSha, "failure", description, { emergency: true });
+  } catch (e) {
+    console.log(
+      `::warning::Could not overwrite the status for ${headSha} while failing closed (${e.message}). It may still show a result that was never re-confirmed.`,
+    );
+  }
+}
+
+// Writes the status (and, unless statusOnly, the comment) for one confirmed
+// evaluation. Pulled out of checkPR() so the retry loop below can call it
+// more than once: GitHub gives us no way to publish a status only if the PR
+// is still the exact pair we checked, so checkPR() calls this, then reads the
+// PR once more to see whether that publish is still valid - see checkPR().
+//
+// onStatusPublished fires the instant setStatus() itself succeeds, before
+// anything else in this function runs. The status is the part that actually
+// matters for branch protection; the comment below it is cosmetic. If the
+// comment step throws, the caller still needs to know a status DID land, so
+// it does not mistake "this call threw" for "nothing was published" - see
+// checkPR()'s use of this.
+async function publishEvaluation(
+  prNumber,
+  evaluation,
+  { quietIfNeverFlagged, signer, statusOnly, onStatusPublished },
+) {
+  const { authors, unresolved, missing, headSha } = evaluation;
 
   if (missing.length === 0 && unresolved.length === 0) {
     await setStatus(
@@ -1807,6 +2453,7 @@ async function checkPRBody(
       "success",
       "All contributors have signed the CLA.",
     );
+    if (onStatusPublished) onStatusPublished();
     if (statusOnly) return;
     // Success is announced only when a pending comment is newer than the
     // last success comment (or there is none yet) - see
@@ -1861,6 +2508,7 @@ async function checkPRBody(
       ? `${missing.length} contributor(s) need to sign the CLA`
       : "Manual verification needed",
   );
+  if (onStatusPublished) onStatusPublished();
   if (statusOnly) return;
   if (signer) {
     // The PR is not clear yet, but this person did just sign. Acknowledge it
@@ -1872,6 +2520,252 @@ async function checkPRBody(
     );
   }
   await postComment(prNumber, lines.join("\n"));
+}
+
+// ---------------------------------------------------------------------------
+// Core: evaluate one PR and bring its status and comment up to date
+//
+// Options:
+//
+// quietIfNeverFlagged (passed as true only by the automatic
+// pull_request_target handler). When the PR is fully signed, post a comment
+// only if the PR was blocked at some point:
+//   - A new PR whose authors had all signed already gets no comment. The
+//     status is still set to success, because merge protection reads that.
+//   - If a "pending" comment was ever posted, the move to fully signed is
+//     announced. This compares the latest "pending" comment with the latest
+//     "success" one, so a second block and resolve cycle is announced again
+//     and an unchanged result stays quiet.
+//   - A personal reply such as "you already signed" does not count as a block.
+// A human trigger (the sign phrase or `recheck`) always gets an answer, so
+// those callers leave this off. The usual same-category dedupe in
+// postComment() still applies.
+//
+// signer ({ id, login }, passed only by handleIssueComment right after it
+// recorded a new signature). It changes who the bot addresses, not the
+// pass/fail logic:
+//   - PR still not clear: a separate "@signer Thank you for signing" comment
+//     comes first, then the pending list.
+//   - PR now fully signed and the signer is one of its required authors: the
+//     signer is thanked by name instead of the generic success message.
+//   - PR fully signed but the signer is allowlisted or has no commit on the
+//     PR: the generic success message. Crediting them would be misleading.
+//
+// statusOnly (passed only for the "already signed" reply). Update the status
+// check and return without any comment. That person's other PR may have a
+// stale status from before they signed, but a full check would also post a
+// new pending or success comment each time they resend the phrase.
+//
+// knownSignatures (passed only by handleIssueComment, with what
+// writeSignatures() just returned). It is merged with checkPR()'s own fresh
+// read, see mergeSignatures(). The fresh read alone can miss the write that
+// just happened, and the snapshot alone can miss a signature written by
+// another run meanwhile.
+// ---------------------------------------------------------------------------
+async function checkPR(
+  prNumber,
+  headSha,
+  {
+    quietIfNeverFlagged = false,
+    signer = null,
+    statusOnly = false,
+    knownSignatures = null,
+    eventBaseSha = null,
+  } = {},
+) {
+  assertValidPRNumber(prNumber, "checkPR(prNumber)");
+  // A headSha we were given is checked before any request is made.
+  if (headSha) assertValidSha(headSha, "checkPR(headSha)");
+  if (eventBaseSha) assertValidSha(eventBaseSha, "checkPR(eventBaseSha)");
+
+  // One budget for the whole run, shared across every evaluation attempt
+  // below (including re-evaluations after the pair moved). It must be
+  // created once here, not inside the loop or inside evaluatePair()'s
+  // default - otherwise a PR that forces several attempts gets the full cap
+  // again on each one. See MAX_COAUTHOR_LOOKUPS_PER_RUN.
+  const lookupBudget = createLookupBudget(MAX_COAUTHOR_LOOKUPS_PER_RUN);
+  // The hard, run-wide ceiling on actual GITHUB_TOKEN requests - see
+  // MAX_GITHUB_TOKEN_REQUESTS_PER_RUN. Each call gets its own isolated
+  // store (see runWithGitHubTokenRequestBudget()), so two overlapping
+  // checkPR() calls in the same process can never share or clobber each
+  // other's budget, and this one is automatically done with once this
+  // call's async chain finishes, success or failure - nothing to reset
+  // afterward, and nothing to leak into anything that runs after it.
+  //
+  // The run-scoped comments cache (see the comment above
+  // commentsCacheStorage for what it buys and why it is scoped this way, not
+  // at module level) is opened inside it, once per call, and is shared by
+  // every evaluation attempt below: postComment(), pendingIsNewerThanSuccess()
+  // and the rest of what this run calls pick the same Map up on their own,
+  // and our own writes are applied to it as they happen, so a later attempt
+  // sees what an earlier one in this run already posted.
+  return runWithGitHubTokenRequestBudget(
+    MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
+    GITHUB_TOKEN_EMERGENCY_RESERVE,
+    () =>
+      commentsCacheStorage.run(new Map(), () =>
+        checkPRInner(prNumber, headSha, {
+          quietIfNeverFlagged,
+          signer,
+          statusOnly,
+          knownSignatures,
+          eventBaseSha,
+          lookupBudget,
+        }),
+      ),
+  );
+}
+
+async function checkPRInner(
+  prNumber,
+  headSha,
+  { quietIfNeverFlagged, signer, statusOnly, knownSignatures, eventBaseSha, lookupBudget },
+) {
+
+  // The status and the author list must describe the same revision. We
+  // compare two fixed commit SHAs (base...head), so nothing on the branch can
+  // change the list mid-read. The one thing left to get right is which pair:
+  // - The webhook gave us both base and head (pull_request_target). Start from
+  //   that exact pair, so no base from a later state is mixed with the
+  //   event's head.
+  // - Otherwise read the PR once and use its own base and head together.
+  // Either way the pair can go stale while we work, so right before
+  // publishing we read the PR once more - and because GitHub gives us no way
+  // to make "confirm, then publish" one atomic operation, we read it once
+  // again right AFTER publishing too. Either re-check finding the pair
+  // changed sends us back around the same loop; MAX_PAIR_ATTEMPTS bounds the
+  // whole thing, pre- and post-publish checks together.
+  const pinnedHead = headSha || null;
+  let pair;
+  if (pinnedHead && eventBaseSha) {
+    pair = { baseSha: eventBaseSha, headSha };
+  } else {
+    const snapshot = await fetchPRSnapshot(prNumber);
+    if (pinnedHead && snapshot.headSha !== pinnedHead) {
+      // The caller named a head that is no longer the PR's head. Certify
+      // nothing: the event for the current head checks it.
+      console.log(
+        `::notice::PR #${prNumber} is now at ${snapshot.headSha}, not ${pinnedHead}. Skipping ${pinnedHead}: the event for the current head checks it.`,
+      );
+      return;
+    }
+    pair = snapshot;
+  }
+  let settled = false;
+  // Tracks whether a status has actually landed on GitHub this run, and for
+  // which head - set the instant setStatus() succeeds (see
+  // publishEvaluation()'s onStatusPublished), not after publishEvaluation()
+  // returns. A status write can be followed by a comment write that fails,
+  // or by a PR re-read that fails (rate limit, network): either throws past
+  // the point where these would otherwise be set. The catch below is what
+  // lets a published-but-now-uncertain status still be found and corrected,
+  // instead of silently standing simply because something after it failed.
+  let everPublished = false;
+  let lastPublishedHeadSha = null;
+
+  try {
+    // settled only ever becomes true right before a `break` (see below), so
+    // checking it here too would be redundant - the loop can only ever end
+    // either by running out of attempts or by that `break`.
+    for (let attempt = 1; attempt <= MAX_PAIR_ATTEMPTS; attempt++) {
+      const result = await evaluatePair(pair, knownSignatures, lookupBudget);
+
+      // Last look before publishing. If the PR moved while we were reading,
+      // this result no longer describes it. A moved head is left to the
+      // event for the new head when the caller pinned one. A moved base has
+      // no event of its own, so the pair is evaluated again instead of
+      // leaving the PR with no status.
+      const beforePublish = await fetchPRSnapshot(prNumber);
+      if (pinnedHead && beforePublish.headSha !== pinnedHead) {
+        console.log(
+          `::notice::PR #${prNumber} is now at ${beforePublish.headSha}, not ${pinnedHead}. Not publishing for ${pinnedHead}: the event for the current head checks it.`,
+        );
+        return;
+      }
+      if (
+        beforePublish.headSha !== pair.headSha ||
+        beforePublish.baseSha !== pair.baseSha
+      ) {
+        pair = beforePublish;
+        continue;
+      }
+
+      // The pair was confirmed fresh immediately before this. Publish it,
+      // then read the PR once more: there is no REST primitive that
+      // publishes a status only if the PR is still this exact pair, so this
+      // is the closest we can get. A change can still land after that read,
+      // including after this run finishes. There is no bounded time guarantee
+      // for how long a status can remain stale; that depends on when another
+      // check is triggered. Every attempt that lands here starts from a pair
+      // just re-confirmed, which is the strongest guarantee this API allows.
+      await publishEvaluation(
+        prNumber,
+        { ...result, headSha: pair.headSha },
+        {
+          quietIfNeverFlagged,
+          signer,
+          statusOnly,
+          onStatusPublished: () => {
+            everPublished = true;
+            lastPublishedHeadSha = pair.headSha;
+          },
+        },
+      );
+
+      const afterPublish = await fetchPRSnapshot(prNumber);
+      if (pinnedHead && afterPublish.headSha !== pinnedHead) {
+        // The head moved on from under the status we just wrote. That
+        // status is bound to the exact head SHA it was written for, which is
+        // no longer this PR's head, so it cannot satisfy anything checking
+        // the PR's current head - the event for the new head covers it.
+        // Nothing left to correct for the old head.
+        settled = true;
+        break;
+      }
+      if (
+        afterPublish.headSha === pair.headSha &&
+        afterPublish.baseSha === pair.baseSha
+      ) {
+        settled = true;
+        break;
+      }
+      // The base moved onto the very same head while, or right after, we
+      // published - the status we just wrote certified the old base, which
+      // no longer matches this head. Go around again with the new pair
+      // instead of leaving a status that no longer describes the PR.
+      pair = afterPublish;
+    }
+  } catch (err) {
+    if (everPublished && lastPublishedHeadSha) {
+      // A status was published at some point this run, but something after
+      // it - another attempt's evaluation, a re-read, a comment write - blew
+      // up before we could either confirm it still holds or correct it. Do
+      // not let it stand unconfirmed: fail closed, then let the original
+      // error surface so the run is still visibly a failure.
+      await failClosedStatus(
+        lastPublishedHeadSha,
+        "An error occurred while finishing this CLA check, so the previous result could not be confirmed; comment `recheck` to try again.",
+      );
+    }
+    throw err;
+  }
+
+  if (!settled) {
+    if (everPublished && lastPublishedHeadSha) {
+      // We did publish at least once, but every time we checked right after,
+      // the PR had already moved on again - so whatever we last wrote may no
+      // longer be accurate. Leave the head in a known, conservative state
+      // instead of trusting a status that was already shown to be stale by
+      // the time we looked.
+      await failClosedStatus(
+        lastPublishedHeadSha,
+        "Could not confirm the CLA result stayed valid long enough to publish; comment `recheck` to try again.",
+      );
+    }
+    throw new Error(
+      `PR #${prNumber} kept changing while checkPR() tried to confirm and publish a result, across ${MAX_PAIR_ATTEMPTS} attempts. Comment \`recheck\` to try again.`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,7 +2784,20 @@ function isPrivileged(payload, commenter) {
   return ["OWNER", "MEMBER", "COLLABORATOR"].includes(association);
 }
 
+// Wraps the whole handler in one GITHUB_TOKEN request budget - see
+// MAX_GITHUB_TOKEN_REQUESTS_PER_RUN. A signing comment reads and writes the
+// signature store (with GITHUB_TOKEN, unless a separate App token is
+// configured) before checkPR() is ever reached, so the budget has to start
+// here, not inside checkPR(), to actually cover everything this event does.
 async function handleIssueComment(payload) {
+  return runWithGitHubTokenRequestBudget(
+    MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
+    GITHUB_TOKEN_EMERGENCY_RESERVE,
+    () => handleIssueCommentInner(payload),
+  );
+}
+
+async function handleIssueCommentInner(payload) {
   if (!payload.issue || !payload.issue.pull_request) return; // plain issue, not a PR
   if (
     !payload.comment ||
@@ -1989,7 +2896,17 @@ async function handleIssueComment(payload) {
   }
 }
 
+// See handleIssueComment() for why this budget is started at the handler,
+// not inside checkPR().
 async function handlePullRequestTarget(payload) {
+  return runWithGitHubTokenRequestBudget(
+    MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
+    GITHUB_TOKEN_EMERGENCY_RESERVE,
+    () => handlePullRequestTargetInner(payload),
+  );
+}
+
+async function handlePullRequestTargetInner(payload) {
   if (!payload.pull_request) {
     // A real pull_request_target event always has this.
     throw new Error(
@@ -2004,14 +2921,34 @@ async function handlePullRequestTarget(payload) {
     await lockPR(prNumber);
     return;
   }
-  if (["opened", "synchronize", "reopened"].includes(payload.action)) {
+  // "edited" also fires for a title or body change, which doesn't need a
+  // re-check - only react to it when payload.changes names "base", GitHub's
+  // own signal that the PR was actually retargeted to a different base
+  // branch. Without this, a retarget with no new commit (so no
+  // "synchronize") never gets evaluated against its new base: the
+  // Compare-based commit list and the status it produces would both still
+  // describe the old base indefinitely, until something else happens on the
+  // PR. See checkPR().
+  const isGenuineRetarget =
+    payload.action === "edited" && payload.changes && payload.changes.base;
+  if (
+    ["opened", "synchronize", "reopened"].includes(payload.action) ||
+    isGenuineRetarget
+  ) {
     const headSha = assertValidSha(
       payload.pull_request.head && payload.pull_request.head.sha,
       "pull_request_target payload pull_request.head.sha",
     );
     // Automatic trigger, not a direct question, so stay quiet on a clean
     // result unless the PR was blocked before. See checkPR().
-    await checkPR(prNumber, headSha, { quietIfNeverFlagged: true });
+    const baseSha = assertValidSha(
+      payload.pull_request.base && payload.pull_request.base.sha,
+      "pull_request_target payload pull_request.base.sha",
+    );
+    await checkPR(prNumber, headSha, {
+      quietIfNeverFlagged: true,
+      eventBaseSha: baseSha,
+    });
   }
 }
 
@@ -2046,6 +2983,11 @@ if (require.main === module) {
 // Exported for tests only, not part of the action's public contract.
 module.exports = {
   isSigned,
+  createLimiter,
+  createReadGroup,
+  allOrAbort,
+  parseLastPage,
+  listPRCommitAuthors,
   SignatureIndex,
   isAllowlisted,
   parseAllowlist,
@@ -2080,11 +3022,19 @@ module.exports = {
   mergeSignatures,
   signerCompletedRequirement,
   extractCoAuthors,
+  createLookupBudget,
+  MAX_COAUTHOR_LOOKUPS_PER_RUN,
+  MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
+  GITHUB_TOKEN_EMERGENCY_RESERVE,
+  runWithGitHubTokenRequestBudget,
   fail,
   getExistingBotComments,
   pendingIsNewerThanSuccess,
   resolveUserIdByLogin,
   resolveLoginById,
   setStatus,
+  isValidGitHubUserId,
+  fetchPRSnapshot,
+  listCommitsBetween,
   commentsCacheStorage,
 };

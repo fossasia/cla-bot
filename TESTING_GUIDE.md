@@ -38,6 +38,7 @@ on:
     types: [opened, synchronize, reopened, closed]
 
 permissions:
+  contents: read
   pull-requests: read
   issues: write
   statuses: write
