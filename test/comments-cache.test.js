@@ -956,4 +956,94 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       );
     });
   });
+
+  await test("a cache update failure after POST is non-fatal and logged", async () => {
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.includes("/issues/1/comments") && method === "POST") {
+        return res(201, { id: 1, body: "posted", user: BOT });
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    const rejected = Promise.reject(new Error("cached fetch failed"));
+    rejected.catch(() => {}); // the post path below is the intended observer
+    const cache = new Map([[1, { promise: rejected }]]);
+    const warnings = [];
+    const originalWarn = console.warn;
+    console.warn = (message) => warnings.push(message);
+    try {
+      await commentsCacheStorage.run(cache, () => postComment(1, "posted", false));
+    } finally {
+      console.warn = originalWarn;
+    }
+    assert.strictEqual(warnings.length, 1);
+    assert.match(warnings[0], /Could not update the run-scoped comment cache/);
+  });
+
+  await test("write-through keeps the cached comment list within MAX_CACHED_COMMENTS", async () => {
+    const existing = Array.from({ length: 200 }, (_, index) => ({
+      id: index + 1,
+      body: `${MARKER}\nexisting #${index}`,
+      user: BOT,
+    }));
+    const gh = makeFakeGitHub({
+      commits: [],
+      initialSignatures: { version: 1, signatures: [] },
+      comments: existing,
+    });
+    global.fetch = gh.fetch;
+    const cache = new Map();
+    await commentsCacheStorage.run(cache, async () => {
+      await getExistingBotComments(1);
+      await postComment(1, "newly posted", false);
+      const current = await getExistingBotComments(1);
+      assert.strictEqual(current.length, 200);
+      assert.strictEqual(current[0].id, 2, "the oldest cached comment is trimmed");
+      assert.strictEqual(current.at(-1).id, 201, "the new comment remains cached");
+    });
+  });
+
+  await test("duplicate-ID spool flushes each full 1,000-ID buffer", async () => {
+    const text = "many exact duplicates";
+    const full = `${MARKER}\n${text}`;
+    const comments = Array.from({ length: 1000 }, (_, index) => ({
+      id: index + 1,
+      body: full,
+      user: BOT,
+    }));
+    comments.push({ id: 1001, body: `${MARKER}\nnewer different comment`, user: BOT });
+    let deleteCount = 0;
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") {
+          const page = Number(new URL(url).searchParams.get("page")) || 1;
+          const start = (page - 1) * 100;
+          return res(200, comments.slice(start, start + 100));
+        }
+        if (method === "POST") {
+          const created = { id: 1002, body: full, user: BOT };
+          comments.push(created);
+          return res(201, created);
+        }
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        deleteCount += 1;
+        const id = Number(url.split("/issues/comments/")[1]);
+        const index = comments.findIndex((comment) => comment.id === id);
+        if (index !== -1) comments.splice(index, 1);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    await postComment(1, text);
+    assert.strictEqual(deleteCount, 1000);
+    assert.deepStrictEqual(
+      comments.map((comment) => comment.id).sort((a, b) => a - b),
+      [1001, 1002],
+      "cleanup removes all old matches and keeps the newest matching comment",
+    );
+  });
 })();
