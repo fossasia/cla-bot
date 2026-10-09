@@ -27,6 +27,8 @@ const {
   getExistingBotComments,
   handlePullRequestTarget,
   handleIssueComment,
+  postComment,
+  commentsCacheStorage,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -714,6 +716,135 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       matching.length,
       1,
       "the older duplicate must have been cleaned up, leaving exactly the newest comment",
+    );
+  });
+
+  // ===========================================================================
+  // Part 3: the duplicate cleanup and the dedupe pre-check must see the PR's
+  // ENTIRE comment history, never just the most recent MAX_CACHED_COMMENTS
+  // (200) - unlike the general-purpose cache, which is fine to cap. Each
+  // test below plants a genuine match far outside a 200-item window and
+  // proves it is still found.
+  // ===========================================================================
+
+  await test("duplicate cleanup finds and deletes an OLD duplicate far beyond MAX_CACHED_COMMENTS (200), not just a recent one", async () => {
+    const text = "dup-beyond-cap";
+    const full = `${MARKER}\n${text}`;
+    // An exact duplicate at position 1, then 499 unrelated filler bot
+    // comments, then this run's own just-posted copy (id 501) - 500
+    // comments separate the two exact duplicates, well past the cap.
+    const oldDup = { id: 1, body: full, user: BOT };
+    const filler = Array.from({ length: 499 }, (_, i) => ({
+      id: 2 + i,
+      body: `${MARKER}\nfiller #${i}`,
+      user: BOT,
+    }));
+    let getCount = 0;
+    const deleted = [];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") {
+          getCount += 1;
+          if (getCount === 1) return res(200, []); // pre-check: nothing yet
+          // The cleanup's own fresh, paginated scan - must see everything,
+          // not just a recent window.
+          const all = [oldDup, ...filler, { id: 501, body: full, user: BOT }];
+          const page = Number(new URL(url).searchParams.get("page")) || 1;
+          const start = (page - 1) * 100;
+          return res(200, all.slice(start, start + 100));
+        }
+        if (method === "POST")
+          return res(201, { id: 501, body: full, user: BOT });
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        const id = Number(url.split("/issues/comments/")[1]);
+        deleted.push(id);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    await postComment(1, text);
+    assert.deepStrictEqual(
+      deleted,
+      [1],
+      "the OLD duplicate (id 1), 500 comments back, must still be found and deleted - not silently left behind",
+    );
+  });
+
+  await test("postComment()'s own dedupe correctly finds an OLD matching comment far beyond MAX_CACHED_COMMENTS (200) and skips reposting it", async () => {
+    // Deliberately a "pending"-category message (not "other"): the 300
+    // filler comments below are "other"-category, so they can never become
+    // a NEWER "pending" that legitimately supersedes this old one - the
+    // test would be meaningless otherwise, since a newer same-category
+    // comment SHOULD win over an older one.
+    const text = "<!-- fossasia-cla-bot:pending -->\nold pending list";
+    const full = `${MARKER}\n${text}`;
+    // The bot's own prior comment with this exact text, then 300 unrelated
+    // "other"-category admitted bot comments since - well past the cap -
+    // with no newer "pending" comment in between.
+    const oldComment = { id: 1, body: full, user: BOT };
+    const filler = Array.from({ length: 300 }, (_, i) => ({
+      id: 2 + i,
+      body: `${MARKER}\nfiller #${i}`,
+      user: BOT,
+    }));
+    let postCalls = 0;
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") {
+          const all = [oldComment, ...filler];
+          const page = Number(new URL(url).searchParams.get("page")) || 1;
+          const start = (page - 1) * 100;
+          return res(200, all.slice(start, start + 100));
+        }
+        if (method === "POST") {
+          postCalls += 1;
+          return res(201, { id: 999, body: full, user: BOT });
+        }
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    await postComment(1, text);
+    assert.strictEqual(
+      postCalls,
+      0,
+      "must recognize the old, exact match 300 comments back and skip reposting - not just within the most recent 200",
+    );
+  });
+
+  await test("a second postComment() call in the same run for the SAME category sees the first call's own just-posted comment immediately, not a stale pre-post snapshot", async () => {
+    // checkPR()'s own two postComment() calls per run are always different
+    // categories, so this never happens there today - but postComment() is
+    // exported, and the shared cache must stay correct regardless of
+    // caller, not just for today's one call pattern.
+    const text = "same-category-twice";
+    const full = `${MARKER}\n${text}`;
+    let postCount = 0;
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") return res(200, []); // nothing posted yet, ever
+        if (method === "POST") {
+          postCount += 1;
+          return res(201, { id: postCount, body: full, user: BOT });
+        }
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+    const cache = new Map();
+    await commentsCacheStorage.run(cache, async () => {
+      await postComment(1, text); // posts for real
+      await postComment(1, text); // identical body, same category - must be a no-op
+    });
+    assert.strictEqual(
+      postCount,
+      1,
+      "the second call must recognize the first call's own just-posted comment and skip reposting, not post a duplicate",
     );
   });
 })();

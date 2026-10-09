@@ -1127,46 +1127,51 @@ async function fetchBotLogin() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-run cache for a PR's raw comment list, used by getExistingBotComments().
+// Per-run cache for a PR's comment history, shared by three different
+// questions checkPR() and postComment() ask about the same PR, sometimes
+// more than once in one run: checkPR()'s own "is a success announcement
+// overdue" history check (pendingIsNewerThanSuccess()), postComment()'s own
+// dedupe check - sometimes twice, for the thank-you and the pending list
+// (latestOwnCommentBody()), and (only for tests or other direct callers,
+// see below) getExistingBotComments()'s general-purpose comment list. All
+// three page through the exact same raw comments - only what each extracts
+// from them differs - so the paginated fetch itself happens at most once
+// per PR per run instead of being repeated for each.
 //
-// One checkPR() run can ask "what did the bot already say on this PR?"
-// several times: its own history check, postComment()'s dedupe check
-// (sometimes twice, for the thank-you and the pending list), and the cleanup
-// re-fetch after posting. They all page through the exact same comments -
-// only the local filter (which identity counts as "the bot") differs - so
-// the raw fetch itself happens at most once per PR per run instead of being
-// repeated.
+// The post-write duplicate cleanup (dedupeIdenticalTrailingComments(), via
+// findExactDuplicateComments()) is NOT one of these three: it needs the
+// PR's entire comment history, every time, with no cap and no reuse of a
+// stale pre-write snapshot (see findExactDuplicateComments() for why a
+// separate, always-fresh, uncapped fetch is still safe there), so it
+// deliberately has its own, completely separate fetch instead of sharing
+// this cache at all.
 //
 // checkPR() opens one AsyncLocalStorage run with a fresh Map and everything
-// it calls - postComment(), getExistingBotComments(), the cleanup - picks
-// that same Map up automatically through commentsCacheStorage.getStore(),
-// with no cache argument threaded through any of their signatures. This is
-// what AsyncLocalStorage is for: request-scoped state that many functions
-// down a call tree need, without every one of them taking and forwarding an
-// extra parameter just to pass it along (easy to forget at some future call
-// site, which would silently turn caching off there). A call made outside
-// any checkPR() run - postComment() used on its own, or a direct call in
-// tests - simply finds no store, so it gets no caching: the original,
-// always-fresh behavior for a one-off call.
+// it calls - postComment(), pendingIsNewerThanSuccess(),
+// latestOwnCommentBody() - picks that same Map up automatically through
+// commentsCacheStorage.getStore(), with no cache argument threaded through
+// any of their signatures. This is what AsyncLocalStorage is for:
+// request-scoped state that many functions down a call tree need, without
+// every one of them taking and forwarding an extra parameter just to pass
+// it along (easy to forget at some future call site, which would silently
+// turn caching off there). A call made outside any checkPR() run -
+// postComment() used on its own, or a direct call in tests - simply finds
+// no store, so it gets no caching: the original, always-fresh behavior for
+// a one-off call.
 //
 // Like the identity lookups above, a cache entry holds the in-flight fetch,
 // so callers that overlap share one fetch, and a failed fetch evicts itself
 // so the next caller gets a real retry instead of a cached error.
 //
-// `fresh: true` always hits GitHub and replaces the cache entry. Only the
-// post-write duplicate cleanup uses it: that check exists specifically to
-// catch a comment a DIFFERENT, concurrent run posted at the same time, so it
-// must see GitHub's real state right now, not a snapshot a write could have
-// made stale. The fresh result then becomes the new cache entry, so later
-// reads in the same run (e.g. a second postComment() call) still get a hit.
-// This only orders a stale fetch's own FAILURE against a newer one's success
-// (see the eviction guard below) - two fresh:true fetches for the same PR
-// that both succeed settle on whichever happens to finish last, same as any
-// cache with concurrent writers. That is fine for the one real caller:
-// checkPR()'s own AsyncLocalStorage scope never reads a PR's comments twice
-// in parallel, so this never actually arises there - `cache` is exposed as
-// a plain parameter mainly so tests can exercise the caching on its own,
-// without a whole checkPR() run.
+// `fresh: true` always hits GitHub and replaces the cache entry, for a
+// direct caller of getExistingBotComments() that wants to bypass whatever
+// is cached (no internal caller needs this anymore - see above - so it
+// exists for tests and other direct use). This only orders a stale fetch's
+// own FAILURE against a newer one's success (see the eviction guard below)
+// - two fresh:true fetches for the same PR that both succeed settle on
+// whichever happens to finish last, same as any cache with concurrent
+// writers. `cache` itself is exposed as a plain parameter mainly so tests
+// can exercise the caching on its own, without a whole checkPR() run.
 // ---------------------------------------------------------------------------
 const commentsCacheStorage = new AsyncLocalStorage();
 
@@ -1295,6 +1300,14 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
   let seq = 0;
   let lastPendingSeq = -1;
   let lastSuccessSeq = -1;
+  // Latest comment BODY per category, for the CURRENT (strict) identity
+  // only - never the broader anyBotIdentity match. Same reasoning and same
+  // "just overwrite it, never trim it" technique as lastPendingSeq /
+  // lastSuccessSeq above: classifyBotComment() only ever returns one of a
+  // small fixed set of categories, so this is bounded by that set, not by
+  // how many comments the PR has - see latestOwnCommentBody() below for who
+  // actually needs this.
+  const latestOwnBodyByCategory = Object.create(null);
   let page = 1;
   for (;;) {
     const comments = await gh(
@@ -1320,6 +1333,9 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
       if (category === "pending") lastPendingSeq = seq;
       else if (category === "success") lastSuccessSeq = seq;
       seq += 1;
+      if (c.user.login === botLogin) {
+        latestOwnBodyByCategory[category] = c.body;
+      }
       all.push({
         id: c.id,
         body: c.body,
@@ -1335,7 +1351,12 @@ async function fetchAllIssueCommentsUncached(prNumber, botLoginPromise) {
     if (comments.length < 100) break;
     page += 1;
   }
-  return { comments: all, lastPendingSeq, lastSuccessSeq };
+  return {
+    comments: all,
+    lastPendingSeq,
+    lastSuccessSeq,
+    latestOwnBodyByCategory,
+  };
 }
 
 // Whether a broad-identity "pending" comment is more recent than the last
@@ -1357,20 +1378,22 @@ async function pendingIsNewerThanSuccess(prNumber) {
   return lastPendingSeq > lastSuccessSeq;
 }
 
-// Drops one comment id from the current run's cached list, if this PR's list
-// is cached. Used right after that comment is deleted, so a later read in
-// the same run doesn't show a comment that is already gone. Only ever
-// called after the list was itself just fetched successfully (see
-// dedupeIdenticalTrailingComments's own `fresh: true` read), so the cached
-// entry's promise here is already resolved.
-async function forgetCachedComment(prNumber, commentId) {
+// The current bot identity's own latest comment body for `category` (or
+// undefined if it has never posted one) - what postComment()'s own dedupe
+// check needs: "did I already say exactly this, most recently?" Using
+// latestOwnBodyByCategory above keeps this correct regardless of how many
+// bot-marked comments the PR has ever accumulated, not just within
+// MAX_CACHED_COMMENTS - the same reasoning as pendingIsNewerThanSuccess()
+// just above. Shares the same cached fetch as any other read for this PR in
+// the same run.
+async function latestOwnCommentBody(prNumber, category) {
   const cache = commentsCacheStorage.getStore();
-  const entry = cache && cache.get(prNumber);
-  if (!entry) return;
-  const { comments: list } = await entry.promise;
-  for (let i = list.length - 1; i >= 0; i--) {
-    if (list[i].id === commentId) list.splice(i, 1);
-  }
+  const botLoginPromise = resolveBotLogin();
+  const { latestOwnBodyByCategory } = await fetchAllIssueComments(prNumber, {
+    cache,
+    botLoginPromise,
+  });
+  return latestOwnBodyByCategory[category];
 }
 
 // `cache` is normally left to default to whatever checkPR() set up for this
@@ -1403,17 +1426,14 @@ async function postComment(prNumber, body, dedupe = true) {
   // postComment() is exported, so it checks its own input.
   assertValidPRNumber(prNumber, "postComment(prNumber)");
   const full = `${BOT_MARKER}\n${body}`;
+  // Compare with the latest bot comment of the same category, not just the
+  // latest bot comment. checkPR() can post a personal thank-you ("other")
+  // and then the pending list ("pending") back to back, so a later pending
+  // comment would otherwise be compared with someone else's thank-you.
+  const category = classifyBotComment(full);
   if (dedupe) {
-    const existing = await getExistingBotComments(prNumber);
-    // Compare with the latest bot comment of the same category, not just the
-    // latest bot comment. checkPR() can post a personal thank-you ("other")
-    // and then the pending list ("pending") back to back, so a later pending
-    // comment would otherwise be compared with someone else's thank-you.
-    const category = classifyBotComment(full);
-    const lastOfCategory = existing.findLast(
-      (c) => classifyBotComment(c.body) === category,
-    );
-    if (lastOfCategory && lastOfCategory.body === full) return; // unchanged
+    const lastBody = await latestOwnCommentBody(prNumber, category);
+    if (lastBody === full) return; // unchanged
   }
   await gh(
     `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments`,
@@ -1425,6 +1445,15 @@ async function postComment(prNumber, body, dedupe = true) {
   );
 
   if (dedupe) {
+    // checkPR()'s own two postComment() calls in a run are always different
+    // categories, so this never matters for it today - but postComment() is
+    // exported, and without this, a second call for the SAME category later
+    // in the same run would compare against a stale, pre-post snapshot
+    // instead of the comment just posted. Always safe to do unconditionally
+    // (unlike the duplicate cleanup below): this is OUR OWN just-posted
+    // comment, never something a concurrent process wrote, so there's no
+    // question of which value is the right one to remember.
+    await rememberOwnPostedComment(prNumber, category, full);
     // Best-effort. The comment is already posted, so a cleanup failure must
     // not fail the run.
     try {
@@ -1435,6 +1464,15 @@ async function postComment(prNumber, body, dedupe = true) {
       );
     }
   }
+}
+
+// See the comment above where this is called, in postComment().
+async function rememberOwnPostedComment(prNumber, category, body) {
+  const cache = commentsCacheStorage.getStore();
+  const entry = cache && cache.get(prNumber);
+  if (!entry) return;
+  const { latestOwnBodyByCategory } = await entry.promise;
+  latestOwnBodyByCategory[category] = body;
 }
 
 // Deletes targeted by one dedupeIdenticalTrailingComments() cleanup are each
@@ -1453,7 +1491,6 @@ async function deleteDuplicateComment(prNumber, dup) {
       GITHUB_TOKEN,
       { method: "DELETE" },
     );
-    await forgetCachedComment(prNumber, dup.id);
   } catch (e) {
     // It may already be gone, or the token may lack permission. This is
     // cosmetic cleanup, so do not fail the run.
@@ -1461,6 +1498,40 @@ async function deleteDuplicateComment(prNumber, dup) {
       `::warning::Could not delete duplicate comment ${dup.id}: ${e.message}`,
     );
   }
+}
+
+// Finds every existing comment, for the CURRENT bot identity only, whose
+// body is an EXACT match for `body` - what dedupeIdenticalTrailingComments()
+// below needs, over the PR's entire comment history. This is deliberately
+// its own fetch, separate from the general cache above: it must see
+// GitHub's real state right now regardless of anything cached before this
+// run's own post (same reason getExistingBotComments()'s own `fresh: true`
+// exists), and unlike that general-purpose list, this one is never capped.
+// That is safe, not reckless: what gets kept is filtered by an EXACT string
+// match as it streams page by page, so what's actually retained is bounded
+// by how many true duplicates of ONE already-known, specific message exist
+// - not by how many comments the PR has in total. Every other comment,
+// however many there are, is compared and discarded as it streams, never
+// accumulated.
+async function findExactDuplicateComments(prNumber, body) {
+  const botLogin = await resolveBotLogin();
+  const matches = [];
+  let page = 1;
+  for (;;) {
+    const comments = await gh(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments?per_page=100&page=${page}`,
+      GITHUB_TOKEN,
+    );
+    if (!comments.length) break;
+    for (const c of comments) {
+      if (c.user && c.user.login === botLogin && c.body === body) {
+        matches.push({ id: c.id });
+      }
+    }
+    if (comments.length < 100) break;
+    page += 1;
+  }
+  return matches;
 }
 
 // The "no matching comment yet, so post" check in postComment() is two HTTP
@@ -1471,13 +1542,9 @@ async function deleteDuplicateComment(prNumber, dup) {
 // `concurrency:` group in the consumer workflow is what really closes the
 // race. This is the backstop for when it is missing.
 async function dedupeIdenticalTrailingComments(prNumber, body) {
-  // fresh: true - this is the check for what a concurrent run may have
-  // posted in the meantime, so it must not settle for whatever was cached
-  // before this run's own post above.
-  const comments = await getExistingBotComments(prNumber, { fresh: true });
-  const matching = comments
-    .filter((c) => c.body === body)
-    .sort((a, b) => a.id - b.id);
+  const matching = (await findExactDuplicateComments(prNumber, body)).sort(
+    (a, b) => a.id - b.id,
+  );
   // Keep the newest (highest id), delete the rest.
   const duplicates = matching.slice(0, -1);
   if (duplicates.length > 0) {
@@ -1924,4 +1991,5 @@ module.exports = {
   resolveUserIdByLogin,
   resolveLoginById,
   setStatus,
+  commentsCacheStorage,
 };
