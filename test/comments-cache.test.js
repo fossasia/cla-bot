@@ -850,6 +850,12 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
     const cache = new Map();
     await commentsCacheStorage.run(cache, async () => {
       await postComment(1, text); // posts for real
+      const currentComments = await getExistingBotComments(1);
+      assert.deepStrictEqual(
+        currentComments,
+        [{ id: 1, body: full, user: { login: BOT.login, type: BOT.type } }],
+        "a cached read after POST must include the comment this run just created",
+      );
       await postComment(1, text); // identical body, same category - must be a no-op
     });
     assert.strictEqual(
@@ -857,5 +863,52 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       1,
       "the second call must recognize the first call's own just-posted comment and skip reposting, not post a duplicate",
     );
+  });
+
+  await test("the run-scoped comment cache reflects a new post and successful duplicate cleanup", async () => {
+    const text = "cache-write-through";
+    const full = `${MARKER}\n${text}`;
+    const comments = [
+      { id: 1, body: full, user: BOT },
+      { id: 2, body: `${MARKER}\nnewer other comment`, user: BOT },
+    ];
+    global.fetch = async (url, opts = {}) => {
+      const method = (opts.method || "GET").toUpperCase();
+      if (url.endsWith("/user")) return res(404, { message: "Not Found" });
+      if (url.includes("/issues/1/comments")) {
+        if (method === "GET") {
+          const page = Number(new URL(url).searchParams.get("page")) || 1;
+          const start = (page - 1) * 100;
+          return res(200, comments.slice(start, start + 100));
+        }
+        if (method === "POST") {
+          const created = {
+            id: 3,
+            body: JSON.parse(opts.body).body,
+            user: BOT,
+          };
+          comments.push(created);
+          return res(201, created);
+        }
+      }
+      if (url.includes("/issues/comments/") && method === "DELETE") {
+        const id = Number(url.split("/issues/comments/")[1]);
+        const index = comments.findIndex((comment) => comment.id === id);
+        if (index !== -1) comments.splice(index, 1);
+        return res(204, null);
+      }
+      throw new Error(`unexpected call: ${method} ${url}`);
+    };
+
+    const cache = new Map();
+    await commentsCacheStorage.run(cache, async () => {
+      await postComment(1, text);
+      const cached = await getExistingBotComments(1);
+      assert.deepStrictEqual(
+        cached.map((comment) => comment.id),
+        [2, 3],
+        "the cache must include the newly created comment and remove the duplicate deleted during cleanup",
+      );
+    });
   });
 })();

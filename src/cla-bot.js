@@ -1165,6 +1165,9 @@ async function fetchBotLogin() {
 // Like the identity lookups above, a cache entry holds the in-flight fetch,
 // so callers that overlap share one fetch, and a failed fetch evicts itself
 // so the next caller gets a real retry instead of a cached error.
+// After that snapshot resolves, successful writes and deletes made by this
+// run are applied to it (write-through). Changes made by other processes are
+// not reflected until a fresh read; callers needing that must use fresh:true.
 //
 // `fresh: true` always hits GitHub and replaces the cache entry, for a
 // direct caller of getExistingBotComments() that wants to bypass whatever
@@ -1438,7 +1441,7 @@ async function postComment(prNumber, body, dedupe = true) {
     const lastBody = await latestOwnCommentBody(prNumber, category);
     if (lastBody === full) return; // unchanged
   }
-  await gh(
+  const createdComment = await gh(
     `/repos/${REPO_OWNER}/${REPO_NAME}/issues/${encodeURIComponent(prNumber)}/comments`,
     GITHUB_TOKEN,
     {
@@ -1447,16 +1450,17 @@ async function postComment(prNumber, body, dedupe = true) {
     },
   );
 
+  // Keep the run-scoped snapshot current after our own write, even when this
+  // call disabled duplicate detection. This is our own API-confirmed comment.
+  try {
+    await rememberOwnPostedComment(prNumber, category, full, createdComment);
+  } catch (e) {
+    console.warn(
+      `::warning::Could not update the run-scoped comment cache after posting (non-fatal): ${e.message}`,
+    );
+  }
+
   if (dedupe) {
-    // checkPR()'s own two postComment() calls in a run are always different
-    // categories, so this never matters for it today - but postComment() is
-    // exported, and without this, a second call for the SAME category later
-    // in the same run would compare against a stale, pre-post snapshot
-    // instead of the comment just posted. Always safe to do unconditionally
-    // (unlike the duplicate cleanup below): this is OUR OWN just-posted
-    // comment, never something a concurrent process wrote, so there's no
-    // question of which value is the right one to remember.
-    await rememberOwnPostedComment(prNumber, category, full);
     // Best-effort. The comment is already posted, so a cleanup failure must
     // not fail the run.
     try {
@@ -1470,12 +1474,31 @@ async function postComment(prNumber, body, dedupe = true) {
 }
 
 // See the comment above where this is called, in postComment().
-async function rememberOwnPostedComment(prNumber, category, body) {
+async function rememberOwnPostedComment(prNumber, category, body, comment) {
   const cache = commentsCacheStorage.getStore();
   const entry = cache && cache.get(prNumber);
   if (!entry) return;
-  const { latestOwnBodyByCategory } = await entry.promise;
+  const { comments, latestOwnBodyByCategory } = await entry.promise;
   latestOwnBodyByCategory[category] = body;
+  if (!comment || !Number.isSafeInteger(comment.id)) {
+    // Without the API's comment ID we cannot safely patch the list. Force the
+    // next read to fetch GitHub instead of returning a known-stale snapshot.
+    if (cache.get(prNumber) === entry) cache.delete(prNumber);
+    return;
+  }
+  if (comments.some((cached) => cached.id === comment.id)) return;
+  const botLogin = await resolveBotLogin();
+  comments.push({
+    id: comment.id,
+    body,
+    user: {
+      login: (comment.user && comment.user.login) || botLogin,
+      type: comment.user && comment.user.type,
+    },
+  });
+  if (comments.length > MAX_CACHED_COMMENTS) {
+    comments.splice(0, comments.length - MAX_CACHED_COMMENTS);
+  }
 }
 
 // Deletes targeted by one dedupeIdenticalTrailingComments() cleanup are each
@@ -1494,13 +1517,29 @@ async function deleteDuplicateComment(prNumber, dup) {
       GITHUB_TOKEN,
       { method: "DELETE" },
     );
+    await forgetDeletedCachedComment(prNumber, dup.id);
   } catch (e) {
+    if (e.status === 404) {
+      // The comment is already absent, so the snapshot must not keep it.
+      await forgetDeletedCachedComment(prNumber, dup.id);
+    }
     // It may already be gone, or the token may lack permission. This is
     // cosmetic cleanup, so do not fail the run.
     console.warn(
       `::warning::Could not delete duplicate comment ${dup.id}: ${e.message}`,
     );
   }
+}
+
+// Keep the run-scoped snapshot in sync with comment deletions this run
+// successfully made. Other writers remain outside the cache's snapshot.
+async function forgetDeletedCachedComment(prNumber, commentId) {
+  const cache = commentsCacheStorage.getStore();
+  const entry = cache && cache.get(prNumber);
+  if (!entry) return;
+  const { comments } = await entry.promise;
+  const index = comments.findIndex((comment) => comment.id === commentId);
+  if (index !== -1) comments.splice(index, 1);
 }
 
 // Finds exact matches for the CURRENT bot identity across the full history.
