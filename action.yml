@@ -42,13 +42,15 @@ inputs:
     default: ""
   app-id:
     description: >-
-      GitHub App ID for short-lived tokens used to write signatures in another
-      repository. Leave empty to use github-token; this only works when both
-      repositories are the same.
+      Positive decimal GitHub App ID for short-lived signature-write tokens.
+      Set this together with app-private-key. Leave both empty to use
+      github-token; this only works when both repositories are the same.
     required: false
     default: ""
   app-private-key:
-    description: "GitHub App private key in PEM format. Store it as a secret."
+    description: >-
+      GitHub App private key in PEM format. Store it as a secret and set it
+      together with app-id.
     required: false
     default: ""
   node-version:
