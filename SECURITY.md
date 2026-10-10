@@ -22,8 +22,6 @@ repository's security team can see, and keeps the whole exchange (and any
 resulting advisory) attached to the repository. You should get an
 acknowledgement within 5 business days.
 
-If for some reason you can't use private vulnerability reporting, email
-`security@fossasia.org` instead.
 
 ## Scope
 
