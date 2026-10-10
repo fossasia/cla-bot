@@ -133,7 +133,13 @@ const [REPO_OWNER, REPO_NAME] = (process.env.GITHUB_REPOSITORY || "/").split(
   "/",
 );
 const EVENT_NAME = process.env.GITHUB_EVENT_NAME;
-const EVENT_JSON = process.env.GITHUB_EVENT_JSON;
+const EVENT_PATH = process.env.GITHUB_EVENT_PATH;
+// These bounded URL inputs come from GitHub's event context in action.yml.
+// Keep them separate from the file-backed payload so event file data cannot
+// flow into API request URLs.
+const EVENT_PR_NUMBER = process.env.CLA_BOT_EVENT_PR_NUMBER;
+const EVENT_HEAD_SHA = process.env.CLA_BOT_EVENT_HEAD_SHA;
+const EVENT_BASE_SHA = process.env.CLA_BOT_EVENT_BASE_SHA;
 
 function fail(msg) {
   console.error(`::error::${msg}`);
@@ -155,6 +161,16 @@ function assertValidPRNumber(value, context) {
     );
   }
   return value;
+}
+
+function assertValidEventPRNumber(value, context) {
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    parsed = undefined;
+  }
+  return assertValidPRNumber(parsed, context);
 }
 
 function buildCommentUrl(prNumber, commentId, serverUrl = GITHUB_SERVER_URL) {
@@ -2270,14 +2286,20 @@ function isPrivileged(payload, commenter) {
 // configured) before checkPR() is ever reached, so the budget has to start
 // here, not inside checkPR(), to actually cover everything this event does.
 async function handleIssueComment(payload) {
+  return handleIssueCommentWithIdentifiers(payload, {
+    prNumber: JSON.stringify(payload.issue && payload.issue.number),
+  });
+}
+
+async function handleIssueCommentWithIdentifiers(payload, identifiers) {
   return runWithGitHubTokenRequestBudget(
     MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
     GITHUB_TOKEN_EMERGENCY_RESERVE,
-    () => handleIssueCommentInner(payload),
+    () => handleIssueCommentInner(payload, identifiers),
   );
 }
 
-async function handleIssueCommentInner(payload) {
+async function handleIssueCommentInner(payload, identifiers) {
   if (!payload.issue || !payload.issue.pull_request) return; // plain issue, not a PR
   if (
     !payload.comment ||
@@ -2293,8 +2315,8 @@ async function handleIssueCommentInner(payload) {
       "issue_comment payload is missing comment.user.login (or it is empty) - malformed or unexpected webhook delivery.",
     );
   }
-  const prNumber = assertValidPRNumber(
-    payload.issue.number,
+  const prNumber = assertValidEventPRNumber(
+    identifiers.prNumber,
     "issue_comment payload issue.number",
   );
   const body = (payload.comment.body || "").trim();
@@ -2379,22 +2401,36 @@ async function handleIssueCommentInner(payload) {
 // See handleIssueComment() for why this budget is started at the handler,
 // not inside checkPR().
 async function handlePullRequestTarget(payload) {
+  return handlePullRequestTargetWithIdentifiers(payload, {
+    prNumber: JSON.stringify(payload.pull_request && payload.pull_request.number),
+    headSha:
+      payload.pull_request &&
+      payload.pull_request.head &&
+      payload.pull_request.head.sha,
+    baseSha:
+      payload.pull_request &&
+      payload.pull_request.base &&
+      payload.pull_request.base.sha,
+  });
+}
+
+async function handlePullRequestTargetWithIdentifiers(payload, identifiers) {
   return runWithGitHubTokenRequestBudget(
     MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
     GITHUB_TOKEN_EMERGENCY_RESERVE,
-    () => handlePullRequestTargetInner(payload),
+    () => handlePullRequestTargetInner(payload, identifiers),
   );
 }
 
-async function handlePullRequestTargetInner(payload) {
+async function handlePullRequestTargetInner(payload, identifiers) {
   if (!payload.pull_request) {
     // A real pull_request_target event always has this.
     throw new Error(
       "pull_request_target payload is missing pull_request - malformed or unexpected webhook delivery.",
     );
   }
-  const prNumber = assertValidPRNumber(
-    payload.pull_request.number,
+  const prNumber = assertValidEventPRNumber(
+    identifiers.prNumber,
     "pull_request_target payload pull_request.number",
   );
   if (payload.action === "closed" && payload.pull_request.merged) {
@@ -2409,13 +2445,13 @@ async function handlePullRequestTargetInner(payload) {
     isGenuineRetarget
   ) {
     const headSha = assertValidSha(
-      payload.pull_request.head && payload.pull_request.head.sha,
+      identifiers.headSha,
       "pull_request_target payload pull_request.head.sha",
     );
     // Automatic trigger, not a direct question, so stay quiet on a clean
     // result unless the PR was blocked before. See checkPR().
     const baseSha = assertValidSha(
-      payload.pull_request.base && payload.pull_request.base.sha,
+      identifiers.baseSha,
       "pull_request_target payload pull_request.base.sha",
     );
     await checkPR(prNumber, headSha, {
@@ -2428,17 +2464,23 @@ async function handlePullRequestTargetInner(payload) {
 // Entry point
 async function main() {
   validateConfig();
-  if (!EVENT_JSON) {
+  if (!EVENT_PATH || !fs.existsSync(EVENT_PATH)) {
     fail(
-      "GITHUB_EVENT_JSON not provided. This script must run as a GitHub Action.",
+      `GITHUB_EVENT_PATH not found (${EVENT_PATH}). This script must run inside a GitHub Actions job.`,
     );
   }
-  const payload = JSON.parse(EVENT_JSON);
+  const payload = JSON.parse(fs.readFileSync(EVENT_PATH, "utf8"));
 
   if (EVENT_NAME === "issue_comment" && payload.action === "created") {
-    await handleIssueComment(payload);
+    await handleIssueCommentWithIdentifiers(payload, {
+      prNumber: EVENT_PR_NUMBER,
+    });
   } else if (EVENT_NAME === "pull_request_target") {
-    await handlePullRequestTarget(payload);
+    await handlePullRequestTargetWithIdentifiers(payload, {
+      prNumber: EVENT_PR_NUMBER,
+      headSha: EVENT_HEAD_SHA,
+      baseSha: EVENT_BASE_SHA,
+    });
   } else {
     console.log(
       `Nothing to do for event "${EVENT_NAME}" / action "${payload.action}".`,

@@ -81,6 +81,8 @@ runs:
         SIG_APP_ID: ${{ inputs.app-id }}
         SIG_APP_PRIVATE_KEY: ${{ inputs.app-private-key }}
         REQUIRE_VERIFIED_COMMITS: ${{ inputs.require-verified-commits }}
-        GITHUB_EVENT_JSON: ${{ toJSON(github.event) }}
+        CLA_BOT_EVENT_PR_NUMBER: ${{ toJSON(github.event.issue.number || github.event.pull_request.number) }}
+        CLA_BOT_EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        CLA_BOT_EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         ACTION_PATH: ${{ github.action_path }}
       run: node "$ACTION_PATH/src/cla-bot.js"

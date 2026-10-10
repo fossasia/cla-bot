@@ -899,6 +899,11 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
         });
       });
       await new Promise((r) => server.listen(0, "127.0.0.1", r));
+      const eventPath = path.join(TMP_DIR, `event-${Date.now()}.json`);
+      fs.writeFileSync(eventPath, JSON.stringify(signPayload()), {
+        flag: "wx",
+        mode: 0o600,
+      });
       try {
         const env = {
           PATH: process.env.PATH,
@@ -906,7 +911,8 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
           ...BASE_ENV,
           GITHUB_API_URL: `http://127.0.0.1:${server.address().port}`,
           GITHUB_EVENT_NAME: "issue_comment",
-          GITHUB_EVENT_JSON: JSON.stringify(signPayload()),
+          GITHUB_EVENT_PATH: eventPath,
+          CLA_BOT_EVENT_PR_NUMBER: "1",
           SIG_APP_ID: "123456",
           SIG_APP_PRIVATE_KEY: PRIVATE_KEY,
         };
@@ -932,6 +938,7 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
           "expected the refresh warning in the Actions log",
         );
       } finally {
+        fs.unlinkSync(eventPath);
         await new Promise((r) => server.close(r));
       }
     },

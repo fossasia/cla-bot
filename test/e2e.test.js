@@ -161,7 +161,10 @@ const OS_PASSTHROUGH_VARS = [
 const CLA_BOT_ENV_VARS = [
   "GITHUB_API_URL",
   "GITHUB_EVENT_NAME",
-  "GITHUB_EVENT_JSON",
+  "GITHUB_EVENT_PATH",
+  "CLA_BOT_EVENT_PR_NUMBER",
+  "CLA_BOT_EVENT_HEAD_SHA",
+  "CLA_BOT_EVENT_BASE_SHA",
   "GITHUB_REPOSITORY",
   "GITHUB_TOKEN",
   "REQUIRE_VERIFIED_COMMITS",
@@ -182,13 +185,22 @@ function buildChildEnv(overrides) {
     env[key] = "";
   }
   const eventPath = overrides.GITHUB_EVENT_PATH;
-  const childOverrides = { ...overrides };
-  delete childOverrides.GITHUB_EVENT_PATH;
-  const childEnv = { ...env, ...childOverrides };
-  if (!Object.hasOwn(childOverrides, "GITHUB_EVENT_JSON")) {
-    childEnv.GITHUB_EVENT_JSON = eventPath && fs.existsSync(eventPath)
-      ? fs.readFileSync(eventPath, "utf8")
-      : "";
+  const childEnv = { ...env, ...overrides };
+  if (eventPath && fs.existsSync(eventPath)) {
+    try {
+      const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
+      const prNumber = event.issue?.number ?? event.pull_request?.number;
+      const fields = {
+        CLA_BOT_EVENT_PR_NUMBER: prNumber == null ? "null" : JSON.stringify(prNumber),
+        CLA_BOT_EVENT_HEAD_SHA: event.pull_request?.head?.sha || "",
+        CLA_BOT_EVENT_BASE_SHA: event.pull_request?.base?.sha || "",
+      };
+      for (const [key, value] of Object.entries(fields)) {
+        if (!Object.hasOwn(overrides, key)) childEnv[key] = value;
+      }
+    } catch {
+      // Leave the API identifiers empty; the CLI should report malformed JSON.
+    }
   }
   return childEnv;
 }
@@ -335,7 +347,12 @@ function baseEnv(apiUrl) {
     const server = await startFakeGitHub({ authorAlreadySigned: true });
     const eventFile = writeTempEventFile({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "e2e-head-sha" }, base: { sha: "base-sha-fixture" } },
+      unused_large_field: "x".repeat(200_000),
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "base-sha-fixture" },
+      },
     });
     try {
       const { code, stderr } = await runScript({
@@ -486,7 +503,7 @@ function baseEnv(apiUrl) {
     }
   });
 
-  await test("the CLI entrypoint fails loudly when no serialized GitHub event is provided", async () => {
+  await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH does not exist", async () => {
     const { code, stderr } = await runScript({
       ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
@@ -494,12 +511,12 @@ function baseEnv(apiUrl) {
     });
     assert.notStrictEqual(code, 0, "expected a non-zero exit code");
     assert.ok(
-      /GITHUB_EVENT_JSON not provided/.test(stderr),
+      /GITHUB_EVENT_PATH not found/.test(stderr),
       `expected a specific error about the missing event payload, got stderr:\n${stderr}`,
     );
   });
 
-  await test("the CLI entrypoint fails loudly when the serialized event is empty", async () => {
+  await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH is unset", async () => {
     const { code, stderr } = await runScript({
       ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
@@ -509,7 +526,7 @@ function baseEnv(apiUrl) {
     });
     assert.notStrictEqual(code, 0, "expected a non-zero exit code");
     assert.ok(
-      /GITHUB_EVENT_JSON not provided/.test(stderr),
+      /GITHUB_EVENT_PATH not found/.test(stderr),
       `expected a specific error about the missing event payload, got stderr:\n${stderr}`,
     );
   });
@@ -528,7 +545,7 @@ function baseEnv(apiUrl) {
       const { code, stderr } = await runScript({
         ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
         GITHUB_EVENT_NAME: "pull_request_target",
-        GITHUB_EVENT_JSON: fs.readFileSync(eventFile, "utf8"),
+        GITHUB_EVENT_PATH: eventFile,
       });
       assert.notStrictEqual(
         code,
@@ -613,6 +630,11 @@ function baseEnv(apiUrl) {
   // Exercise the `e.message` fallback by making JSON.parse reject with a
   // plain object that has no stack.
   await test("the top-level main().catch() handler falls back to e.message when the rejection has no .stack at all (a non-Error throw)", async () => {
+    const eventFile = path.join(
+      TMP_DIR,
+      `nonerror-event-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
+    );
+    fs.writeFileSync(eventFile, '{"action":"opened"}');
     // A `-r`-preloaded module, NOT a wrapper that `require()`s the real
     // script - requiring cla-bot.js from another script would make THAT
     // script `require.main`, so `if (require.main === module)` inside
@@ -642,7 +664,7 @@ function baseEnv(apiUrl) {
           env: buildChildEnv({
             ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
             GITHUB_EVENT_NAME: "pull_request_target",
-            GITHUB_EVENT_JSON: '{"action":"opened"}',
+            GITHUB_EVENT_PATH: eventFile,
           }),
         });
         let stderrOut = "";
@@ -666,6 +688,7 @@ function baseEnv(apiUrl) {
         "with no .stack on the thrown value, no stack trace naming main() should appear anywhere in the output - confirming the LHS (e.stack) was genuinely NOT what was used here",
       );
     } finally {
+      fs.unlinkSync(eventFile);
       fs.unlinkSync(preload);
     }
   });
@@ -676,6 +699,14 @@ function baseEnv(apiUrl) {
   // removed the preload file.
   await test("runScriptCapturingFirstFetchUrl's timeout path rejects cleanly, and its cleanup completes deterministically - with no temp preload file left behind - once the delayed 'close' event fires", async () => {
     let caught = null;
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "e2e-base-sha" },
+      },
+    });
     try {
       await runScriptCapturingFirstFetchUrl(
         {
@@ -687,14 +718,7 @@ function baseEnv(apiUrl) {
           CLA_DOCUMENT_URL: "https://example.com/CLA.md",
           ALLOWLIST: "",
           GITHUB_EVENT_NAME: "pull_request_target",
-          GITHUB_EVENT_JSON: JSON.stringify({
-            action: "opened",
-            pull_request: {
-              number: 1,
-              head: { sha: "e2e-head-sha" },
-              base: { sha: "e2e-base-sha" },
-            },
-          }),
+          GITHUB_EVENT_PATH: eventFile,
         },
         { timeoutMs: 200, forceHangUntilKilled: true },
       );
