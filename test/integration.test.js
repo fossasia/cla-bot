@@ -23,6 +23,7 @@ const {
   resolveUserIdByLogin,
   resolveLoginById,
   setStatus,
+  buildCommentUrl,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -236,6 +237,31 @@ function makeFakeGitHub({
 }
 
 (async () => {
+  await test("buildCommentUrl uses the GitHub server origin for public GitHub and GHES", () => {
+    for (const [serverUrl, expected] of [
+      ["https://github.com", "https://github.com/fossasia/testrepo/pull/42#issuecomment-123"],
+      ["https://ghe.example.test", "https://ghe.example.test/fossasia/testrepo/pull/42#issuecomment-123"],
+      ["https://ghe.example.test/", "https://ghe.example.test/fossasia/testrepo/pull/42#issuecomment-123"],
+    ]) {
+      assert.strictEqual(buildCommentUrl(42, 123, serverUrl), expected);
+    }
+  });
+
+  await test("buildCommentUrl rejects non-HTTP schemes and server URLs with credentials", () => {
+    for (const serverUrl of [
+      "not a URL",
+      "file:///tmp",
+      "https://user@example.com",
+      "https://:password@example.com",
+    ]) {
+      assert.throws(
+        () => buildCommentUrl(1, 123, serverUrl),
+        /GITHUB_SERVER_URL must be an HTTP\(S\) URL without credentials/,
+        serverUrl,
+      );
+    }
+  });
+
   await test("a sole commit author signing their own PR flips status to success and posts one comment", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -254,9 +280,10 @@ function makeFakeGitHub({
       action: "created",
       issue: { number: 1, pull_request: {}, user: { login: "alice" } },
       comment: {
+        id: 101,
         user: { id: 1001, login: "alice" },
         body: "I have read the CLA Document and I hereby sign the CLA",
-        html_url: "https://github.com/fossasia/testrepo/pull/1#issuecomment-1",
+        html_url: "https://attacker.example/untrusted",
         author_association: "NONE",
       },
     };
@@ -273,6 +300,11 @@ function makeFakeGitHub({
       gh.signatures.signatures[0].id,
       1001,
       "the signer's immutable numeric id must be recorded alongside the login",
+    );
+    assert.strictEqual(
+      gh.signatures.signatures[0].commentUrl,
+      "https://github.com/fossasia/testrepo/pull/1#issuecomment-101",
+      "the stored link must be reconstructed from trusted fields, not copied from the event file",
     );
     assert.strictEqual(gh.statuses.length, 1);
     assert.strictEqual(gh.statuses[0].state, "success");

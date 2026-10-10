@@ -534,6 +534,7 @@ const VALID_BASE_CONFIG = {
   SIG_REPO: "cla-signatures",
   SIG_PATH: "signatures/cla.json",
   CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+  GITHUB_SERVER_URL: "https://github.com",
   // Explicitly empty: this file's process-wide ALLOWLIST (set at the top)
   // contains login entries, which make validateConfig() emit an advisory
   // warning. Tests asserting an exact warning list must not inherit that.
@@ -556,6 +557,19 @@ test("validateConfig rejects a non-http(s) CLA_DOCUMENT_URL (e.g. file://)", () 
     { ...VALID_BASE_CONFIG, CLA_DOCUMENT_URL: "file:///etc/passwd" },
     "CLA_DOCUMENT_URL",
   );
+});
+
+test("validateConfig rejects an invalid GITHUB_SERVER_URL before processing events", () => {
+  for (const value of [
+    "not a URL",
+    "file:///tmp",
+    "https://user:secret@example.com",
+  ]) {
+    assertConfigFails(
+      { ...VALID_BASE_CONFIG, GITHUB_SERVER_URL: value },
+      "GITHUB_SERVER_URL must be an HTTP(S) URL without credentials",
+    );
+  }
 });
 
 test("validateConfig rejects a SIG_OWNER that is not a valid GitHub login", () => {
@@ -754,6 +768,7 @@ test("validateConfig accepts SIG_PATH values that always worked and must keep wo
       "signatures/cla.json  ",
       "./signatures/cla.json",
       " leading/cla.json",
+      " ./signatures/cla.json",
       "\u00a0signatures/cla.json",
       "signatures/cla.json\u00a0",
     ]) {
@@ -766,13 +781,16 @@ test("validateConfig warns - once, as one escaped line - when it normalizes SIG_
   const warned = withMutedWarnings(() =>
     assertConfigOK({
       ...VALID_BASE_CONFIG,
-      SIG_PATH: "./signatures/cla.json\n",
+      SIG_PATH: " \t./signatures/cla.json\n",
     }),
   );
   assert.strictEqual(warned.length, 1);
   assert.ok(warned[0].startsWith("::warning::SIG_PATH "), warned[0]);
   assert.ok(!warned[0].includes("\n"), "no raw newline in the warning");
-  assert.ok(warned[0].includes('"./signatures/cla.json\\n"'), warned[0]);
+  assert.ok(
+    warned[0].includes('" \\t./signatures/cla.json\\n"'),
+    warned[0],
+  );
   assert.ok(
     warned[0].includes('normalized to "signatures/cla.json"'),
     warned[0],
