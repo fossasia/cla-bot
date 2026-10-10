@@ -237,6 +237,16 @@ function makeFakeGitHub({
 }
 
 (async () => {
+  await test("buildCommentUrl uses the GitHub server origin for public GitHub and GHES", () => {
+    for (const [serverUrl, expected] of [
+      ["https://github.com", "https://github.com/fossasia/testrepo/pull/42#issuecomment-123"],
+      ["https://ghe.example.test", "https://ghe.example.test/fossasia/testrepo/pull/42#issuecomment-123"],
+      ["https://ghe.example.test/", "https://ghe.example.test/fossasia/testrepo/pull/42#issuecomment-123"],
+    ]) {
+      assert.strictEqual(buildCommentUrl(42, 123, serverUrl), expected);
+    }
+  });
+
   await test("buildCommentUrl rejects non-HTTP schemes and server URLs with credentials", () => {
     for (const serverUrl of [
       "not a URL",

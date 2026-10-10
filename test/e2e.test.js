@@ -386,7 +386,7 @@ function baseEnv(apiUrl) {
     }
   });
 
-  await test("main() rejects an invalid GITHUB_SERVER_URL before making API requests", async () => {
+  await test("main() rejects invalid GITHUB_SERVER_URL values before making API requests", async () => {
     const server = await startFakeGitHub({ authorAlreadySigned: true });
     const eventFile = writeTempEventFile({
       action: "created",
@@ -398,14 +398,20 @@ function baseEnv(apiUrl) {
       },
     });
     try {
-      const { code, stderr } = await runScript({
-        ...baseEnv(server.url),
-        GITHUB_SERVER_URL: "not a URL",
-        GITHUB_EVENT_NAME: "issue_comment",
-        GITHUB_EVENT_PATH: eventFile,
-      });
-      assert.strictEqual(code, 1, stderr);
-      assert.match(stderr, /GITHUB_SERVER_URL must be an HTTP\(S\) URL/);
+      for (const value of [
+        "not a URL",
+        "file:///tmp",
+        "https://user:secret@example.com",
+      ]) {
+        const { code, stderr } = await runScript({
+          ...baseEnv(server.url),
+          GITHUB_SERVER_URL: value,
+          GITHUB_EVENT_NAME: "issue_comment",
+          GITHUB_EVENT_PATH: eventFile,
+        });
+        assert.strictEqual(code, 1, `${value}: ${stderr}`);
+        assert.match(stderr, /GITHUB_SERVER_URL must be an HTTP\(S\) URL/);
+      }
       assert.strictEqual(
         server.requestsSeen.length,
         0,
