@@ -42,7 +42,8 @@ inputs:
     default: ""
   app-id:
     description: >-
-      Positive decimal GitHub App ID for short-lived signature-write tokens.
+      Positive safe-integer decimal GitHub App ID for short-lived
+      signature-write tokens.
       Set this together with app-private-key. Leave both empty to use
       github-token; this only works when both repositories are the same.
     required: false
