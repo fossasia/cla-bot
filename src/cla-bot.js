@@ -1216,7 +1216,7 @@ async function readSignatures(token) {
         entry.login.length === 0
       ) {
         console.warn(
-          `::warning::Signature entry at index ${position} is missing/has an invalid "login" field (kept as-is, not treated as a match) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
+          `::warning::Signature entry at index ${position} is missing/has an invalid "login" field (kept as-is; any valid numeric id is still used for matching) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
         );
       }
       index.add(entry);

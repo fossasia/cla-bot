@@ -442,9 +442,9 @@ test("signerCompletedRequirement uses the signer's id for the allowlist (an allo
   );
 });
 
-test("isSigned still ignores a well-formed signature entry with a non-string login (defense in depth on stored data too)", () => {
+test("isSigned matches a malformed stored login by numeric id", () => {
   const data = { signatures: [{ id: 1, login: 123 }] };
-  assert.strictEqual(isSigned(data, { id: 2, login: "someone" }), false);
+  assert.strictEqual(isSigned(data, { id: 1, login: "someone" }), true);
 });
 
 test("isSigned fails closed (returns false, never throws) on a null/non-object STORED entry", () => {
