@@ -794,14 +794,14 @@ function baseEnv(apiUrl) {
     }
   });
 
-  await test("GITHUB_API uses GITHUB_API_URL verbatim when it's set, instead of the default host", async () => {
+  await test("GITHUB_API preserves the configured GHES API prefix and handles its trailing slash", async () => {
     const eventFile = writeTempEventFile({
       action: "opened",
       pull_request: { number: 1, head: { sha: "test-sha" }, base: { sha: "base-sha-fixture" } },
     });
     try {
       const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
-        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3",
+        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3/",
         GITHUB_TOKEN: "e2e-fake-token",
         GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
         SIG_OWNER: "fossasia",
@@ -817,7 +817,11 @@ function baseEnv(apiUrl) {
           capturedUrl.startsWith(
             "https://custom-ghe-instance.example.test/api/v3/",
           ),
-        `expected the custom GITHUB_API_URL to be used verbatim (e.g. a GitHub Enterprise host), not the default, got: ${capturedUrl}`,
+        `expected the custom GHES API prefix, got: ${capturedUrl}`,
+      );
+      assert.ok(
+        !capturedUrl.includes("/api/v3//"),
+        `trailing base slashes must not create a doubled API path separator: ${capturedUrl}`,
       );
     } finally {
       fs.unlinkSync(eventFile);

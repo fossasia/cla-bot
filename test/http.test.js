@@ -20,7 +20,7 @@ const {
   getSignaturesToken,
   postComment,
   ghRaw,
-  assertSafeApiPath,
+  buildSafeApiUrl,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -49,24 +49,190 @@ function fakeResponse(status, jsonBody, headers = {}) {
 }
 
 (async () => {
-  await test("ghRaw rejects paths that could change the request origin before fetch()", async () => {
-    assert.strictEqual(
-      assertSafeApiPath("/repos/owner/repo/issues/1"),
-      "/repos/owner/repo/issues/1",
-    );
-    for (const unsafe of ["https://example.com", "//example.com", "relative/path", "", null]) {
-      assert.throws(() => assertSafeApiPath(unsafe), /unsafe path/);
+  await test("API URLs stay on the configured origin and preserve GHES API prefixes", () => {
+    const cases = [
+      [
+        "https://api.github.com",
+        "/repos/owner/repo/issues/1",
+        "https://api.github.com/repos/owner/repo/issues/1",
+      ],
+      [
+        "https://api.github.com/",
+        "/repos/owner/repo/issues/1",
+        "https://api.github.com/repos/owner/repo/issues/1",
+      ],
+      [
+        "https://ghe.example.test/api/v3",
+        "/repos/owner/repo/issues/1",
+        "https://ghe.example.test/api/v3/repos/owner/repo/issues/1",
+      ],
+      [
+        "https://ghe.example.test/api/v3/",
+        "/repos/owner/repo/issues/1",
+        "https://ghe.example.test/api/v3/repos/owner/repo/issues/1",
+      ],
+      [
+        "https://ghe.example.test/api/v3///",
+        "/repos/owner/repo/issues/1",
+        "https://ghe.example.test/api/v3/repos/owner/repo/issues/1",
+      ],
+      [
+        "http://ghe.example.test/api/v3",
+        "/repos/owner/repo/issues/1",
+        "http://ghe.example.test/api/v3/repos/owner/repo/issues/1",
+      ],
+    ];
+    for (const [base, path, expected] of cases) {
+      const url = buildSafeApiUrl(path, base);
+      assert.strictEqual(url, expected);
+      assert.strictEqual(new URL(url).origin, new URL(base).origin);
+    }
+  });
+
+  await test("encoded separators remain path data on the configured origin", () => {
+    for (const path of [
+      "/repos/owner%2Frepo/issues/1",
+      "/%2f%2fevil.example/path",
+      "/%5c%5cevil.example/path",
+      "/repos/owner/repo/issues?per_page=100&page=2",
+      "/repos/owner/repo/issues?next=//evil.example/path",
+    ]) {
+      const url = new URL(buildSafeApiUrl(path, "https://ghe.example.test/api/v3"));
+      assert.strictEqual(url.origin, "https://ghe.example.test");
+      assert.ok(url.pathname.startsWith("/api/v3/"), url.href);
+    }
+  });
+
+  await test("API URL builder rejects malformed paths and URL-parser normalization tricks", () => {
+    for (const unsafe of [
+      "https://example.com",
+      "//example.com",
+      "///example.com",
+      "relative/path",
+      "",
+      "/",
+      null,
+      undefined,
+      7,
+      1n,
+      Symbol("path"),
+      {},
+      "/\\\\evil.example/path",
+      "/\\\\\\evil.example/path",
+      "/\n//evil.example/path",
+      "/ \t//evil.example/path",
+      "/path#fragment",
+      "/path\u0000tail",
+      "/path\u001b//evil.example",
+      "/path\u0085tail",
+      "/path%",
+      "/path%2",
+      "/path%gg",
+    ]) {
+      assert.throws(
+        () => buildSafeApiUrl(unsafe),
+        /unsafe path/,
+        typeof unsafe === "string" ? JSON.stringify(unsafe) : String(unsafe),
+      );
     }
 
+    for (const badBase of [
+      "file:///tmp/api",
+      "https://user:secret@ghe.example.test/api/v3",
+      "https://ghe.example.test/api/v3?query=1",
+      "https://ghe.example.test/api/v3#fragment",
+      "not a URL",
+      "",
+      null,
+      7,
+      {},
+    ]) {
+      assert.throws(
+        () => buildSafeApiUrl("/repos/owner/repo", badBase),
+        /GITHUB_API_URL/,
+        badBase,
+      );
+    }
+  });
+
+  await test("dot-segment paths are rejected for GHES API bases", () => {
+    for (const path of [
+      "/./outside",
+      "/../outside",
+      "/repos/../../outside",
+      "/repos/%2e/outside",
+      "/%2e%2e/outside",
+      "/repos/%2e%2e/outside",
+      "/repos/.%2e/outside",
+      "/repos/%2E./outside",
+    ]) {
+      assert.throws(
+        () => buildSafeApiUrl(path, "https://ghe.example.test/api/v3"),
+        /unsafe path/,
+        path,
+      );
+    }
+  });
+
+  await test("API URL builder fails closed if URL parsing fails or changes origin", () => {
+    const NativeURL = global.URL;
+    try {
+      global.URL = class ControlledURL {
+        constructor(input) {
+          if (input === "https://ghe.example.test/api/v3") {
+            return new NativeURL(input);
+          }
+          throw new TypeError("malformed request URL");
+        }
+      };
+      assert.throws(
+        () => buildSafeApiUrl("/repos/owner/repo", "https://ghe.example.test/api/v3"),
+        /unsafe path/,
+      );
+
+      global.URL = class RedirectingURL {
+        constructor(input) {
+          if (input === "https://ghe.example.test/api/v3") {
+            return new NativeURL(input);
+          }
+          return {
+            href: String(input),
+            origin: "https://evil.example.test",
+            username: "",
+            password: "",
+          };
+        }
+      };
+      assert.throws(
+        () => buildSafeApiUrl("/repos/owner/repo", "https://ghe.example.test/api/v3"),
+        /unsafe path/,
+      );
+    } finally {
+      global.URL = NativeURL;
+    }
+  });
+
+  await test("ghRaw validates the final URL before fetch()", async () => {
     const originalFetch = global.fetch;
     let calls = 0;
-    global.fetch = async () => {
+    let sentUrl;
+    global.fetch = async (url) => {
       calls += 1;
+      sentUrl = String(url);
       return fakeResponse(200, {});
     };
     try {
-      await assert.rejects(ghRaw("//example.com/path", "tok"), /unsafe path/);
+      await assert.rejects(
+        ghRaw("/\\\\evil.example/path", "tok"),
+        /unsafe path/,
+      );
       assert.strictEqual(calls, 0, "unsafe paths must not reach fetch()");
+      await ghRaw("/repos/owner%2Frepo/issues/1", "tok");
+      assert.strictEqual(calls, 1);
+      assert.strictEqual(
+        new URL(sentUrl).origin,
+        new URL(process.env.GITHUB_API_URL || "https://api.github.com").origin,
+      );
     } finally {
       global.fetch = originalFetch;
     }

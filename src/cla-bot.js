@@ -457,23 +457,76 @@ function consumeGitHubTokenRequest(token, { emergency = false } = {}) {
   store.remaining -= 1;
 }
 
-function assertSafeApiPath(path) {
+function buildSafeApiUrl(path, apiBase = GITHUB_API) {
+  const reject = () => {
+    const value =
+      typeof path === "string" ? JSON.stringify(path) : `<${typeof path}>`;
+    throw new Error(
+      `Refusing to build a request URL from an unsafe path: ${value}`,
+    );
+  };
+  const rejectBase = () => {
+    throw new Error(
+      "GITHUB_API_URL must be an absolute HTTP(S) URL without credentials, query, or fragment.",
+    );
+  };
   if (
     typeof path !== "string" ||
+    path.length < 2 ||
     !path.startsWith("/") ||
-    path.startsWith("//")
+    path.startsWith("//") ||
+    /[\\#\s\x00-\x1f\x7f-\x9f]/u.test(path) ||
+    /%(?![0-9a-f]{2})/i.test(path)
   ) {
-    throw new Error(
-      `Refusing to build a request URL from an unsafe path: ${JSON.stringify(path)}`,
-    );
+    reject();
   }
-  return path;
+  if (typeof apiBase !== "string" || apiBase.length === 0) rejectBase();
+  const requestPath = path.split("?", 1)[0];
+  for (const segment of requestPath.split("/")) {
+    // The URL parser treats encoded dot segments as path navigation too.
+    const dotSegment = segment.replace(/%2e/gi, ".");
+    if (dotSegment === "." || dotSegment === "..") reject();
+  }
+
+  let base;
+  try {
+    base = new URL(apiBase);
+  } catch {
+    rejectBase();
+  }
+  if (
+    (base.protocol !== "http:" && base.protocol !== "https:") ||
+    base.username ||
+    base.password ||
+    base.search ||
+    base.hash
+  ) {
+    rejectBase();
+  }
+
+  let request;
+  try {
+    const baseHref = base.href.replace(/\/+$/, "");
+    request = new URL(`${baseHref}${path}`);
+  } catch {
+    reject();
+  }
+  if (
+    request.origin !== base.origin ||
+    request.username ||
+    request.password
+  ) {
+    reject();
+  }
+
+  return request.href;
 }
 
 // HTTP helper: timeout, JSON handling and a retry for transient failures
 // (rate limits, brief 5xx). 409 conflicts on writes are handled in
 // writeSignatures(), since they need a re-read, not a blind retry.
 async function ghRaw(path, token, options = {}) {
+  const requestUrl = buildSafeApiUrl(path);
   // Count each attempt here, including retries and direct ghRaw() calls.
   consumeGitHubTokenRequest(token, { emergency: options.emergency === true });
   const controller = new AbortController();
@@ -481,7 +534,7 @@ async function ghRaw(path, token, options = {}) {
   const fetchOptions = { ...options };
   delete fetchOptions.preserveUnsafeIds;
   try {
-    const res = await fetch(`${GITHUB_API}${assertSafeApiPath(path)}`, {
+    const res = await fetch(requestUrl, {
       ...fetchOptions,
       signal: controller.signal,
       headers: {
@@ -2513,7 +2566,7 @@ module.exports = {
   parseAllowlist,
   createAppJWT,
   ghRaw,
-  assertSafeApiPath,
+  buildSafeApiUrl,
   base64url,
   readSignatures,
   writeSignatures,
