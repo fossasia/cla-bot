@@ -439,8 +439,20 @@ function validateConfig() {
       `ALLOWLIST entries must be numeric GitHub account ids (usernames are not supported - they can be renamed and reclaimed by someone else); invalid: ${ALLOWLIST.invalid.map((e) => JSON.stringify(e)).join(", ")}. Look an id up with: gh api users/NAME --jq .id`,
     );
   }
-  // App auth is optional (getSignaturesToken falls back to GITHUB_TOKEN), but
-  // a key that is set must look like a PEM, so a mis-pasted secret fails
+  // App auth is optional, but its credentials must be configured as a pair.
+  // Otherwise a typo silently selects the GITHUB_TOKEN fallback and can make
+  // cross-repository writes fail much later.
+  if (Boolean(SIG_APP_ID) !== Boolean(SIG_APP_PRIVATE_KEY)) {
+    fail(
+      "SIG_APP_ID and SIG_APP_PRIVATE_KEY must either both be set or both be empty (both empty uses GITHUB_TOKEN fallback).",
+    );
+  }
+  // GitHub App IDs are positive decimal identifiers. Reject malformed values
+  // here instead of producing an invalid JWT issuer and failing at the API.
+  if (SIG_APP_ID && !/^[1-9][0-9]*$/.test(SIG_APP_ID)) {
+    fail("SIG_APP_ID must be a positive integer in decimal form.");
+  }
+  // A key that is set must look like a PEM, so a mis-pasted secret fails
   // clearly instead of deep inside crypto.sign().
   if (SIG_APP_PRIVATE_KEY && !SIG_APP_PRIVATE_KEY.includes("-----BEGIN")) {
     fail(

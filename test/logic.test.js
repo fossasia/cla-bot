@@ -545,6 +545,29 @@ test("validateConfig accepts a well-formed config (baseline sanity check for the
   assertConfigOK(VALID_BASE_CONFIG);
 });
 
+test("validateConfig accepts the documented GITHUB_TOKEN fallback when both App credentials are empty", () => {
+  assertConfigOK({
+    ...VALID_BASE_CONFIG,
+    SIG_APP_ID: "",
+    SIG_APP_PRIVATE_KEY: "",
+  });
+});
+
+test("validateConfig rejects either partial GitHub App credential configuration", () => {
+  assertConfigFails(
+    { ...VALID_BASE_CONFIG, SIG_APP_ID: "12345", SIG_APP_PRIVATE_KEY: "" },
+    "SIG_APP_ID and SIG_APP_PRIVATE_KEY",
+  );
+  assertConfigFails(
+    {
+      ...VALID_BASE_CONFIG,
+      SIG_APP_ID: "",
+      SIG_APP_PRIVATE_KEY: "-----BEGIN RSA PRIVATE KEY-----",
+    },
+    "SIG_APP_ID and SIG_APP_PRIVATE_KEY",
+  );
+});
+
 test("validateConfig rejects a CLA_DOCUMENT_URL that is not a valid URL", () => {
   assertConfigFails(
     { ...VALID_BASE_CONFIG, CLA_DOCUMENT_URL: "not-a-url" },
@@ -866,6 +889,16 @@ test("validateConfig rejects a SIG_APP_PRIVATE_KEY that does not look like PEM",
     },
     "SIG_APP_PRIVATE_KEY",
   );
+});
+
+test("validateConfig rejects SIG_APP_ID values that are not positive decimal integers", () => {
+  const pem = "-----BEGIN RSA PRIVATE KEY-----\nkey\n-----END RSA PRIVATE KEY-----";
+  for (const id of ["0", "-1", "+1", "1.5", "1e3", "abc", " 123", "0123"]) {
+    assertConfigFails(
+      { ...VALID_BASE_CONFIG, SIG_APP_ID: id, SIG_APP_PRIVATE_KEY: pem },
+      "SIG_APP_ID",
+    );
+  }
 });
 
 // validateConfig checks the PEM header only. A valid-looking header is
