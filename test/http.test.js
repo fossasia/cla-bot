@@ -658,7 +658,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       );
       assert.strictEqual(
         warnings[0],
-        '::warning::Signature entry at index 0 is missing/has an invalid "login" field (kept as-is, not treated as a match) - check a-user-account/cla-signatures/signatures/cla.json',
+        '::warning::Signature entry at index 0 is missing/has an invalid "login" field (kept as-is; any valid numeric id is still used for matching) - check a-user-account/cla-signatures/signatures/cla.json',
         "expected the exact message for the null-entry case, verbatim",
       );
       assert.ok(
