@@ -227,6 +227,13 @@ const INVALID_PATHS = [
       normalizeSigPath("signatures/cla.json\t\n\v\f\r "),
       "signatures/cla.json",
     );
+    for (const whitespace of [" ", "\t", "\n", "\v", "\f", "\r"]) {
+      assert.strictEqual(
+        normalizeSigPath(`${whitespace}././signatures/cla.json`),
+        "signatures/cla.json",
+        JSON.stringify(whitespace),
+      );
+    }
   });
 
   await test("findSigPathProblem's message names the offending character, JSON-escaped (so the log line stays a single, readable line)", () => {
@@ -422,8 +429,8 @@ const INVALID_PATHS = [
   });
 
   // The exact whitespace contract, spelled out against the OLD behaviour on
-  // the raw value. Each row: [raw SIG_PATH, what the old code actually
-  // addressed (as a request-path tail)].
+  // the raw value. Each row: [raw SIG_PATH, old request-path tail, new tail].
+  // Only ASCII whitespace obscuring a leading `./` intentionally changes.
   const COMPAT_ROWS = [
     // trailing ASCII whitespace: ignored by the URL parser
     ["signatures/cla.json ", "signatures/cla.json"],
@@ -434,15 +441,33 @@ const INVALID_PATHS = [
     ["./signatures/cla.json", "signatures/cla.json"],
     ["././signatures/cla.json", "signatures/cla.json"],
     ["./signatures/cla.json\n", "signatures/cla.json"],
-    // LEADING whitespace: part of the file name, NOT stripped
-    [" signatures/cla.json", "%20signatures/cla.json"],
-    ["  signatures/cla.json  ", "%20%20signatures/cla.json"],
+    // Leading whitespace on a filename remains part of that filename.
+    [
+      " signatures/cla.json",
+      "%20signatures/cla.json",
+      "%20signatures/cla.json",
+    ],
+    [
+      "  signatures/cla.json  ",
+      "%20%20signatures/cla.json",
+      "%20%20signatures/cla.json",
+    ],
     ["\u00a0signatures/cla.json", "%C2%A0signatures/cla.json"],
     // Unicode whitespace at the END: encoded, NOT stripped
     ["signatures/cla.json\u00a0", "signatures/cla.json%C2%A0"],
     ["signatures/cla.json\u2003", "signatures/cla.json%E2%80%83"],
-    // " ./x": the first segment is " ." (a real name), not a dot-segment
-    [" ./signatures/cla.json", "%20./signatures/cla.json"],
+    // Whitespace hiding a leading `./` is normalized, but other leading
+    // whitespace remains part of the filename.
+    [
+      " ./signatures/cla.json",
+      "%20./signatures/cla.json",
+      "signatures/cla.json",
+    ],
+    [
+      "  ./signatures/cla.json",
+      "%20%20./signatures/cla.json",
+      "signatures/cla.json",
+    ],
   ];
 
   await test("compat: for every row, the OLD code's behaviour is what the table says (guards the table itself against being wrong)", () => {
@@ -455,18 +480,18 @@ const INVALID_PATHS = [
     }
   });
 
-  await test("compat: the NEW code addresses exactly what the old code did for every row - compared on the RAW value, never a pre-trimmed one", () => {
-    for (const [raw] of COMPAT_ROWS) {
+  await test("compat: the NEW code preserves paths except ASCII whitespace hiding a leading `./`", () => {
+    for (const [raw, oldTail, expectedTail = oldTail] of COMPAT_ROWS) {
       const bot = loadBot({ SIG_PATH: raw });
       assert.strictEqual(
         new URL(`${API}${bot.sigContentsApiPath()}`).pathname,
-        oldPathname(raw),
+        `/repos/fossasia/cla-signatures/contents/${expectedTail}`,
         JSON.stringify(raw),
       );
     }
   });
 
-  await test("leading whitespace is preserved as part of the path (percent-encoded), never trimmed - a blanket .trim() would silently address a different file", () => {
+  await test("leading whitespace is preserved in filenames, but removed when hiding a leading `./`", () => {
     assert.strictEqual(
       loadBot({ SIG_PATH: " signatures/cla.json" }).sigContentsApiPath(),
       "/repos/fossasia/cla-signatures/contents/%20signatures/cla.json",
@@ -478,6 +503,10 @@ const INVALID_PATHS = [
     assert.notStrictEqual(
       loadBot({ SIG_PATH: "  signatures/cla.json  " }).sigContentsApiPath(),
       loadBot({ SIG_PATH: "signatures/cla.json" }).sigContentsApiPath(),
+    );
+    assert.strictEqual(
+      loadBot({ SIG_PATH: " \t./signatures/cla.json" }).sigContentsApiPath(),
+      "/repos/fossasia/cla-signatures/contents/signatures/cla.json",
     );
   });
 
@@ -839,7 +868,7 @@ const INVALID_PATHS = [
     ["signatures/cla.json\n", "signatures/cla.json"],
     ["signatures/cla.json   ", "signatures/cla.json"],
     ["./signatures/cla.json", "signatures/cla.json"],
-    [" ./signatures/cla.json", null],
+    [" ./signatures/cla.json", "signatures/cla.json"],
   ]) {
     await test(`CLI: previously-working SIG_PATH ${JSON.stringify(p)} still passes validateConfig${normalized ? " (with a normalization warning)" : " (no warning - used as-is)"}`, () => {
       const r = runCli({ SIG_PATH: p });
@@ -862,16 +891,6 @@ const INVALID_PATHS = [
       }
     });
   }
-
-  await test("CLI warns when whitespace before a literal './' may be a config typo, while keeping the old path", () => {
-    const r = runCli({ SIG_PATH: " ./signatures/cla.json" });
-    assert.strictEqual(r.status, 1);
-    assert.match(r.stderr, /GITHUB_EVENT_PATH not found/);
-    assert.ok(
-      r.stderr.includes('has whitespace before "./"; that whitespace is part of the path'),
-      r.stderr,
-    );
-  });
 
   await test("CLI: a default / already-clean SIG_PATH produces no normalization warning", () => {
     assert.ok(!/normalized/.test(runCli({}).stderr));

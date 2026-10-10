@@ -256,8 +256,8 @@ function assertValidSha(value, context) {
 // and because the value is echoed into "::error::" log lines.
 const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
 
-// Remove trailing ASCII whitespace and a literal leading `./`. Leading
-// whitespace remains part of the path, as it did before normalization.
+// Remove trailing ASCII whitespace and ASCII whitespace hiding a leading `./`.
+// Other leading whitespace remains part of the filename.
 function normalizeSigPath(raw) {
   let p = raw || "signatures/cla.json";
   let end = p.length;
@@ -269,7 +269,21 @@ function normalizeSigPath(raw) {
     end -= 1;
   }
   p = p.slice(0, end);
-  while (p.startsWith("./")) p = p.slice(2);
+  while (true) {
+    let leadingWhitespaceEnd = 0;
+    while (leadingWhitespaceEnd < p.length) {
+      const code = p.charCodeAt(leadingWhitespaceEnd);
+      const isAsciiWhitespace =
+        code === 0x20 || (code >= 0x09 && code <= 0x0d);
+      if (!isAsciiWhitespace) break;
+      leadingWhitespaceEnd += 1;
+    }
+    if (p.startsWith("./", leadingWhitespaceEnd)) {
+      p = p.slice(leadingWhitespaceEnd + 2);
+    } else {
+      break;
+    }
+  }
   return p;
 }
 
@@ -417,12 +431,7 @@ function validateConfig() {
   // Say so when normalization changed the value.
   if (SIG_PATH_RAW && SIG_PATH_RAW !== SIG_PATH) {
     console.warn(
-      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing ASCII whitespace and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
-    );
-  }
-  if (SIG_PATH_RAW && /^[\t\n\v\f\r ]+\.\//.test(SIG_PATH_RAW)) {
-    console.warn(
-      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} has whitespace before "./"; that whitespace is part of the path. Remove it if unintended.`,
+      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing ASCII whitespace and ASCII whitespace before a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
     );
   }
   if (ALLOWLIST.invalid.length) {

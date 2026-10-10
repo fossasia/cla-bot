@@ -768,6 +768,7 @@ test("validateConfig accepts SIG_PATH values that always worked and must keep wo
       "signatures/cla.json  ",
       "./signatures/cla.json",
       " leading/cla.json",
+      " ./signatures/cla.json",
       "\u00a0signatures/cla.json",
       "signatures/cla.json\u00a0",
     ]) {
@@ -780,13 +781,16 @@ test("validateConfig warns - once, as one escaped line - when it normalizes SIG_
   const warned = withMutedWarnings(() =>
     assertConfigOK({
       ...VALID_BASE_CONFIG,
-      SIG_PATH: "./signatures/cla.json\n",
+      SIG_PATH: " \t./signatures/cla.json\n",
     }),
   );
   assert.strictEqual(warned.length, 1);
   assert.ok(warned[0].startsWith("::warning::SIG_PATH "), warned[0]);
   assert.ok(!warned[0].includes("\n"), "no raw newline in the warning");
-  assert.ok(warned[0].includes('"./signatures/cla.json\\n"'), warned[0]);
+  assert.ok(
+    warned[0].includes('" \\t./signatures/cla.json\\n"'),
+    warned[0],
+  );
   assert.ok(
     warned[0].includes('normalized to "signatures/cla.json"'),
     warned[0],
