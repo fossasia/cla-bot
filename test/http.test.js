@@ -20,6 +20,7 @@ const {
   getSignaturesToken,
   postComment,
   ghRaw,
+  assertSafeApiPath,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -48,6 +49,29 @@ function fakeResponse(status, jsonBody, headers = {}) {
 }
 
 (async () => {
+  await test("ghRaw rejects paths that could change the request origin before fetch()", async () => {
+    assert.strictEqual(
+      assertSafeApiPath("/repos/owner/repo/issues/1"),
+      "/repos/owner/repo/issues/1",
+    );
+    for (const unsafe of ["https://example.com", "//example.com", "relative/path", "", null]) {
+      assert.throws(() => assertSafeApiPath(unsafe), /unsafe path/);
+    }
+
+    const originalFetch = global.fetch;
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return fakeResponse(200, {});
+    };
+    try {
+      await assert.rejects(ghRaw("//example.com/path", "tok"), /unsafe path/);
+      assert.strictEqual(calls, 0, "unsafe paths must not reach fetch()");
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   await test("readSignatures returns an empty store on 404 (file does not exist yet)", async () => {
     global.fetch = async () => fakeResponse(404, { message: "Not Found" });
     const { sha, data } = await readSignatures("tok");

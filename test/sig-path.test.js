@@ -816,6 +816,7 @@ const INVALID_PATHS = [
     ["signatures/cla.json\n", "signatures/cla.json"],
     ["signatures/cla.json   ", "signatures/cla.json"],
     ["./signatures/cla.json", "signatures/cla.json"],
+    [" ./signatures/cla.json", "signatures/cla.json"],
   ]) {
     await test(`CLI: previously-working SIG_PATH ${JSON.stringify(p)} still passes validateConfig${normalized ? " (with a normalization warning)" : " (no warning - used as-is)"}`, () => {
       const r = runCli({ SIG_PATH: p });

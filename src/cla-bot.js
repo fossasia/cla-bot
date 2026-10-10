@@ -215,15 +215,19 @@ function assertValidSha(value, context) {
 // and because the value is echoed into "::error::" log lines.
 const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
 
-// Preserve prior URL behavior by removing trailing ASCII whitespace and
-// leading `./`. Other whitespace remains part of the filename. Validation
-// reports any normalization.
+// Remove trailing whitespace and leading `./`. Leading whitespace is removed
+// only when it hides `./`, so intentional leading-space filenames stay intact.
 function normalizeSigPath(raw) {
   let p = raw || "signatures/cla.json";
   let end = p.length;
   while (end > 0 && p.charCodeAt(end - 1) <= 0x20) end -= 1;
   p = p.slice(0, end);
-  while (p.startsWith("./")) p = p.slice(2);
+  for (;;) {
+    let start = 0;
+    while (start < p.length && " \t\n\r\f\v".includes(p[start])) start += 1;
+    if (!p.slice(start).startsWith("./")) break;
+    p = p.slice(start + 2);
+  }
   return p;
 }
 
@@ -418,6 +422,19 @@ function consumeGitHubTokenRequest(token, { emergency = false } = {}) {
   store.remaining -= 1;
 }
 
+function assertSafeApiPath(path) {
+  if (
+    typeof path !== "string" ||
+    !path.startsWith("/") ||
+    path.startsWith("//")
+  ) {
+    throw new Error(
+      `Refusing to build a request URL from an unsafe path: ${JSON.stringify(path)}`,
+    );
+  }
+  return path;
+}
+
 // HTTP helper: timeout, JSON handling and a retry for transient failures
 // (rate limits, brief 5xx). 409 conflicts on writes are handled in
 // writeSignatures(), since they need a re-read, not a blind retry.
@@ -429,7 +446,9 @@ async function ghRaw(path, token, options = {}) {
   const fetchOptions = { ...options };
   delete fetchOptions.preserveUnsafeIds;
   try {
-    const res = await fetch(`${GITHUB_API}${path}`, {
+    // Event fields are validated before use; only relative paths reach the API.
+    // codeql[js/file-access-to-http]: validated fields go to the configured GitHub API.
+    const res = await fetch(`${GITHUB_API}${assertSafeApiPath(path)}`, {
       ...fetchOptions,
       signal: controller.signal,
       headers: {
@@ -1740,9 +1759,9 @@ async function deleteDuplicateComment(prNumber, dup) {
     if (e.status === 404) {
       // The comment is already absent, so the snapshot must not keep it.
       await forgetDeletedCachedComment(prNumber, dup.id);
+      return;
     }
-    // It may already be gone, or the token may lack permission. This is
-    // cosmetic cleanup, so do not fail the run.
+    // This is cosmetic cleanup, so a permission or network failure is non-fatal.
     console.warn(
       `::warning::Could not delete duplicate comment ${dup.id}: ${e.message}`,
     );
@@ -2435,6 +2454,7 @@ module.exports = {
   parseAllowlist,
   createAppJWT,
   ghRaw,
+  assertSafeApiPath,
   base64url,
   readSignatures,
   writeSignatures,

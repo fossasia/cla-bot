@@ -41,7 +41,12 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
 // small real delay to each DELETE so overlapping ones are actually
 // observable, and the result reports the highest number seen in flight at
 // once. Returns what was observed.
-async function run({ extraIds, failDeleteIds = [], trackConcurrency = false }) {
+async function run({
+  extraIds,
+  failDeleteIds = [],
+  missingDeleteIds = [],
+  trackConcurrency = false,
+}) {
   const text = "dup-warning-body";
   const full = `${MARKER}\n${text}`;
   const warnings = [];
@@ -72,6 +77,8 @@ async function run({ extraIds, failDeleteIds = [], trackConcurrency = false }) {
       if (trackConcurrency) await new Promise((r) => setTimeout(r, 5));
       deleted.push(id);
       inFlightDeletes -= 1;
+      if (missingDeleteIds.includes(id))
+        return res(404, { message: "Not Found" });
       return failDeleteIds.includes(id)
         ? res(403, { message: "Forbidden" })
         : res(204, null);
@@ -141,6 +148,19 @@ const isDupSummary = (w) => w.includes("duplicate bot comment(s)");
     assert.strictEqual(warnings.filter(isDupSummary).length, 1);
     assert.ok(
       warnings.some((w) => w.includes("Could not delete duplicate comment 98")),
+      `got: ${JSON.stringify(warnings)}`,
+    );
+  });
+
+  await test("a duplicate already deleted elsewhere updates the cache without a per-comment warning", async () => {
+    const { warnings, deleted } = await run({
+      extraIds: [98],
+      missingDeleteIds: [98],
+    });
+    assert.deepStrictEqual(deleted, [98]);
+    assert.strictEqual(warnings.filter(isDupSummary).length, 1);
+    assert.ok(
+      !warnings.some((w) => w.includes("Could not delete duplicate comment 98")),
       `got: ${JSON.stringify(warnings)}`,
     );
   });
