@@ -7,7 +7,8 @@
  * inventory of direct GitHub Actions pinned in action.yml. It does not cover
  * downloaded code or dependencies inside those actions.
  *
- * Uses Node.js built-ins only. Exit codes: 0 success, 1 check failed, 2 usage.
+ * `verify` uses Node.js built-ins only. `sbom` also needs the installed
+ * `js-yaml` dependency. Exit codes: 0 success, 1 check failed, 2 usage.
  */
 const fs = require("fs");
 const crypto = require("node:crypto");

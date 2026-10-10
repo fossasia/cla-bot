@@ -24,7 +24,8 @@ inputs:
       Relative path to the signature JSON file. It cannot start or end with
       "/", contain empty, ".", "..", or ".git" segments, or include "#", "?",
       backslash, control characters, or "%". A leading "./" and trailing
-      whitespace are ignored. Spaces and non-ASCII characters are encoded.
+      characters through U+0020 are ignored. Spaces and non-ASCII characters
+      are encoded.
     required: false
     default: "signatures/cla.json"
   cla-document-url:

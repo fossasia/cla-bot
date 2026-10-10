@@ -1884,6 +1884,10 @@ test("consumer verification pins the resolved tag commit to both attestations an
   assert.ok(example.includes("resolved ONCE during the"));
   assert.ok(example.includes("verification procedure in SECURITY.md"));
   assert.match(example, /Do not resolve the tag again/);
+  const setup = read("SETUP_GUIDE.md");
+  assert.match(setup, /exact `SOURCE_SHA`\s+resolved and verified/);
+  assert.match(setup, /Do not resolve the tag again after\s+verification/);
+  assert.doesNotMatch(setup, /git ls-remote/);
 });
 
 // --- the release policy gate (runs before anything is built) -----------------------

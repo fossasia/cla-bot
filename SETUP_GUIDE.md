@@ -11,16 +11,10 @@ Create the public `fossasia/cla-bot` repository and push this code. Run
 [`CONTRIBUTING.md`](./CONTRIBUTING.md#releasing-a-new-version).
 
 Before using a release, verify its assets and attestations using
-[SECURITY.md](./SECURITY.md#verifying-a-release). Pin the full commit SHA of
-the verified tag in each consumer workflow:
-
-```bash
-git ls-remote --tags https://github.com/fossasia/cla-bot.git v1.0.0 'v1.0.0^{}'
-```
-
-Use the 40-character SHA on the line ending in `^{}`. Add the version as a
-trailing comment. Repeat for each release. Never use a moving tag in
-production.
+[SECURITY.md](./SECURITY.md#verifying-a-release). Copy the exact `SOURCE_SHA`
+resolved and verified there into each consumer workflow as a full commit SHA.
+Add the version as a trailing comment. Do not resolve the tag again after
+verification or use a moving tag in production.
 
 ## 2. Create the signature repository
 
