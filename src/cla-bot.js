@@ -173,12 +173,24 @@ function assertValidEventPRNumber(value, context) {
   return assertValidPRNumber(parsed, context);
 }
 
-function buildCommentUrl(prNumber, commentId, serverUrl = GITHUB_SERVER_URL) {
-  if (!Number.isSafeInteger(commentId) || commentId <= 0) return undefined;
-  const server = new URL(serverUrl);
+function parseGitHubServerUrl(serverUrl) {
+  let server;
+  try {
+    server = new URL(serverUrl);
+  } catch {
+    throw new Error(
+      "GITHUB_SERVER_URL must be an HTTP(S) URL without credentials",
+    );
+  }
   if (!/^https?:$/.test(server.protocol) || server.username || server.password) {
     throw new Error("GITHUB_SERVER_URL must be an HTTP(S) URL without credentials");
   }
+  return server;
+}
+
+function buildCommentUrl(prNumber, commentId, serverUrl = GITHUB_SERVER_URL) {
+  if (!Number.isSafeInteger(commentId) || commentId <= 0) return undefined;
+  const server = parseGitHubServerUrl(serverUrl);
   return new URL(
     `/${encodeURIComponent(REPO_OWNER)}/${encodeURIComponent(REPO_NAME)}/pull/${prNumber}#issuecomment-${commentId}`,
     server.origin,
@@ -360,6 +372,12 @@ function validateConfig() {
     if (!val) fail(`Missing required input/env: ${name}`);
   }
 
+  try {
+    parseGitHubServerUrl(GITHUB_SERVER_URL);
+  } catch (error) {
+    fail(error.message);
+  }
+
   // Fail fast on config typos instead of a vague API error later.
   if (!GITHUB_LOGIN_RE.test(SIG_OWNER)) {
     fail(
@@ -480,7 +498,14 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
   ) {
     reject();
   }
-  if (typeof apiBase !== "string" || apiBase.length === 0) rejectBase();
+  if (
+    typeof apiBase !== "string" ||
+    apiBase.length === 0 ||
+    apiBase.includes("?") ||
+    apiBase.includes("#")
+  ) {
+    rejectBase();
+  }
   const requestPath = path.split("?", 1)[0];
   for (const segment of requestPath.split("/")) {
     // The URL parser treats encoded dot segments as path navigation too.

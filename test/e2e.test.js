@@ -386,6 +386,37 @@ function baseEnv(apiUrl) {
     }
   });
 
+  await test("main() rejects an invalid GITHUB_SERVER_URL before making API requests", async () => {
+    const server = await startFakeGitHub({ authorAlreadySigned: true });
+    const eventFile = writeTempEventFile({
+      action: "created",
+      issue: { number: 1, pull_request: {} },
+      comment: {
+        id: 123,
+        body: "I agree to the CLA",
+        user: { id: 1001, login: "alice" },
+      },
+    });
+    try {
+      const { code, stderr } = await runScript({
+        ...baseEnv(server.url),
+        GITHUB_SERVER_URL: "not a URL",
+        GITHUB_EVENT_NAME: "issue_comment",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(code, 1, stderr);
+      assert.match(stderr, /GITHUB_SERVER_URL must be an HTTP\(S\) URL/);
+      assert.strictEqual(
+        server.requestsSeen.length,
+        0,
+        "invalid server configuration must fail before reading or writing the signature store",
+      );
+    } finally {
+      await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
   await test("main() does nothing but still exits 0 for an event type it doesn't handle (e.g. 'push')", async () => {
     const server = await startFakeGitHub({ authorAlreadySigned: true });
     const eventFile = writeTempEventFile({ ref: "refs/heads/main" });

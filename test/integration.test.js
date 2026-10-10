@@ -239,6 +239,7 @@ function makeFakeGitHub({
 (async () => {
   await test("buildCommentUrl rejects non-HTTP schemes and server URLs with credentials", () => {
     for (const serverUrl of [
+      "not a URL",
       "file:///tmp",
       "https://user@example.com",
       "https://:password@example.com",
