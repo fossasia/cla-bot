@@ -34,6 +34,7 @@ if (NODE_MAJOR < 22 || typeof fetch !== "function") {
 
 // Config (all values come from env vars set by action.yml)
 const GITHUB_API = process.env.GITHUB_API_URL || "https://api.github.com";
+const GITHUB_SERVER_URL = process.env.GITHUB_SERVER_URL || "https://github.com";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const SIG_APP_ID = process.env.SIG_APP_ID || "";
 const SIG_APP_PRIVATE_KEY = process.env.SIG_APP_PRIVATE_KEY || "";
@@ -133,6 +134,12 @@ const [REPO_OWNER, REPO_NAME] = (process.env.GITHUB_REPOSITORY || "/").split(
 );
 const EVENT_NAME = process.env.GITHUB_EVENT_NAME;
 const EVENT_PATH = process.env.GITHUB_EVENT_PATH;
+// These bounded URL inputs come from GitHub's event context in action.yml.
+// Keep them separate from the file-backed payload so event file data cannot
+// flow into API request URLs.
+const EVENT_PR_NUMBER = process.env.CLA_BOT_EVENT_PR_NUMBER;
+const EVENT_HEAD_SHA = process.env.CLA_BOT_EVENT_HEAD_SHA;
+const EVENT_BASE_SHA = process.env.CLA_BOT_EVENT_BASE_SHA;
 
 function fail(msg) {
   console.error(`::error::${msg}`);
@@ -154,6 +161,40 @@ function assertValidPRNumber(value, context) {
     );
   }
   return value;
+}
+
+function assertValidEventPRNumber(value, context) {
+  let parsed;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    parsed = undefined;
+  }
+  return assertValidPRNumber(parsed, context);
+}
+
+function parseGitHubServerUrl(serverUrl) {
+  let server;
+  try {
+    server = new URL(serverUrl);
+  } catch {
+    throw new Error(
+      "GITHUB_SERVER_URL must be an HTTP(S) URL without credentials",
+    );
+  }
+  if (!/^https?:$/.test(server.protocol) || server.username || server.password) {
+    throw new Error("GITHUB_SERVER_URL must be an HTTP(S) URL without credentials");
+  }
+  return server;
+}
+
+function buildCommentUrl(prNumber, commentId, serverUrl = GITHUB_SERVER_URL) {
+  if (!Number.isSafeInteger(commentId) || commentId <= 0) return undefined;
+  const server = parseGitHubServerUrl(serverUrl);
+  return new URL(
+    `/${encodeURIComponent(REPO_OWNER)}/${encodeURIComponent(REPO_NAME)}/pull/${prNumber}#issuecomment-${commentId}`,
+    server.origin,
+  ).href;
 }
 
 // Its own function so NaN and Infinity can be tested directly. They cannot
@@ -215,15 +256,34 @@ function assertValidSha(value, context) {
 // and because the value is echoed into "::error::" log lines.
 const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
 
-// Preserve prior URL behavior by removing trailing ASCII whitespace and
-// leading `./`. Other whitespace remains part of the filename. Validation
-// reports any normalization.
+// Remove trailing ASCII whitespace and ASCII whitespace hiding a leading `./`.
+// Other leading whitespace remains part of the filename.
 function normalizeSigPath(raw) {
   let p = raw || "signatures/cla.json";
   let end = p.length;
-  while (end > 0 && p.charCodeAt(end - 1) <= 0x20) end -= 1;
+  while (end > 0) {
+    const code = p.charCodeAt(end - 1);
+    const isAsciiWhitespace =
+      code === 0x20 || (code >= 0x09 && code <= 0x0d);
+    if (!isAsciiWhitespace) break;
+    end -= 1;
+  }
   p = p.slice(0, end);
-  while (p.startsWith("./")) p = p.slice(2);
+  while (true) {
+    let leadingWhitespaceEnd = 0;
+    while (leadingWhitespaceEnd < p.length) {
+      const code = p.charCodeAt(leadingWhitespaceEnd);
+      const isAsciiWhitespace =
+        code === 0x20 || (code >= 0x09 && code <= 0x0d);
+      if (!isAsciiWhitespace) break;
+      leadingWhitespaceEnd += 1;
+    }
+    if (p.startsWith("./", leadingWhitespaceEnd)) {
+      p = p.slice(leadingWhitespaceEnd + 2);
+    } else {
+      break;
+    }
+  }
   return p;
 }
 
@@ -326,6 +386,12 @@ function validateConfig() {
     if (!val) fail(`Missing required input/env: ${name}`);
   }
 
+  try {
+    parseGitHubServerUrl(GITHUB_SERVER_URL);
+  } catch (error) {
+    fail(error.message);
+  }
+
   // Fail fast on config typos instead of a vague API error later.
   if (!GITHUB_LOGIN_RE.test(SIG_OWNER)) {
     fail(
@@ -365,7 +431,7 @@ function validateConfig() {
   // Say so when normalization changed the value.
   if (SIG_PATH_RAW && SIG_PATH_RAW !== SIG_PATH) {
     console.warn(
-      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing whitespace/control characters and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
+      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing ASCII whitespace and ASCII whitespace before a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
     );
   }
   if (ALLOWLIST.invalid.length) {
@@ -418,10 +484,83 @@ function consumeGitHubTokenRequest(token, { emergency = false } = {}) {
   store.remaining -= 1;
 }
 
+function buildSafeApiUrl(path, apiBase = GITHUB_API) {
+  const reject = () => {
+    const value =
+      typeof path === "string" ? JSON.stringify(path) : `<${typeof path}>`;
+    throw new Error(
+      `Refusing to build a request URL from an unsafe path: ${value}`,
+    );
+  };
+  const rejectBase = () => {
+    throw new Error(
+      "GITHUB_API_URL must be an absolute HTTP(S) URL without credentials, query, or fragment.",
+    );
+  };
+  if (
+    typeof path !== "string" ||
+    path.length < 2 ||
+    !path.startsWith("/") ||
+    path.startsWith("//") ||
+    /[\\#\s\x00-\x1f\x7f-\x9f]/u.test(path) ||
+    /%(?![0-9a-f]{2})/i.test(path)
+  ) {
+    reject();
+  }
+  if (
+    typeof apiBase !== "string" ||
+    apiBase.length === 0 ||
+    apiBase.includes("?") ||
+    apiBase.includes("#")
+  ) {
+    rejectBase();
+  }
+  const requestPath = path.split("?", 1)[0];
+  for (const segment of requestPath.split("/")) {
+    // The URL parser treats encoded dot segments as path navigation too.
+    const dotSegment = segment.replace(/%2e/gi, ".");
+    if (dotSegment === "." || dotSegment === "..") reject();
+  }
+
+  let base;
+  try {
+    base = new URL(apiBase);
+  } catch {
+    rejectBase();
+  }
+  if (
+    (base.protocol !== "http:" && base.protocol !== "https:") ||
+    base.username ||
+    base.password ||
+    base.search ||
+    base.hash
+  ) {
+    rejectBase();
+  }
+
+  let request;
+  try {
+    const baseHref = base.href.replace(/\/+$/, "");
+    request = new URL(`${baseHref}${path}`);
+  } catch {
+    reject();
+  }
+  if (
+    request.origin !== base.origin ||
+    request.username ||
+    request.password
+  ) {
+    reject();
+  }
+
+  return request.href;
+}
+
 // HTTP helper: timeout, JSON handling and a retry for transient failures
 // (rate limits, brief 5xx). 409 conflicts on writes are handled in
 // writeSignatures(), since they need a re-read, not a blind retry.
 async function ghRaw(path, token, options = {}) {
+  const requestUrl = buildSafeApiUrl(path);
   // Count each attempt here, including retries and direct ghRaw() calls.
   consumeGitHubTokenRequest(token, { emergency: options.emergency === true });
   const controller = new AbortController();
@@ -429,7 +568,7 @@ async function ghRaw(path, token, options = {}) {
   const fetchOptions = { ...options };
   delete fetchOptions.preserveUnsafeIds;
   try {
-    const res = await fetch(`${GITHUB_API}${path}`, {
+    const res = await fetch(requestUrl, {
       ...fetchOptions,
       signal: controller.signal,
       headers: {
@@ -1740,9 +1879,9 @@ async function deleteDuplicateComment(prNumber, dup) {
     if (e.status === 404) {
       // The comment is already absent, so the snapshot must not keep it.
       await forgetDeletedCachedComment(prNumber, dup.id);
+      return;
     }
-    // It may already be gone, or the token may lack permission. This is
-    // cosmetic cleanup, so do not fail the run.
+    // This is cosmetic cleanup, so a permission or network failure is non-fatal.
     console.warn(
       `::warning::Could not delete duplicate comment ${dup.id}: ${e.message}`,
     );
@@ -2240,14 +2379,20 @@ function isPrivileged(payload, commenter) {
 // configured) before checkPR() is ever reached, so the budget has to start
 // here, not inside checkPR(), to actually cover everything this event does.
 async function handleIssueComment(payload) {
+  return handleIssueCommentWithIdentifiers(payload, {
+    prNumber: JSON.stringify(payload.issue && payload.issue.number),
+  });
+}
+
+async function handleIssueCommentWithIdentifiers(payload, identifiers) {
   return runWithGitHubTokenRequestBudget(
     MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
     GITHUB_TOKEN_EMERGENCY_RESERVE,
-    () => handleIssueCommentInner(payload),
+    () => handleIssueCommentInner(payload, identifiers),
   );
 }
 
-async function handleIssueCommentInner(payload) {
+async function handleIssueCommentInner(payload, identifiers) {
   if (!payload.issue || !payload.issue.pull_request) return; // plain issue, not a PR
   if (
     !payload.comment ||
@@ -2263,8 +2408,8 @@ async function handleIssueCommentInner(payload) {
       "issue_comment payload is missing comment.user.login (or it is empty) - malformed or unexpected webhook delivery.",
     );
   }
-  const prNumber = assertValidPRNumber(
-    payload.issue.number,
+  const prNumber = assertValidEventPRNumber(
+    identifiers.prNumber,
     "issue_comment payload issue.number",
   );
   const body = (payload.comment.body || "").trim();
@@ -2300,7 +2445,7 @@ async function handleIssueCommentInner(payload) {
                 id: commenterId,
                 login: commenter,
                 pr: `${REPO_OWNER}/${REPO_NAME}#${prNumber}`,
-                commentUrl: payload.comment.html_url,
+                commentUrl: buildCommentUrl(prNumber, payload.comment.id),
                 signedAt: new Date().toISOString(),
               },
             ],
@@ -2349,22 +2494,36 @@ async function handleIssueCommentInner(payload) {
 // See handleIssueComment() for why this budget is started at the handler,
 // not inside checkPR().
 async function handlePullRequestTarget(payload) {
+  return handlePullRequestTargetWithIdentifiers(payload, {
+    prNumber: JSON.stringify(payload.pull_request && payload.pull_request.number),
+    headSha:
+      payload.pull_request &&
+      payload.pull_request.head &&
+      payload.pull_request.head.sha,
+    baseSha:
+      payload.pull_request &&
+      payload.pull_request.base &&
+      payload.pull_request.base.sha,
+  });
+}
+
+async function handlePullRequestTargetWithIdentifiers(payload, identifiers) {
   return runWithGitHubTokenRequestBudget(
     MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
     GITHUB_TOKEN_EMERGENCY_RESERVE,
-    () => handlePullRequestTargetInner(payload),
+    () => handlePullRequestTargetInner(payload, identifiers),
   );
 }
 
-async function handlePullRequestTargetInner(payload) {
+async function handlePullRequestTargetInner(payload, identifiers) {
   if (!payload.pull_request) {
     // A real pull_request_target event always has this.
     throw new Error(
       "pull_request_target payload is missing pull_request - malformed or unexpected webhook delivery.",
     );
   }
-  const prNumber = assertValidPRNumber(
-    payload.pull_request.number,
+  const prNumber = assertValidEventPRNumber(
+    identifiers.prNumber,
     "pull_request_target payload pull_request.number",
   );
   if (payload.action === "closed" && payload.pull_request.merged) {
@@ -2379,13 +2538,13 @@ async function handlePullRequestTargetInner(payload) {
     isGenuineRetarget
   ) {
     const headSha = assertValidSha(
-      payload.pull_request.head && payload.pull_request.head.sha,
+      identifiers.headSha,
       "pull_request_target payload pull_request.head.sha",
     );
     // Automatic trigger, not a direct question, so stay quiet on a clean
     // result unless the PR was blocked before. See checkPR().
     const baseSha = assertValidSha(
-      payload.pull_request.base && payload.pull_request.base.sha,
+      identifiers.baseSha,
       "pull_request_target payload pull_request.base.sha",
     );
     await checkPR(prNumber, headSha, {
@@ -2406,9 +2565,15 @@ async function main() {
   const payload = JSON.parse(fs.readFileSync(EVENT_PATH, "utf8"));
 
   if (EVENT_NAME === "issue_comment" && payload.action === "created") {
-    await handleIssueComment(payload);
+    await handleIssueCommentWithIdentifiers(payload, {
+      prNumber: EVENT_PR_NUMBER,
+    });
   } else if (EVENT_NAME === "pull_request_target") {
-    await handlePullRequestTarget(payload);
+    await handlePullRequestTargetWithIdentifiers(payload, {
+      prNumber: EVENT_PR_NUMBER,
+      headSha: EVENT_HEAD_SHA,
+      baseSha: EVENT_BASE_SHA,
+    });
   } else {
     console.log(
       `Nothing to do for event "${EVENT_NAME}" / action "${payload.action}".`,
@@ -2435,6 +2600,7 @@ module.exports = {
   parseAllowlist,
   createAppJWT,
   ghRaw,
+  buildSafeApiUrl,
   base64url,
   readSignatures,
   writeSignatures,
@@ -2451,6 +2617,7 @@ module.exports = {
   validateConfig,
   lockPR,
   findSigPathProblem,
+  normalizeSigPath,
   encodeRepoPath,
   sigInstallationApiPath,
   sigContentsApiPath,
@@ -2458,6 +2625,7 @@ module.exports = {
   assertValidInstallationId,
   assertValidUserId,
   assertValidSha,
+  buildCommentUrl,
   classifyBotComment,
   personalSuccessMessage,
   isSameContributor,

@@ -162,6 +162,9 @@ const CLA_BOT_ENV_VARS = [
   "GITHUB_API_URL",
   "GITHUB_EVENT_NAME",
   "GITHUB_EVENT_PATH",
+  "CLA_BOT_EVENT_PR_NUMBER",
+  "CLA_BOT_EVENT_HEAD_SHA",
+  "CLA_BOT_EVENT_BASE_SHA",
   "GITHUB_REPOSITORY",
   "GITHUB_TOKEN",
   "REQUIRE_VERIFIED_COMMITS",
@@ -181,7 +184,25 @@ function buildChildEnv(overrides) {
   for (const key of CLA_BOT_ENV_VARS) {
     env[key] = "";
   }
-  return { ...env, ...overrides };
+  const eventPath = overrides.GITHUB_EVENT_PATH;
+  const childEnv = { ...env, ...overrides };
+  if (eventPath && fs.existsSync(eventPath)) {
+    try {
+      const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
+      const prNumber = event.issue?.number ?? event.pull_request?.number;
+      const fields = {
+        CLA_BOT_EVENT_PR_NUMBER: prNumber == null ? "null" : JSON.stringify(prNumber),
+        CLA_BOT_EVENT_HEAD_SHA: event.pull_request?.head?.sha || "",
+        CLA_BOT_EVENT_BASE_SHA: event.pull_request?.base?.sha || "",
+      };
+      for (const [key, value] of Object.entries(fields)) {
+        if (!Object.hasOwn(overrides, key)) childEnv[key] = value;
+      }
+    } catch {
+      // Leave the API identifiers empty; the CLI should report malformed JSON.
+    }
+  }
+  return childEnv;
 }
 
 // A minimal fake GitHub API, just enough to let a full run complete. Keeps
@@ -326,7 +347,12 @@ function baseEnv(apiUrl) {
     const server = await startFakeGitHub({ authorAlreadySigned: true });
     const eventFile = writeTempEventFile({
       action: "opened",
-      pull_request: { number: 1, head: { sha: "e2e-head-sha" }, base: { sha: "base-sha-fixture" } },
+      unused_large_field: "x".repeat(200_000),
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "base-sha-fixture" },
+      },
     });
     try {
       const { code, stderr } = await runScript({
@@ -353,6 +379,43 @@ function baseEnv(apiUrl) {
         server.statusesSeen[0].sha,
         "e2e-head-sha",
         "the status must be posted against the PR's actual head sha",
+      );
+    } finally {
+      await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("main() rejects invalid GITHUB_SERVER_URL values before making API requests", async () => {
+    const server = await startFakeGitHub({ authorAlreadySigned: true });
+    const eventFile = writeTempEventFile({
+      action: "created",
+      issue: { number: 1, pull_request: {} },
+      comment: {
+        id: 123,
+        body: "I agree to the CLA",
+        user: { id: 1001, login: "alice" },
+      },
+    });
+    try {
+      for (const value of [
+        "not a URL",
+        "file:///tmp",
+        "https://user:secret@example.com",
+      ]) {
+        const { code, stderr } = await runScript({
+          ...baseEnv(server.url),
+          GITHUB_SERVER_URL: value,
+          GITHUB_EVENT_NAME: "issue_comment",
+          GITHUB_EVENT_PATH: eventFile,
+        });
+        assert.strictEqual(code, 1, `${value}: ${stderr}`);
+        assert.match(stderr, /GITHUB_SERVER_URL must be an HTTP\(S\) URL/);
+      }
+      assert.strictEqual(
+        server.requestsSeen.length,
+        0,
+        "invalid server configuration must fail before reading or writing the signature store",
       );
     } finally {
       await server.close();
@@ -477,7 +540,7 @@ function baseEnv(apiUrl) {
     }
   });
 
-  await test("the CLI entrypoint fails loudly and exits non-zero when GITHUB_EVENT_PATH doesn't point to a real file", async () => {
+  await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH does not exist", async () => {
     const { code, stderr } = await runScript({
       ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
@@ -486,17 +549,11 @@ function baseEnv(apiUrl) {
     assert.notStrictEqual(code, 0, "expected a non-zero exit code");
     assert.ok(
       /GITHUB_EVENT_PATH not found/.test(stderr),
-      `expected a specific error about the missing event file, got stderr:\n${stderr}`,
+      `expected a specific error about the missing event payload, got stderr:\n${stderr}`,
     );
   });
 
-  // The check is `if (!EVENT_PATH || !fs.existsSync(EVENT_PATH))` - the
-  // test above exercises the RIGHT side (a real, non-empty path that just
-  // doesn't exist). This one exercises the LEFT side specifically: no
-  // GITHUB_EVENT_PATH at all (empty string, via buildChildEnv's default),
-  // so `!EVENT_PATH` alone is true and short-circuits before
-  // fs.existsSync() is ever called on it.
-  await test("the CLI entrypoint fails loudly and exits non-zero when GITHUB_EVENT_PATH is entirely unset (as opposed to set-but-nonexistent)", async () => {
+  await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH is unset", async () => {
     const { code, stderr } = await runScript({
       ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
@@ -507,12 +564,12 @@ function baseEnv(apiUrl) {
     assert.notStrictEqual(code, 0, "expected a non-zero exit code");
     assert.ok(
       /GITHUB_EVENT_PATH not found/.test(stderr),
-      `expected the same specific error as the set-but-missing case, got stderr:\n${stderr}`,
+      `expected a specific error about the missing event payload, got stderr:\n${stderr}`,
     );
   });
 
   // Invalid JSON makes main() reject and exercises its top-level catch.
-  await test("the CLI entrypoint's top-level main().catch() handler fires (and fails loudly) on a genuinely malformed - not just missing - GITHUB_EVENT_PATH file", async () => {
+  await test("the CLI entrypoint's top-level main().catch() handler fires on malformed event JSON", async () => {
     const eventFile = path.join(
       TMP_DIR,
       `bad-event-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
@@ -552,7 +609,7 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // Real CLI entrypoint, real event file: a sign-phrase issue_comment whose
+  // Real CLI entrypoint: a sign-phrase issue_comment whose
   // comment.user.id is missing must fail the run (non-zero exit, "::error::"
   // annotation naming the field) WITHOUT a single request reaching the API.
   // 127.0.0.1:1 is unroutable, so if the bot ignored the guard and tried to
@@ -607,16 +664,14 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // Exercise the `e.message` fallback by making readFileSync reject with a
+  // Exercise the `e.message` fallback by making JSON.parse reject with a
   // plain object that has no stack.
   await test("the top-level main().catch() handler falls back to e.message when the rejection has no .stack at all (a non-Error throw)", async () => {
     const eventFile = path.join(
       TMP_DIR,
       `nonerror-event-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
     );
-    // The file must genuinely exist so main()'s existsSync guard passes
-    // and execution reaches the patched readFileSync call below.
-    fs.writeFileSync(eventFile, JSON.stringify({ action: "opened" }));
+    fs.writeFileSync(eventFile, '{"action":"opened"}');
     // A `-r`-preloaded module, NOT a wrapper that `require()`s the real
     // script - requiring cla-bot.js from another script would make THAT
     // script `require.main`, so `if (require.main === module)` inside
@@ -627,16 +682,15 @@ function baseEnv(apiUrl) {
     fs.writeFileSync(
       preload,
       [
-        "const fs = require('fs');",
-        "const originalReadFileSync = fs.readFileSync;",
-        "fs.readFileSync = function (...args) {",
-        `  if (args[0] === ${JSON.stringify(eventFile)}) {`,
+        "const originalParse = JSON.parse;",
+        "JSON.parse = function (value, ...args) {",
+        `  if (value === ${JSON.stringify('{"action":"opened"}')}) {`,
         "    // A plain object, not an Error - no .stack property at all,",
         "    // only .message - exactly the shape that forces the RHS of",
         "    // `e.stack || e.message` to be the one actually used.",
         "    throw { message: 'synthetic non-Error rejection for e.message fallback test' };",
         "  }",
-        "  return originalReadFileSync.apply(fs, args);",
+        "  return originalParse.call(JSON, value, ...args);",
         "};",
       ].join("\n"),
     );
@@ -682,6 +736,14 @@ function baseEnv(apiUrl) {
   // removed the preload file.
   await test("runScriptCapturingFirstFetchUrl's timeout path rejects cleanly, and its cleanup completes deterministically - with no temp preload file left behind - once the delayed 'close' event fires", async () => {
     let caught = null;
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "e2e-base-sha" },
+      },
+    });
     try {
       await runScriptCapturingFirstFetchUrl(
         {
@@ -693,7 +755,7 @@ function baseEnv(apiUrl) {
           CLA_DOCUMENT_URL: "https://example.com/CLA.md",
           ALLOWLIST: "",
           GITHUB_EVENT_NAME: "pull_request_target",
-          GITHUB_EVENT_PATH: "/nonexistent",
+          GITHUB_EVENT_PATH: eventFile,
         },
         { timeoutMs: 200, forceHangUntilKilled: true },
       );
@@ -769,14 +831,14 @@ function baseEnv(apiUrl) {
     }
   });
 
-  await test("GITHUB_API uses GITHUB_API_URL verbatim when it's set, instead of the default host", async () => {
+  await test("GITHUB_API preserves the configured GHES API prefix and handles its trailing slash", async () => {
     const eventFile = writeTempEventFile({
       action: "opened",
       pull_request: { number: 1, head: { sha: "test-sha" }, base: { sha: "base-sha-fixture" } },
     });
     try {
       const { capturedUrl } = await runScriptCapturingFirstFetchUrl({
-        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3",
+        GITHUB_API_URL: "https://custom-ghe-instance.example.test/api/v3/",
         GITHUB_TOKEN: "e2e-fake-token",
         GITHUB_REPOSITORY: "fossasia/e2e-test-repo",
         SIG_OWNER: "fossasia",
@@ -792,7 +854,11 @@ function baseEnv(apiUrl) {
           capturedUrl.startsWith(
             "https://custom-ghe-instance.example.test/api/v3/",
           ),
-        `expected the custom GITHUB_API_URL to be used verbatim (e.g. a GitHub Enterprise host), not the default, got: ${capturedUrl}`,
+        `expected the custom GHES API prefix, got: ${capturedUrl}`,
+      );
+      assert.ok(
+        !capturedUrl.includes("/api/v3//"),
+        `trailing base slashes must not create a doubled API path separator: ${capturedUrl}`,
       );
     } finally {
       fs.unlinkSync(eventFile);

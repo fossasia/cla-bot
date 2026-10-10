@@ -12,7 +12,7 @@ const SRC = path.resolve(__dirname, "../src/cla-bot.js");
 // fs.mkdtempSync (unlike a hand-built "pid + Date.now()" path in the shared,
 // world-writable os.tmpdir()) creates a directory with an unguessable name
 // and owner-only permissions (0o700 on POSIX), so no other local user can
-// pre-create, read, or symlink-swap the event file. Same pattern as
+// pre-create, read, or symlink-swap an event fixture. Same pattern as
 // test/e2e.test.js.
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-token-expiry-"));
 process.on("exit", () => {
@@ -899,10 +899,8 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
         });
       });
       await new Promise((r) => server.listen(0, "127.0.0.1", r));
-      const eventFile = path.join(TMP_DIR, "event.json");
-      // flag "wx": fail instead of following/overwriting anything that
-      // already exists at this path. mode 0o600: owner read/write only.
-      fs.writeFileSync(eventFile, JSON.stringify(signPayload()), {
+      const eventPath = path.join(TMP_DIR, `event-${Date.now()}.json`);
+      fs.writeFileSync(eventPath, JSON.stringify(signPayload()), {
         flag: "wx",
         mode: 0o600,
       });
@@ -913,7 +911,8 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
           ...BASE_ENV,
           GITHUB_API_URL: `http://127.0.0.1:${server.address().port}`,
           GITHUB_EVENT_NAME: "issue_comment",
-          GITHUB_EVENT_PATH: eventFile,
+          GITHUB_EVENT_PATH: eventPath,
+          CLA_BOT_EVENT_PR_NUMBER: "1",
           SIG_APP_ID: "123456",
           SIG_APP_PRIVATE_KEY: PRIVATE_KEY,
         };
@@ -939,8 +938,8 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
           "expected the refresh warning in the Actions log",
         );
       } finally {
+        fs.unlinkSync(eventPath);
         await new Promise((r) => server.close(r));
-        fs.unlinkSync(eventFile);
       }
     },
     { clock: false },
