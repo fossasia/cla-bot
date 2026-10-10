@@ -113,7 +113,7 @@ function installFakeContentsApi({ owner, repo }) {
   return { files, requests };
 }
 
-const { findSigPathProblem, encodeRepoPath } = loadBot();
+const { findSigPathProblem, normalizeSigPath, encodeRepoPath } = loadBot();
 
 // Paths that must be accepted: ordinary ones plus the awkward-but-legal ones
 // (hidden dirs, non-ASCII, URL sub-delims, "..."-like names that are NOT
@@ -161,6 +161,11 @@ const INVALID_PATHS = [
   ["an interior newline (URL parser silently strips it)", "a\nb.json"],
   ["a carriage return", "a\rb.json"],
   ["a NUL byte", "a\x00b.json"],
+  ["a leading NUL before a dot segment", "\x00./signatures/cla.json"],
+  ["a leading BEL before a dot segment", "\x07./signatures/cla.json"],
+  ["a leading ESC before a dot segment", "\x1b./signatures/cla.json"],
+  ["a trailing BEL control", "signatures/cla.json\x07"],
+  ["a trailing ESC control", "signatures/cla.json\x1b"],
   ["a DEL character", "a\x7fb.json"],
   ["a C1 control character", "a\u0085b.json"],
   ["a backslash", "signatures\\cla.json"],
@@ -203,6 +208,25 @@ const INVALID_PATHS = [
     for (const bad of [null, undefined, 42, {}, [], true]) {
       assert.strictEqual(typeof findSigPathProblem(bad), "string");
     }
+  });
+
+  await test("normalization strips only ASCII whitespace and leaves NUL, BEL, and ESC for validation", () => {
+    for (const raw of [
+      "\x00./signatures/cla.json",
+      "\x07./signatures/cla.json",
+      "\x1b./signatures/cla.json",
+      "signatures/cla.json\x00",
+      "signatures/cla.json\x07",
+      "signatures/cla.json\x1b",
+    ]) {
+      const normalized = normalizeSigPath(raw);
+      assert.strictEqual(normalized, raw, JSON.stringify(raw));
+      assert.ok(findSigPathProblem(normalized), JSON.stringify(raw));
+    }
+    assert.strictEqual(
+      normalizeSigPath("signatures/cla.json\t\n\v\f\r "),
+      "signatures/cla.json",
+    );
   });
 
   await test("findSigPathProblem's message names the offending character, JSON-escaped (so the log line stays a single, readable line)", () => {
@@ -401,14 +425,11 @@ const INVALID_PATHS = [
   // the raw value. Each row: [raw SIG_PATH, what the old code actually
   // addressed (as a request-path tail)].
   const COMPAT_ROWS = [
-    // trailing ASCII whitespace / C0 controls: stripped by the URL parser
+    // trailing ASCII whitespace: ignored by the URL parser
     ["signatures/cla.json ", "signatures/cla.json"],
     ["signatures/cla.json   ", "signatures/cla.json"],
     ["signatures/cla.json\n", "signatures/cla.json"],
     ["signatures/cla.json\r\n\t ", "signatures/cla.json"],
-    // (U+001F: another C0 control. NUL itself can't be exercised here -
-    // process.env truncates a value at a NUL byte, so it would pass trivially.)
-    ["signatures/cla.json\x1f", "signatures/cla.json"],
     // leading "./": collapsed by the URL parser
     ["./signatures/cla.json", "signatures/cla.json"],
     ["././signatures/cla.json", "signatures/cla.json"],
@@ -460,20 +481,21 @@ const INVALID_PATHS = [
     );
   });
 
-  await test("Unicode whitespace at the END is preserved (percent-encoded), not stripped - only trailing U+0000..U+0020 is", () => {
+  await test("Unicode whitespace at the END is preserved (percent-encoded), not stripped - only trailing ASCII whitespace is", () => {
     assert.strictEqual(
       loadBot({ SIG_PATH: "signatures/cla.json\u00a0" }).sigContentsApiPath(),
       "/repos/fossasia/cla-signatures/contents/signatures/cla.json%C2%A0",
     );
   });
 
-  await test("trailing ASCII whitespace/control characters ARE ignored (that is what the old URL parser did), including a mixed run", () => {
+  await test("trailing ASCII whitespace is ignored, including a mixed run", () => {
     const plain = loadBot({
       SIG_PATH: "signatures/cla.json",
     }).sigContentsApiPath();
     for (const raw of [
       "signatures/cla.json ",
       "signatures/cla.json\n",
+      "signatures/cla.json\v\f",
       "signatures/cla.json \r\n\t ",
     ]) {
       assert.strictEqual(

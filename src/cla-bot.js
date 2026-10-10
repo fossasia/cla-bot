@@ -244,12 +244,18 @@ function assertValidSha(value, context) {
 // and because the value is echoed into "::error::" log lines.
 const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
 
-// Remove trailing whitespace and a literal leading `./`. Leading whitespace
-// remains part of the path, as it was before normalization.
+// Remove trailing ASCII whitespace and a literal leading `./`. Leading
+// whitespace remains part of the path, as it did before normalization.
 function normalizeSigPath(raw) {
   let p = raw || "signatures/cla.json";
   let end = p.length;
-  while (end > 0 && p.charCodeAt(end - 1) <= 0x20) end -= 1;
+  while (end > 0) {
+    const code = p.charCodeAt(end - 1);
+    const isAsciiWhitespace =
+      code === 0x20 || (code >= 0x09 && code <= 0x0d);
+    if (!isAsciiWhitespace) break;
+    end -= 1;
+  }
   p = p.slice(0, end);
   while (p.startsWith("./")) p = p.slice(2);
   return p;
@@ -393,7 +399,7 @@ function validateConfig() {
   // Say so when normalization changed the value.
   if (SIG_PATH_RAW && SIG_PATH_RAW !== SIG_PATH) {
     console.warn(
-      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing whitespace/control characters and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
+      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing ASCII whitespace and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
     );
   }
   if (SIG_PATH_RAW && /^[\t\n\v\f\r ]+\.\//.test(SIG_PATH_RAW)) {
@@ -2524,6 +2530,7 @@ module.exports = {
   validateConfig,
   lockPR,
   findSigPathProblem,
+  normalizeSigPath,
   encodeRepoPath,
   sigInstallationApiPath,
   sigContentsApiPath,
