@@ -1,13 +1,5 @@
 "use strict";
-/**
- * End-to-end test of the real orchestration (handleIssueComment -> writeSignatures
- * -> checkPR -> listPRCommitAuthors/postComment/setStatus), all against a single
- * mocked `fetch` router. This is the layer the other two test files don't cover:
- * they test the pieces in isolation, this exercises them wired together the way
- * a real webhook event would.
- *
- * Run: node test/integration.test.js (also included in `npm test`)
- */
+/** Tests webhook handling and PR checks against a mocked GitHub API. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "dummy-token";
@@ -1198,7 +1190,6 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // dedupeIdenticalTrailingComments() catches each DELETE failure
   // individually (inside its per-comment loop) and keeps going, as
   // opposed to the cleanup step's own re-fetch GET failing outright, which
@@ -1206,7 +1197,6 @@ function makeFakeGitHub({
   // pins down the former: one duplicate refuses to delete (403), but that
   // must not stop the newer duplicate from still being cleaned up, and
   // must not surface as a failure of the run at all.
-  // ---------------------------------------------------------------------
   await test("dedupeIdenticalTrailingComments swallows an individual comment's DELETE failure and still deletes the other duplicate(s)", async () => {
     const originalWarn = console.warn;
     const warnings = [];
@@ -1326,12 +1316,10 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // lockPR: direct coverage. Production code is deliberately best-effort
   // here (see lockPR's comment in src/cla-bot.js) - a failed lock call must
   // never fail the whole run, only warn. Neither the success path nor the
   // failure path had any dedicated coverage before.
-  // ---------------------------------------------------------------------
   await test("lockPR locks the PR with lock_reason 'resolved'", async () => {
     const gh = makeFakeGitHub({
       commits: [],
@@ -1381,12 +1369,10 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // handlePullRequestTarget: direct dispatch coverage. Previously only the
   // malformed-payload guard was tested here - the real event-routing logic
   // (opened/synchronize/reopened -> checkPR, closed+merged -> lockPR,
   // everything else -> no-op) had no coverage at all.
-  // ---------------------------------------------------------------------
   await test("handlePullRequestTarget locks the PR when a 'closed' event reports it was merged", async () => {
     const gh = makeFakeGitHub({
       commits: [],
@@ -1680,11 +1666,9 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // Pagination: previously every mock had <100 items, so the "there might
   // be another page" continuation branch in listPRCommitAuthors() and
   // getExistingBotComments() never actually ran.
-  // ---------------------------------------------------------------------
   await test("listPRCommitAuthors pages through more than 100 commits on a single PR", async () => {
     const commits = [];
     for (let i = 0; i < 150; i++) {
@@ -1787,10 +1771,8 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // postComment's duplicate-cleanup step is explicitly best-effort (same
   // pattern as lockPR) - a failure there must not fail the run.
-  // ---------------------------------------------------------------------
   await test("postComment's duplicate-cleanup failure is caught and logged as a warning, without failing the run", async () => {
     // The cleanup step (dedupeIdenticalTrailingComments) already catches
     // and warns on a per-comment DELETE failure internally (it's meant to
@@ -1845,9 +1827,7 @@ function makeFakeGitHub({
     }
   });
 
-  // ---------------------------------------------------------------------
   // Co-author id/login resolution: the "can't resolve" and "cached" edges.
-  // ---------------------------------------------------------------------
   await test("a co-author in noreply-email format whose id/login cannot be resolved (e.g. a deleted account) is flagged for manual review, not silently dropped", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -1945,9 +1925,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // Grammar/edge cases in checkPR's output.
-  // ---------------------------------------------------------------------
   await test("more than one unresolvable commit produces correctly pluralized wording in the PR comment ('commits' / 'them', not 'commit' / 'it')", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -2048,7 +2026,6 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
   // handleIssueComment's "recheck" command gates on isPrivileged() - but
   // EVERY other "recheck" test in this suite happens to have the commenter
   // be the PR's own author (privileged via that path alone), so the
@@ -2057,7 +2034,6 @@ function makeFakeGitHub({
   // standalone unit tests. This is the one that actually wires a random,
   // unprivileged third party's "recheck" comment through the real
   // handler and proves it does genuinely nothing at all.
-  // ===========================================================================
   await test("a random, unprivileged commenter's 'recheck' on someone ELSE's PR is silently ignored end-to-end - no status update, no comment, no API calls at all", async () => {
     global.fetch = async (url) => {
       throw new Error(
@@ -2273,16 +2249,7 @@ function makeFakeGitHub({
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
   });
 
-  // =========================================================================
-  // "Already signed" PRs must stay quiet: checkPR's quietIfNeverFlagged
-  // behaviour (only used by the automatic pull_request_target trigger).
-  //
-  // Regression coverage for: a contributor who already signed the CLA (in
-  // an earlier PR/repo) opens a brand new PR, and the bot's very first
-  // comment on that PR is "All contributors have signed the CLA. ✅" - pure
-  // noise, since nothing was ever required of anyone on this PR. See
-  // https://github.com/rajnishtiwari7/cla-testing/pull/7 for a live example.
-  // =========================================================================
+  // Automatic checks stay quiet when every contributor has already signed.
 
   await test("opening a PR whose sole author already signed the CLA sets a success status but posts NO comment at all (nothing ever needed doing)", async () => {
     const gh = makeFakeGitHub({
@@ -2496,7 +2463,6 @@ function makeFakeGitHub({
     );
   });
 
-  // -------------------------------------------------------------------------
   // Regression: "any bot comment exists" is NOT the same thing as "this PR
   // was previously blocked". A PR that was compliant from the very start can
   // still pick up a bot comment that has nothing to do with its own status -
@@ -2504,7 +2470,6 @@ function makeFakeGitHub({
   // more to do here" reply someone gets for redundantly re-submitting the
   // sign phrase. That reply must not be mistaken for proof the PR itself was
   // ever blocked.
-  // -------------------------------------------------------------------------
   await test("a redundant 'already signed' reply on an always-compliant PR does NOT make a later automatic check wrongly announce success", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -2980,17 +2945,7 @@ function makeFakeGitHub({
     assert.ok(gh.comments[1].body.includes("All contributors have signed"));
   });
 
-  // -------------------------------------------------------------------------
-  // Migration/backward-compatibility: a PR that was blocked under an OLDER
-  // deployment of this bot - one that predates PENDING_MARKER and simply
-  // wrote the same "need to sign our CLA" / "could not be automatically
-  // attributed" wording without any invisible marker - must still be
-  // recognized as having been genuinely blocked once this fix is deployed.
-  // Without this, upgrading the bot mid-flight on an already-open,
-  // already-blocked PR would silently swallow that PR's eventual recovery
-  // announcement, because its one and only "ask" comment predates the
-  // marker.
-  // -------------------------------------------------------------------------
+  // Recognize pending comments from older bot versions that lack the marker.
   await test("a PR blocked by an OLDER deployment of the bot (a 'needs to sign' comment with no PENDING_MARKER at all) is still recognized as having been blocked, so its resolution is announced after an upgrade", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -3123,7 +3078,6 @@ function makeFakeGitHub({
     );
   });
 
-  // =========================================================================
   // Input-validation hardening: PR/issue numbers and commit SHAs pulled out
   // of the webhook payload (itself read from a file, GITHUB_EVENT_PATH) must
   // never reach an outbound GitHub API URL unvalidated - see
@@ -3133,7 +3087,6 @@ function makeFakeGitHub({
   // pass proves not just "an error was thrown" but that it was thrown
   // strictly before any network request was attempted - the exact property
   // that closes the CodeQL js/file-access-to-http finding.
-  // =========================================================================
 
   const INVALID_PR_NUMBERS = [
     { label: "zero", value: 0 },
@@ -3400,11 +3353,9 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // Positive control: the validators above must not reject genuinely valid
   // input. Without this, an over-eager regex could silently break real
   // traffic while every negative test above kept passing.
-  // ---------------------------------------------------------------------
   await test("a large, ordinary positive integer PR number and a real-shaped 40-char hex sha both pass validation and flow through end-to-end", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -3447,7 +3398,6 @@ function makeFakeGitHub({
     assert.strictEqual(gh.statuses[gh.statuses.length - 1].state, "success");
   });
 
-  // ---------------------------------------------------------------------
   // encodeURIComponent() at the point of URL construction (see ghRaw()'s
   // callers): assertValidSha's blocklist rejects structurally dangerous
   // characters (/, .., ?, #, %, whitespace) but, by design, doesn't
@@ -3457,7 +3407,6 @@ function makeFakeGitHub({
   // proves percent-encoding is genuinely applied at the sink (not just
   // present in the source and inert), by checking the literal bytes that
   // reach fetch().
-  // ---------------------------------------------------------------------
   await test("checkPR percent-encodes a validator-legal but URL-significant sha (containing '&') before it ever reaches fetch(), so it can't inject or override a query parameter", async () => {
     const trickySha = "abc&page=999&per_page=1";
     const gh = makeFakeGitHub({
@@ -3495,12 +3444,10 @@ function makeFakeGitHub({
     );
   });
 
-  // =========================================================================
   // Per-signer personalized thank-you comments (replaces the old, anonymous
   // "All contributors have signed the CLA. ✅" announcement whenever we
   // know exactly who just signed via a comment - see checkPR's `signer`
   // option and personalSuccessMessage() in src/cla-bot.js).
-  // =========================================================================
   await test("on a PR with 3 contributors, each one signing via a comment gets their OWN personalized thank-you - not the generic 'All contributors have signed' announcement", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -3942,7 +3889,7 @@ function makeFakeGitHub({
 
   await test("an unrelated commenter signing the CLA on an already-fully-signed PR is NOT credited with completing that PR", async () => {
     // Regression test: alice is the PR's only commit author and has
-    // already signed (e.g. on some earlier PR - signatures are global).
+    // already signed globally.
     // mallory then comments the sign phrase on THIS pr even though she has
     // no commits on it at all. Her signature is real and gets recorded,
     // but it had zero effect on this PR's own requirement, which was
@@ -4083,11 +4030,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
-  // Additional coverage merged in from PR #12 (add-tests-2): closed+merged
-  // head.sha exemption, lockPR transient-retry behavior, REQUIRE_VERIFIED_COMMITS
-  // edge cases, concurrent duplicate-webhook dedup, and combined comment rendering.
-  // ---------------------------------------------------------------------
+  // Additional handler, retry, verification, and comment-rendering cases.
   await test("handlePullRequestTarget does NOT require pull_request.head.sha for a 'closed'+merged event - only opened/synchronize/reopened need it", async () => {
     const gh = makeFakeGitHub({
       commits: [],
@@ -4103,12 +4046,10 @@ function makeFakeGitHub({
     assert.strictEqual(gh.lockCalls.length, 1);
   });
 
-  // ---------------------------------------------------------------------
   // lockPR: transient-failure retry behavior (distinct from the existing
   // immediate-403-no-retry test) - a PUT is safeToRetry inside gh(), so a
   // transient 503 on the lock call should be retried automatically before
   // lockPR's own best-effort catch/warn ever gets involved.
-  // ---------------------------------------------------------------------
   await test("lockPR retries a transient failure (503) via gh()'s built-in PUT retry and succeeds silently, without ever logging the best-effort warning", async () => {
     const gh = makeFakeGitHub({
       commits: [],
@@ -4209,11 +4150,9 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // REQUIRE_VERIFIED_COMMITS: combinations beyond the 3 existing
   // "flag=true" scenarios - the default/off state, env-var parsing
   // edge cases, and a missing `committer` field under hardening.
-  // ---------------------------------------------------------------------
   await test("REQUIRE_VERIFIED_COMMITS is false by default: an unverified commit with a mismatched committer is still auto-trusted via GitHub's email-based author match", async () => {
     const originalRVC = process.env.REQUIRE_VERIFIED_COMMITS;
     try {
@@ -4418,11 +4357,9 @@ function makeFakeGitHub({
     }
   });
 
-  // ---------------------------------------------------------------------
   // Concurrent write-success race: the SAME user (a duplicate webhook
   // delivery of the identical sign-phrase comment, which GitHub can and
   // does send) racing against itself, rather than two different users.
-  // ---------------------------------------------------------------------
   await test("the same user signing via a genuinely concurrent duplicate webhook delivery is deduped to exactly one recorded signature, not two", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -4505,9 +4442,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ---------------------------------------------------------------------
   // Comment rendering: both "missing" and "unresolved" sections together.
-  // ---------------------------------------------------------------------
   await test("a PR comment correctly lists BOTH missing signers AND unresolved commits at the same time, not just whichever was checked first", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -4549,10 +4484,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
-  // Item G: getExistingBotComments() full filter truth table, tested directly
-  // rather than only inferred through postComment/checkPR's own use of it.
-  // ===========================================================================
+  // Test getExistingBotComments() filtering directly.
   await test("getExistingBotComments filters out comments missing a user, missing a body, or lacking BOT_MARKER, and (by default) only matches the CURRENT bot identity", async () => {
     global.fetch = async (url, opts) => {
       const method = (opts.method || "GET").toUpperCase();
@@ -4629,9 +4561,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
-  // Item J: resolveUserIdByLogin/resolveLoginById negative-cache call counts.
-  // ===========================================================================
+  // Verify unresolved identity lookups are cached.
   await test("resolveUserIdByLogin caches an UNRESOLVED (404) lookup too: a second call for the same login makes zero additional API requests", async () => {
     let calls = 0;
     global.fetch = async (url) => {
@@ -4677,14 +4607,8 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
-  // Item F: resolveBotLogin() succeeding (GET /user returns 200) but with a
-  // body that carries no usable login - the third branch beyond "succeeds
-  // with a real login" (bot-identity-success.test.js) and "the request
-  // itself fails" (bot-identity.test.js). Needs its own fresh module
-  // instance, same reasoning as those two files: _botLoginLookup is a
-  // module-scope cache.
-  // ===========================================================================
+  // A successful /user response without a usable login falls back to the
+  // default identity. Load a fresh module to reset its cache.
   await test("resolveBotLogin falls back to DEFAULT_BOT_LOGIN when GET /user succeeds but the body has no usable login (empty object)", async () => {
     delete require.cache[require.resolve("../src/cla-bot.js")];
     const { postComment: freshPostComment } = require("../src/cla-bot.js");
@@ -4752,11 +4676,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
-  // Item L: checkPR() combinations not yet covered elsewhere - statusOnly on
-  // both outcomes, and the signer-present cases beyond "signer completes a
-  // straightforward missing-signers-only PR" (already covered above).
-  // ===========================================================================
+  // Cover statusOnly outcomes and signer replies with other missing authors.
   await test("checkPR({statusOnly: true}) on a still-failing PR updates the status but posts no comment at all", async () => {
     const gh = makeFakeGitHub({
       headSha: "sha-x",
@@ -4919,20 +4839,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
-  // Item M: handleIssueComment() malformed comment-field shapes not yet
-  // covered (missing comment.user.login and missing comment.user entirely
-  // are already tested elsewhere - these fill in the remaining fields;
-  // comment.user.id is now REJECTED on the sign path, see the block below).
-  // ===========================================================================
-  // ---------------------------------------------------------------------------
-  // comment.user.id validation. The id is the one payload value that is
-  // PERSISTED into the signature store, and isSigned() only matches on it when
-  // both sides are numbers - so a missing/malformed id used to be accepted and
-  // silently degrade that signature to login-only matching forever (a released
-  // login claimed by someone else would inherit it). These tests pin the
-  // fail-closed behavior: reject loudly, BEFORE any network call or write.
-  // ---------------------------------------------------------------------------
+  // Validate commenter ids before writing them to the signature store.
   const SIGN_BODY = "I have read the CLA Document and I hereby sign the CLA";
   function signPayload(user, extra = {}) {
     return {
@@ -5219,12 +5126,7 @@ function makeFakeGitHub({
     });
   });
 
-  // ===========================================================================
-  // Positive-cache-hit tests for resolveUserIdByLogin/resolveLoginById -
-  // the earlier PR added negative (unresolved) caching; these confirm the
-  // ordinary successful-lookup case is ALSO cached (a second call for the
-  // same key costs zero additional API requests), not just the 404 case.
-  // ===========================================================================
+  // Confirm successful identity lookups are cached too.
   await test("resolveUserIdByLogin caches a SUCCESSFUL lookup too: a second call for the same login makes zero additional API requests", async () => {
     let calls = 0;
     global.fetch = async (url) => {
@@ -5266,15 +5168,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
-  // resolveUserIdByLogin/resolveLoginById with a genuinely malformed but
-  // SUCCESSFUL (200) response - the exact category of bug found (and
-  // fixed) in getSignaturesToken() twice over: a 200 OK doesn't guarantee
-  // a *usable* body. Only the outright-404 "not found" case was tested
-  // for these two functions before; a 200 with a non-numeric id or an
-  // empty-string login must be treated as equally unresolved, not
-  // silently accepted as a real id/login.
-  // ===========================================================================
+  // Treat malformed successful responses as unresolved, just like a 404.
   await test("resolveUserIdByLogin treats a 200 response with a non-numeric id as unresolved (returns null), not as a literal non-numeric id", async () => {
     global.fetch = async (url) => {
       if (url.includes("/users/malformed-200-id-response-login"))
@@ -5318,7 +5212,6 @@ function makeFakeGitHub({
     assert.strictEqual(result, null);
   });
 
-  // ===========================================================================
   // listPRCommitAuthors' merge-commit skip: `Array.isArray(c.parents) &&
   // c.parents.length > 1`. The "> 1" side (an actual merge commit) is
   // already covered elsewhere - this covers the defensive side: a commit
@@ -5326,7 +5219,6 @@ function makeFakeGitHub({
   // unusually-shaped API response) must NOT be mistaken for a merge commit
   // and skipped - it must still be treated as a normal, single commit
   // whose author is required to sign.
-  // ===========================================================================
   await test("a commit with no `parents` field at all is treated as a normal (non-merge) commit - its author is still required to sign, not silently skipped", async () => {
     const gh = makeFakeGitHub({
       headSha: "sha-parentless",
@@ -5349,14 +5241,12 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
   // listPRCommitAuthors' primary-author condition is a 3-way AND:
   // `c.author && c.author.login && typeof c.author.id === "number"`.
   // `c.author` being null entirely is covered elsewhere - these force the
   // other two sub-clauses to fail independently, with `c.author` itself
   // still present, proving each one is actually load-bearing rather than
   // redundant with the null-author check.
-  // ===========================================================================
   await test("a commit whose author object is present but has no login at all is treated as unresolved (needs manual review), not silently skipped or crashed on", async () => {
     const gh = makeFakeGitHub({
       headSha: "sha-no-login",
@@ -5409,14 +5299,12 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
   // postComment() re-validates prNumber itself via its own direct
   // assertValidPRNumber() call, rather than trusting every caller to have
   // already done so - it's exported and callable directly (as every dedupe
   // test in this section already does), so this proves that check fires
   // for real when called that way, not just indirectly through
   // handleIssueComment/handlePullRequestTarget's own separate calls.
-  // ===========================================================================
   await test("postComment rejects an invalid prNumber via its own direct validation, before making any API calls", async () => {
     global.fetch = async (url) => {
       throw new Error(
@@ -5429,13 +5317,11 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
   // postComment(..., dedupe = false): the explicit opt-out path. Every
   // other postComment test in this suite relies on the default (true), so
   // this proves passing `false` genuinely skips BOTH the pre-check GET and
   // the post-POST cleanup - not just one of them - by making any GET call
   // to the comments endpoint throw.
-  // ===========================================================================
   await test("postComment(prNumber, body, false) skips both the pre-check AND the cleanup entirely - it always posts, even if that means a literal duplicate", async () => {
     let postCount = 0;
     global.fetch = async (url, opts) => {
@@ -5460,12 +5346,10 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
   // dedupeIdenticalTrailingComments' own no-op path: `matching.slice(0,
   // -1)` is empty (nothing to delete) when 0 or 1 comments match the body
   // on the cleanup re-fetch. The "many duplicates" case is covered
   // elsewhere - these are the two smallest, most easily-overlooked cases.
-  // ===========================================================================
   await test("dedupeIdenticalTrailingComments is a genuine no-op (zero DELETE calls) when the cleanup re-fetch finds only the ONE comment just posted (no true duplicates)", async () => {
     let getCount = 0;
     let deleteAttempts = 0;
@@ -5533,11 +5417,9 @@ function makeFakeGitHub({
     assert.strictEqual(deleteAttempts, 0);
   });
 
-  // ===========================================================================
   // setStatus()'s own defensive truncation - no real production call site
   // currently produces a description over 140 chars, so this is tested
   // directly against the exported function.
-  // ===========================================================================
   await test("setStatus truncates a description longer than 140 characters before sending it to the GitHub Status API", async () => {
     let capturedBody = null;
     global.fetch = async (url, opts) => {
@@ -5555,7 +5437,6 @@ function makeFakeGitHub({
     assert.strictEqual(capturedBody.description, "x".repeat(140));
   });
 
-  // ===========================================================================
   // quietIfNeverFlagged's findLastIndex comparison ignores "other"-
   // classified comments entirely (e.g. the personal, non-blocking "you
   // already signed the CLA" reply) - they match neither the "pending" nor
@@ -5563,7 +5444,6 @@ function makeFakeGitHub({
   // as the most RECENT comment of all, must not perturb the
   // lastPendingIdx <= lastSuccessIdx comparison or cause a spurious
   // re-announcement.
-  // ===========================================================================
   await test("quietIfNeverFlagged stays silent even when the single most recent bot comment is an unrelated 'other'-classified one, trailing after an already-resolved pending/success pair", async () => {
     const gh = makeFakeGitHub({
       headSha: "sha-quiet-trailing-other",
@@ -5612,11 +5492,7 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
-  // checkPR(prNumber, undefined) - headSha genuinely omitted, forcing the
-  // internal `GET /pulls/{n}` fallback to fetch it, tested in pure
-  // isolation (the many other checkPR tests always pass headSha directly).
-  // ===========================================================================
+  // Fetch the PR head when checkPR() receives no head SHA.
   await test("checkPR fetches the head sha itself via GET /pulls/{n} when headSha is omitted entirely", async () => {
     const gh = makeFakeGitHub({
       commits: [
@@ -5638,7 +5514,6 @@ function makeFakeGitHub({
     );
   });
 
-  // ===========================================================================
   // Sign-phrase matching: `body.toLowerCase() === SIGN_PHRASE.toLowerCase()`
   // after `.trim()`. The many tests elsewhere all use the exact literal
   // phrase - these specifically probe the two things .trim()+toLowerCase()
@@ -5646,7 +5521,6 @@ function makeFakeGitHub({
   // trailing whitespace is tolerated, but the match is still exact
   // character-for-character in between - a real copy-paste artifact like an
   // internal non-breaking space is deliberately NOT treated as a match.
-  // ===========================================================================
   await test("handleIssueComment recognizes the sign phrase with mixed CASE and extra ordinary/unicode whitespace around it (leading/trailing, not internal)", async () => {
     const gh = makeFakeGitHub({
       commits: [

@@ -156,9 +156,7 @@ gh attestation verify "${temporary}/assets/${name}.tar.gz" \
   --source-digest "$commit" \
   --predicate-type "https://cyclonedx.org/bom"
 
-# Hand the write-capable Latest job a fingerprint of the exact verified
-# assets plus the verified tag binding. That job can re-fetch and compare
-# these values immediately before its write without executing this helper.
+# Give the Latest job a fingerprint to recheck before its write.
 asset_digest="$(cd "$temporary/assets" && sha256sum -- "${expected_assets[@]}" | sha256sum | awk '{print $1}')"
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   {

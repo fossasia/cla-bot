@@ -1,136 +1,67 @@
-# fossasia/cla-bot
+# FOSSASIA CLA Bot
 
-A small GitHub Action that checks whether contributors have signed
-FOSSASIA's Contributor License Agreement (CLA), and asks them to sign if
-they haven't. It works across every FOSSASIA repository, using one shared
-private repo (`fossasia/cla-signatures`) to keep track of who has signed.
+This GitHub Action checks whether pull request contributors have signed
+FOSSASIA's Contributor License Agreement. It checks commit authors and
+co-authors against a shared private signature repository. A comment alone
+cannot satisfy another contributor's signature requirement.
 
-It's written from scratch in plain Node.js, with no external packages. That
-means there's nothing to install and nothing outside this repo that could
-break or get abandoned.
+The action uses Node.js built-ins and has no runtime dependencies. It does not
+check out or run pull request code.
+
+## Setup
+
+Copy [`examples/consumer-workflow.yml`](./examples/consumer-workflow.yml) to
+`.github/workflows/cla.yml`, then fill in its inputs and secrets. For the
+organization-wide setup, see [`SETUP_GUIDE.md`](./SETUP_GUIDE.md).
+
+Pin the action to the full commit SHA of a verified release. Keep the version
+in a comment so Dependabot or Renovate can update both:
+
+```yaml
+uses: fossasia/cla-bot@<verified commit SHA> # vX.Y.Z
+```
+
+See [release verification](./SECURITY.md#verifying-a-release) before using a
+release.
 
 ## How it works
 
-1. Someone opens a pull request in a FOSSASIA repo that has this bot set up.
-2. The bot checks if everyone who contributed to that PR has already signed
-   the CLA - this includes co-authors added through a `Co-authored-by` line
-   in a commit message, not just the main author. If someone hasn't signed,
-   it comments with instructions and marks the PR's `cla/fossasia` check as
-   failing.
-3. The contributor replies on the PR with the exact sign phrase.
-4. The bot saves the signature (in `fossasia/cla-signatures`) and re-checks
-   the PR. Once everyone has signed, the check turns green.
-5. Since the signature list is shared across the whole org, signing once
-   covers every other FOSSASIA repo too - no need to sign again.
+1. On a pull request, the bot checks commit authors and `Co-authored-by`
+   trailers against the signature store.
+2. Missing signatures or unresolved authors are reported in a PR comment and
+   the `cla/fossasia` status.
+3. A contributor signs by posting the exact phrase shown in the comment.
+4. The bot records the signature and checks the PR again. One signature then
+   applies across FOSSASIA repositories.
 
-## Why no dependencies
+## Security
 
-Everything here uses only what Node.js already comes with (`fetch`,
-`crypto`, `fs`) - nothing to `npm install`. That keeps the surface area
-small: there's no third-party package that could stop being maintained,
-get compromised, or need updating. See `CONTRIBUTING.md` before adding one.
+- Signatures and allowlist entries use numeric GitHub account ids.
+- A signer cannot satisfy another contributor's requirement.
+- Signature writes use a short-lived GitHub App token when configured.
+- Releases include Sigstore signatures and GitHub attestations.
 
-(The one exception is in `ci.yml`, which installs a small package just to
-double-check `action.yml` is well-formed. That never ships as part of the
-action itself - it's only used to test this repo.)
-
-## Security highlights
-
-The short version:
-
-- Writing to the signatures repo uses a **short-lived** GitHub App token,
-  created fresh each time the bot runs - never a long-lived token sitting
-  in a secret.
-- A PR only counts as "signed" once everyone who contributed to it
-  (checked via the GitHub API, including co-authors) matches the signature
-  list - not just whoever left a comment. Someone else can't clear a PR by
-  signing on your behalf.
-- The list of accounts allowed to skip signing (bots like Dependabot) only
-  matches immutable numeric GitHub account ids - no usernames (which can be
-  renamed and re-claimed) and no wildcards that a person could exploit.
-- This action never checks out or runs any code from the pull request.
-- Releases are **signed and attested** (Sigstore, keyless) by CI from a signed
-  tag, with an SBOM and build provenance - see
-  [Releases and verification](#releases-and-verification).
-
-## Using this in a repo
-
-Copy [`examples/consumer-workflow.yml`](./examples/consumer-workflow.yml)
-into `.github/workflows/cla.yml` in any repo that needs it, and fill in the
-`with:` values for your setup. That file is the actual, tested
-configuration - this README won't duplicate it separately, so it can't
-drift out of date.
-
-Reference the action by the **full commit SHA** of a release you have
-verified, with the version in a trailing comment:
-
-```yaml
-uses: fossasia/cla-bot@<full commit SHA of the release> # vX.Y.Z
-```
-
-A tag is only a name for a commit, and names can be moved; a full commit SHA
-cannot. How to find the SHA and verify the release first is in
-[Releases and verification](#releases-and-verification). Dependabot and
-Renovate keep a SHA pin and its version comment up to date.
-
-For the full org-wide setup - creating the GitHub App, setting up the
-signatures repo, secrets, and rolling this out to every repo - see
-"SETUP_GUIDE.md".
-
-## Releases and verification
-
-Every release is built and published by
-[`release.yml`](./.github/workflows/release.yml) when a signed, annotated
-tag is pushed. It runs the full test suite, then attaches to the release:
-
-- generated `RELEASE_NOTES.md`, the source archive, and the CycloneDX SBOM,
-  each directly signed with [Sigstore](https://www.sigstore.dev/) (keyless -
-  there is no signing key to leak),
-- Cosign signature bundles for those payloads and a signed `SHA256SUMS`
-  manifest covering all three,
-- SLSA build provenance and SBOM attestation bundles, verified with GitHub CLI.
-
-Verify a release before you first use it (`sha256sum`, `cosign verify-blob`,
-`gh attestation verify`, `gh release verify`); the exact commands, what the
-signatures do and do not prove, and how to get the commit SHA to pin are in
-"Verifying a release" in [`SECURITY.md`](./SECURITY.md#verifying-a-release).
-How to cut a release is in `CONTRIBUTING.md`.
+See [`SECURITY.md`](./SECURITY.md) for the security model and its limits.
 
 ## Inputs
 
-| Name                       | Required | Default               | What it's for                                                                                                                                                                                                                                                                                           |
-| -------------------------- | -------- | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `github-token`             | yes      | -                     | Usually `secrets.GITHUB_TOKEN`. See `action.yml` for the exact permissions it needs.                                                                                                                                                                                                                    |
-| `signatures-owner`         | yes      | -                     | The org or user that owns the signatures repo.                                                                                                                                                                                                                                                          |
-| `signatures-repo`          | yes      | -                     | Name of the private repo storing signatures.                                                                                                                                                                                                                                                            |
-| `signatures-path`          | no       | `signatures/cla.json` | Relative path to the file inside that repo. Spaces and non-ASCII are fine (encoded automatically); trailing whitespace and a leading `./` are ignored. `#`, `?`, `%`, `\`, control characters, a trailing `/`, empty/`.`/`..` segments and a `.git` segment are rejected. Full rules: see `action.yml`. |
-| `cla-document-url`         | yes      | -                     | Link to the CLA text shown to contributors.                                                                                                                                                                                                                                                             |
-| `allowlist`                | no       | `''`                  | Comma/whitespace-separated numeric GitHub account ids that don't need to sign (no usernames, no wildcards). See [Allowlist](#allowlist).                                                                                                                                                                |
-| `app-id`                   | no       | `''`                  | GitHub App ID, used to get access to the signatures repo.                                                                                                                                                                                                                                               |
-| `app-private-key`          | no       | `''`                  | The GitHub App's private key (should come from a secret).                                                                                                                                                                                                                                               |
-| `require-verified-commits` | no       | `'false'`             | When `true`, only trusts a commit's author if that same account is also its verified committer - hardens against forged authors. Off by default so unsigned-commit workflows keep working.                                                                                                              |
-| `node-version`             | no       | `'22'`                | Node.js version the bot's script runs on. Only matters if you're on a self-hosted runner without a recent Node already installed.                                                                                                                                                                       |
-
-## Development
-
-```bash
-npm test                       # runs all the tests, no network needed
-npm run coverage               # same, but fails below 100% line/statement/function/branch coverage
-node --check src/cla-bot.js    # quick syntax check
-```
-
-See `CONTRIBUTING.md` for guidelines and `CHANGELOG.md` for what's changed.
-
-## License
-
-Apache-2.0 - see `LICENSE`.
+| Input | Required | Default | Purpose |
+| --- | --- | --- | --- |
+| `github-token` | Yes | | Read PR data, post comments, and set status. See `action.yml` for permissions. |
+| `signatures-owner` | Yes | | Owner of the signature repository. |
+| `signatures-repo` | Yes | | Private repository that stores signatures. |
+| `signatures-path` | No | `signatures/cla.json` | Signature file path. See `action.yml` for path rules. |
+| `cla-document-url` | Yes | | CLA shown to contributors. |
+| `allowlist` | No | Empty | Numeric account ids that do not need to sign. |
+| `app-id` | No | Empty | GitHub App id for signature writes. |
+| `app-private-key` | No | Empty | App private key, provided as a secret. |
+| `require-verified-commits` | No | `false` | Require the author to match the verified committer. |
+| `node-version` | No | `22` | Node.js version for self-hosted runners. |
 
 ## Allowlist
 
-Accounts on the `allowlist` input (bots such as Dependabot, or trusted
-maintainers) don't need to sign the CLA. The allowlist is a list of **numeric
-GitHub account ids**, separated by commas and/or whitespace (so a multi-line
-YAML value works):
+Use comma or whitespace-separated numeric GitHub account ids. Usernames and
+wildcards are rejected.
 
 ```yaml
 allowlist: |
@@ -139,24 +70,24 @@ allowlist: |
   29139614
 ```
 
-Ids are matched against the id GitHub itself reports for each commit author
-or co-author - the same identity the signature store is keyed on. They are
-immutable and never reassigned, so a renamed account stays exempt and a
-different account that later claims an old username does **not** inherit the
-exemption. For that reason usernames are deliberately not supported: any entry
-that isn't a plain positive integer (`dependabot[bot]`, `id:5`, `0`, `1e3`, ...)
-fails the run instead of being silently ignored.
+These ids are for `github-actions[bot]`, `dependabot[bot]`, and
+`renovate[bot]`. Look up an id with:
 
-Ids of the bots most repositories want to exempt (each one is the number in
-the bot's `ID+name[bot]@users.noreply.github.com` commit email, and matches
-`gh api 'users/NAME[bot]' --jq .id`):
+```bash
+gh api 'users/dependabot[bot]' --jq .id
+```
 
-| Bot                   | Account id |
-| --------------------- | ---------- |
-| `github-actions[bot]` | `41898282` |
-| `dependabot[bot]`     | `49699333` |
-| `renovate[bot]`       | `29139614` |
+## Development
 
-Find an id with `gh api users/NAME --jq .id` (bots included, e.g.
-`gh api 'users/dependabot[bot]' --jq .id`), or open
-`https://api.github.com/users/NAME` in a browser.
+```bash
+npm test
+npm run coverage
+node --check src/cla-bot.js
+```
+
+Tests run offline. See [`CONTRIBUTING.md`](./CONTRIBUTING.md) and
+[`CHANGELOG.md`](./CHANGELOG.md) for development and release details.
+
+## License
+
+Apache-2.0. See [`LICENSE`](./LICENSE).

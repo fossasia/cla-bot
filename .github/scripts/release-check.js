@@ -1,61 +1,14 @@
 #!/usr/bin/env node
 "use strict";
-/**
- * Pre-flight checks and metadata generation for a signed release. Used by
- * .github/workflows/release.yml; has no dependencies beyond Node built-ins
- * (same rule as the action itself, see CONTRIBUTING.md).
+/** Release preflight and SBOM helper used by release.yml.
  *
- *   node release-check.js verify --notes <file>
- *       Refuses to continue (exit 1) unless ALL of these hold:
- *         1. RELEASE_TAG is a strict stable semver tag: vMAJOR.MINOR.PATCH.
- *         2. package.json's "version" equals the tag without its "v".
- *         3. package.json declares no runtime dependencies of ANY kind
- *            (dependencies, optionalDependencies, peerDependencies,
- *            bundleDependencies / bundledDependencies). The SBOM below
- *            inventories direct pinned GitHub Actions referenced by the
- *            composite action; npm runtime dependencies are outside that
- *            inventory. Teach buildSbom about them before adding one (and see
- *            CONTRIBUTING.md).
- *         4. CHANGELOG.md has a non-empty "## [X.Y.Z]" section. It becomes
- *            the release notes, written to --notes.
- *         5. The tag is ANNOTATED, the tag object's own name is the tag being
- *            released, it points at GITHUB_SHA (the commit being built), and
- *            GitHub reports its signature as verified.
- *       Check 5 ties a release to an identifiable person: anyone who can push
- *       a tag can start this workflow, but only the holder of a signing key
- *       registered on their GitHub account can push a *verified* one. The
- *       SHA of the verified tag OBJECT is written to $GITHUB_OUTPUT as
- *       `tag-object-sha`: a tag object is content-addressed (commit,
- *       signature and message), so the publish job re-checks that the tag
- *       still resolves to exactly that object right before it releases. That
- *       closes the gap between "verified at build time" and "released later".
+ * `verify --notes <file>` checks the stable tag, package version, changelog,
+ * and verified annotated tag object. `sbom --out <file>` writes a CycloneDX
+ * inventory of direct GitHub Actions pinned in action.yml. It does not cover
+ * downloaded code or dependencies inside those actions.
  *
- *   node release-check.js sbom --out <file>
- *       Writes a CycloneDX 1.6 SBOM inventory of the direct third-party
- *       GitHub Actions referenced by action.yml, each pinned to a full
- *       commit SHA. This is not a complete inventory of everything that may
- *       execute at runtime: shell commands, downloaded code, and dependencies
- *       internal to referenced actions are outside its scope. action.yml is
- *       PARSED as YAML; the `uses` value in every `runs.steps` entry is read,
- *       so no layout (flow
- *       style, value on the next line, quoting) can hide one, while a
- *       `uses` key that is merely data (an input or `with:` value named
- *       "uses") is correctly not a dependency. Only composite actions are
- *       modelled; anything else (a node/docker action, a local `./` action) is
- *       an error rather than an incomplete SBOM.
- *       An unpinned `uses:` fails the command, so a release can never ship
- *       a mutable dependency. `sbom` ALSO refuses npm dependencies itself,
- *       so the scope checks never rely on `verify` having run first.
- *
- * Environment (set by the workflow, never interpolated into shell text):
- *   RELEASE_TAG        e.g. v1.2.3 (github.ref_name)
- *   GITHUB_SHA         commit the tag points at
- *   GITHUB_REPOSITORY  owner/name
- *   GH_TOKEN           read-only token, `verify` only
- *   GITHUB_OUTPUT      optional, file `verify` appends tag-object-sha to
- *   SOURCE_DATE_ISO    optional, commit time for the SBOM (reproducible)
- *
- * Exit codes: 0 ok, 1 a check failed, 2 bad usage.
+ * `verify` uses Node.js built-ins only. `sbom` also needs the installed
+ * `js-yaml` dependency. Exit codes: 0 success, 1 check failed, 2 usage.
  */
 const fs = require("fs");
 const crypto = require("node:crypto");

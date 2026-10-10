@@ -1,66 +1,11 @@
 #!/usr/bin/env node
 "use strict";
-/**
- * Independent safety net behind `npm run coverage:check`, run after
- * `c8 check-coverage`. c8's own threshold check only judges the files c8
- * decided to track, so it can pass when it should not:
+/** Independent coverage guard run after c8. It checks that every source file
+ * is measured at 100%, that the action runs only measured source, and that no
+ * source symlink or relative import escapes src/.
  *
- *  - No data at all. If `include` matches nothing (src/ renamed, the
- *    pattern edited, a typo), c8 reports 0/0 with "Unknown" percentages and
- *    `c8 check-coverage` exits 0. "Nothing was measured" must never read
- *    as "100% covered".
- *  - A source file c8 silently dropped from the report (upstream tracks
- *    cases like this, e.g. bcoe/c8#588 and #610). A new, never-tested
- *    src/*.js must show up as 0% and fail the gate, not vanish from it.
- *
- * So this script does not trust c8's tracking. It lists the source files
- * on disk itself and requires every one of them to appear in
- * coverage/coverage-summary.json, with all four metrics fully covered and
- * at least some code measured overall.
- *
- * It also checks that what ships is what gets measured, because the gate
- * only means something if the executed code is inside src/:
- *
- *  - action.yml (a composite action) must run only `node` scripts that live
- *    under src/ and are in the report, and must not run inline (`-e`) or
- *    preloaded (`-r`, `--import`, `--loader`) code, which is never measured.
- *    That covers the same flags smuggled in through NODE_OPTIONS: in a
- *    step's `env`, as a `NODE_OPTIONS=... node ...` prefix, or via
- *    `export NODE_OPTIONS=...` / `echo NODE_OPTIONS=... >> $GITHUB_ENV` in
- *    any step. A NODE_OPTIONS value built from an expression or variable
- *    (`${{ inputs.x }}`, `$X`) cannot be evaluated here, so it is rejected
- *    too. Otherwise action.yml could be pointed at an unmeasured script, or
- *    preload one, while src/ stays at 100%.
- *  - No file under src/ may load a relative module from outside src/ (also
- *    never measured), and src/ may not contain symlinks (a link such as
- *    src/x.js -> ../tools/x.js would look like measured source but run
- *    code from elsewhere).
- *
- * Known limits (best-effort static guards, deliberately not "fixed"):
- *
- *  - Only literal specifiers are followed: require(path.join(__dirname,
- *    "../x.js")), import(variable), createRequire() and the like are
- *    invisible. Resolving every dynamic load statically is undecidable.
- *  - Shell indirection around `node` (`env node`, `${NODE:-node}`,
- *    `command node`) is not parsed; the project's action.yml uses the plain
- *    form and a regex cannot chase every wrapper without false positives.
- *  - The test process that produces the coverage data is PR code. A
- *    malicious test can forge the V8 coverage files that c8 reads (c8 trusts
- *    any JSON in its temp dir) and so fake 100%. Repository writers can
- *    change tests and the coverage gate without separate approval, and CI
- *    does not cryptographically prove that coverage came from genuine test
- *    execution; that would need a second trusted job or signed coverage
- *    artifacts.
- *
- * Scope: every .js/.cjs/.mjs file under src/ (the shipped action). If a
- * file type here is not matched by .c8rc.json's `include`, it is reported
- * as missing - which is the point: it forces the config to be fixed rather
- * than letting code ship unmeasured.
- *
- * This script is itself part of the PR, so it cannot protect against a PR
- * that edits it; see CONTRIBUTING.md "How the coverage gate is enforced".
- *
- * Exports are pure functions so they can be tested without running c8.
+ * This is a best-effort static check. Dynamic imports and forged coverage data
+ * are outside its scope. See CONTRIBUTING.md for the limits of this gate.
  */
 
 const fs = require("fs");

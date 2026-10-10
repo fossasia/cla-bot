@@ -7,114 +7,25 @@ Format loosely follows [Keep a Changelog](https://keepachangelog.com/).
 
 ### Added
 
-- **Signed, attested releases.** Pushing a signed, annotated `vMAJOR.MINOR.PATCH`
-  tag runs `.github/workflows/release.yml`, the supported verified release
-  path. Repository writers can still create releases manually. CI verifies the
-  tag (annotated, GitHub-verified signature, on
-  `main`, matches `package.json` and `CHANGELOG.md`), re-runs the full test
-  suite and the 100% coverage gate, and publishes generated release notes, a
-  deterministic source archive, and a CycloneDX SBOM, each with a direct
-  Sigstore (cosign, keyless) signature. The signed `SHA256SUMS` covers those
-  payloads; SLSA build-provenance and SBOM attestations provide additional
-  signed proof. Signature and attestation bundles are verified as proof files,
-  not recursively signed. The release is created as a draft, verified,
-  published, and verified again from the public copy. See the "Verifying a
-  release" section in `SECURITY.md`.
-- **Verified Latest selection and recovery.** Latest only advances to the
-  highest stable release whose signed tag, default-branch ancestry, exact
-  assets, checksums, signatures and workflow attestations verify. The workflow
-  supports manual reconciliation after a post-publication failure, without
-  overwriting a published release; updates are eventually consistent when a
-  new release races with an in-flight reconciliation.
-- The publish job pins the tag: it re-checks (before creating the release,
-  before publishing, and after) that the tag still resolves to the exact
-  signed tag object the build job verified. The final publish step also
-  rechecks draft metadata and every asset immediately before publication.
-  `.github/rulesets/release-tags.json` blocks updates/deletions of release tags
-  once imported. The Latest verifier is pinned to the workflow commit, manual
-  recovery cannot bypass the policy gate, and mutability is set in reviewed
-  workflow code. Every `gh attestation
-  verify`, before and after publishing, uses the persisted bundle and pins the
-  repository, signer workflow, tag ref and commit digest.
-- Consumer instructions resolve the tag commit once, require both attestations
-  to match it via `--source-digest`, and pin that same SHA in `uses:`. The
-  release workflow requires GitHub CLI 2.102.0 or newer for attestation
-  verification, verifies published notes/title/tag metadata, retains cross-job
-  artifacts for 90 days, and isolates different version runs from each other.
-- The release workflow now publishes without changing GitHub's `Latest` marker,
-  then reconciles it in a globally serialized job to the highest published
-  stable SemVer tag. Backfilling an older version can no longer demote a newer
-  release; queued reconciliation runs safely re-read the full release list.
-- The release policy now checks GitHub's effective repository and inherited
-  tag rulesets before building, requiring an active `refs/tags/v*` ruleset that
-  blocks updates and deletions. Manual Latest recovery is restricted to the
-  default branch; administrators still verify the empty ruleset bypass list
-  because GitHub may hide it from the workflow's read-only token.
-- The release helper refuses npm dependencies in every field that can pull
-  code in (`dependencies`, `optionalDependencies`, `peerDependencies`,
-  `bundleDependencies`/`bundledDependencies`), and reads `action.yml` as YAML
-  instead of with a line regex.
-- Before publishing, the draft release's assets are downloaded and compared
-  byte for byte, and as a set, with the files that were signed and verified.
-  The published copy is also checked byte for byte and as a set after upload.
-  The build job now builds and hashes the assets before any repository test
-  code runs (the publish job re-checks that digest), and uploads only after the
-  tests pass.
-- The SBOM helper refuses npm dependencies itself (not only via `verify`),
-  reads only `runs.steps[*].uses` of a composite action (a `uses` that is an
-  input or a `with:` value is not a dependency), versions components by their
-  pinned commit, and keeps the human version label as an annotation that is
-  dropped when the source comments disagree. Its scope is the direct pinned
-  GitHub Actions inventory, not all runtime or transitive dependencies.
-- Action dependencies use the registered `pkg:github` PURL type, including the
-  action subpath where applicable; tests validate output against the official
-  CycloneDX 1.6 JSON schema.
-- The tag check also verifies the signed tag object's own name equals the tag
-  being released, so a validly signed tag for another version cannot be
-  replayed under a new ref. The draft check covers release metadata (title,
-  tag, notes, draft and pre-release flags) as well as the assets. The final
-  step now checks the release's own `isImmutable` flag plus GitHub's release
-  attestation, and FAILS the run when a release declared `required` is not
-  immutable, instead of warning.
-- The release helper refuses a local `./` action in `action.yml` (it resolves
-  against the caller's workspace and would hide dependencies from the SBOM), and
-  validates owner/repository/action path syntax and refuses extra `@` suffixes;
-  its changelog parser ignores `##` lines inside fenced code blocks.
-- Third-party code no longer shares a machine with the archive. The release is
-  now six jobs: `policy`, `build` (verifies the tag and builds the archive with
-  `git` and Node built-ins only, no npm), `checks` (installs dev dependencies,
-  generates the SBOM, runs the tests and the 100% coverage gate) and `publish`
-  (which needs both, re-checks both digests, and writes `SHA256SUMS` itself),
-  `verify-latest` (which validates releases from their signed tags through
-  asset attestations and provides a recovery path), and `latest` (which
-  promotes the highest verified stable SemVer release).
-- A release policy gate runs before anything is built: the workflow declares
-  `RELEASE_IMMUTABILITY` (`required` or `not-required`; GitHub's setting cannot
-  be read from a workflow token), and the `release` environment must have no
-  required reviewers. Any actor with repository release rights can publish;
-  the project intentionally permits mutable releases.
-- The last tag check and the publish call are now one shell step, so nothing
-  but one API round trip sits between them.
-- Least-privilege release pipeline: the job that runs repository code can only
-  read; the job that signs and publishes runs no repository code, re-checks
-  the build's digest, and waits on the `release` environment.
-- `.github/scripts/release-check.js` (tag/version/changelog/tag-signature
-  verification, release notes extraction, SBOM generation) with offline tests,
-  and `test/release-workflow.test.js`, which pins the pipeline's security
-  properties (permissions, SHA pinning, no shell interpolation, step order,
-  documented assets).
+- Signed, annotated version tags trigger a release workflow that verifies the
+  tag, tests, and coverage before publishing signed release notes, a source
+  archive, an SBOM, checksums, and GitHub attestations.
+- The workflow separates build, checks, signing, publishing, and Latest
+  reconciliation. Publishing rechecks the signed tag, release metadata, and
+  assets. See [release verification](SECURITY.md#verifying-a-release).
+- Latest points to the highest verified stable release. A manual workflow can
+  reconcile it after a failed update without replacing a published release.
+- Release policy checks validate tag protection, release settings, and
+  environment rules before the build. Administrators must verify the tag
+  ruleset bypass list.
+- Release tooling validates versions, tags, action dependencies, SBOM data,
+  and release assets. Offline tests cover the helpers and workflow policy.
 
 ### Changed
 
-- Documentation (`README.md`, `SETUP_GUIDE.md`, `TESTING_GUIDE.md`,
-  `examples/consumer-workflow.yml`) now recommends pinning the action by the
-  **full commit SHA** of a verified release, with the version in a trailing
-  comment, instead of a mutable tag.
-- `CONTRIBUTING.md`'s release section replaced the manual `git tag` /
-  `git push` steps with the signed-release procedure, one-time repository
-  setup and failure recovery.
-- `README.md`'s security summary said the allowlist matches usernames; it has
-  matched numeric account ids since the id-based allowlist change. Corrected.
+- Setup docs and the example workflow pin verified releases by full commit SHA.
+- README security notes now describe the numeric-id allowlist accurately.
+- Contributor instructions document the signed release process and recovery.
 
 ## [1.0.0]
 

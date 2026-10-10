@@ -1,24 +1,13 @@
 name: CI
 
-# ONE entry point for every pull-request check in this repository.
-#
-# The checks live in their own files (actionlint.yml, zizmor.yml, codeql.yml,
-# coverage.yml) as *reusable workflows* and are called from here, next to the
-# inline `test` job. The last job, `required-checks-pass`, fans in all of
-# them via `needs:`. It is the ONLY status check branch protection has to
-# require (see .github/rulesets/README.md), so adding, removing or renaming
-# a check never means touching repo Settings again.
-#
-# To add a check: add a job below, then add its id to `needs:` of
-# `required-checks-pass`. test/ci-gate.test.js fails the build if you forget.
+# CI entry point. `required-checks-pass` is the only required branch check.
+# Add each new job to its `needs` list; test/ci-gate.test.js checks the gate.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-  # Weekly run of everything, so new advisories/lint rules surface even when
-  # nobody is pushing. Replaces the per-workflow crons the checks used to
-  # have on their own.
+  # Refresh scheduled security and lint checks weekly.
   schedule:
     - cron: "23 4 * * 1"
   workflow_dispatch: {}
@@ -26,13 +15,9 @@ on:
 permissions:
   contents: read
 
-# The ONE concurrency group for the whole gate. The called (reusable)
-# workflows must NOT declare their own: inside a reusable workflow
-# `github.workflow` resolves to the CALLER's name ("CI"), so a same-looking
-# group there would collide with this one and GitHub would cancel the run.
-# See https://docs.github.com/en/actions/reference/workflows-and-actions/reusing-workflow-configurations
-# Only pull_request runs are cancelled on supersede; push/schedule runs on
-# main always run to completion so main keeps a full set of results.
+# One concurrency group for the gate. Reusable workflows must not define one,
+# since their workflow name resolves to this caller. Only superseded PR runs
+# are cancelled; runs on main finish.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -44,18 +29,13 @@ jobs:
     timeout-minutes: 15
     strategy:
       matrix:
-        # 18/20 are past End-of-Life (see package.json's engines field). 22
-        # is current Maintenance LTS, 24 is Active LTS - testing both catches
-        # anything that only breaks on the newer runtime early.
+        # Test the supported Node versions listed in package.json.
         node-version: ["22", "24"]
     steps:
-      # Pinned to a commit SHA, not a tag - tags can be repointed later, a
-      # SHA can't. Check https://github.com/actions/checkout/releases before
-      # bumping this.
+      # Keep third-party actions pinned to reviewed commit SHAs.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          # We only read our own code to run our own tests; no later step
-          # needs a live git credential sitting on disk.
+          # Tests need no checkout credentials after this step.
           persist-credentials: false
 
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -63,10 +43,7 @@ jobs:
           node-version: ${{ matrix.node-version }}
           cache: "npm"
 
-      # package-lock.json pins js-yaml (used below, only to validate
-      # action.yml) to an exact version. `npm ci` installs exactly what's
-      # locked instead of resolving fresh, and `--ignore-scripts` stops any
-      # dependency from running install-time scripts.
+      # Install the lockfile versions without running package scripts.
       - name: Install dependencies
         run: npm ci --ignore-scripts
 
@@ -121,16 +98,7 @@ jobs:
             console.log('action.yml is valid YAML with the required structure');
           "
 
-  # The four checks below are called as `./.github/workflows/<file>.yml`,
-  # not with GitHub's newer self-repository form (`$/.github/workflows/...`,
-  # which zizmor's `self-repository` audit prefers as a "help"-level, not
-  # blocking, suggestion). `./` is used deliberately: actionlint v1.7.12
-  # (also a gate here, via actionlint.yml) rejects `$/` outright, while `./`
-  # is understood by it, works on every runner/GHES version, and for a
-  # `pull_request` run resolves to the very commit under test. Each `uses:`
-  # below is annotated to suppress that one low-severity zizmor suggestion;
-  # switch to `$/` once actionlint supports it (the failing linter will
-  # tell you when that is safe).
+  # Use ./ paths until the pinned actionlint version supports $/ references.
   actionlint:
     name: actionlint
     permissions:
@@ -159,22 +127,8 @@ jobs:
       contents: read
     uses: ./.github/workflows/coverage.yml # zizmor: ignore[self-repository]
 
-  # >>> The ONLY job to mark as a required status check in branch protection. <<<
-  # (Its check name is exactly "Required checks pass" - see
-  # .github/rulesets/main.json and .github/rulesets/README.md.)
-  #
-  # - `if: always()` is essential. Without it this job is SKIPPED, not
-  #   failed, whenever a dependency fails - and GitHub treats a skipped
-  #   required check as passing, which would silently turn the whole gate
-  #   green exactly when something broke.
-  # - The check is an allow-list: every needed job must be exactly `success`.
-  #   `failure`, `cancelled` and `skipped` all fail the gate, so a job that
-  #   someone later gates behind an `if:` cannot quietly stop being enforced.
-  # - The needs JSON goes through an environment variable, never straight
-  #   into the script text, so there is nothing to inject into.
-  # - Keep this job free of `if:` conditions other than always(), and keep
-  #   `needs` equal to every other job in this file.
-  #   test/ci-gate.test.js enforces both.
+  # The required check fails unless every other job succeeds, including jobs
+  # that were skipped. Keep `needs` in sync with all jobs above.
   required-checks-pass:
     name: Required checks pass
     if: ${{ always() }}

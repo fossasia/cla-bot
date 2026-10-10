@@ -1,15 +1,5 @@
 "use strict";
-/**
- * Offline tests for .github/scripts/coverage-report.js - the script that
- * turns c8's output into the "Test Coverage" PR comment. No network.
- * Run: node test/coverage-report.test.js (also part of `npm test`).
- *
- * The script isn't part of the shipped action (src/cla-bot.js), so it is
- * deliberately outside the 100%-coverage gate (.c8rc.json only includes
- * src/**), but it sits inside the CI gate itself - if it silently
- * misreported, contributors would be told the wrong thing - so it is tested
- * thoroughly anyway, including against genuine c8 output.
- */
+/** Tests the offline coverage report generator and its CLI. */
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");
@@ -181,9 +171,8 @@ test("resolvePaths follows the directory it is given, not wherever the module wa
 });
 
 // --- isFileFullyCovered ---------------------------------------------------------
-// The exact bug a reviewer flagged: a file can be 100% on lines, branches
-// and functions while a *statement* is still uncovered (two statements on
-// one line), so all four metrics have to be checked.
+// Statement coverage can differ from line coverage when a line has two
+// statements, so check all four metrics.
 
 test("isFileFullyCovered is true only when all four metrics are 100%", () => {
   assert.strictEqual(isFileFullyCovered(fullEntry()), true);

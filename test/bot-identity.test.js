@@ -1,12 +1,5 @@
 "use strict";
-/**
- * resolveBotLogin() caches its result at module scope (same pattern as
- * getSignaturesToken's token cache), so each scenario needs its own fresh
- * process - that's why this is a separate file rather than more cases
- * bolted onto http.test.js or integration.test.js.
- *
- * Run: node test/bot-identity.test.js (also included in `npm test`)
- */
+/** Tests bot identity fallback when GET /user fails. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "dummy";

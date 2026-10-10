@@ -1,15 +1,5 @@
 "use strict";
-/**
- * Offline tests for .github/scripts/verify-coverage.js - the independent
- * check run after `c8 check-coverage` so that "nothing was measured" or "a
- * source file was dropped from the report" can never pass as 100%.
- * Run: node test/verify-coverage.test.js (also part of `npm test`).
- *
- * The last group runs the REAL c8 with the project's REAL .c8rc.json on
- * tiny scratch projects, so these tests describe what c8 actually does
- * (including where it passes when it shouldn't) rather than what a
- * hand-written fixture assumes.
- */
+/** Tests the independent coverage check, including its c8 integration. */
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");

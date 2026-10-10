@@ -1,15 +1,5 @@
 "use strict";
-/**
- * dedupeIdenticalTrailingComments() deletes identical bot comments that a
- * race between two runs left behind. It also logs a ::warning:: when it finds
- * any, so a maintainer can notice a consuming workflow that is missing the
- * `concurrency:` group which is what actually prevents that race.
- *
- * The function is not exported, so it is exercised through postComment(),
- * the way the other dedupe tests do.
- *
- * Run: node test/duplicate-warning.test.js (also included in `npm test`)
- */
+/** Tests duplicate cleanup warnings when concurrent runs race. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "dummy";

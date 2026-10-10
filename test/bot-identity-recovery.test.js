@@ -1,24 +1,5 @@
 "use strict";
-/**
- * Regression coverage for: getExistingBotComments() used to filter strictly
- * to the CURRENTLY resolved bot identity (resolveBotLogin()). A consumer
- * that switches GITHUB_TOKEN from the default Actions token to a PAT or a
- * separate GitHub App installation token (or back) mid-flight would then
- * have every comment posted under the OLD identity silently excluded from
- * checkPR's "was this PR ever genuinely blocked" history check. A PR
- * blocked before the switch would look like it was never flagged once the
- * identity changed, and its recovery announcement ("All contributors have
- * signed the CLA. ✅") would be wrongly suppressed - even though nothing
- * about the PR itself changed, only which credential the automation runs
- * under.
- *
- * resolveBotLogin() caches its result at module scope for the life of the
- * process (same pattern as getSignaturesToken's token cache and the other
- * bot-identity*.test.js files), so this needs its own fresh process rather
- * than more cases bolted onto integration.test.js.
- *
- * Run: node test/bot-identity-recovery.test.js (also included in `npm test`)
- */
+/** Tests that bot comments remain recognizable after a token identity change. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "a-pat-not-the-actions-token";

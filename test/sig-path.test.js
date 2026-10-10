@@ -1,31 +1,5 @@
 "use strict";
-/**
- * Tests for how SIG_PATH / SIG_OWNER / SIG_REPO become signature-store request
- * URLs: validation (findSigPathProblem), per-segment encoding
- * (encodeRepoPath / sigContentsApiPath), the defense-in-depth refusal in the
- * URL builders, and the real CLI entrypoint's behaviour on a bad value.
- *
- * Why this exists: Node's fetch() parses URLs with the WHATWG algorithm, so
- * an unencoded "#" or "?" silently truncates the request path, "%2e%2e" is
- * collapsed into a real ".." traversal, and tab/CR/LF are silently stripped.
- * Because readSignatures() treats a 404 as "no signatures yet", a truncated
- * path looks exactly like an empty store and the bot would read/write the
- * WRONG file without any error. These tests pin down that this can't happen.
- *
- * Backward compatibility is part of the contract too (see CONTRIBUTING.md,
- * rule 4): every SIG_PATH the old, un-normalized code accepted must address
- * EXACTLY the same file now (byte-identical request URL, or - for
- * sub-delimiters like "+" - a semantically identical one). The old code's
- * quirks were: fetch()'s URL parser strips TRAILING C0-control-or-space
- * characters and collapses a leading "./"; everything else - including
- * LEADING whitespace and Unicode whitespace like NBSP at either end - stayed
- * part of the file name. The compat tests below therefore compare against
- * the old code's behaviour on the RAW value (never a pre-trimmed one, which
- * would hide exactly the divergence they exist to catch).
- *
- * No network, no mocking library. Run: node test/sig-path.test.js
- * (also part of `npm test`).
- */
+/** Tests signature path validation, URL encoding, compatibility, and CLI errors. */
 const assert = require("assert");
 const crypto = require("crypto");
 const path = require("path");

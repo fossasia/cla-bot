@@ -1,32 +1,5 @@
 "use strict";
-/**
- * Regression coverage for: checkPR()'s per-signer personalized completion
- * message (personalSuccessMessage(), replacing the generic "All
- * contributors have signed the CLA. ✅" announcement whenever the person who
- * just signed via a comment is the one who completed the PR's requirement)
- * must NOT credit an allowlisted account with "completing" a PR - allowlisted
- * authors are excluded from `missing` regardless of their signature status
- * (see isAllowlisted() in checkPR's `missing` filter), so their signing never
- * actually blocked anything to begin with.
- *
- * This is deliberately a full, real handleIssueComment -> checkPR run
- * against a mocked fetch, NOT just a direct call to the extracted
- * signerCompletedRequirement() helper (that gets its own unit coverage in
- * test/logic.test.js) - a unit test of the helper in isolation would stay
- * green even if checkPR's actual call site stopped using it (e.g. someone
- * "simplifies" checkPR back down to `signer ? personalSuccessMessage(...) :
- * SUCCESS_MESSAGE` and drops the allowlist gate entirely). Only exercising
- * the real orchestration proves the gate is actually wired in.
- *
- * ALLOWLIST is read into a module-scope const at require time (see
- * src/cla-bot.js), and test/integration.test.js already fixes it to ""
- * for its entire process - so, like the bot-identity*.test.js files (which
- * need their own GITHUB_TOKEN/env), this needs its own fresh process with a
- * real, non-empty ALLOWLIST rather than a case bolted onto
- * integration.test.js.
- *
- * Run: node test/allowlist-signer-credit.test.js (also included in `npm test`)
- */
+/** Tests that allowlisted signers are not credited with completing a PR. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "dummy-token";
@@ -171,7 +144,7 @@ function b64(obj) {
       "an allowlisted account was never actually blocking this PR, so checkPR's real success path must not personally credit it with completing that PR",
     );
 
-    // The signature is still genuinely recorded, though - this is about
+    // The signature is still recorded; this is about
     // withholding undue CREDIT for completing a PR, not about refusing to
     // record a real signature.
     assert.ok(

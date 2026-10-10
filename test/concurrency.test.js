@@ -1,20 +1,5 @@
 "use strict";
-/**
- * The bot's independent GitHub reads (co-author lookups, pages of commits and
- * comments, the bot's own login) run side by side through one
- * limiter instead of one after another. These tests check that:
- *
- *   1. the limiter and the `Link` header parser work on their own,
- *   2. reads really overlap, and never go past the limit of 8,
- *   3. the result is exactly what the one-by-one code gave (same items, same
- *      order, same failures), even if a list grows while we read it,
- *   4. renamed co-authors end up where we expect (see the last section).
- *
- * Overlap is measured by counting requests in flight and the order they
- * start in, never by time, so nothing here is flaky.
- *
- * Run: node test/concurrency.test.js (also part of `npm test`)
- */
+/** Tests bounded concurrency, pagination, and author ordering. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "dummy";
@@ -85,9 +70,7 @@ function makeTracker() {
 const linkTo = (path, last) =>
   `<https://api.github.com${path}?per_page=100&page=2>; rel="next", <https://api.github.com${path}?per_page=100&page=${last}>; rel="last"`;
 
-// ---------------------------------------------------------------------------
 // 1. The limiter
-// ---------------------------------------------------------------------------
 (async () => {
   await test("createLimiter never runs more than the maximum at once, runs every task, and starts them in queue order", async () => {
     const run = bot.createLimiter(3);
@@ -144,9 +127,7 @@ const linkTo = (path, last) =>
     assert.deepStrictEqual(results[1], { status: "fulfilled", value: 7 });
   });
 
-  // -------------------------------------------------------------------------
   // 2. The Link header parser
-  // -------------------------------------------------------------------------
   await test("parseLastPage reads the real GitHub header, in either order", () => {
     const next =
       '<https://api.github.com/repositories/1/issues/2/comments?per_page=100&page=2>; rel="next"';
@@ -309,9 +290,7 @@ const linkTo = (path, last) =>
     );
   });
 
-  // -------------------------------------------------------------------------
   // 3. ghRaw withLink
-  // -------------------------------------------------------------------------
   await test("ghRaw returns { data, link } only when asked, and tolerates a response with no headers", async () => {
     global.fetch = async () => res(200, [1, 2], { link: 'x; rel="last"' });
     assert.deepStrictEqual(await bot.ghRaw("/p", "t", { withLink: true }), {
@@ -343,9 +322,7 @@ const linkTo = (path, last) =>
     });
   });
 
-  // -------------------------------------------------------------------------
   // A fake GitHub for the identity / comments / checkPR tests
-  // -------------------------------------------------------------------------
   // Default base SHA for every test PR. Distinct from headSha so a mock that
   // forgets to set one stands out immediately instead of accidentally working.
   const BASE_SHA = "base0000".repeat(5);
@@ -505,9 +482,7 @@ const linkTo = (path, last) =>
   const newStyle = (id, name = "someone") =>
     `${id}+${name}@users.noreply.github.com`;
 
-  // -------------------------------------------------------------------------
   // 4. Co-author identity lookups
-  // -------------------------------------------------------------------------
   await test("extractCoAuthors: all lookups of one commit are in flight together, and the result keeps TRAILER order even when answers arrive in reverse", async () => {
     const b = freshModule();
     const ids = [101, 102, 103, 104, 105, 106];
@@ -604,9 +579,7 @@ const linkTo = (path, last) =>
     }
   });
 
-  // -------------------------------------------------------------------------
   // 5. listPRCommitAuthors
-  // -------------------------------------------------------------------------
   const commit = (n, id, login, message = "", extra = {}) => ({
     sha: `c${n}`,
     author: { id, login },
@@ -769,9 +742,7 @@ const linkTo = (path, last) =>
     );
   });
 
-  // -------------------------------------------------------------------------
   // 6. Comments: bot login + pages, and the dedupe on top of them
-  // -------------------------------------------------------------------------
   const BOT_MARKER = "<!-- fossasia-cla-bot:v1 -->";
   const botComment = (id, body) => ({
     id,
@@ -887,9 +858,7 @@ const linkTo = (path, last) =>
     assert.strictEqual(remaining.length, 1);
   });
 
-  // -------------------------------------------------------------------------
   // 7. checkPR: the PR snapshot (base + head) is read BEFORE the commit list
-  // -------------------------------------------------------------------------
   await test("checkPR with no headSha reads the PR first, then compares base...head, and uses the head it read", async () => {
     const b = freshModule();
     const sha = "b".repeat(40);
@@ -994,9 +963,7 @@ const linkTo = (path, last) =>
     );
   });
 
-  // -------------------------------------------------------------------------
   // 7b. The limit of 8 counts EVERY read that can overlap
-  // -------------------------------------------------------------------------
   await test("checkPR: co-author lookups stay within the limit of 8 while the PR is re-read", async () => {
     const b = freshModule();
     const ids = Array.from({ length: 30 }, (_, i) => 900 + i);
@@ -1046,9 +1013,7 @@ const linkTo = (path, last) =>
     }
   });
 
-  // -------------------------------------------------------------------------
   // 7c. Renamed co-authors
-  // -------------------------------------------------------------------------
   const SHA = "d".repeat(40);
   const alice = { id: 1, login: "alice" };
 
@@ -1123,9 +1088,7 @@ const linkTo = (path, last) =>
     assert.ok(g.posted[g.posted.length - 1].body.includes("- @OldName"));
   });
 
-  // -------------------------------------------------------------------------
   // 8. End to end at scale
-  // -------------------------------------------------------------------------
   await test("at scale: 250 commits (3 pages), 250 distinct co-authors and a 230-comment PR give the right verdict with bounded concurrency and exactly one request per identity", async () => {
     const b = freshModule();
     const N = 250;
@@ -1185,17 +1148,7 @@ const linkTo = (path, last) =>
     );
   });
 
-  // -------------------------------------------------------------------------
-  // 8. checkPR: the author list always belongs to the exact revision we
-  //    report on, because it's read by comparing two fixed commit SHAs
-  //
-  // There used to be a pin-head / list-commits / re-read-head dance here,
-  // because the old commits endpoint tracked the PR's live, moving head. A
-  // force-push at exactly the wrong moment could still slip a mixed commit
-  // list past that check (see git history / PR review for the details).
-  // Comparing two fixed SHAs removes the moving target entirely: a commit
-  // SHA can't change once it exists, so there's nothing left to race.
-  // -------------------------------------------------------------------------
+  // Compare fixed SHAs so the author list stays tied to the reported revision.
   const REV_A = "a".repeat(40);
   const REV_B = "b".repeat(40);
 
@@ -1706,9 +1659,7 @@ const linkTo = (path, last) =>
     );
   });
 
-  // -------------------------------------------------------------------------
   // 5. Page limits for the commit list
-  // -------------------------------------------------------------------------
   await test("listCommitsBetween: a compare that needs more than 100 pages fails after one request, whether total_commits or the Link header says so", async () => {
     for (const [total, header, why] of [
       [10001, null, "total_commits"],
@@ -1804,9 +1755,7 @@ const linkTo = (path, last) =>
     );
   });
 
-  // -------------------------------------------------------------------------
   // 6. Comment history does not depend on page boundaries
-  // -------------------------------------------------------------------------
   const BOT_MARK = "<!-- fossasia-cla-bot:v1 -->";
   const pagedBotComment = (id, kind) => ({
     id,
@@ -1913,9 +1862,7 @@ const linkTo = (path, last) =>
     assert.deepStrictEqual(deletes, [], "the only copy is not deleted");
   });
 
-  // -------------------------------------------------------------------------
   // 7. The PR is checked again right before a result is published
-  // -------------------------------------------------------------------------
   // GET /pulls/1 answers with whatever `prAt(readNumber)` says. Compare
   // answers by BASE: only the pair based on `A` leaves bob out.
   function makeMovingBase(prAt) {
@@ -1984,15 +1931,8 @@ const linkTo = (path, last) =>
     assert.strictEqual(g.posted.length, 0, "no comment");
   });
 
-  // -------------------------------------------------------------------------
-  // 8. The final base/head check and the status write are two separate HTTP
-  //    calls, so GitHub gives us no way to make them atomic. checkPR() now
-  //    reads the PR once more right AFTER publishing too, and treats that
-  //    the same way as the pre-publish check above: a base that moved onto
-  //    the very same head is re-evaluated and re-published instead of being
-  //    left alone. These tests are the missing regression test the review
-  //    repeatedly asked for.
-  // -------------------------------------------------------------------------
+  // A base can change between the final check and status write. Verify again
+  // after publishing and re-evaluate if the same head now has a new base.
   await test("checkPR: a base change landing right after a successful publish is caught and corrected - the stale 'success' is not left standing", async () => {
     const b = freshModule();
     const A = "a1".repeat(20);
@@ -2174,12 +2114,10 @@ const linkTo = (path, last) =>
     assert.strictEqual(g.statuses[1].state, "failure");
   });
 
-  // -------------------------------------------------------------------------
   // 9. A real failure (not just a stale pair) after a status has already
   //    landed: checkPR() must not let that status stand unconfirmed, and
   //    failClosedStatus()'s own best-effort recovery write can itself fail
   //    without masking the original error.
-  // -------------------------------------------------------------------------
   await test("checkPR: a hard failure after a successful publish still fails closed, and a failed recovery write doesn't mask the original error", async () => {
     const b = freshModule();
     const A = "a1".repeat(20);

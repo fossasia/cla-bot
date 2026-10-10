@@ -1,198 +1,81 @@
-# FOSSASIA CLA Bot Setup Guide
+# FOSSASIA CLA Bot Setup
 
-## Architecture
+The setup has three parts: publish this action, create a private signature
+repository, and install a GitHub App that can write to it. Consumer
+repositories use the tested workflow in `examples/consumer-workflow.yml`.
 
-- `fossasia/cla-bot` - this action itself (zero npm dependencies). Every
-  repo references a signed release of it, pinned by the release's **full
-  commit SHA** with the version in a trailing comment:
-  `uses: fossasia/cla-bot@<full commit SHA> # vX.Y.Z`. Which release and which
-  SHA - see Step 1.4 below. Don't hardcode a version number anywhere else in
-  your own notes; it goes stale the moment a new version ships.
-- `fossasia/cla-signatures` - a private repo holding the signature record,
-  `signatures/cla.json`.
-- Each project repo gets a workflow file at `.github/workflows/cla.yml`,
-  copied from this repo's `examples/consumer-workflow.yml`, that triggers
-  the bot.
+## 1. Publish the action
 
-Writing to the signatures repo from another repo uses a short-lived GitHub
-App token - no long-lived personal access token is stored anywhere.
+Create the public `fossasia/cla-bot` repository and push this code. Run
+`npm test`, then follow the signed release steps in
+[`CONTRIBUTING.md`](./CONTRIBUTING.md#releasing-a-new-version).
 
----
+Before using a release, verify its assets and attestations using
+[SECURITY.md](./SECURITY.md#verifying-a-release). Copy the exact `SOURCE_SHA`
+resolved and verified there into each consumer workflow as a full commit SHA.
+Add the version as a trailing comment. Do not resolve the tag again after
+verification or use a moving tag in production.
 
-## Step 1 - Publish the `cla-bot` repo
+## 2. Create the signature repository
 
-1. Create a **public** repo named `fossasia/cla-bot` (public is fine -
-   there's no secret in it, just code, and it keeps the `uses:` reference
-   simple for anyone using it).
-2. Push this repo's content to it as-is.
-3. Run `npm test` and confirm every test passes. The count grows as the bot
-   gets more features, so don't assume a specific number - just check for
-   `ALL TESTS PASSED.`
-4. **Cut a signed release - don't skip this, everything after this step
-   depends on it existing.** Releases are built, signed and published by CI
-   from a signed tag; nobody creates one by hand. The one-time repository
-   settings (mutable releases, the
-   `release` environment and tag ruleset, and a registered signing key) and the exact steps are in CONTRIBUTING.md's
-   "Releasing a new version" section. In short:
-   ```bash
-   git tag -s v1.0.0 -m "cla-bot v1.0.0"   # or whatever version CHANGELOG.md says
-   git push origin v1.0.0
-   ```
-   The **Release** workflow publishes without a second-person approval; wait
-   for its verification to finish.
-5. **Verify the release before anyone depends on it.** Open
-   `https://github.com/fossasia/cla-bot/releases` and confirm the release
-   carries `RELEASE_NOTES.md`, the signed archive and SBOM, their Cosign
-   signature bundles, the provenance and SBOM attestations, and signed
-   `SHA256SUMS`, then run the commands in SECURITY.md's "Verifying a release"
-   section. Until a release exists **and verifies**, any workflow referencing
-   it will fail to resolve or should not be trusted.
-6. **Get the commit SHA to pin** (this is what goes into every consumer
-   workflow, not the tag):
-   ```bash
-   git ls-remote --tags https://github.com/fossasia/cla-bot.git v1.0.0 "v1.0.0^{}"
-   ```
-   Use the 40-character SHA on the line ending in `^{}`. Write it as
-   `uses: fossasia/cla-bot@<that full commit SHA> # v1.0.0`. A full commit SHA
-   cannot be moved to different code later, while a tag, even a protected one,
-   is only a name for a commit. When you later release a new version, repeat
-   steps 4-6 and update every reference; Dependabot or Renovate can do the
-   update for you once the SHA-plus-comment form is in place. Never use a
-   moving reference like `v1` or `main` for anything other than testing.
-   CONTRIBUTING.md's "Releasing a new version" section has the full checklist.
+1. Create a private repository named `fossasia/cla-signatures`.
+2. Add the reviewed CLA text as `CLA.md`.
+3. Limit access to people who manage CLA records. The repository contains
+   contributor names, account ids, and timestamps.
+4. Do not create `signatures/cla.json`; the bot creates it when the first
+   contributor signs.
 
-## Step 2 - Create the central signatures repo
+## 3. Create and install a GitHub App
 
-1. Create a **private** repo named `fossasia/cla-signatures`.
-2. Add a `CLA.md` to it with the CLA text (get this reviewed by whoever
-   handles FOSSASIA's legal matters before treating it as final).
-3. Don't manually create `signatures/cla.json` - the bot creates it
-   automatically the first time anyone signs.
-4. **Privacy access control**: give access to this private repo only to the
-   people who need to manage CLA records. It contains contributors' names,
-   GitHub ids, and timestamps. This limits access to personal data; it does
-   not create an approval requirement for code changes or releases.
+1. Create an organization App named `fossasia-cla-bot`.
+2. Disable its webhook. It only needs to mint installation tokens.
+3. Grant **Repository permissions → Contents: Read and write**.
+4. Allow installation only on the FOSSASIA account, then install it only on
+   `fossasia/cla-signatures`.
+5. Save the App ID and downloaded private key for the next step. Keep the key
+   in a secret, not in a file or repository.
 
-## Step 3 - Create a GitHub App (for cross-repo access, not a personal token)
+## 4. Add organization secrets
 
-1. Go to `https://github.com/organizations/fossasia/settings/apps/new`.
-2. Name it `fossasia-cla-bot`. Under Webhook, **uncheck "Active"** - this
-   app only mints tokens, it doesn't need to receive webhooks.
-3. Permissions: **Repository permissions → Contents: Read and write**. It
-   doesn't need anything else.
-4. Under "Where can this GitHub App be installed?", choose **Only on this
-   account**.
-5. After creating it:
-   - Note down the **App ID** (this becomes the `CLA_APP_ID` secret).
-   - Click **Generate a private key** - this downloads a `.pem` file
-     (this becomes the `CLA_APP_PRIVATE_KEY` secret). Don't keep a copy of
-     this file anywhere else.
-6. **Install** the app, but only on the `fossasia/cla-signatures` repo
-   ("Only select repositories", pick just that one). This means its token
-   can only ever touch that one repo, even if it were somehow leaked.
+At the organization Actions secrets page, create:
 
-## Step 4 - Add org secrets (scoped, not "All repositories")
+- `CLA_APP_ID`: the App ID.
+- `CLA_APP_PRIVATE_KEY`: the full `.pem` contents, including real line breaks.
 
-Go to `https://github.com/organizations/fossasia/settings/secrets/actions`.
+Set access to **Selected repositories** and include only repositories that
+need the CLA check. Do not replace line breaks with the characters `\n`.
 
-Create two secrets:
+## 5. Add the consumer workflow
 
-- `CLA_APP_ID` = the App ID from Step 3
-- `CLA_APP_PRIVATE_KEY` = the entire content of the `.pem` file
+Copy `examples/consumer-workflow.yml` to each repository's
+`.github/workflows/cla.yml`. Set the signature repository, CLA URL, verified
+action SHA, and required secrets. Keep the workflow's permissions and
+per-PR concurrency settings.
 
-⚠️ **Common mistake**: paste the `.pem` file's raw content, with real line
-breaks, directly into the secret's value box. Don't convert the line
-breaks into a literal `\n` - that makes JWT signing fail with a confusing
-OpenSSL parse error. GitHub Secrets support multi-line values natively, no
-escaping needed.
+Check the repository's organization base permissions. Keep private signature
+records unavailable to members who do not manage them.
 
-Set repository access to **"Selected repositories"** - pick only the repos
-that actually need the CLA check. The fewer repos that can see a secret,
-the smaller the blast radius if anything ever goes wrong.
+Start with one test repository:
 
-⚠️ **Common mistake #2**: a typo in `signatures-owner`/`signatures-repo`
-(inside the workflow file) won't crash the bot right away. `readSignatures`
-treats a non-existent repo or file the same as "nobody has signed yet" (a
-404), so it will quietly show everyone as missing until someone actually
-tries to sign - that's when the write fails and the job errors out. After
-rolling this out, double-check the values in one repo's workflow file
-match `cla-signatures` exactly.
+1. Open a PR from a second account and confirm the bot lists missing signers.
+2. Post the exact sign phrase shown by the bot.
+3. Confirm the signature appears in `cla-signatures` and the PR status passes.
+4. On another PR, confirm a bystander cannot sign for its author.
 
-## Step 5 - Repository change and release permissions
+After that, add the workflow to the remaining repositories. For a large
+rollout, use an internal deployment script and preserve repositories with
+custom workflows.
 
-Repository permissions determine who can propose and merge changes, including
-workflow changes, and who can create releases. This setup requires no extra
-reviewer or team approval. Required CI checks and the release workflow's tag,
-artifact, and environment-policy validations still apply.
+## Operations
 
-## Step 6 - Check the org-wide default permission (a PII leak check)
+- Keep a regular backup of `cla-signatures` and restrict repository deletion.
+- Notify maintainers about failed workflow runs.
+- When the CLA changes, use a new signature file path and ask contributors to
+  sign again. Keep old records for the audit trail.
 
-Go to `https://github.com/organizations/fossasia/settings/member_privileges`.
+## Limits
 
-Confirm "Base permissions" is set to **"No permission"**, or at least
-something that restricts private-repo access by default. If it's "Read" or
-higher, `cla-signatures` could be visible to the whole org even though it's
-marked "Private" - a broad org-wide default can override the specific
-access control from Step 2.
-
-## Step 7 - Test the workflow on one repo first
-
-1. Copy `examples/consumer-workflow.yml` to a test repo's
-   `.github/workflows/cla.yml`, filling in the `with:` values for your
-   setup.
-2. Open a test PR - ideally from a second GitHub account, so you're
-   testing what a real external contributor would see.
-3. The bot should comment listing the missing signers.
-4. Sign by commenting exactly: `I have read the CLA Document and I hereby sign the CLA`
-5. Confirm a new entry showed up in `cla-signatures`.
-6. **Impersonation test**: on a different PR, comment the sign phrase from
-   a third account and check the PR does _not_ get marked as signed
-   (unless that commenter is actually the PR's commit author). This is
-   already covered by the bot's own test suite, but it's worth confirming
-   once against a real PR too.
-
-## Step 8 - Roll out across the whole org
-
-Copy `examples/consumer-workflow.yml` into every repo that needs the CLA check. If you're
-rolling out to many repos, a small internal script that pushes the
-workflow file via the GitHub API (skipping repos that already have a
-customized `cla.yml`) is worth writing, but that tooling isn't part of
-this repository.
-
-## Step 9 - Backups and monitoring
-
-- Keep a weekly mirror or export of the `cla-signatures` repo somewhere
-  else, in case it's ever accidentally deleted.
-- Where possible, turn on repo deletion protection or require org-owner
-  approval before a repo can be deleted, in Repo Settings.
-- Set up a Slack or email notification for failed workflow runs (a small
-  alert workflow listening for `workflow_run` events works for this).
-
-## Step 10 - CLA versioning process (a plan, not yet needed)
-
-When the CLA text itself changes:
-
-1. Update `CLA.md` in the `cla-signatures` repo.
-2. Point the new workflow version at a new path, like
-   `signatures/cla-v2.json`, instead of the old one.
-3. Announce that everyone needs to re-sign (a blog post or README banner
-   works).
-
-Old signatures stay valid under the old version - they're not deleted,
-just no longer counted for the new one. This keeps a full audit trail.
-
----
-
-## Known limitations
-
-1. **Resolving a commit's email to a GitHub account**: if a contributor's
-   git commit email isn't linked to their GitHub account (a privacy
-   setting), the bot can't automatically resolve who they are - those PRs
-   get flagged as "needs manual verification". This is a limitation shared
-   by every CLA bot out there; it can't be fully automated without asking
-   the contributor to verify their commit email.
-2. **Concurrent write retries**: the bot retries up to a few times when two
-   people sign at almost the same moment, including the very first
-   signature ever written to a brand-new signature file. Under extremely
-   high concurrent signing traffic this could still need watching, but
-   that's an unlikely scale for FOSSASIA in practice.
+- If GitHub cannot link a commit email to an account, the bot asks a
+  maintainer to verify the author.
+- Concurrent signature writes are retried, but unusually high signing volume
+  may still need attention.

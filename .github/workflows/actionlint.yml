@@ -1,14 +1,6 @@
 name: "Lint GitHub Actions workflows"
 
-# Reusable workflow, called from ci.yml (that is what makes it part of the
-# single "Required checks pass" gate). It deliberately has NO push /
-# pull_request / schedule triggers of its own - they would run this check
-# twice per push/PR. `workflow_dispatch` is kept only to re-run it by hand.
-#
-# No `concurrency:` here on purpose: inside a reusable workflow
-# `github.workflow` resolves to the CALLER's name ("CI"), so a same-looking
-# group here would collide with ci.yml's and GitHub would cancel the run.
-# ci.yml owns concurrency for the whole gate.
+# Reusable CI check. ci.yml owns its triggers and concurrency.
 on:
   workflow_call: {}
   workflow_dispatch: {}
@@ -33,7 +25,7 @@ jobs:
         run: echo "::add-matcher::.github/actionlint-matcher.json"
 
       # Official Docker image, pinned by digest for reproducibility.
-      # Digest corresponds to v1.7.12 (latest as of 2026-09-11).
+      # Digest for actionlint v1.7.12.
       - name: Check workflow files with actionlint
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # v1.7.12
         with:
