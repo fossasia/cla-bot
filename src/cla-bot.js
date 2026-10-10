@@ -133,7 +133,7 @@ const [REPO_OWNER, REPO_NAME] = (process.env.GITHUB_REPOSITORY || "/").split(
   "/",
 );
 const EVENT_NAME = process.env.GITHUB_EVENT_NAME;
-const EVENT_PATH = process.env.GITHUB_EVENT_PATH;
+const EVENT_JSON = process.env.GITHUB_EVENT_JSON;
 
 function fail(msg) {
   console.error(`::error::${msg}`);
@@ -459,8 +459,6 @@ async function ghRaw(path, token, options = {}) {
   const fetchOptions = { ...options };
   delete fetchOptions.preserveUnsafeIds;
   try {
-    // Event fields are validated before use; only relative paths reach the API.
-    // codeql[js/file-access-to-http]: validated fields go to the configured GitHub API.
     const res = await fetch(`${GITHUB_API}${assertSafeApiPath(path)}`, {
       ...fetchOptions,
       signal: controller.signal,
@@ -2430,12 +2428,12 @@ async function handlePullRequestTargetInner(payload) {
 // Entry point
 async function main() {
   validateConfig();
-  if (!EVENT_PATH || !fs.existsSync(EVENT_PATH)) {
+  if (!EVENT_JSON) {
     fail(
-      `GITHUB_EVENT_PATH not found (${EVENT_PATH}). This script must run inside a GitHub Actions job.`,
+      "GITHUB_EVENT_JSON not provided. This script must run as a GitHub Action.",
     );
   }
-  const payload = JSON.parse(fs.readFileSync(EVENT_PATH, "utf8"));
+  const payload = JSON.parse(EVENT_JSON);
 
   if (EVENT_NAME === "issue_comment" && payload.action === "created") {
     await handleIssueComment(payload);

@@ -81,5 +81,6 @@ runs:
         SIG_APP_ID: ${{ inputs.app-id }}
         SIG_APP_PRIVATE_KEY: ${{ inputs.app-private-key }}
         REQUIRE_VERIFIED_COMMITS: ${{ inputs.require-verified-commits }}
+        GITHUB_EVENT_JSON: ${{ toJSON(github.event) }}
         ACTION_PATH: ${{ github.action_path }}
       run: node "$ACTION_PATH/src/cla-bot.js"

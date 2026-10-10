@@ -161,7 +161,7 @@ const OS_PASSTHROUGH_VARS = [
 const CLA_BOT_ENV_VARS = [
   "GITHUB_API_URL",
   "GITHUB_EVENT_NAME",
-  "GITHUB_EVENT_PATH",
+  "GITHUB_EVENT_JSON",
   "GITHUB_REPOSITORY",
   "GITHUB_TOKEN",
   "REQUIRE_VERIFIED_COMMITS",
@@ -181,7 +181,16 @@ function buildChildEnv(overrides) {
   for (const key of CLA_BOT_ENV_VARS) {
     env[key] = "";
   }
-  return { ...env, ...overrides };
+  const eventPath = overrides.GITHUB_EVENT_PATH;
+  const childOverrides = { ...overrides };
+  delete childOverrides.GITHUB_EVENT_PATH;
+  const childEnv = { ...env, ...childOverrides };
+  if (!Object.hasOwn(childOverrides, "GITHUB_EVENT_JSON")) {
+    childEnv.GITHUB_EVENT_JSON = eventPath && fs.existsSync(eventPath)
+      ? fs.readFileSync(eventPath, "utf8")
+      : "";
+  }
+  return childEnv;
 }
 
 // A minimal fake GitHub API, just enough to let a full run complete. Keeps
@@ -477,7 +486,7 @@ function baseEnv(apiUrl) {
     }
   });
 
-  await test("the CLI entrypoint fails loudly and exits non-zero when GITHUB_EVENT_PATH doesn't point to a real file", async () => {
+  await test("the CLI entrypoint fails loudly when no serialized GitHub event is provided", async () => {
     const { code, stderr } = await runScript({
       ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
@@ -485,18 +494,12 @@ function baseEnv(apiUrl) {
     });
     assert.notStrictEqual(code, 0, "expected a non-zero exit code");
     assert.ok(
-      /GITHUB_EVENT_PATH not found/.test(stderr),
-      `expected a specific error about the missing event file, got stderr:\n${stderr}`,
+      /GITHUB_EVENT_JSON not provided/.test(stderr),
+      `expected a specific error about the missing event payload, got stderr:\n${stderr}`,
     );
   });
 
-  // The check is `if (!EVENT_PATH || !fs.existsSync(EVENT_PATH))` - the
-  // test above exercises the RIGHT side (a real, non-empty path that just
-  // doesn't exist). This one exercises the LEFT side specifically: no
-  // GITHUB_EVENT_PATH at all (empty string, via buildChildEnv's default),
-  // so `!EVENT_PATH` alone is true and short-circuits before
-  // fs.existsSync() is ever called on it.
-  await test("the CLI entrypoint fails loudly and exits non-zero when GITHUB_EVENT_PATH is entirely unset (as opposed to set-but-nonexistent)", async () => {
+  await test("the CLI entrypoint fails loudly when the serialized event is empty", async () => {
     const { code, stderr } = await runScript({
       ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
@@ -506,13 +509,13 @@ function baseEnv(apiUrl) {
     });
     assert.notStrictEqual(code, 0, "expected a non-zero exit code");
     assert.ok(
-      /GITHUB_EVENT_PATH not found/.test(stderr),
-      `expected the same specific error as the set-but-missing case, got stderr:\n${stderr}`,
+      /GITHUB_EVENT_JSON not provided/.test(stderr),
+      `expected a specific error about the missing event payload, got stderr:\n${stderr}`,
     );
   });
 
   // Invalid JSON makes main() reject and exercises its top-level catch.
-  await test("the CLI entrypoint's top-level main().catch() handler fires (and fails loudly) on a genuinely malformed - not just missing - GITHUB_EVENT_PATH file", async () => {
+  await test("the CLI entrypoint's top-level main().catch() handler fires on malformed event JSON", async () => {
     const eventFile = path.join(
       TMP_DIR,
       `bad-event-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
@@ -525,7 +528,7 @@ function baseEnv(apiUrl) {
       const { code, stderr } = await runScript({
         ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
         GITHUB_EVENT_NAME: "pull_request_target",
-        GITHUB_EVENT_PATH: eventFile,
+        GITHUB_EVENT_JSON: fs.readFileSync(eventFile, "utf8"),
       });
       assert.notStrictEqual(
         code,
@@ -552,7 +555,7 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // Real CLI entrypoint, real event file: a sign-phrase issue_comment whose
+  // Real CLI entrypoint: a sign-phrase issue_comment whose
   // comment.user.id is missing must fail the run (non-zero exit, "::error::"
   // annotation naming the field) WITHOUT a single request reaching the API.
   // 127.0.0.1:1 is unroutable, so if the bot ignored the guard and tried to
@@ -607,16 +610,9 @@ function baseEnv(apiUrl) {
     }
   });
 
-  // Exercise the `e.message` fallback by making readFileSync reject with a
+  // Exercise the `e.message` fallback by making JSON.parse reject with a
   // plain object that has no stack.
   await test("the top-level main().catch() handler falls back to e.message when the rejection has no .stack at all (a non-Error throw)", async () => {
-    const eventFile = path.join(
-      TMP_DIR,
-      `nonerror-event-${Date.now()}-${Math.random().toString(36).slice(2)}.json`,
-    );
-    // The file must genuinely exist so main()'s existsSync guard passes
-    // and execution reaches the patched readFileSync call below.
-    fs.writeFileSync(eventFile, JSON.stringify({ action: "opened" }));
     // A `-r`-preloaded module, NOT a wrapper that `require()`s the real
     // script - requiring cla-bot.js from another script would make THAT
     // script `require.main`, so `if (require.main === module)` inside
@@ -627,16 +623,15 @@ function baseEnv(apiUrl) {
     fs.writeFileSync(
       preload,
       [
-        "const fs = require('fs');",
-        "const originalReadFileSync = fs.readFileSync;",
-        "fs.readFileSync = function (...args) {",
-        `  if (args[0] === ${JSON.stringify(eventFile)}) {`,
+        "const originalParse = JSON.parse;",
+        "JSON.parse = function (value, ...args) {",
+        `  if (value === ${JSON.stringify('{"action":"opened"}')}) {`,
         "    // A plain object, not an Error - no .stack property at all,",
         "    // only .message - exactly the shape that forces the RHS of",
         "    // `e.stack || e.message` to be the one actually used.",
         "    throw { message: 'synthetic non-Error rejection for e.message fallback test' };",
         "  }",
-        "  return originalReadFileSync.apply(fs, args);",
+        "  return originalParse.call(JSON, value, ...args);",
         "};",
       ].join("\n"),
     );
@@ -647,7 +642,7 @@ function baseEnv(apiUrl) {
           env: buildChildEnv({
             ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
             GITHUB_EVENT_NAME: "pull_request_target",
-            GITHUB_EVENT_PATH: eventFile,
+            GITHUB_EVENT_JSON: '{"action":"opened"}',
           }),
         });
         let stderrOut = "";
@@ -671,7 +666,6 @@ function baseEnv(apiUrl) {
         "with no .stack on the thrown value, no stack trace naming main() should appear anywhere in the output - confirming the LHS (e.stack) was genuinely NOT what was used here",
       );
     } finally {
-      fs.unlinkSync(eventFile);
       fs.unlinkSync(preload);
     }
   });
@@ -693,7 +687,14 @@ function baseEnv(apiUrl) {
           CLA_DOCUMENT_URL: "https://example.com/CLA.md",
           ALLOWLIST: "",
           GITHUB_EVENT_NAME: "pull_request_target",
-          GITHUB_EVENT_PATH: "/nonexistent",
+          GITHUB_EVENT_JSON: JSON.stringify({
+            action: "opened",
+            pull_request: {
+              number: 1,
+              head: { sha: "e2e-head-sha" },
+              base: { sha: "e2e-base-sha" },
+            },
+          }),
         },
         { timeoutMs: 200, forceHangUntilKilled: true },
       );

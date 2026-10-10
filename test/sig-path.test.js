@@ -749,6 +749,7 @@ const INVALID_PATHS = [
         // Nothing listens here: validateConfig() must fail first, so no
         // request should ever be attempted.
         GITHUB_API_URL: "http://127.0.0.1:1",
+        GITHUB_EVENT_JSON: "",
         ...overrides,
       },
     });
@@ -806,7 +807,7 @@ const INVALID_PATHS = [
   });
 
   // Previously-working values pass validateConfig (they reach the NEXT check,
-  // the missing event file). Those that normalization changed also announce
+  // the missing event payload). Those that normalization changed also announce
   // it with a ::warning:: - never silently.
   for (const [p, normalized] of [
     ["signatures/my file.json", null],
@@ -820,8 +821,8 @@ const INVALID_PATHS = [
   ]) {
     await test(`CLI: previously-working SIG_PATH ${JSON.stringify(p)} still passes validateConfig${normalized ? " (with a normalization warning)" : " (no warning - used as-is)"}`, () => {
       const r = runCli({ SIG_PATH: p });
-      assert.strictEqual(r.status, 1); // no GITHUB_EVENT_PATH - the NEXT check
-      assert.match(r.stderr, /GITHUB_EVENT_PATH not found/);
+      assert.strictEqual(r.status, 1); // no GITHUB_EVENT_JSON - the NEXT check
+      assert.match(r.stderr, /GITHUB_EVENT_JSON not provided/);
       assert.ok(!/::error::SIG_PATH/.test(r.stderr), r.stderr);
       if (normalized) {
         assert.ok(
@@ -843,7 +844,7 @@ const INVALID_PATHS = [
   await test("CLI warns when whitespace before a literal './' may be a config typo, while keeping the old path", () => {
     const r = runCli({ SIG_PATH: " ./signatures/cla.json" });
     assert.strictEqual(r.status, 1);
-    assert.match(r.stderr, /GITHUB_EVENT_PATH not found/);
+    assert.match(r.stderr, /GITHUB_EVENT_JSON not provided/);
     assert.ok(
       r.stderr.includes('has whitespace before "./"; that whitespace is part of the path'),
       r.stderr,
@@ -865,10 +866,10 @@ const INVALID_PATHS = [
     });
   }
 
-  await test("CLI: a valid awkward-but-legal SIG_PATH passes validateConfig (proceeds to the event-file check instead)", () => {
-    const r = runCli({ SIG_PATH: "签名/a+b@c.json" }); // no GITHUB_EVENT_PATH
+  await test("CLI: a valid awkward-but-legal SIG_PATH passes validateConfig (proceeds to the event-payload check instead)", () => {
+    const r = runCli({ SIG_PATH: "签名/a+b@c.json" }); // no GITHUB_EVENT_JSON
     assert.strictEqual(r.status, 1);
-    assert.match(r.stderr, /GITHUB_EVENT_PATH not found/);
+    assert.match(r.stderr, /GITHUB_EVENT_JSON not provided/);
     assert.ok(!/SIG_PATH/.test(r.stderr));
   });
 
