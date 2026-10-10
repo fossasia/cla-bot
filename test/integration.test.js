@@ -23,6 +23,7 @@ const {
   resolveUserIdByLogin,
   resolveLoginById,
   setStatus,
+  buildCommentUrl,
 } = require("../src/cla-bot.js");
 
 let passed = 0;
@@ -236,6 +237,20 @@ function makeFakeGitHub({
 }
 
 (async () => {
+  await test("buildCommentUrl rejects non-HTTP schemes and server URLs with credentials", () => {
+    for (const serverUrl of [
+      "file:///tmp",
+      "https://user@example.com",
+      "https://:password@example.com",
+    ]) {
+      assert.throws(
+        () => buildCommentUrl(1, 123, serverUrl),
+        /GITHUB_SERVER_URL must be an HTTP\(S\) URL without credentials/,
+        serverUrl,
+      );
+    }
+  });
+
   await test("a sole commit author signing their own PR flips status to success and posts one comment", async () => {
     const gh = makeFakeGitHub({
       commits: [

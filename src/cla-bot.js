@@ -157,9 +157,9 @@ function assertValidPRNumber(value, context) {
   return value;
 }
 
-function buildCommentUrl(prNumber, commentId) {
+function buildCommentUrl(prNumber, commentId, serverUrl = GITHUB_SERVER_URL) {
   if (!Number.isSafeInteger(commentId) || commentId <= 0) return undefined;
-  const server = new URL(GITHUB_SERVER_URL);
+  const server = new URL(serverUrl);
   if (!/^https?:$/.test(server.protocol) || server.username || server.password) {
     throw new Error("GITHUB_SERVER_URL must be an HTTP(S) URL without credentials");
   }
@@ -2491,6 +2491,7 @@ module.exports = {
   assertValidInstallationId,
   assertValidUserId,
   assertValidSha,
+  buildCommentUrl,
   classifyBotComment,
   personalSuccessMessage,
   isSameContributor,
