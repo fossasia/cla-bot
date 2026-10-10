@@ -907,6 +907,9 @@ test("validateConfig rejects SIG_APP_ID values that are not positive decimal int
     "123\r\n",
     "123\u2028",
     "123\u2029",
+    "9007199254740992",
+    "9007199254740993",
+    "999999999999999999999",
   ]) {
     assertConfigFails(
       {
@@ -917,6 +920,14 @@ test("validateConfig rejects SIG_APP_ID values that are not positive decimal int
       "SIG_APP_ID",
     );
   }
+});
+
+test("validateConfig accepts Number.MAX_SAFE_INTEGER as a SIG_APP_ID", () => {
+  assertConfigOK({
+    ...VALID_BASE_CONFIG,
+    SIG_APP_ID: String(Number.MAX_SAFE_INTEGER),
+    SIG_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----",
+  });
 });
 
 // validateConfig checks the PEM header only. A valid-looking header is
