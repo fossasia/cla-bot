@@ -34,6 +34,7 @@ if (NODE_MAJOR < 22 || typeof fetch !== "function") {
 
 // Config (all values come from env vars set by action.yml)
 const GITHUB_API = process.env.GITHUB_API_URL || "https://api.github.com";
+const GITHUB_SERVER_URL = process.env.GITHUB_SERVER_URL || "https://github.com";
 const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
 const SIG_APP_ID = process.env.SIG_APP_ID || "";
 const SIG_APP_PRIVATE_KEY = process.env.SIG_APP_PRIVATE_KEY || "";
@@ -156,6 +157,18 @@ function assertValidPRNumber(value, context) {
   return value;
 }
 
+function buildCommentUrl(prNumber, commentId) {
+  if (!Number.isSafeInteger(commentId) || commentId <= 0) return undefined;
+  const server = new URL(GITHUB_SERVER_URL);
+  if (!/^https?:$/.test(server.protocol) || server.username || server.password) {
+    throw new Error("GITHUB_SERVER_URL must be an HTTP(S) URL without credentials");
+  }
+  return new URL(
+    `/${encodeURIComponent(REPO_OWNER)}/${encodeURIComponent(REPO_NAME)}/pull/${prNumber}#issuecomment-${commentId}`,
+    server.origin,
+  ).href;
+}
+
 // Its own function so NaN and Infinity can be tested directly. They cannot
 // survive a JSON round trip, so a mocked fetch could never produce them.
 function assertValidInstallationId(value, context) {
@@ -215,19 +228,14 @@ function assertValidSha(value, context) {
 // and because the value is echoed into "::error::" log lines.
 const SIG_PATH_UNSAFE_CHAR_RE = /[\\?#%\x00-\x1f\x7f-\x9f]/;
 
-// Remove trailing whitespace and leading `./`. Leading whitespace is removed
-// only when it hides `./`, so intentional leading-space filenames stay intact.
+// Remove trailing whitespace and a literal leading `./`. Leading whitespace
+// remains part of the path, as it was before normalization.
 function normalizeSigPath(raw) {
   let p = raw || "signatures/cla.json";
   let end = p.length;
   while (end > 0 && p.charCodeAt(end - 1) <= 0x20) end -= 1;
   p = p.slice(0, end);
-  for (;;) {
-    let start = 0;
-    while (start < p.length && " \t\n\r\f\v".includes(p[start])) start += 1;
-    if (!p.slice(start).startsWith("./")) break;
-    p = p.slice(start + 2);
-  }
+  while (p.startsWith("./")) p = p.slice(2);
   return p;
 }
 
@@ -370,6 +378,11 @@ function validateConfig() {
   if (SIG_PATH_RAW && SIG_PATH_RAW !== SIG_PATH) {
     console.warn(
       `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} was normalized to ${JSON.stringify(SIG_PATH)} (trailing whitespace/control characters and a leading "./" are ignored). Update the "signatures-path" input to the normalized value to silence this.`,
+    );
+  }
+  if (SIG_PATH_RAW && /^[\t\n\v\f\r ]+\.\//.test(SIG_PATH_RAW)) {
+    console.warn(
+      `::warning::SIG_PATH ${JSON.stringify(SIG_PATH_RAW)} has whitespace before "./"; that whitespace is part of the path. Remove it if unintended.`,
     );
   }
   if (ALLOWLIST.invalid.length) {
@@ -2319,7 +2332,7 @@ async function handleIssueCommentInner(payload) {
                 id: commenterId,
                 login: commenter,
                 pr: `${REPO_OWNER}/${REPO_NAME}#${prNumber}`,
-                commentUrl: payload.comment.html_url,
+                commentUrl: buildCommentUrl(prNumber, payload.comment.id),
                 signedAt: new Date().toISOString(),
               },
             ],

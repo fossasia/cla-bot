@@ -816,7 +816,7 @@ const INVALID_PATHS = [
     ["signatures/cla.json\n", "signatures/cla.json"],
     ["signatures/cla.json   ", "signatures/cla.json"],
     ["./signatures/cla.json", "signatures/cla.json"],
-    [" ./signatures/cla.json", "signatures/cla.json"],
+    [" ./signatures/cla.json", null],
   ]) {
     await test(`CLI: previously-working SIG_PATH ${JSON.stringify(p)} still passes validateConfig${normalized ? " (with a normalization warning)" : " (no warning - used as-is)"}`, () => {
       const r = runCli({ SIG_PATH: p });
@@ -839,6 +839,16 @@ const INVALID_PATHS = [
       }
     });
   }
+
+  await test("CLI warns when whitespace before a literal './' may be a config typo, while keeping the old path", () => {
+    const r = runCli({ SIG_PATH: " ./signatures/cla.json" });
+    assert.strictEqual(r.status, 1);
+    assert.match(r.stderr, /GITHUB_EVENT_PATH not found/);
+    assert.ok(
+      r.stderr.includes('has whitespace before "./"; that whitespace is part of the path'),
+      r.stderr,
+    );
+  });
 
   await test("CLI: a default / already-clean SIG_PATH produces no normalization warning", () => {
     assert.ok(!/normalized/.test(runCli({}).stderr));
