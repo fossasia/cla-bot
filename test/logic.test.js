@@ -922,11 +922,14 @@ test("validateConfig rejects SIG_APP_ID values that are not positive decimal int
   }
 });
 
+const FAKE_PEM_SHAPED_PRIVATE_KEY =
+  "-----BEGIN RSA PRIVATE KEY-----\nnot-real-key-bytes-but-has-the-right-shape\n-----END RSA PRIVATE KEY-----";
+
 test("validateConfig accepts Number.MAX_SAFE_INTEGER as a SIG_APP_ID", () => {
   assertConfigOK({
     ...VALID_BASE_CONFIG,
     SIG_APP_ID: String(Number.MAX_SAFE_INTEGER),
-    SIG_APP_PRIVATE_KEY: "-----BEGIN PRIVATE KEY-----",
+    SIG_APP_PRIVATE_KEY: FAKE_PEM_SHAPED_PRIVATE_KEY,
   });
 });
 
@@ -936,8 +939,7 @@ test("validateConfig accepts a SIG_APP_PRIVATE_KEY that does look like PEM (happ
   assertConfigOK({
     ...VALID_BASE_CONFIG,
     SIG_APP_ID: "12345",
-    SIG_APP_PRIVATE_KEY:
-      "-----BEGIN RSA PRIVATE KEY-----\nnot-real-key-bytes-but-has-the-right-shape\n-----END RSA PRIVATE KEY-----",
+    SIG_APP_PRIVATE_KEY: FAKE_PEM_SHAPED_PRIVATE_KEY,
   });
 });
 
