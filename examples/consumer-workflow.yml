@@ -1,24 +1,15 @@
-# Copy this file to .github/workflows/cla.yml in any repository that should
-# enforce CLA signing. This is the canonical, tested config - it's meant to
-# be copied as-is, only the `with:` values under "Run CLA bot" need filling
-# in for your setup.
+# Copy this tested workflow to .github/workflows/cla.yml and fill in the
+# `with:` values for your repository.
 #
-# ⚠️ The `uses: fossasia/cla-bot@... # vX.Y.Z` line only works once that
-# release exists - see CONTRIBUTING.md's "Releasing a new version" section.
-# Check https://github.com/fossasia/cla-bot/releases before copying, use the
-# latest release that is actually there, and VERIFY IT first ("Verifying a
-# release" in SECURITY.md): every release is signed, and unsigned or
-# partially-signed ones must not be used.
+# Use a published, verified release. See "Verifying a release" in
+# SECURITY.md and the release steps in CONTRIBUTING.md.
 #
-# Pin the action by the full commit SHA you resolved ONCE during the
-# verification procedure in SECURITY.md. That procedure passes the same SHA
-# to gh attestation verify as --source-digest, so the verified provenance must
-# match the commit this workflow will execute. Do not resolve the tag again
-# after verification. Keep the version only in the trailing comment.
-# Dependabot / Renovate update a SHA pin and its comment together.
+# Use the full commit SHA resolved ONCE during the
+# verification procedure in SECURITY.md. Keep the version in the trailing
+# comment. Do not resolve the tag again after verification. Dependabot and
+# Renovate update both together.
 #
-# Full setup walkthrough (creating the GitHub App, the signatures repo,
-# secrets, etc.) is in "SETUP_GUIDE.md" in this repo.
+# See SETUP_GUIDE.md for the GitHub App, signatures repo, and secrets setup.
 
 name: "CLA Bot"
 
@@ -26,41 +17,23 @@ on:
   issue_comment:
     types: [created]
   pull_request_target:
-    # "edited" also covers a title/body change; the bot itself checks
-    # payload.changes.base and only re-runs the CLA check when this PR was
-    # actually retargeted to a different base branch - see
-    # handlePullRequestTarget(). Without "edited" here, a retarget with no
-    # new commit on it (so no "synchronize") is never re-evaluated against
-    # its new base at all.
+    # Retargets arrive as "edited" events. The bot checks changes.base and
+    # ignores title and body edits.
     types: [opened, synchronize, reopened, closed, edited]
 
-# See action.yml's github-token input for exactly why each of these is
-# needed. In short: "pull-requests: read" covers the PR read; "contents: read"
-# is needed for the commit list, which comes from GitHub's Compare endpoint
-# (GitHub gates it behind Contents read); "issues: write" covers both comments
-# and locking (both are Issues-API endpoints even on a PR); "statuses: write"
-# sets the CLA status. Nothing here writes to the repo's contents.
+# Required for reading PRs and commits, posting comments, locking PRs, and
+# setting the CLA status. The workflow does not write repository contents.
 permissions:
   contents: read
   pull-requests: read
   issues: write
   statuses: write
 
-# Without this, two events landing close together for the same PR (e.g. a
-# push arriving right as someone signs) can run as overlapping jobs and
-# race each other - not just duplicate comments, but a slower run posting a
-# stale "not signed" status after a faster run already posted "signed".
-# This queues overlapping runs instead, so each one sees the up-to-date
-# result of the one before it.
+# Serialize events for each PR so concurrent runs cannot overwrite newer
+# signature or status results.
 #
-# `queue: max` matters as much as the group itself: GitHub's default
-# concurrency queue holds only ONE pending run at a time, and a third event
-# arriving while a run is already queued behind the one in progress REPLACES
-# that pending run rather than adding to a line. A signing comment is a
-# state-changing write (it records the signature), not just a re-check, so
-# losing it this way would mean the comment stays on the PR but the
-# signature is never actually recorded. `queue: max` makes every event wait
-# its turn (up to 100 at once) instead of being discarded this way.
+# Keep up to 100 runs queued. Without this, a newer event can replace a
+# pending signing run before it records the signature.
 concurrency:
   group: cla-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: false
@@ -70,10 +43,7 @@ jobs:
   cla-check:
     runs-on: ubuntu-latest
     steps:
-      # `uses: fossasia/cla-bot@<sha>` fetches the action from that repo
-      # automatically; no separate checkout step needed. Replace BOTH the
-      # placeholder SHA and "vX.Y.Z" with a real, verified release (see the
-      # header of this file). Don't leave the placeholders in.
+      # Replace the placeholder SHA and version with a verified release.
       - name: Run CLA bot
         uses: fossasia/cla-bot@REPLACE_WITH_THE_FULL_COMMIT_SHA_OF_THE_RELEASE # vX.Y.Z
         with:
@@ -82,8 +52,7 @@ jobs:
           signatures-repo: cla-signatures
           signatures-path: signatures/cla.json
           cla-document-url: https://github.com/fossasia/cla-signatures/blob/main/CLA.md
-          # Numeric GitHub account ids, NOT usernames (usernames can be
-          # renamed and reclaimed by someone else). Look one up with
+          # Use numeric GitHub account ids. Look them up with
           # `gh api 'users/NAME[bot]' --jq .id`.
           allowlist: |
             41898282
@@ -92,8 +61,7 @@ jobs:
           # 41898282 = github-actions[bot]
           # 49699333 = dependabot[bot]
           # 29139614 = renovate[bot]
-          # Short-lived GitHub App token for writing to the signatures repo.
-          # These are org secrets scoped to "Selected repositories" only -
-          # see "SETUP_GUIDE.md" for how to create the App and set these up.
+          # App credentials for writing to the signatures repo. Scope these
+          # org secrets to selected repositories; see SETUP_GUIDE.md.
           app-id: ${{ secrets.CLA_APP_ID }}
           app-private-key: ${{ secrets.CLA_APP_PRIVATE_KEY }}

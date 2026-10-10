@@ -1,26 +1,5 @@
 "use strict";
-/**
- * Regression tests for the check-then-act race in the identity lookups:
- * resolveUserIdByLogin(), resolveLoginById() and resolveBotLogin().
- *
- * Each of them used to cache the finished VALUE, so two callers asking for
- * the same key before the first request came back both missed the cache and
- * each sent their own GitHub API call. They now cache the in-flight PROMISE,
- * so concurrent (and later) callers share exactly one request.
- *
- * How concurrency is forced: every mocked request parks on a gate that the
- * test only opens AFTER all callers have started, so "all callers passed the
- * cache check before any response arrived" is guaranteed rather than hoped
- * for. Against the old code, every "exactly one request" assertion below
- * fails with N requests.
- *
- * resolveBotLogin() is not exported, so it is exercised through
- * getExistingBotComments()/postComment(). Its cache is module-scope, so each
- * of those scenarios loads a fresh copy of the module (same technique as
- * the other bot-identity tests).
- *
- * Run: node test/cache-race.test.js (also included in `npm test`)
- */
+/** Tests that concurrent identity lookups share one request. */
 const assert = require("assert");
 
 process.env.GITHUB_TOKEN = "dummy";

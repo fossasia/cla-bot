@@ -10,7 +10,7 @@ FOSSASIA's projects.
    (`src/cla-bot.js`, run via `action.yml`) uses only Node.js built-ins on
    purpose - adding a package reintroduces the "could get abandoned or
    compromised" risk this project exists to avoid. If you think one is
-   genuinely justified, open an issue first. (CI tooling is a different
+   clearly justified, open an issue first. (CI tooling is a different
    bar: `.github/workflows/ci.yml` installs `js-yaml` purely to validate
    `action.yml`'s structure, and `c8` measures test coverage. Neither ships
    with the action, so neither counts against this rule.)

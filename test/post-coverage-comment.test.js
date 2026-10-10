@@ -1,17 +1,5 @@
 "use strict";
-/**
- * Offline tests for .github/scripts/post-coverage-comment.js - the
- * privileged (pull-requests: write) script that posts the coverage report
- * as a sticky PR comment. No network: `github` and `core` are in-memory
- * fakes. Run: node test/post-coverage-comment.test.js (also part of
- * `npm test`).
- *
- * The behaviour that matters most here is the TRUST BOUNDARY. The report
- * artifact comes from a job that ran the PR's own test code, so these
- * tests check that nothing in it can redirect the comment to another
- * issue, revive a stale run, attach an old run to a later PR that reuses
- * the same fork branch, or smuggle in notifications.
- */
+/** Tests report validation and safe posting of coverage comments. */
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");

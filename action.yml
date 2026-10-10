@@ -8,17 +8,10 @@ branding:
 inputs:
   github-token:
     description: >-
-      Token for comments/status/locking on this repo - usually
-      secrets.GITHUB_TOKEN. The calling workflow must grant it "issues: write"
-      (comments and locking are Issues-API endpoints even for PRs),
-      "pull-requests: read" (this action only reads PR data, never writes to
-      a PR itself), "statuses: write", and "contents: read". "contents: read"
-      is required in every setup: the commit list comes from GitHub's Compare
-      endpoint, which GitHub only allows with Contents read. It is read-only.
-      If you're not using a GitHub App (app-id/app-private-key left empty) and
-      signatures-repo is the same repo running this workflow, this token also
-      reads and writes the signature file directly, so it needs
-      "contents: write" too.
+      Token for comments, statuses, and PR locking, usually secrets.GITHUB_TOKEN.
+      Grant it issues: write, pull-requests: read, statuses: write, and
+      contents: read. Without a GitHub App, it also needs contents: write when
+      the signatures repo is this repository.
     required: true
   signatures-owner:
     description: "Org/user owning the central signatures repo, e.g. fossasia"
@@ -28,16 +21,11 @@ inputs:
     required: true
   signatures-path:
     description: >-
-      Path to the JSON file inside the signatures repo. Must be a relative
-      path to a file: no leading or trailing "/", no empty, "." or ".."
-      segments, and no ".git" segment. Trailing whitespace/control characters
-      (such as the newline a YAML "|" block adds) and a leading "./" are
-      ignored; any other whitespace, including leading whitespace, is part of
-      the file name. These characters are rejected: "#", "?", backslash,
-      control characters, and "%" (write the literal character instead - a
-      space, not "%20" - because encoding it again would silently address a
-      different file). Spaces and non-ASCII characters are fine and are
-      percent-encoded automatically.
+      Relative path to the signature JSON file. It cannot start or end with
+      "/", contain empty, ".", "..", or ".git" segments, or include "#", "?",
+      backslash, control characters, or "%". A leading "./" and trailing
+      characters through U+0020 are ignored. Spaces and non-ASCII characters
+      are encoded.
     required: false
     default: "signatures/cla.json"
   cla-document-url:
@@ -45,47 +33,38 @@ inputs:
     required: true
   allowlist:
     description: >-
-      Accounts exempt from signing, as numeric GitHub account ids separated
-      by commas and/or whitespace/newlines, e.g. "12345678,87654321". Ids are
-      immutable and never reassigned, unlike usernames (which can be renamed
-      and then claimed by a different account, who would inherit the
-      exemption) - so usernames are NOT accepted, and any non-numeric entry
-      fails the run. Look an id up with `gh api users/NAME --jq .id` (bots:
-      `gh api 'users/dependabot[bot]' --jq .id`). No wildcard support by design.
+      Comma or whitespace separated numeric GitHub account ids. Usernames and
+      wildcards are not accepted. Invalid entries fail the run. Find an id with
+      `gh api users/NAME --jq .id`.
     required: false
     default: ""
   app-id:
-    description: "GitHub App ID used to mint short-lived tokens for cross-repo signature writes. Leave empty to fall back to github-token (only works if signatures-repo equals the current repo)."
+    description: >-
+      GitHub App ID for short-lived tokens used to write signatures in another
+      repository. Leave empty to use github-token; this only works when both
+      repositories are the same.
     required: false
     default: ""
   app-private-key:
-    description: "GitHub App private key (PEM). Must come from a secret never hardcode this."
+    description: "GitHub App private key in PEM format. Store it as a secret."
     required: false
     default: ""
   node-version:
-    description: "Node.js version to run the bot on. Must be 22 or later - older versions make the script exit with an error. Defaults to a current LTS."
+    description: "Node.js version for the bot. Must be 22 or later. Defaults to 22."
     required: false
     default: "22"
   require-verified-commits:
     description: >-
-      When "true", a commit's author is only trusted when that same account
-      is also its cryptographically verified committer. GitHub only ever
-      verifies the committer, never the author, so a validly signed commit
-      can still carry a forged author (e.g. via a public ID+username noreply
-      address) unless both checks agree. An unverified or author != committer
-      commit is flagged for manual review, even if that author already
-      signed the CLA. Off by default so unsigned-commit workflows (the
-      common case) keep working unchanged.
+      When true, trust the author only if that account is also the verified
+      committer. Otherwise flag the commit for manual review, even if the
+      author has signed. Defaults to false.
     required: false
     default: "false"
 
 runs:
   using: "composite"
   steps:
-    # Installs a known Node version explicitly rather than assuming the
-    # runner's PATH has one - self-hosted runners may not. This is a
-    # composite action, not a JS action (node22/node24), so it isn't tied to
-    # GitHub's periodic JS-action-runtime deprecation cycle (see CHANGELOG).
+    # Pin Node explicitly so self-hosted runners use the supported runtime.
     - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: ${{ inputs.node-version }}

@@ -1,11 +1,5 @@
 "use strict";
-/**
- * Offline tests for .github/scripts/release-check.js - the pre-flight and
- * SBOM helper behind the signed-release workflow. GitHub is never contacted:
- * `fetch` is injected. The CLI (`require.main`) path is exercised by running
- * the real script in a child process on scratch directories.
- * Run: node test/release-check.test.js (also part of `npm test`).
- */
+/** Tests release checks and SBOM generation without network access. */
 const assert = require("assert");
 const fs = require("fs");
 const os = require("os");

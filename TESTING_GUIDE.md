@@ -257,7 +257,7 @@ Only these values need to change for the real FOSSASIA deployment:
   `@main` is fine for testing, but production should always pin the full
   commit SHA of a release you have verified. Before switching over, check
   `https://github.com/fossasia/cla-bot/releases` to confirm that release is
-  genuinely there, verify it ("Verifying a release" in SECURITY.md), and take
+  available, verify it ("Verifying a release" in SECURITY.md), and take
   the SHA from `git ls-remote --tags https://github.com/fossasia/cla-bot.git vX.Y.Z "vX.Y.Z^{}"`
   (the line ending in `^{}`).
 

@@ -1,32 +1,5 @@
 "use strict";
-/**
- * Offline guard for the signed-release pipeline (.github/workflows/release.yml,
- * and the docs consumers rely on). Nothing here runs the
- * workflow - it pins the properties that make the pipeline trustworthy, so a
- * later edit cannot quietly undo one:
- *
- *  - it publishes on stable-semver tag pushes and periodically reconciles
- *    Latest on the default branch; same-tag runs serialize, and reconciliation is globally
- *    serialized without dropping the publication of other versions;
- *  - least privilege: workflow permissions are empty; `policy`, `build` and
- *    `checks` can only READ; `sign` can sign/attest but cannot publish, and
- *    `publish` has contents:write but runs no third-party action or repo code;
- *    both jobs verify digests delivered through job outputs;
- *  - third-party code (npm packages) only ever runs in `checks`, never on the
- *    machine that builds the archive;
- *  - the release policy (immutability declared, reviewers on the environment)
- *    is enforced before anything is built;
- *  - every action is pinned to a full commit SHA, cosign to an exact
- *    version, and no expression is interpolated into shell text;
- *  - caching is off (cache poisoning) and checkout keeps no credentials;
- *  - the steps run in the safe order: verify -> sign -> self-verify ->
- *    DRAFT -> publish -> verify the published copy (a published immutable
- *    release can never be fixed);
- *  - the assets match what SECURITY.md tells consumers to verify, and include
- *    the file types OpenSSF Scorecard's Signed-Releases check looks for;
- *
- * Run: node test/release-workflow.test.js (also part of `npm test`).
- */
+/** Checks release workflow permissions, ordering, and verification. */
 const assert = require("assert");
 const fs = require("fs");
 const crypto = require("crypto");
@@ -1911,6 +1884,10 @@ test("consumer verification pins the resolved tag commit to both attestations an
   assert.ok(example.includes("resolved ONCE during the"));
   assert.ok(example.includes("verification procedure in SECURITY.md"));
   assert.match(example, /Do not resolve the tag again/);
+  const setup = read("SETUP_GUIDE.md");
+  assert.match(setup, /exact `SOURCE_SHA`\s+resolved and verified/);
+  assert.match(setup, /Do not resolve the tag again after\s+verification/);
+  assert.doesNotMatch(setup, /git ls-remote/);
 });
 
 // --- the release policy gate (runs before anything is built) -----------------------
