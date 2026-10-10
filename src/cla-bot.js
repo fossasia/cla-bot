@@ -449,7 +449,10 @@ function validateConfig() {
   }
   // GitHub App IDs are positive decimal identifiers. Reject malformed values
   // here instead of producing an invalid JWT issuer and failing at the API.
-  if (SIG_APP_ID && !/^[1-9][0-9]*$/.test(SIG_APP_ID)) {
+  // Compare the matched text with the full input instead of using `$`, which
+  // also matches before a final JavaScript line terminator.
+  const appIdMatch = /^[1-9][0-9]*/.exec(SIG_APP_ID);
+  if (SIG_APP_ID && (!appIdMatch || appIdMatch[0] !== SIG_APP_ID)) {
     fail("SIG_APP_ID must be a positive integer in decimal form.");
   }
   // A key that is set must look like a PEM, so a mis-pasted secret fails
