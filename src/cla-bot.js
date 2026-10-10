@@ -447,13 +447,20 @@ function validateConfig() {
       "SIG_APP_ID and SIG_APP_PRIVATE_KEY must either both be set or both be empty (both empty uses GITHUB_TOKEN fallback).",
     );
   }
-  // GitHub App IDs are positive decimal identifiers. Reject malformed values
-  // here instead of producing an invalid JWT issuer and failing at the API.
+  // GitHub App IDs are positive decimal identifiers. Keep them within
+  // JavaScript's safe-integer range, as with other numeric GitHub IDs, so an
+  // identifier cannot silently lose precision if it is ever parsed as a
+  // number downstream.
   // Compare the matched text with the full input instead of using `$`, which
   // also matches before a final JavaScript line terminator.
   const appIdMatch = /^[1-9][0-9]*/.exec(SIG_APP_ID);
-  if (SIG_APP_ID && (!appIdMatch || appIdMatch[0] !== SIG_APP_ID)) {
-    fail("SIG_APP_ID must be a positive integer in decimal form.");
+  if (
+    SIG_APP_ID &&
+    (!appIdMatch ||
+      appIdMatch[0] !== SIG_APP_ID ||
+      !Number.isSafeInteger(Number(SIG_APP_ID)))
+  ) {
+    fail("SIG_APP_ID must be a positive safe integer in decimal form.");
   }
   // A key that is set must look like a PEM, so a mis-pasted secret fails
   // clearly instead of deep inside crypto.sign().
