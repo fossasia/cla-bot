@@ -614,30 +614,91 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
 // writeSignatures(), since they need a re-read, not a blind retry.
 async function ghRaw(path, token, options = {}) {
   const requestUrl = buildSafeApiUrl(path);
-  // Count each attempt here, including retries and direct ghRaw() calls.
-  consumeGitHubTokenRequest(token, { emergency: options.emergency === true });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const fetchOptions = { ...options };
   delete fetchOptions.preserveUnsafeIds;
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "fossasia-cla-bot",
+    // fetch() does not set this for a plain string body.
+    ...(options.body ? { "Content-Type": "application/json" } : {}),
+    ...(options.headers || {}),
+  };
+  const apiOrigin = parseGitHubApiUrl(GITHUB_API).origin;
+  const visited = new Set([requestUrl]);
+  const maxRedirects = 5;
   try {
-    const res = await fetch(requestUrl, {
+    let currentUrl = requestUrl;
+    let requestOptions = {
       ...fetchOptions,
-      // Do not follow responses outside the authenticated API origin. Large
-      // signature files use the Git Blobs API below, so raw-media redirects
-      // are unnecessary here.
-      redirect: "error",
+      redirect: "manual",
       signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "fossasia-cla-bot",
-        // fetch() does not set this for a plain string body.
-        ...(options.body ? { "Content-Type": "application/json" } : {}),
-        ...(options.headers || {}),
-      },
-    });
+      headers,
+    };
+    let res;
+    for (let redirects = 0; ; redirects += 1) {
+      // Count each network attempt, including redirect hops, retries, and
+      // direct ghRaw() calls.
+      consumeGitHubTokenRequest(token, {
+        emergency: options.emergency === true,
+      });
+      res = await fetch(currentUrl, requestOptions);
+      const location = res.headers?.get?.("location");
+      if (!location || ![301, 302, 303, 307, 308].includes(res.status)) break;
+      if (redirects >= maxRedirects) {
+        throw new Error("GitHub API request exceeded the redirect limit.");
+      }
+
+      let nextUrl;
+      try {
+        nextUrl = new URL(location, currentUrl);
+      } catch {
+        throw new Error("GitHub API returned an invalid redirect URL.");
+      }
+      // A redirect may change repository paths after a rename, but must never
+      // move credentials or trusted API responses to another origin or HTTP.
+      if (
+        nextUrl.protocol !== "https:" ||
+        nextUrl.origin !== apiOrigin ||
+        nextUrl.username ||
+        nextUrl.password ||
+        nextUrl.hash
+      ) {
+        throw new Error(
+          "GitHub API redirect must remain on the configured HTTPS origin.",
+        );
+      }
+      const nextHref = nextUrl.href;
+      if (visited.has(nextHref)) {
+        throw new Error("GitHub API returned a redirect loop.");
+      }
+      visited.add(nextHref);
+      // Drain the redirect response before opening the next connection.
+      await res.body?.cancel?.();
+
+      const method = (requestOptions.method || "GET").toUpperCase();
+      const switchToGet =
+        (res.status === 303 && method !== "GET" && method !== "HEAD") ||
+        ((res.status === 301 || res.status === 302) && method === "POST");
+      if (switchToGet) {
+        requestOptions = { ...requestOptions, method: "GET", body: undefined };
+        for (const header of [
+          "content-encoding",
+          "content-language",
+          "content-length",
+          "content-location",
+          "content-type",
+        ]) {
+          for (const key of Object.keys(headers)) {
+            if (key.toLowerCase() === header) delete headers[key];
+          }
+        }
+      }
+      currentUrl = nextHref;
+    }
     const text = await res.text();
     if (!res.ok) {
       // A proxy can return an HTML error page on a 502/503/504. Parse

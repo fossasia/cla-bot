@@ -431,7 +431,7 @@ function baseEnv(apiUrl) {
         GITHUB_EVENT_PATH: eventFile,
       });
       assert.strictEqual(code, 1, stderr);
-      assert.match(stderr, /fetch failed/i);
+      assert.match(stderr, /redirect must remain on the configured HTTPS origin/i);
       assert.ok(api.requestsSeen.length > 0);
       assert.strictEqual(
         target.requestsSeen.length,

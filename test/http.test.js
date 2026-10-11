@@ -237,16 +237,75 @@ function fakeResponse(status, jsonBody, headers = {}) {
     }
   });
 
-  await test("ghRaw disables redirects on authenticated API requests", async () => {
+  await test("ghRaw follows same-origin HTTPS redirects for renamed repositories", async () => {
     const originalFetch = global.fetch;
-    let requestOptions;
-    global.fetch = async (_url, options) => {
-      requestOptions = options;
-      throw new TypeError("fetch rejected redirect");
+    const requests = [];
+    global.fetch = async (url, options) => {
+      requests.push({ url: String(url), options });
+      if (requests.length === 1) {
+        return fakeResponse(301, null, {
+          location: "https://api.github.com/repos/new-owner/new-repo",
+        });
+      }
+      return fakeResponse(200, { moved: true });
     };
     try {
-      await assert.rejects(ghRaw("/repos/owner/repo", "tok"), /fetch rejected redirect/);
-      assert.strictEqual(requestOptions.redirect, "error");
+      assert.deepStrictEqual(
+        await ghRaw("/repos/old-owner/old-repo", "tok"),
+        { moved: true },
+      );
+      assert.strictEqual(requests.length, 2);
+      assert.strictEqual(requests[0].options.redirect, "manual");
+      assert.strictEqual(requests[1].url, "https://api.github.com/repos/new-owner/new-repo");
+      assert.strictEqual(requests[1].options.headers.Authorization, "Bearer tok");
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  await test("ghRaw rejects HTTP and cross-origin redirects before contacting their targets", async () => {
+    const originalFetch = global.fetch;
+    for (const location of [
+      "http://api.github.com/repos/owner/repo",
+      "https://attacker.example/repos/owner/repo",
+    ]) {
+      let calls = 0;
+      global.fetch = async () => {
+        calls += 1;
+        return fakeResponse(302, null, { location });
+      };
+      await assert.rejects(
+        ghRaw("/repos/owner/repo", "tok"),
+        /redirect must remain on the configured HTTPS origin/,
+      );
+      assert.strictEqual(calls, 1, `${location} must not be contacted`);
+    }
+    global.fetch = originalFetch;
+  });
+
+  await test("ghRaw preserves write method and body across GitHub 307 redirects", async () => {
+    const originalFetch = global.fetch;
+    const requests = [];
+    global.fetch = async (url, options) => {
+      requests.push({ url: String(url), options });
+      return requests.length === 1
+        ? fakeResponse(307, null, {
+            location: "https://api.github.com/repos/new-owner/new-repo/contents/file",
+          })
+        : fakeResponse(200, { saved: true });
+    };
+    try {
+      const body = JSON.stringify({ message: "save" });
+      assert.deepStrictEqual(
+        await ghRaw("/repos/old-owner/old-repo/contents/file", "tok", {
+          method: "PUT",
+          body,
+        }),
+        { saved: true },
+      );
+      assert.strictEqual(requests.length, 2);
+      assert.strictEqual(requests[1].options.method, "PUT");
+      assert.strictEqual(requests[1].options.body, body);
     } finally {
       global.fetch = originalFetch;
     }
