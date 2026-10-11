@@ -1,6 +1,7 @@
 "use strict";
 /** Tests signature path validation, URL encoding, compatibility, and CLI errors. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 const crypto = require("crypto");
 const path = require("path");
 const { spawnSync } = require("child_process");
@@ -104,7 +105,7 @@ function installFakeContentsApi({ owner, repo }) {
       const body = JSON.parse(opts.body);
       shaCounter += 1;
       files.set(key, {
-        sha: `sha${shaCounter}`,
+        sha: testGitSha(shaCounter),
         text: Buffer.from(body.content, "base64").toString("utf8"),
       });
       return fakeResponse(200, {});
@@ -594,7 +595,7 @@ const INVALID_PATHS = [
         assert.deepStrictEqual([...api.files.keys()], [p]);
         assert.strictEqual(written.signatures.length, 1);
         const { sha, data } = await bot.readSignatures("tok");
-        assert.strictEqual(sha, "sha1");
+        assert.strictEqual(sha, testGitSha(1));
         assert.deepStrictEqual(data.signatures, [{ id: 1, login: "alice" }]);
       } finally {
         global.fetch = originalFetch;

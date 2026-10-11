@@ -1,6 +1,7 @@
 "use strict";
 /** Tests signature reads and writes against mocked GitHub API responses. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 
 process.env.GITHUB_TOKEN = "dummy";
 process.env.SIG_OWNER = "a-user-account"; // deliberately user-like, not org-like, to prove the fix
@@ -293,9 +294,23 @@ function fakeResponse(status, jsonBody, headers = {}) {
         "https://ghe.example.test/private/path",
         "https://ghe.example.test/api/v30/repos/owner/repo",
         "https://ghe.example.test/api/v3/%2fadmin",
+        "https://ghe.example.test/api/v3/%5cadmin",
         "https://ghe.example.test/api/v3/%2e%2e/admin",
         "https://ghe.example.test/api/v3/.%2e/admin",
         "https://ghe.example.test/api/v3/%2E%2E/admin",
+        "https://ghe.example.test/api/v3/%252e%252e/admin",
+        "https://ghe.example.test/api/v3/%252E%252E/admin",
+        "https://ghe.example.test/api/v3/%252e%2e/admin",
+        "https://ghe.example.test/api/v3/%2e%252e/admin",
+        "https://ghe.example.test/api/v3/.%252e/admin",
+        "https://ghe.example.test/api/v3/%252e./admin",
+        "https://ghe.example.test/api/v3/%252fadmin",
+        "https://ghe.example.test/api/v3/%255cadmin",
+        "https://ghe.example.test/api/v3\\..\\admin",
+        "https://ghe.example.test/api/v3\\.\\/admin",
+        "https://ghe.example.test/api/v3/%2e\\%2e/admin",
+        "https://ghe.example.test/api/v3/%252e%255cadmin",
+        "https://ghe.example.test/api/v3/../admin",
         "https://user@ghe.example.test/api/v3/repos/owner/repo",
         "https://:secret@ghe.example.test/api/v3/repos/owner/repo",
         "https://ghe.example.test/api/v3/repos/owner/repo#fragment",
@@ -526,6 +541,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       [{ type: "file", sha: "", content: "", encoding: "base64" }, /did not return a blob SHA/],
       [{ type: "file", sha: 42, content: "", encoding: "base64" }, /did not return a blob SHA/],
       [{ type: "file", sha: "not-a-git-blob-sha", content: "", encoding: "none" }, /metadata is missing a valid Git blob SHA/],
+      [{ type: "file", sha: "abc123", content: b64({ version: 1, signatures: [] }), encoding: "base64" }, /metadata is missing a valid Git blob SHA/],
     ];
     const originalFetch = global.fetch;
     try {
@@ -554,7 +570,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       calls += 1;
       return fakeResponse(200, {
         type: "file",
-        sha: "empty-file-sha",
+        sha: testGitSha("empty-file-sha"),
         content: "",
         encoding: "base64",
       });
@@ -574,7 +590,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
         );
         return fakeResponse(200, {
           type: "file",
-          sha: FALLBACK_BLOB_SHA,
+          sha: FALLBACK_BLOB_SHA.toUpperCase(),
           content: "",
           encoding: "none",
         });
@@ -615,6 +631,30 @@ function fakeResponse(status, jsonBody, headers = {}) {
     assert.strictEqual(calls, 2);
   });
 
+  await test("readSignatures rejects a Git Blobs response with a malformed SHA", async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return calls === 1
+        ? fakeResponse(200, {
+            type: "file",
+            sha: FALLBACK_BLOB_SHA,
+            content: "",
+            encoding: "none",
+          })
+        : fakeResponse(200, {
+            sha: "not-a-git-blob-sha",
+            content: b64({ version: 1, signatures: [{ login: "forged" }] }),
+            encoding: "base64",
+          });
+    };
+    await assert.rejects(
+      readSignatures("tok"),
+      /GitHub blob response is missing a valid Git blob SHA/,
+    );
+    assert.strictEqual(calls, 2);
+  });
+
   await test("writeSignatures does not overwrite the store when its blob fallback returns 404", async () => {
     let calls = 0;
     global.fetch = async (url) => {
@@ -622,7 +662,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       if (calls === 1) {
         return fakeResponse(200, {
           type: "file",
-          sha: FALLBACK_BLOB_SHA,
+          sha: FALLBACK_BLOB_SHA.toUpperCase(),
           content: "",
           encoding: "none",
         });
@@ -659,12 +699,12 @@ function fakeResponse(status, jsonBody, headers = {}) {
     global.fetch = async () =>
       fakeResponse(200, {
         type: "file",
-        sha: "abc123",
+        sha: testGitSha("abc123"),
         content: b64(stored),
         encoding: "base64",
       });
     const { sha, data } = await readSignatures("tok");
-    assert.strictEqual(sha, "abc123");
+    assert.strictEqual(sha, testGitSha("abc123"));
     assert.deepStrictEqual(data, stored);
   });
 
@@ -695,7 +735,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     global.fetch = async () =>
       fakeResponse(200, {
         type: "file",
-        sha: "s",
+        sha: testGitSha("s"),
         content: b64(stored),
         encoding: "base64",
       });
@@ -733,7 +773,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       if (accept === "application/vnd.github.object+json") {
         return fakeResponse(200, {
           type: "file",
-          sha: FALLBACK_BLOB_SHA,
+          sha: FALLBACK_BLOB_SHA.toUpperCase(),
           content: "",
           encoding: "none",
         });
@@ -774,7 +814,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       readCount += 1;
       return fakeResponse(200, {
         type: "file",
-        sha: `sha-${readCount}`,
+        sha: testGitSha(`sha-${readCount}`),
         content: b64(stored),
         encoding: "base64",
       });
@@ -808,7 +848,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       capturedHeaders = opts.headers;
       return fakeResponse(200, {
         type: "file",
-        sha: "x",
+        sha: testGitSha("x"),
         content: b64({ version: 1, signatures: [] }),
         encoding: "base64",
       });
@@ -830,7 +870,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       // internal re-read that writeSignatures performs before the PUT
       return fakeResponse(200, {
         type: "file",
-        sha: "x",
+        sha: testGitSha("x"),
         content: b64({ version: 1, signatures: [] }),
         encoding: "base64",
       });
@@ -849,7 +889,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       if (opts.method === "PUT") putCalled = true;
       return fakeResponse(200, {
         type: "file",
-        sha: "x",
+        sha: testGitSha("x"),
         content: b64({ version: 1, signatures: [] }),
         encoding: "base64",
       });
@@ -878,7 +918,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       readCount += 1;
       return fakeResponse(200, {
         type: "file",
-        sha: `sha-${readCount}`,
+        sha: testGitSha(`sha-${readCount}`),
         content: b64({ version: 1, signatures: [] }),
         encoding: "base64",
       });
@@ -909,7 +949,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     // real sha-based compare-and-swap (409 if the sha doesn't match), so
     // whichever PUT lands first wins, and the loser's own 409-retry logic
     // has to correctly re-apply its write on top of the winner's.
-    let sha = "sha-0";
+    let sha = testGitSha("sha-0");
     let signatures = [];
     let inFlightGets = 0;
     let releaseGets;
@@ -939,7 +979,9 @@ function fakeResponse(status, jsonBody, headers = {}) {
           Buffer.from(body.content, "base64").toString(),
         );
         signatures = newData.signatures;
-        sha = `sha-${signatures.length}-${Math.random().toString(36).slice(2)}`;
+          sha = testGitSha(
+            `sha-${signatures.length}-${Math.random().toString(36).slice(2)}`,
+          );
         return fakeResponse(200, { content: { sha } });
       }
       throw new Error(`unexpected method in race test: ${method}`);
@@ -971,7 +1013,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     global.fetch = async () =>
       fakeResponse(200, {
         type: "file",
-        sha: "x",
+        sha: testGitSha("x"),
         content: b64({
           version: 1,
           signatures: [
@@ -1009,7 +1051,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       if (!opts || opts.method === undefined) {
         return fakeResponse(200, {
           type: "file",
-          sha: "abc",
+          sha: testGitSha("abc"),
           content: b64(stored),
           encoding: "base64",
         });
@@ -1064,7 +1106,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     global.fetch = async () =>
       fakeResponse(200, {
         type: "file",
-        sha: "abc",
+        sha: testGitSha("abc"),
         content: b64(stored),
         encoding: "base64",
       });
@@ -1408,7 +1450,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
         // 'object' media type: content is empty and encoding is 'none'.
         return fakeResponse(200, {
           type: "file",
-          sha: FALLBACK_BLOB_SHA,
+          sha: FALLBACK_BLOB_SHA.toUpperCase(),
           content: "",
           encoding: "none",
         });
@@ -1454,7 +1496,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       );
       return fakeResponse(200, {
         type: "file",
-        sha: "small-file-sha",
+        sha: testGitSha("small-file-sha"),
         content: b64(stored),
         encoding: "base64",
       });
@@ -1570,7 +1612,9 @@ function fakeResponse(status, jsonBody, headers = {}) {
             Buffer.from(body.content, "base64").toString(),
           );
           signatures = newData.signatures;
-          sha = `sha-created-${Math.random().toString(36).slice(2)}`;
+          sha = testGitSha(
+            `sha-created-${Math.random().toString(36).slice(2)}`,
+          );
           return fakeResponse(201, { content: { sha } });
         }
         if (!body.sha) {
@@ -1588,7 +1632,9 @@ function fakeResponse(status, jsonBody, headers = {}) {
           Buffer.from(body.content, "base64").toString(),
         );
         signatures = newData.signatures;
-        sha = `sha-updated-${Math.random().toString(36).slice(2)}`;
+        sha = testGitSha(
+          `sha-updated-${Math.random().toString(36).slice(2)}`,
+        );
         return fakeResponse(200, { content: { sha } });
       }
       throw new Error(`unexpected method in first-write race test: ${method}`);
@@ -1684,7 +1730,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
         return Promise.resolve(
           fakeResponse(200, {
             type: "file",
-            sha: "recovered-after-timeout-sha",
+            sha: testGitSha("recovered-after-timeout-sha"),
             content: b64({ version: 1, signatures: [] }),
             encoding: "base64",
           }),
@@ -1692,7 +1738,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       };
 
       const { sha } = await readSignatures("tok");
-      assert.strictEqual(sha, "recovered-after-timeout-sha");
+      assert.strictEqual(sha, testGitSha("recovered-after-timeout-sha"));
       assert.strictEqual(
         fetchCalls,
         2,
@@ -1714,7 +1760,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       global.fetch = async () =>
         fakeResponse(200, {
           type: "file",
-          sha: "x",
+          sha: testGitSha("x"),
           content: b64({ version: 1, signatures: [] }),
           encoding: "base64",
         });
@@ -1744,13 +1790,13 @@ function fakeResponse(status, jsonBody, headers = {}) {
           return fakeResponse(503, { message: "Service Unavailable" });
         return fakeResponse(200, {
           type: "file",
-          sha: "recovered-sha",
+          sha: testGitSha("recovered-sha"),
           content: b64({ version: 1, signatures: [] }),
           encoding: "base64",
         });
       };
       const { sha } = await readSignatures("tok");
-      assert.strictEqual(sha, "recovered-sha");
+      assert.strictEqual(sha, testGitSha("recovered-sha"));
       assert.strictEqual(
         calls,
         3,
@@ -1771,7 +1817,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
         if (calls === 1) return fakeResponse(429, { message: "rate limited" });
         return fakeResponse(200, {
           type: "file",
-          sha: "x",
+          sha: testGitSha("x"),
           content: b64({ version: 1, signatures: [] }),
           encoding: "base64",
         });
@@ -1802,7 +1848,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
           );
         return fakeResponse(200, {
           type: "file",
-          sha: "x",
+          sha: testGitSha("x"),
           content: b64({ version: 1, signatures: [] }),
           encoding: "base64",
         });
@@ -1880,7 +1926,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     global.fetch = async () =>
       fakeResponse(200, {
         type: "file",
-        sha: "corrupt-sha",
+        sha: testGitSha("corrupt-sha"),
         content: b64({ version: 1, signatures: { not: "an array" } }),
         encoding: "base64",
       });
@@ -1915,7 +1961,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
         // wins, no matter how many times it retries.
         return fakeResponse(200, {
           type: "file",
-          sha: "always-stale-sha",
+          sha: testGitSha("always-stale-sha"),
           content: b64({ version: 1, signatures: [] }),
           encoding: "base64",
         });
@@ -1958,7 +2004,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       }
       return fakeResponse(200, {
         type: "file",
-        sha: "x",
+        sha: testGitSha("x"),
         content: b64({ version: 1, signatures: [] }),
         encoding: "base64",
       });
@@ -2187,7 +2233,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
         if (method === "GET") {
           return fakeResponse(200, {
             type: "file",
-            sha: "s1",
+            sha: testGitSha("s1"),
             content: b64({ version: 1, signatures: [] }),
             encoding: "base64",
           });
@@ -2236,7 +2282,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
         if (method === "GET") {
           return fakeResponse(200, {
             type: "file",
-            sha: "s1",
+            sha: testGitSha("s1"),
             content: b64({ version: 1, signatures: [] }),
             encoding: "base64",
           });
@@ -2419,7 +2465,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
       if (method === "GET") {
         return fakeResponse(200, {
           type: "file",
-          sha: "s1",
+          sha: testGitSha("s1"),
           content: b64({ version: 1, signatures: [] }),
           encoding: "base64",
         });
@@ -2713,7 +2759,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
         if (method === "GET") {
           return fakeResponse(200, {
             type: "file",
-            sha: "s1",
+            sha: testGitSha("s1"),
             content: b64({ version: 1, signatures: [] }),
             encoding: "base64",
           });
@@ -3025,13 +3071,13 @@ function fakeResponse(status, jsonBody, headers = {}) {
           return fakeResponse(599, { message: "edge of range" });
         return fakeResponse(200, {
           type: "file",
-          sha: "recovered-at-599-boundary",
+          sha: testGitSha("recovered-at-599-boundary"),
           content: b64({ version: 1, signatures: [] }),
           encoding: "base64",
         });
       };
       const { sha } = await readSignatures("tok");
-      assert.strictEqual(sha, "recovered-at-599-boundary");
+      assert.strictEqual(sha, testGitSha("recovered-at-599-boundary"));
       assert.strictEqual(
         getAttempts,
         2,

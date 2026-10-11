@@ -1,6 +1,7 @@
 "use strict";
 /** Tests that the PR flow matches allowlist entries against GitHub user ids. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 
 process.env.GITHUB_TOKEN = "dummy-token";
 process.env.GITHUB_REPOSITORY = "fossasia/testrepo";
@@ -67,7 +68,7 @@ function installMockGitHub({ commits, signatures = [], usersById = {} }) {
       if (method === "GET") {
         return res(200, {
           type: "file",
-          sha: "sig-sha-0",
+          sha: testGitSha("sig-sha-0"),
           content: b64(state.signatures),
           encoding: "base64",
         });

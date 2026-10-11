@@ -1,6 +1,7 @@
 "use strict";
 /** Tests token caching, refresh, expiry, and the GITHUB_TOKEN fallback. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
@@ -134,7 +135,7 @@ function makeAppGitHub({
     statuses: [],
     comments: [],
     hooks: {},
-    sigSha: "sig-sha-0",
+    sigSha: testGitSha("sig-sha-0"),
     sigPuts: 0,
     signatures,
     commits: commits || [
@@ -208,7 +209,7 @@ function makeAppGitHub({
           Buffer.from(payload.content, "base64").toString("utf8"),
         );
         s.sigPuts += 1;
-        s.sigSha = `sig-sha-${s.sigPuts}`;
+        s.sigSha = testGitSha(`sig-sha-${s.sigPuts}`);
         return { status: 200, body: { content: { sha: s.sigSha } } };
       }
     }

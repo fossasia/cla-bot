@@ -1,6 +1,7 @@
 "use strict";
 /** Tests that bot comments remain recognizable after a token identity change. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 
 process.env.GITHUB_TOKEN = "a-pat-not-the-actions-token";
 process.env.GITHUB_REPOSITORY = "fossasia/testrepo";
@@ -45,7 +46,7 @@ function b64(obj) {
         version: 1,
         signatures: [{ id: 1, login: "alice" }], // alice already signed
       },
-      sha: "sig-sha-0",
+      sha: testGitSha("sig-sha-0"),
       comments: [
         // Seeded exactly as the OLD identity would have posted it, back
         // before the token was switched: same PENDING_MARKER/wording this
@@ -151,7 +152,7 @@ function b64(obj) {
   await test("a comment forged by an ordinary user (not a Bot-type account) is still never mistaken for real bot history, even under the broadened cross-identity check", async () => {
     const state = {
       signatures: { version: 1, signatures: [{ id: 1, login: "alice" }] },
-      sha: "sig-sha-0",
+      sha: testGitSha("sig-sha-0"),
       comments: [
         // A regular contributor's comment, crafted to look exactly like a
         // genuine "needs to sign" comment, including the literal marker

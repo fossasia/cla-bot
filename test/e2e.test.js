@@ -1,6 +1,7 @@
 /** Runs the CLI in a child process against a local mock GitHub API. */
 
 const assert = require("node:assert");
+const testGitSha = require("./helpers/git-sha");
 const http = require("node:http");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -259,7 +260,7 @@ function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
   const requestsSeen = [];
   const statusesSeen = [];
   let signaturesState = {
-    sha: "sig-sha-0",
+    sha: testGitSha("sig-sha-0"),
     data: {
       version: 1,
       signatures: authorAlreadySigned ? [{ id: 42, login: "e2e-author" }] : [],
@@ -328,7 +329,9 @@ function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
           const newData = JSON.parse(
             Buffer.from(payload.content, "base64").toString("utf8"),
           );
-          const newSha = `sig-sha-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          const newSha = testGitSha(
+            `sig-sha-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          );
           signaturesState = { sha: newSha, data: newData };
           return send(200, { content: { sha: newSha } });
         }

@@ -49,6 +49,7 @@ function res(status, jsonBody, headers = {}) {
 function b64(obj) {
   return Buffer.from(JSON.stringify(obj)).toString("base64");
 }
+const testGitSha = require("./helpers/git-sha");
 
 // A fetch stub for the input-validation tests below: any call at all means
 // a value that should have been rejected made it past validation and
@@ -83,7 +84,7 @@ function makeFakeGitHub({
   const state = {
     lastCompare: null,
     signatures: initialSignatures,
-    sha: "sha-0",
+    sha: testGitSha("sha-0"),
     comments: [],
     statuses: [],
     lockCalls: [],
@@ -164,7 +165,7 @@ function makeFakeGitHub({
         state.signatures = JSON.parse(
           Buffer.from(body.content, "base64").toString(),
         );
-        state.sha = `sha-${Number(state.sha.split("-")[1]) + 1}`;
+        state.sha = testGitSha("sha-1");
         return res(200, { content: { sha: state.sha } });
       }
     }
@@ -3667,7 +3668,7 @@ function makeFakeGitHub({
     let putHappened = false;
     let getCallsAfterPut = 0;
     const preWriteSignatures = { version: 1, signatures: [] };
-    let sigSha = "sig-sha-0";
+    let sigSha = testGitSha("sig-sha-0");
 
     const commits = [
       {
@@ -3718,7 +3719,7 @@ function makeFakeGitHub({
         }
         if (method === "PUT") {
           putHappened = true;
-          sigSha = "sig-sha-1";
+          sigSha = testGitSha("sig-sha-1");
           return res(200, { content: { sha: sigSha } });
         }
       }
@@ -3821,7 +3822,7 @@ function makeFakeGitHub({
     // write already completed - it only ever becomes visible through
     // checkPR's own subsequent fresh GET, never through knownSignatures.
     const storedSignatures = { version: 1, signatures: [] };
-    let sigSha = "sig-sha-0";
+    let sigSha = testGitSha("sig-sha-0");
 
     function res(status, jsonBody) {
       return {
@@ -3868,7 +3869,7 @@ function makeFakeGitHub({
             ...written.signatures,
             { id: 9002, login: "bob" },
           ];
-          sigSha = "sig-sha-1";
+          sigSha = testGitSha("sig-sha-1");
           return res(200, { content: { sha: sigSha } });
         }
       }

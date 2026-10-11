@@ -402,15 +402,20 @@ function sigContentsApiPath() {
   return `${sigRepoBasePath()}/contents/${encodeRepoPath(SIG_PATH)}`;
 }
 
-function sigBlobApiPath(blobSha) {
+function assertValidGitBlobSha(blobSha, source = "Signatures file metadata") {
   if (
     typeof blobSha !== "string" ||
     !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(blobSha)
   ) {
     throw new Error(
-      "Signatures file metadata is missing a valid Git blob SHA; refusing to fetch its content.",
+      `${source} is missing a valid Git blob SHA; refusing to trust its content.`,
     );
   }
+  return blobSha.toLowerCase();
+}
+
+function sigBlobApiPath(blobSha) {
+  assertValidGitBlobSha(blobSha);
   return `${sigRepoBasePath()}/git/blobs/${blobSha}`;
 }
 
@@ -661,9 +666,13 @@ async function ghRaw(path, token, options = {}) {
         throw new Error("GitHub API returned an invalid redirect URL.");
       }
       const rawLocationPath = location.split(/[?#]/, 1)[0];
+      const hasRawBackslash = rawLocationPath.includes("\\");
       const hasDotSegment = /(?:^|\/)(?:\.|%2e){1,2}(?:\/|$)/i.test(
         rawLocationPath,
       );
+      // An encoded percent can become another encoded separator or dot segment
+      // if a proxy decodes the path more than once. Reject that ambiguity.
+      const hasEncodedPercent = /%25/i.test(nextUrl.pathname);
       const withinApiPath =
         apiBasePath === "" ||
         nextUrl.pathname === apiBasePath ||
@@ -676,7 +685,9 @@ async function ghRaw(path, token, options = {}) {
         nextUrl.protocol !== "https:" ||
         nextUrl.origin !== apiOrigin ||
         !withinApiPath ||
+        hasRawBackslash ||
         hasEncodedPathSeparator ||
+        hasEncodedPercent ||
         hasDotSegment ||
         nextUrl.username ||
         nextUrl.password ||
@@ -1349,17 +1360,18 @@ async function readSignatures(token) {
       "GitHub Contents API did not return a blob SHA for the signatures file.",
     );
   }
+  const metadataSha = assertValidGitBlobSha(meta.sha);
 
   let text;
   if (typeof meta.content === "string" && meta.encoding === "base64") {
     text = Buffer.from(meta.content, "base64").toString("utf8");
   } else {
-    const blob = await gh(sigBlobApiPath(meta.sha), token);
+    const blob = await gh(sigBlobApiPath(metadataSha), token);
     if (
       !blob ||
       typeof blob !== "object" ||
       Array.isArray(blob) ||
-      blob.sha !== meta.sha
+      assertValidGitBlobSha(blob.sha, "GitHub blob response") !== metadataSha
     ) {
       throw new Error(
         "GitHub returned a blob SHA that does not match the signatures file metadata.",
@@ -1395,7 +1407,7 @@ async function readSignatures(token) {
     index.add(entry);
   });
   // `index` describes this `data` snapshot only.
-  return { sha: meta.sha, data, index };
+  return { sha: metadataSha, data, index };
 }
 
 async function writeSignatures(token, mutate, message, attempt = 1) {
