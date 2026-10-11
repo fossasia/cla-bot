@@ -1297,59 +1297,64 @@ async function readSignatures(token) {
   // Built and validated outside the try on purpose, so an invalid SIG_PATH
   // surfaces as a config error and is never mistaken for the 404 below.
   const contentsPath = sigContentsApiPath();
+  let meta;
   try {
     // The object media type returns the sha needed for compare-and-swap
     // writes. Larger files may omit content; fetch those by sha through the
     // Git Blobs API, which returns base64 JSON without a raw-media redirect.
-    const meta = await gh(contentsPath, token, {
+    meta = await gh(contentsPath, token, {
       headers: { Accept: "application/vnd.github.object+json" },
     });
-
-    let text;
-    if (meta.content && meta.encoding === "base64") {
-      text = Buffer.from(meta.content, "base64").toString("utf8");
-    } else {
-      const blob = await gh(sigBlobApiPath(meta.sha), token);
-      if (blob.encoding !== "base64" || typeof blob.content !== "string") {
-        throw new Error(
-          "GitHub did not return base64 content for the signatures file blob.",
-        );
-      }
-      text = Buffer.from(blob.content, "base64").toString("utf8");
-    }
-
-    const data = JSON.parse(text);
-    if (!Array.isArray(data.signatures))
-      throw new Error(
-        'signatures file is malformed: "signatures" is not an array',
-      );
-
-    // Keep malformed entries to avoid deleting old records. Warn by position
-    // only, and index valid numeric ids regardless of the login field.
-    const index = new SignatureIndex([]);
-    data.signatures.forEach((entry, position) => {
-      if (
-        !entry ||
-        typeof entry.login !== "string" ||
-        entry.login.length === 0
-      ) {
-        console.warn(
-          `::warning::Signature entry at index ${position} is missing/has an invalid "login" field (kept as-is; any valid numeric id is still used for matching) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
-        );
-      }
-      index.add(entry);
-    });
-    // `index` describes this `data` snapshot only.
-    return { sha: meta.sha, data, index };
   } catch (e) {
-    if (e.status === 404)
+    // Only a missing Contents resource means the signature store has not been
+    // created yet. A 404 from a later blob read indicates inconsistent or
+    // inaccessible existing data and must fail closed.
+    if (e.status === 404) {
       return {
         sha: null,
         data: { version: 1, signatures: [] },
         index: new SignatureIndex([]),
       };
+    }
     throw e;
   }
+
+  let text;
+  if (meta.content && meta.encoding === "base64") {
+    text = Buffer.from(meta.content, "base64").toString("utf8");
+  } else {
+    const blob = await gh(sigBlobApiPath(meta.sha), token);
+    if (blob.encoding !== "base64" || typeof blob.content !== "string") {
+      throw new Error(
+        "GitHub did not return base64 content for the signatures file blob.",
+      );
+    }
+    text = Buffer.from(blob.content, "base64").toString("utf8");
+  }
+
+  const data = JSON.parse(text);
+  if (!Array.isArray(data.signatures))
+    throw new Error(
+      'signatures file is malformed: "signatures" is not an array',
+    );
+
+  // Keep malformed entries to avoid deleting old records. Warn by position
+  // only, and index valid numeric ids regardless of the login field.
+  const index = new SignatureIndex([]);
+  data.signatures.forEach((entry, position) => {
+    if (
+      !entry ||
+      typeof entry.login !== "string" ||
+      entry.login.length === 0
+    ) {
+      console.warn(
+        `::warning::Signature entry at index ${position} is missing/has an invalid "login" field (kept as-is; any valid numeric id is still used for matching) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
+      );
+    }
+    index.add(entry);
+  });
+  // `index` describes this `data` snapshot only.
+  return { sha: meta.sha, data, index };
 }
 
 async function writeSignatures(token, mutate, message, attempt = 1) {

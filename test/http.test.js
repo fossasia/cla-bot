@@ -265,22 +265,25 @@ function fakeResponse(status, jsonBody, headers = {}) {
 
   await test("ghRaw rejects HTTP and cross-origin redirects before contacting their targets", async () => {
     const originalFetch = global.fetch;
-    for (const location of [
-      "http://api.github.com/repos/owner/repo",
-      "https://attacker.example/repos/owner/repo",
-    ]) {
-      let calls = 0;
-      global.fetch = async () => {
-        calls += 1;
-        return fakeResponse(302, null, { location });
-      };
-      await assert.rejects(
-        ghRaw("/repos/owner/repo", "tok"),
-        /redirect must remain on the configured HTTPS origin/,
-      );
-      assert.strictEqual(calls, 1, `${location} must not be contacted`);
+    try {
+      for (const location of [
+        "http://api.github.com/repos/owner/repo",
+        "https://attacker.example/repos/owner/repo",
+      ]) {
+        let calls = 0;
+        global.fetch = async () => {
+          calls += 1;
+          return fakeResponse(302, null, { location });
+        };
+        await assert.rejects(
+          ghRaw("/repos/owner/repo", "tok"),
+          /redirect must remain on the configured HTTPS origin/,
+        );
+        assert.strictEqual(calls, 1, `${location} must not be contacted`);
+      }
+    } finally {
+      global.fetch = originalFetch;
     }
-    global.fetch = originalFetch;
   });
 
   await test("ghRaw rejects malformed, looping, and excessive redirects", async () => {
@@ -437,6 +440,52 @@ function fakeResponse(status, jsonBody, headers = {}) {
     const { sha, data } = await readSignatures("tok");
     assert.strictEqual(sha, null);
     assert.deepStrictEqual(data, { version: 1, signatures: [] });
+  });
+
+  await test("readSignatures propagates a blob 404 instead of treating existing signatures as an empty store", async () => {
+    let calls = 0;
+    global.fetch = async (url, options) => {
+      calls += 1;
+      if (calls === 1) {
+        assert.strictEqual(
+          options.headers.Accept,
+          "application/vnd.github.object+json",
+        );
+        return fakeResponse(200, {
+          sha: FALLBACK_BLOB_SHA,
+          content: "",
+          encoding: "none",
+        });
+      }
+      assert.ok(String(url).endsWith(`/git/blobs/${FALLBACK_BLOB_SHA}`));
+      return fakeResponse(404, { message: "Not Found" });
+    };
+    await assert.rejects(readSignatures("tok"), (error) => {
+      assert.strictEqual(error.status, 404);
+      return true;
+    });
+    assert.strictEqual(calls, 2);
+  });
+
+  await test("writeSignatures does not overwrite the store when its blob fallback returns 404", async () => {
+    let calls = 0;
+    global.fetch = async (url) => {
+      calls += 1;
+      if (calls === 1) {
+        return fakeResponse(200, {
+          sha: FALLBACK_BLOB_SHA,
+          content: "",
+          encoding: "none",
+        });
+      }
+      assert.ok(String(url).endsWith(`/git/blobs/${FALLBACK_BLOB_SHA}`));
+      return fakeResponse(404, { message: "Not Found" });
+    };
+    await assert.rejects(
+      writeSignatures("tok", (data) => data, "should not write"),
+      (error) => error.status === 404,
+    );
+    assert.strictEqual(calls, 2, "no PUT may follow a failed blob read");
   });
 
   await test("readSignatures refuses blob fallback metadata without a valid SHA", async () => {
