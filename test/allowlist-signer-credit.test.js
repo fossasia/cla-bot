@@ -25,18 +25,12 @@ async function test(name, fn) {
 }
 
 function res(status, jsonBody) {
-  if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
     headers: { get: () => null },
   };
-}
-function isContentsFileResponse(status, body) {
-  return status === 200 && body && typeof body.sha === "string" &&
-    typeof body.content === "string" && typeof body.encoding === "string" &&
-    !("type" in body);
 }
 function b64(obj) {
   return Buffer.from(JSON.stringify(obj)).toString("base64");
@@ -86,6 +80,7 @@ function b64(obj) {
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
           return res(200, {
+            type: "file",
             sha: state.sha,
             content: b64(state.signatures),
             encoding: "base64",
@@ -193,6 +188,7 @@ function b64(obj) {
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
           return res(200, {
+            type: "file",
             sha: state.sha,
             content: b64(state.signatures),
             encoding: "base64",

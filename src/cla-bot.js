@@ -660,18 +660,24 @@ async function ghRaw(path, token, options = {}) {
       } catch {
         throw new Error("GitHub API returned an invalid redirect URL.");
       }
+      const rawLocationPath = location.split(/[?#]/, 1)[0];
+      const hasDotSegment = /(?:^|\/)(?:\.|%2e){1,2}(?:\/|$)/i.test(
+        rawLocationPath,
+      );
       const withinApiPath =
         apiBasePath === "" ||
         nextUrl.pathname === apiBasePath ||
         nextUrl.pathname.startsWith(`${apiBasePath}/`);
       const hasEncodedPathSeparator = /%(?:2f|5c)/i.test(nextUrl.pathname);
-      // A redirect may change repository paths after a rename, but must never
-      // move credentials or trusted API responses outside the configured API.
+      // A redirect may change repository paths after a rename, but must stay
+      // inside the configured API path. Query parameters remain allowed for
+      // API endpoints that legitimately use them.
       if (
         nextUrl.protocol !== "https:" ||
         nextUrl.origin !== apiOrigin ||
         !withinApiPath ||
         hasEncodedPathSeparator ||
+        hasDotSegment ||
         nextUrl.username ||
         nextUrl.password ||
         nextUrl.hash
@@ -1349,6 +1355,16 @@ async function readSignatures(token) {
     text = Buffer.from(meta.content, "base64").toString("utf8");
   } else {
     const blob = await gh(sigBlobApiPath(meta.sha), token);
+    if (
+      !blob ||
+      typeof blob !== "object" ||
+      Array.isArray(blob) ||
+      blob.sha !== meta.sha
+    ) {
+      throw new Error(
+        "GitHub returned a blob SHA that does not match the signatures file metadata.",
+      );
+    }
     if (blob.encoding !== "base64" || typeof blob.content !== "string") {
       throw new Error(
         "GitHub did not return base64 content for the signatures file blob.",

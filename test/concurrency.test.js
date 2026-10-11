@@ -43,18 +43,12 @@ async function test(name, fn) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function res(status, jsonBody, headers = {}) {
-  if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
     headers: { get: (h) => headers[h.toLowerCase()] || null },
   };
-}
-function isContentsFileResponse(status, body) {
-  return status === 200 && body && typeof body.sha === "string" &&
-    typeof body.content === "string" && typeof body.encoding === "string" &&
-    !("type" in body);
 }
 
 // Counts requests in flight and remembers the order they started in.
@@ -436,6 +430,7 @@ const linkTo = (path, last) =>
         if (path.startsWith("/repos/fossasia/cla-signatures/contents/")) {
           await sleep(1);
           return res(200, {
+            type: "file",
             sha: "s0",
             content: Buffer.from(
               JSON.stringify({ version: 1, signatures }),

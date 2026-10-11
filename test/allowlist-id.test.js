@@ -30,18 +30,12 @@ async function test(name, fn) {
 }
 
 function res(status, jsonBody) {
-  if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
     headers: { get: () => null },
   };
-}
-function isContentsFileResponse(status, body) {
-  return status === 200 && body && typeof body.sha === "string" &&
-    typeof body.content === "string" && typeof body.encoding === "string" &&
-    !("type" in body);
 }
 const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString("base64");
 
@@ -72,6 +66,7 @@ function installMockGitHub({ commits, signatures = [], usersById = {} }) {
     if (pathname.includes("/contents/signatures/cla.json")) {
       if (method === "GET") {
         return res(200, {
+          type: "file",
           sha: "sig-sha-0",
           content: b64(state.signatures),
           encoding: "base64",

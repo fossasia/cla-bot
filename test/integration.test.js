@@ -39,18 +39,12 @@ async function test(name, fn) {
 }
 
 function res(status, jsonBody, headers = {}) {
-  if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
     headers: { get: (name) => headers[name.toLowerCase()] || null },
   };
-}
-function isContentsFileResponse(status, body) {
-  return status === 200 && body && typeof body.sha === "string" &&
-    typeof body.content === "string" && typeof body.encoding === "string" &&
-    !("type" in body);
 }
 function b64(obj) {
   return Buffer.from(JSON.stringify(obj)).toString("base64");
@@ -149,6 +143,7 @@ function makeFakeGitHub({
         // real content inline (small file) or needs a Git Blobs API fallback
         // (file over 1 MB). Test data here is always small.
         return res(200, {
+          type: "file",
           sha: state.sha,
           content: b64(state.signatures),
           encoding: "base64",
@@ -3685,7 +3680,6 @@ function makeFakeGitHub({
     const comments = [];
 
     function res(status, jsonBody) {
-      if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
       return {
         ok: status >= 200 && status < 300,
         status,
@@ -3716,6 +3710,7 @@ function makeFakeGitHub({
           // checkPR's correctness depended on this GET, it would get the
           // wrong answer every single time in this test.
           return res(200, {
+            type: "file",
             sha: sigSha,
             content: b64(preWriteSignatures),
             encoding: "base64",
@@ -3829,7 +3824,6 @@ function makeFakeGitHub({
     let sigSha = "sig-sha-0";
 
     function res(status, jsonBody) {
-      if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
       return {
         ok: status >= 200 && status < 300,
         status,
@@ -3854,6 +3848,7 @@ function makeFakeGitHub({
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
           return res(200, {
+            type: "file",
             sha: sigSha,
             content: b64(storedSignatures),
             encoding: "base64",
