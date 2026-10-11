@@ -1,6 +1,7 @@
 "use strict";
 /** Tests that allowlisted signers are not credited with completing a PR. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 
 process.env.GITHUB_TOKEN = "dummy-token";
 process.env.GITHUB_REPOSITORY = "fossasia/testrepo";
@@ -48,7 +49,8 @@ function b64(obj) {
     // blocked.
     const state = {
       signatures: { version: 1, signatures: [] },
-      sha: "sig-sha-0",
+      sha: testGitSha("sig-sha-0"),
+      shaCounter: 0,
       comments: [],
       statuses: [],
     };
@@ -80,6 +82,7 @@ function b64(obj) {
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
           return res(200, {
+            type: "file",
             sha: state.sha,
             content: b64(state.signatures),
             encoding: "base64",
@@ -90,7 +93,7 @@ function b64(obj) {
           state.signatures = JSON.parse(
             Buffer.from(body.content, "base64").toString(),
           );
-          state.sha = `sig-sha-${Number(state.sha.split("-").pop()) + 1}`;
+          state.sha = testGitSha(`sig-sha-${++state.shaCounter}`);
           return res(200, { content: { sha: state.sha } });
         }
       }
@@ -161,7 +164,8 @@ function b64(obj) {
     // regardless of allowlist status for some unrelated reason).
     const state = {
       signatures: { version: 1, signatures: [] },
-      sha: "sig-sha-0",
+      sha: testGitSha("sig-sha-0"),
+      shaCounter: 0,
       comments: [],
       statuses: [],
     };
@@ -187,6 +191,7 @@ function b64(obj) {
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
           return res(200, {
+            type: "file",
             sha: state.sha,
             content: b64(state.signatures),
             encoding: "base64",
@@ -197,7 +202,7 @@ function b64(obj) {
           state.signatures = JSON.parse(
             Buffer.from(body.content, "base64").toString(),
           );
-          state.sha = `sig-sha-${Number(state.sha.split("-").pop()) + 1}`;
+          state.sha = testGitSha(`sig-sha-${++state.shaCounter}`);
           return res(200, { content: { sha: state.sha } });
         }
       }

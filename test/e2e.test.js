@@ -1,6 +1,7 @@
 /** Runs the CLI in a child process against a local mock GitHub API. */
 
 const assert = require("node:assert");
+const testGitSha = require("./helpers/git-sha");
 const http = require("node:http");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -9,6 +10,21 @@ const path = require("node:path");
 
 const REPO_ROOT = path.join(__dirname, "..");
 const SCRIPT = path.join(REPO_ROOT, "src", "cla-bot.js");
+// Keep the local HTTP test server usable with HTTPS-only API validation. Embed
+// this test-only fetch bridge in NODE_OPTIONS so CI needs no extra preload
+// file to be checked in or external TLS tooling.
+const LOOPBACK_FETCH_PRELOAD = `--import=data:text/javascript;base64,${Buffer.from(
+  `const nativeFetch = globalThis.fetch;
+globalThis.fetch = (input, options) => {
+  const isRequest = input instanceof Request;
+  const url = new URL(isRequest ? input.url : input);
+  if (url.protocol === "https:" && url.hostname === "127.0.0.1") {
+    url.protocol = "http:";
+    return nativeFetch(isRequest ? new Request(url, input) : url, options);
+  }
+  return nativeFetch(input, options);
+};`,
+).toString("base64")}`;
 
 // Keep test files in a private temporary directory.
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-e2e-"));
@@ -146,6 +162,34 @@ function runScript(env, { timeoutMs = 10000 } = {}) {
   });
 }
 
+function runNodeSource(source, { timeoutMs = 10000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-e", source], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        NODE_OPTIONS: LOOPBACK_FETCH_PRELOAD,
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`inline Node process did not exit within ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
 // Pass only Node's required OS variables and this test's explicit bot config.
 // The parent environment could otherwise change which authentication path
 // the child takes.
@@ -186,6 +230,7 @@ function buildChildEnv(overrides) {
   }
   const eventPath = overrides.GITHUB_EVENT_PATH;
   const childEnv = { ...env, ...overrides };
+  childEnv.NODE_OPTIONS = LOOPBACK_FETCH_PRELOAD;
   if (eventPath && fs.existsSync(eventPath)) {
     try {
       const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
@@ -211,11 +256,15 @@ function buildChildEnv(overrides) {
 // what a later GET returns in the same run - otherwise a test could see
 // "a write happened" and pass even if that write was never actually
 // persisted or read back correctly by the rest of the flow.
-function startFakeGitHub({ authorAlreadySigned }) {
+function startFakeGitHub({
+  authorAlreadySigned,
+  redirectTo,
+  largeSignatures = false,
+}) {
   const requestsSeen = [];
   const statusesSeen = [];
   let signaturesState = {
-    sha: "sig-sha-0",
+    sha: testGitSha("sig-sha-0"),
     data: {
       version: 1,
       signatures: authorAlreadySigned ? [{ id: 42, login: "e2e-author" }] : [],
@@ -225,7 +274,16 @@ function startFakeGitHub({ authorAlreadySigned }) {
     let rawBody = "";
     req.on("data", (c) => (rawBody += c));
     req.on("end", () => {
-      requestsSeen.push({ method: req.method, url: req.url });
+      requestsSeen.push({
+        method: req.method,
+        url: req.url,
+        accept: req.headers.accept,
+      });
+      if (redirectTo) {
+        res.writeHead(302, { Location: redirectTo });
+        res.end();
+        return;
+      }
       const send = (status, obj) => {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(obj === null ? "" : JSON.stringify(obj));
@@ -253,10 +311,27 @@ function startFakeGitHub({ authorAlreadySigned }) {
       }
       if (req.url.includes("/contents/signatures/cla.json")) {
         if (req.method === "GET") {
+          if (req.headers.accept === "application/vnd.github.raw+json") {
+            res.writeHead(302, {
+              Location:
+                "https://raw.githubusercontent.com/fossasia/cla-signatures/signatures/cla.json",
+            });
+            res.end();
+            return;
+          }
+          if (largeSignatures) {
+            return send(200, {
+              type: "file",
+              sha: signaturesState.sha,
+              content: "",
+              encoding: "none",
+            });
+          }
           const content = Buffer.from(
             JSON.stringify(signaturesState.data),
           ).toString("base64");
           return send(200, {
+            type: "file",
             sha: signaturesState.sha,
             content,
             encoding: "base64",
@@ -278,10 +353,24 @@ function startFakeGitHub({ authorAlreadySigned }) {
           const newData = JSON.parse(
             Buffer.from(payload.content, "base64").toString("utf8"),
           );
-          const newSha = `sig-sha-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+          const newSha = testGitSha(
+            `sig-sha-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+          );
           signaturesState = { sha: newSha, data: newData };
           return send(200, { content: { sha: newSha } });
         }
+      }
+      if (
+        req.url ===
+        `/repos/fossasia/cla-signatures/git/blobs/${signaturesState.sha}`
+      ) {
+        return send(200, {
+          sha: signaturesState.sha,
+          content: Buffer.from(JSON.stringify(signaturesState.data)).toString(
+            "base64",
+          ),
+          encoding: "base64",
+        });
       }
       if (req.url.includes("/statuses/")) {
         let payload = {};
@@ -319,10 +408,28 @@ function startFakeGitHub({ authorAlreadySigned }) {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
       resolve({
-        url: `http://127.0.0.1:${port}`,
+        url: `https://127.0.0.1:${port}`,
         requestsSeen,
         statusesSeen,
         getSignatures: () => signaturesState.data,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+function startRedirectTarget() {
+  const requestsSeen = [];
+  const server = http.createServer((req, res) => {
+    requestsSeen.push({ method: req.method, url: req.url });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ version: 1, signatures: [{ id: 42, login: "e2e-author" }] }));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        requestsSeen,
         close: () => new Promise((r) => server.close(r)),
       });
     });
@@ -386,6 +493,152 @@ function baseEnv(apiUrl) {
     }
   });
 
+  await test("large signature store end-to-end uses Contents metadata then Git Blobs only, never raw media", async () => {
+    const server = await startFakeGitHub({
+      authorAlreadySigned: true,
+      largeSignatures: true,
+    });
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "e2e-base-sha" },
+      },
+    });
+    try {
+      const { code, stderr } = await runScript({
+        ...baseEnv(server.url),
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(
+        code,
+        0,
+        `expected the large-file check to succeed, got ${code}. stderr:\n${stderr}`,
+      );
+
+      const signatureRequests = server.requestsSeen.filter(
+        (request) =>
+          request.url.includes("/contents/signatures/cla.json") ||
+          request.url.includes("/git/blobs/"),
+      );
+      assert.deepStrictEqual(signatureRequests, [
+        {
+          method: "GET",
+          url: "/repos/fossasia/cla-signatures/contents/signatures/cla.json",
+          accept: "application/vnd.github.object+json",
+        },
+        {
+          method: "GET",
+          url: `/repos/fossasia/cla-signatures/git/blobs/${testGitSha("sig-sha-0")}`,
+          accept: "application/vnd.github+json",
+        },
+      ]);
+      assert.ok(
+        !server.requestsSeen.some(
+          (request) => request.accept === "application/vnd.github.raw+json",
+        ),
+        "the CLI must never request raw media or follow its redirect",
+      );
+    } finally {
+      await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("the CLI refuses an HTTP redirect from the configured HTTPS API", async () => {
+    const target = await startRedirectTarget();
+    const api = await startFakeGitHub({
+      authorAlreadySigned: true,
+      redirectTo: target.url,
+    });
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "e2e-base-sha" },
+      },
+    });
+    try {
+      const { code, stderr } = await runScript({
+        ...baseEnv(api.url),
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(code, 1, stderr);
+      assert.match(stderr, /redirect must remain within the configured HTTPS API base path/i);
+      assert.ok(api.requestsSeen.length > 0);
+      assert.strictEqual(
+        target.requestsSeen.length,
+        0,
+        "fetch must reject the redirect before contacting its HTTP target",
+      );
+    } finally {
+      await api.close();
+      await target.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("the loopback fetch bridge preserves Request method, headers, and body", async () => {
+    let received;
+    let redirectFollowed = false;
+    const server = http.createServer((req, res) => {
+      if (req.url !== "/request") {
+        redirectFollowed = true;
+        res.end("redirect followed");
+        return;
+      }
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        received = {
+          method: req.method,
+          header: req.headers["x-bridge-test"],
+          body: Buffer.concat(chunks).toString("utf8"),
+        };
+        res.statusCode = 307;
+        res.setHeader("Location", "/redirect-target");
+        res.end();
+      });
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const requestUrl = `https://127.0.0.1:${server.address().port}/request`;
+      const source = `(async () => {
+        const request = new Request(${JSON.stringify(requestUrl)}, {
+          method: "POST",
+          headers: { "X-Bridge-Test": "preserved" },
+          body: "request-body",
+          redirect: "manual",
+        });
+        const response = await fetch(request);
+        console.log(JSON.stringify({
+          status: response.status,
+          location: response.headers.get("location"),
+        }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });`;
+      const result = await runNodeSource(source);
+      assert.strictEqual(result.code, 0, result.stderr);
+      assert.deepStrictEqual(JSON.parse(result.stdout), {
+        status: 307,
+        location: "/redirect-target",
+      });
+      assert.deepStrictEqual(received, {
+        method: "POST",
+        header: "preserved",
+        body: "request-body",
+      });
+      assert.strictEqual(redirectFollowed, false);
+    } finally {
+      await new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
   await test("main() rejects invalid GITHUB_SERVER_URL values before making API requests", async () => {
     const server = await startFakeGitHub({ authorAlreadySigned: true });
     const eventFile = writeTempEventFile({
@@ -402,6 +655,11 @@ function baseEnv(apiUrl) {
         "not a URL",
         "file:///tmp",
         "https://user:secret@example.com",
+        "https://github.example/api/something",
+        "https://github.example?query=value",
+        "https://github.example#fragment",
+        "https://github.example?",
+        "https://github.example#",
       ]) {
         const { code, stderr } = await runScript({
           ...baseEnv(server.url),
@@ -410,7 +668,7 @@ function baseEnv(apiUrl) {
           GITHUB_EVENT_PATH: eventFile,
         });
         assert.strictEqual(code, 1, `${value}: ${stderr}`);
-        assert.match(stderr, /GITHUB_SERVER_URL must be an HTTP\(S\) URL/);
+        assert.match(stderr, /GITHUB_SERVER_URL must be an HTTPS URL/);
       }
       assert.strictEqual(
         server.requestsSeen.length,
@@ -542,7 +800,7 @@ function baseEnv(apiUrl) {
 
   await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH does not exist", async () => {
     const { code, stderr } = await runScript({
-      ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+      ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
       GITHUB_EVENT_PATH: "/nonexistent/path/to/event.json",
     });
@@ -555,7 +813,7 @@ function baseEnv(apiUrl) {
 
   await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH is unset", async () => {
     const { code, stderr } = await runScript({
-      ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+      ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
       // GITHUB_EVENT_PATH deliberately omitted - buildChildEnv() defaults
       // it to "", so `!EVENT_PATH` is the true operand here, not
@@ -580,7 +838,7 @@ function baseEnv(apiUrl) {
     fs.writeFileSync(eventFile, "{ this is not valid json");
     try {
       const { code, stderr } = await runScript({
-        ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+        ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
         GITHUB_EVENT_NAME: "pull_request_target",
         GITHUB_EVENT_PATH: eventFile,
       });
@@ -636,7 +894,7 @@ function baseEnv(apiUrl) {
     );
     try {
       const { code, stderr } = await runScript({
-        ...baseEnv("http://127.0.0.1:1"),
+        ...baseEnv("https://127.0.0.1:1"),
         GITHUB_EVENT_NAME: "issue_comment",
         GITHUB_EVENT_PATH: eventFile,
       });
@@ -699,7 +957,7 @@ function baseEnv(apiUrl) {
         const child = spawn(process.execPath, ["-r", preload, SCRIPT], {
           cwd: REPO_ROOT,
           env: buildChildEnv({
-            ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+            ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
             GITHUB_EVENT_NAME: "pull_request_target",
             GITHUB_EVENT_PATH: eventFile,
           }),
@@ -1009,7 +1267,7 @@ function baseEnv(apiUrl) {
       const { code, stderr } = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [wrapper], {
           cwd: REPO_ROOT,
-          env: buildChildEnv(baseEnv("http://127.0.0.1:1")),
+          env: buildChildEnv(baseEnv("https://127.0.0.1:1")),
         });
         let stderrOut = "";
         child.stderr.on("data", (d) => (stderrOut += d));
@@ -1047,7 +1305,7 @@ function baseEnv(apiUrl) {
       const { code, stderr } = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [wrapper], {
           cwd: REPO_ROOT,
-          env: buildChildEnv(baseEnv("http://127.0.0.1:1")),
+          env: buildChildEnv(baseEnv("https://127.0.0.1:1")),
         });
         let stderrOut = "";
         child.stderr.on("data", (d) => (stderrOut += d));

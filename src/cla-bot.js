@@ -174,18 +174,74 @@ function assertValidEventPRNumber(value, context) {
 }
 
 function parseGitHubServerUrl(serverUrl) {
+  const errorMessage =
+    "GITHUB_SERVER_URL must be an HTTPS URL without credentials, path, query, or fragment";
+  if (
+    typeof serverUrl !== "string" ||
+    serverUrl.length === 0 ||
+    serverUrl.includes("?") ||
+    serverUrl.includes("#")
+  ) {
+    throw new Error(errorMessage);
+  }
+
   let server;
   try {
     server = new URL(serverUrl);
   } catch {
-    throw new Error(
-      "GITHUB_SERVER_URL must be an HTTP(S) URL without credentials",
-    );
+    throw new Error(errorMessage);
   }
-  if (!/^https?:$/.test(server.protocol) || server.username || server.password) {
-    throw new Error("GITHUB_SERVER_URL must be an HTTP(S) URL without credentials");
+
+  // GITHUB_SERVER_URL is an origin (for example https://github.com), unlike
+  // GITHUB_API_URL which may have a GHES API prefix. Check the raw path too,
+  // since URL parsing can normalize dot segments such as /path/.. to "/".
+  const authorityStart = serverUrl.indexOf("://") + 3;
+  const pathStart = serverUrl.indexOf("/", authorityStart);
+  const rawPath =
+    pathStart === -1
+      ? ""
+      : serverUrl.slice(pathStart).split(/[?#]/, 1)[0];
+  if (
+    server.protocol !== "https:" ||
+    !server.hostname ||
+    server.username ||
+    server.password ||
+    server.pathname !== "/" ||
+    (rawPath !== "" && rawPath !== "/") ||
+    server.search ||
+    server.hash
+  ) {
+    throw new Error(errorMessage);
   }
   return server;
+}
+
+function parseGitHubApiUrl(apiUrl) {
+  try {
+    if (
+      typeof apiUrl !== "string" ||
+      apiUrl.length === 0 ||
+      apiUrl.includes("?") ||
+      apiUrl.includes("#")
+    ) {
+      throw new Error("invalid API base");
+    }
+    const base = new URL(apiUrl);
+    if (
+      base.protocol !== "https:" ||
+      base.username ||
+      base.password ||
+      base.search ||
+      base.hash
+    ) {
+      throw new Error("invalid API base");
+    }
+    return base;
+  } catch {
+    throw new Error(
+      "GITHUB_API_URL must be an absolute HTTPS URL without credentials, query, or fragment.",
+    );
+  }
 }
 
 function buildCommentUrl(prNumber, commentId, serverUrl = GITHUB_SERVER_URL) {
@@ -376,6 +432,23 @@ function sigContentsApiPath() {
   return `${sigRepoBasePath()}/contents/${encodeRepoPath(SIG_PATH)}`;
 }
 
+function assertValidGitBlobSha(blobSha, source = "Signatures file metadata") {
+  if (
+    typeof blobSha !== "string" ||
+    !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(blobSha)
+  ) {
+    throw new Error(
+      `${source} is missing a valid Git blob SHA; refusing to trust its content.`,
+    );
+  }
+  return blobSha.toLowerCase();
+}
+
+function sigBlobApiPath(blobSha) {
+  assertValidGitBlobSha(blobSha);
+  return `${sigRepoBasePath()}/git/blobs/${blobSha}`;
+}
+
 function validateConfig() {
   for (const [name, val] of [
     ["GITHUB_TOKEN", GITHUB_TOKEN],
@@ -388,6 +461,11 @@ function validateConfig() {
 
   try {
     parseGitHubServerUrl(GITHUB_SERVER_URL);
+  } catch (error) {
+    fail(error.message);
+  }
+  try {
+    parseGitHubApiUrl(GITHUB_API);
   } catch (error) {
     fail(error.message);
   }
@@ -416,16 +494,21 @@ function validateConfig() {
       `SIG_PATH ${JSON.stringify(SIG_PATH)} is not a valid path within the signatures repo: ${sigPathProblem}.`,
     );
   }
+  let claDocumentUrl;
   try {
-    const parsed = new URL(CLA_DOCUMENT_URL);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      fail(
-        `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} must be an http(s) URL.`,
-      );
-    }
+    claDocumentUrl = new URL(CLA_DOCUMENT_URL);
   } catch {
     fail(
       `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} is not a valid URL.`,
+    );
+  }
+  if (
+    claDocumentUrl.protocol !== "https:" ||
+    claDocumentUrl.username ||
+    claDocumentUrl.password
+  ) {
+    fail(
+      `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} must be an HTTPS URL without credentials.`,
     );
   }
   // Say so when normalization changed the value.
@@ -516,7 +599,7 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
   };
   const rejectBase = () => {
     throw new Error(
-      "GITHUB_API_URL must be an absolute HTTP(S) URL without credentials, query, or fragment.",
+      "GITHUB_API_URL must be an absolute HTTPS URL without credentials, query, or fragment.",
     );
   };
   if (
@@ -529,14 +612,6 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
   ) {
     reject();
   }
-  if (
-    typeof apiBase !== "string" ||
-    apiBase.length === 0 ||
-    apiBase.includes("?") ||
-    apiBase.includes("#")
-  ) {
-    rejectBase();
-  }
   const requestPath = path.split("?", 1)[0];
   for (const segment of requestPath.split("/")) {
     // The URL parser treats encoded dot segments as path navigation too.
@@ -546,17 +621,8 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
 
   let base;
   try {
-    base = new URL(apiBase);
+    base = parseGitHubApiUrl(apiBase);
   } catch {
-    rejectBase();
-  }
-  if (
-    (base.protocol !== "http:" && base.protocol !== "https:") ||
-    base.username ||
-    base.password ||
-    base.search ||
-    base.hash
-  ) {
     rejectBase();
   }
 
@@ -583,26 +649,112 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
 // writeSignatures(), since they need a re-read, not a blind retry.
 async function ghRaw(path, token, options = {}) {
   const requestUrl = buildSafeApiUrl(path);
-  // Count each attempt here, including retries and direct ghRaw() calls.
-  consumeGitHubTokenRequest(token, { emergency: options.emergency === true });
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   const fetchOptions = { ...options };
   delete fetchOptions.preserveUnsafeIds;
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    Accept: "application/vnd.github+json",
+    "X-GitHub-Api-Version": "2022-11-28",
+    "User-Agent": "fossasia-cla-bot",
+    // fetch() does not set this for a plain string body.
+    ...(options.body ? { "Content-Type": "application/json" } : {}),
+    ...(options.headers || {}),
+  };
+  const apiBase = parseGitHubApiUrl(GITHUB_API);
+  const apiOrigin = apiBase.origin;
+  const apiBasePath = apiBase.pathname.replace(/\/+$/, "");
+  const visited = new Set([requestUrl]);
+  const maxRedirects = 5;
   try {
-    const res = await fetch(requestUrl, {
+    let currentUrl = requestUrl;
+    let requestOptions = {
       ...fetchOptions,
+      redirect: "manual",
       signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "User-Agent": "fossasia-cla-bot",
-        // fetch() does not set this for a plain string body.
-        ...(options.body ? { "Content-Type": "application/json" } : {}),
-        ...(options.headers || {}),
-      },
-    });
+      headers,
+    };
+    let res;
+    for (let redirects = 0; ; redirects += 1) {
+      // Count each network attempt, including redirect hops, retries, and
+      // direct ghRaw() calls.
+      consumeGitHubTokenRequest(token, {
+        emergency: options.emergency === true,
+      });
+      res = await fetch(currentUrl, requestOptions);
+      const location = res.headers?.get?.("location");
+      if (!location || ![301, 302, 303, 307, 308].includes(res.status)) break;
+      if (redirects >= maxRedirects) {
+        throw new Error("GitHub API request exceeded the redirect limit.");
+      }
+
+      let nextUrl;
+      try {
+        nextUrl = new URL(location, currentUrl);
+      } catch {
+        throw new Error("GitHub API returned an invalid redirect URL.");
+      }
+      const rawLocationPath = location.split(/[?#]/, 1)[0];
+      const hasRawBackslash = rawLocationPath.includes("\\");
+      const hasDotSegment = /(?:^|\/)(?:\.|%2e){1,2}(?:\/|$)/i.test(
+        rawLocationPath,
+      );
+      // An encoded percent can become another encoded separator or dot segment
+      // if a proxy decodes the path more than once. Reject that ambiguity.
+      const hasEncodedPercent = /%25/i.test(nextUrl.pathname);
+      const withinApiPath =
+        apiBasePath === "" ||
+        nextUrl.pathname === apiBasePath ||
+        nextUrl.pathname.startsWith(`${apiBasePath}/`);
+      const hasEncodedPathSeparator = /%(?:2f|5c)/i.test(nextUrl.pathname);
+      // A redirect may change repository paths after a rename, but must stay
+      // inside the configured API path. Query parameters remain allowed for
+      // API endpoints that legitimately use them.
+      if (
+        nextUrl.protocol !== "https:" ||
+        nextUrl.origin !== apiOrigin ||
+        !withinApiPath ||
+        hasRawBackslash ||
+        hasEncodedPathSeparator ||
+        hasEncodedPercent ||
+        hasDotSegment ||
+        nextUrl.username ||
+        nextUrl.password ||
+        nextUrl.hash
+      ) {
+        throw new Error(
+          "GitHub API redirect must remain within the configured HTTPS API base path.",
+        );
+      }
+      const nextHref = nextUrl.href;
+      if (visited.has(nextHref)) {
+        throw new Error("GitHub API returned a redirect loop.");
+      }
+      visited.add(nextHref);
+      // Drain the redirect response before opening the next connection.
+      await res.body?.cancel?.();
+
+      const method = (requestOptions.method || "GET").toUpperCase();
+      const switchToGet =
+        (res.status === 303 && method !== "GET" && method !== "HEAD") ||
+        ((res.status === 301 || res.status === 302) && method === "POST");
+      if (switchToGet) {
+        requestOptions = { ...requestOptions, method: "GET", body: undefined };
+        for (const header of [
+          "content-encoding",
+          "content-language",
+          "content-length",
+          "content-location",
+          "content-type",
+        ]) {
+          for (const key of Object.keys(headers)) {
+            if (key.toLowerCase() === header) delete headers[key];
+          }
+        }
+      }
+      currentUrl = nextHref;
+    }
     const text = await res.text();
     if (!res.ok) {
       // A proxy can return an HTML error page on a 502/503/504. Parse
@@ -623,8 +775,6 @@ async function ghRaw(path, token, options = {}) {
       err.retryAfter = Number(res.headers.get("retry-after")) || null;
       throw err;
     }
-    // Raw media-type requests (see readSignatures) return plain text.
-    if (options.raw) return text;
     const jsonText = options.preserveUnsafeIds
       ? preserveUnsafeJsonIds(text)
       : text;
@@ -1203,57 +1353,91 @@ async function readSignatures(token) {
   // Built and validated outside the try on purpose, so an invalid SIG_PATH
   // surfaces as a config error and is never mistaken for the 404 below.
   const contentsPath = sigContentsApiPath();
+  let meta;
   try {
-    // The 'object' media type works up to 100 MB (the default format is only
-    // reliable under 1 MB) and still returns the sha needed for
-    // compare-and-swap writes. Files up to 1 MB come with their content.
-    // Larger ones come back empty and are fetched with the 'raw' media type.
-    const meta = await gh(contentsPath, token, {
+    // The object media type returns the sha needed for compare-and-swap
+    // writes. Larger files may omit content; fetch those by sha through the
+    // Git Blobs API, which returns base64 JSON without a raw-media redirect.
+    meta = await gh(contentsPath, token, {
       headers: { Accept: "application/vnd.github.object+json" },
     });
-
-    let text;
-    if (meta.content && meta.encoding === "base64") {
-      text = Buffer.from(meta.content, "base64").toString("utf8");
-    } else {
-      text = await gh(contentsPath, token, {
-        headers: { Accept: "application/vnd.github.raw+json" },
-        raw: true,
-      });
-    }
-
-    const data = JSON.parse(text);
-    if (!Array.isArray(data.signatures))
-      throw new Error(
-        'signatures file is malformed: "signatures" is not an array',
-      );
-
-    // Keep malformed entries to avoid deleting old records. Warn by position
-    // only, and index valid numeric ids regardless of the login field.
-    const index = new SignatureIndex([]);
-    data.signatures.forEach((entry, position) => {
-      if (
-        !entry ||
-        typeof entry.login !== "string" ||
-        entry.login.length === 0
-      ) {
-        console.warn(
-          `::warning::Signature entry at index ${position} is missing/has an invalid "login" field (kept as-is; any valid numeric id is still used for matching) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
-        );
-      }
-      index.add(entry);
-    });
-    // `index` describes this `data` snapshot only.
-    return { sha: meta.sha, data, index };
   } catch (e) {
-    if (e.status === 404)
+    // Only a missing Contents resource means the signature store has not been
+    // created yet. A 404 from a later blob read indicates inconsistent or
+    // inaccessible existing data and must fail closed.
+    if (e.status === 404) {
       return {
         sha: null,
         data: { version: 1, signatures: [] },
         index: new SignatureIndex([]),
       };
+    }
     throw e;
   }
+
+  if (
+    !meta ||
+    typeof meta !== "object" ||
+    Array.isArray(meta) ||
+    meta.type !== "file"
+  ) {
+    throw new Error(
+      "GitHub Contents API did not return a file object for the signatures file.",
+    );
+  }
+  if (typeof meta.sha !== "string" || meta.sha.length === 0) {
+    throw new Error(
+      "GitHub Contents API did not return a blob SHA for the signatures file.",
+    );
+  }
+  const metadataSha = assertValidGitBlobSha(meta.sha);
+
+  let text;
+  if (typeof meta.content === "string" && meta.encoding === "base64") {
+    text = Buffer.from(meta.content, "base64").toString("utf8");
+  } else {
+    const blob = await gh(sigBlobApiPath(metadataSha), token);
+    if (
+      !blob ||
+      typeof blob !== "object" ||
+      Array.isArray(blob) ||
+      assertValidGitBlobSha(blob.sha, "GitHub blob response") !== metadataSha
+    ) {
+      throw new Error(
+        "GitHub returned a blob SHA that does not match the signatures file metadata.",
+      );
+    }
+    if (blob.encoding !== "base64" || typeof blob.content !== "string") {
+      throw new Error(
+        "GitHub did not return base64 content for the signatures file blob.",
+      );
+    }
+    text = Buffer.from(blob.content, "base64").toString("utf8");
+  }
+
+  const data = JSON.parse(text);
+  if (!Array.isArray(data.signatures))
+    throw new Error(
+      'signatures file is malformed: "signatures" is not an array',
+    );
+
+  // Keep malformed entries to avoid deleting old records. Warn by position
+  // only, and index valid numeric ids regardless of the login field.
+  const index = new SignatureIndex([]);
+  data.signatures.forEach((entry, position) => {
+    if (
+      !entry ||
+      typeof entry.login !== "string" ||
+      entry.login.length === 0
+    ) {
+      console.warn(
+        `::warning::Signature entry at index ${position} is missing/has an invalid "login" field (kept as-is; any valid numeric id is still used for matching) - check ${SIG_OWNER}/${SIG_REPO}/${SIG_PATH}`,
+      );
+    }
+    index.add(entry);
+  });
+  // `index` describes this `data` snapshot only.
+  return { sha: metadataSha, data, index };
 }
 
 async function writeSignatures(token, mutate, message, attempt = 1) {

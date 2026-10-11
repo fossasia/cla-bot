@@ -534,6 +534,7 @@ const VALID_BASE_CONFIG = {
   SIG_REPO: "cla-signatures",
   SIG_PATH: "signatures/cla.json",
   CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+  GITHUB_API_URL: "https://api.github.com",
   GITHUB_SERVER_URL: "https://github.com",
   // Explicitly empty: this file's process-wide ALLOWLIST (set at the top)
   // contains login entries, which make validateConfig() emit an advisory
@@ -543,6 +544,20 @@ const VALID_BASE_CONFIG = {
 
 test("validateConfig accepts a well-formed config (baseline sanity check for the tests below)", () => {
   assertConfigOK(VALID_BASE_CONFIG);
+});
+
+test("validateConfig accepts HTTPS server origins independently from a GHES API prefix", () => {
+  for (const serverUrl of [
+    "https://github.example",
+    "https://github.example/",
+    "https://github.example:443",
+  ]) {
+    assertConfigOK({
+      ...VALID_BASE_CONFIG,
+      GITHUB_SERVER_URL: serverUrl,
+      GITHUB_API_URL: "https://github.example/api/v3",
+    });
+  }
 });
 
 test("validateConfig accepts the documented GITHUB_TOKEN fallback when both App credentials are empty", () => {
@@ -575,9 +590,20 @@ test("validateConfig rejects a CLA_DOCUMENT_URL that is not a valid URL", () => 
   );
 });
 
-test("validateConfig rejects a non-http(s) CLA_DOCUMENT_URL (e.g. file://)", () => {
+test("validateConfig requires HTTPS for CLA_DOCUMENT_URL", () => {
+  assertConfigFails(
+    { ...VALID_BASE_CONFIG, CLA_DOCUMENT_URL: "http://example.com/CLA.md" },
+    "CLA_DOCUMENT_URL",
+  );
   assertConfigFails(
     { ...VALID_BASE_CONFIG, CLA_DOCUMENT_URL: "file:///etc/passwd" },
+    "CLA_DOCUMENT_URL",
+  );
+  assertConfigFails(
+    {
+      ...VALID_BASE_CONFIG,
+      CLA_DOCUMENT_URL: "https://user:secret@example.com/CLA.md",
+    },
     "CLA_DOCUMENT_URL",
   );
 });
@@ -586,11 +612,32 @@ test("validateConfig rejects an invalid GITHUB_SERVER_URL before processing even
   for (const value of [
     "not a URL",
     "file:///tmp",
+    "http://github.example.com",
     "https://user:secret@example.com",
+    "https://github.example.com/api/something",
+    "https://github.example.com?query=value",
+    "https://github.example.com#fragment",
+    "https://github.example.com?",
+    "https://github.example.com#",
+    "https://github.example.com/path/..",
+    "https://github.example.com\\api",
   ]) {
     assertConfigFails(
       { ...VALID_BASE_CONFIG, GITHUB_SERVER_URL: value },
-      "GITHUB_SERVER_URL must be an HTTP(S) URL without credentials",
+      "GITHUB_SERVER_URL must be an HTTPS URL without credentials, path, query, or fragment",
+    );
+  }
+});
+
+test("validateConfig rejects HTTP and malformed GITHUB_API_URL values up front", () => {
+  for (const value of [
+    "http://github.example.com/api/v3",
+    "https://github.example.com/api/v3?",
+    "https://github.example.com/api/v3#",
+  ]) {
+    assertConfigFails(
+      { ...VALID_BASE_CONFIG, GITHUB_API_URL: value },
+      "GITHUB_API_URL must be an absolute HTTPS URL",
     );
   }
 });
@@ -743,10 +790,11 @@ test("validateConfig's SIG_REPO failure is ONE log line with the value JSON-quot
   assert.ok(!msg.includes("\n"), msg);
 });
 
-test("validateConfig's CLA_DOCUMENT_URL failures (not-a-URL, and non-http(s)) are ONE log line with the value JSON-quoted", () => {
+test("validateConfig's CLA_DOCUMENT_URL failures (not-a-URL, and non-HTTPS) are ONE log line with the value JSON-quoted", () => {
   for (const value of [
     "not a url\n::warning::pwned",
     "ftp://example.com/\n::warning::pwned",
+    "http://example.com/CLA.md\n::warning::pwned",
   ]) {
     const msg = captureConfigFailure({
       ...VALID_BASE_CONFIG,

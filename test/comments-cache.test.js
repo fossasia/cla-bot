@@ -1,6 +1,7 @@
 "use strict";
 /** Tests comment-history caching and its use by checkPR(). */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 const fs = require("fs");
 const { Readable } = require("stream");
 
@@ -410,7 +411,8 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
   function makeFakeGitHub({ commits, initialSignatures, comments = [] }) {
     const state = {
       signatures: initialSignatures,
-      sha: "sig-sha-0",
+      sha: testGitSha("sig-sha-0"),
+      shaCounter: 0,
       _comments: comments,
       statuses: [],
     };
@@ -443,6 +445,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
       if (url.includes("/contents/signatures/cla.json")) {
         if (method === "GET") {
           return res(200, {
+            type: "file",
             sha: state.sha,
             content: b64(state.signatures),
             encoding: "base64",
@@ -455,7 +458,7 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
           state.signatures = JSON.parse(
             Buffer.from(body.content, "base64").toString(),
           );
-          state.sha = `sig-sha-${Number(state.sha.split("-")[2]) + 1}`;
+          state.sha = testGitSha(`sig-sha-${++state.shaCounter}`);
           return res(200, { content: { sha: state.sha } });
         }
       }

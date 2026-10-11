@@ -1,6 +1,7 @@
 "use strict";
 /** Tests token caching, refresh, expiry, and the GITHUB_TOKEN fallback. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 const crypto = require("crypto");
 const fs = require("fs");
 const http = require("http");
@@ -9,6 +10,20 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const SRC = path.resolve(__dirname, "../src/cla-bot.js");
+// Embed the loopback-only HTTPS-to-HTTP test bridge so child processes do not
+// depend on an additional preload file being present in a CI checkout.
+const LOOPBACK_FETCH_PRELOAD = `--import=data:text/javascript;base64,${Buffer.from(
+  `const nativeFetch = globalThis.fetch;
+globalThis.fetch = (input, options) => {
+  const isRequest = input instanceof Request;
+  const url = new URL(isRequest ? input.url : input);
+  if (url.protocol === "https:" && url.hostname === "127.0.0.1") {
+    url.protocol = "http:";
+    return nativeFetch(isRequest ? new Request(url, input) : url, options);
+  }
+  return nativeFetch(input, options);
+};`,
+).toString("base64")}`;
 // fs.mkdtempSync (unlike a hand-built "pid + Date.now()" path in the shared,
 // world-writable os.tmpdir()) creates a directory with an unguessable name
 // and owner-only permissions (0o700 on POSIX), so no other local user can
@@ -120,7 +135,7 @@ function makeAppGitHub({
     statuses: [],
     comments: [],
     hooks: {},
-    sigSha: "sig-sha-0",
+    sigSha: testGitSha("sig-sha-0"),
     sigPuts: 0,
     signatures,
     commits: commits || [
@@ -176,6 +191,7 @@ function makeAppGitHub({
         const out = {
           status: 200,
           body: {
+            type: "file",
             sha: s.sigSha,
             content: b64(s.signatures),
             encoding: "base64",
@@ -193,7 +209,7 @@ function makeAppGitHub({
           Buffer.from(payload.content, "base64").toString("utf8"),
         );
         s.sigPuts += 1;
-        s.sigSha = `sig-sha-${s.sigPuts}`;
+        s.sigSha = testGitSha(`sig-sha-${s.sigPuts}`);
         return { status: 200, body: { content: { sha: s.sigSha } } };
       }
     }
@@ -909,7 +925,8 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
           PATH: process.env.PATH,
           HOME: process.env.HOME || TMP_DIR,
           ...BASE_ENV,
-          GITHUB_API_URL: `http://127.0.0.1:${server.address().port}`,
+          GITHUB_API_URL: `https://127.0.0.1:${server.address().port}`,
+          NODE_OPTIONS: LOOPBACK_FETCH_PRELOAD,
           GITHUB_EVENT_NAME: "issue_comment",
           GITHUB_EVENT_PATH: eventPath,
           CLA_BOT_EVENT_PR_NUMBER: "1",

@@ -1,6 +1,7 @@
 "use strict";
 /** Tests bounded concurrency, pagination, and author ordering. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 
 process.env.GITHUB_TOKEN = "dummy";
 process.env.GITHUB_REPOSITORY = "fossasia/testrepo";
@@ -430,7 +431,8 @@ const linkTo = (path, last) =>
         if (path.startsWith("/repos/fossasia/cla-signatures/contents/")) {
           await sleep(1);
           return res(200, {
-            sha: "s0",
+            type: "file",
+            sha: testGitSha("s0"),
             content: Buffer.from(
               JSON.stringify({ version: 1, signatures }),
             ).toString("base64"),

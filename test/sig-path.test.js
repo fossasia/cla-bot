@@ -1,6 +1,7 @@
 "use strict";
 /** Tests signature path validation, URL encoding, compatibility, and CLI errors. */
 const assert = require("assert");
+const testGitSha = require("./helpers/git-sha");
 const crypto = require("crypto");
 const path = require("path");
 const { spawnSync } = require("child_process");
@@ -94,6 +95,7 @@ function installFakeContentsApi({ owner, repo }) {
       const f = files.get(key);
       if (!f) return fakeResponse(404, { message: "Not Found" });
       return fakeResponse(200, {
+        type: "file",
         sha: f.sha,
         content: Buffer.from(f.text).toString("base64"),
         encoding: "base64",
@@ -103,7 +105,7 @@ function installFakeContentsApi({ owner, repo }) {
       const body = JSON.parse(opts.body);
       shaCounter += 1;
       files.set(key, {
-        sha: `sha${shaCounter}`,
+        sha: testGitSha(shaCounter),
         text: Buffer.from(body.content, "base64").toString("utf8"),
       });
       return fakeResponse(200, {});
@@ -593,7 +595,7 @@ const INVALID_PATHS = [
         assert.deepStrictEqual([...api.files.keys()], [p]);
         assert.strictEqual(written.signatures.length, 1);
         const { sha, data } = await bot.readSignatures("tok");
-        assert.strictEqual(sha, "sha1");
+        assert.strictEqual(sha, testGitSha(1));
         assert.deepStrictEqual(data.signatures, [{ id: 1, login: "alice" }]);
       } finally {
         global.fetch = originalFetch;
@@ -601,8 +603,9 @@ const INVALID_PATHS = [
     });
   }
 
-  await test("readSignatures' large-file fallback (empty content -> second raw GET) hits the identical, correctly-encoded URL both times", async () => {
+  await test("readSignatures' large-file fallback fetches the metadata SHA through the Git Blobs API", async () => {
     const valid = "ünï/sig-file.json"; // non-ASCII, so encoding is observable
+    const blobSha = "a".repeat(40);
     const bot = loadBot({ SIG_PATH: valid });
     const seen = [];
     try {
@@ -610,24 +613,29 @@ const INVALID_PATHS = [
         seen.push({ url, accept: opts.headers && opts.headers.Accept });
         if (seen.length === 1) {
           return fakeResponse(200, {
-            sha: "big",
+            type: "file",
+            sha: blobSha,
             content: "",
             encoding: "none",
           });
         }
-        return {
-          ok: true,
-          status: 200,
-          text: async () => JSON.stringify({ version: 1, signatures: [] }),
-          headers: { get: () => null },
-        };
+        return fakeResponse(200, {
+          sha: blobSha,
+          content: Buffer.from(
+            JSON.stringify({ version: 1, signatures: [] }),
+          ).toString("base64"),
+          encoding: "base64",
+        });
       };
       const { sha } = await bot.readSignatures("tok");
-      assert.strictEqual(sha, "big");
+      assert.strictEqual(sha, blobSha);
       assert.strictEqual(seen.length, 2);
       const expected = `${API}/repos/fossasia/cla-signatures/contents/${encodeRepoPath(valid)}`;
       assert.strictEqual(seen[0].url, expected);
-      assert.strictEqual(seen[1].url, expected);
+      assert.strictEqual(
+        seen[1].url,
+        `${API}/repos/fossasia/cla-signatures/git/blobs/${blobSha}`,
+      );
       assert.match(seen[0].url, /%C3%BC/);
     } finally {
       global.fetch = originalFetch;
@@ -799,7 +807,7 @@ const INVALID_PATHS = [
         ...BASE_ENV,
         // Nothing listens here: validateConfig() must fail first, so no
         // request should ever be attempted.
-        GITHUB_API_URL: "http://127.0.0.1:1",
+        GITHUB_API_URL: "https://127.0.0.1:1",
         GITHUB_EVENT_PATH: "",
         ...overrides,
       },
