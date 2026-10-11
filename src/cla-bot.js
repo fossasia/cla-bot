@@ -627,7 +627,9 @@ async function ghRaw(path, token, options = {}) {
     ...(options.body ? { "Content-Type": "application/json" } : {}),
     ...(options.headers || {}),
   };
-  const apiOrigin = parseGitHubApiUrl(GITHUB_API).origin;
+  const apiBase = parseGitHubApiUrl(GITHUB_API);
+  const apiOrigin = apiBase.origin;
+  const apiBasePath = apiBase.pathname.replace(/\/+$/, "");
   const visited = new Set([requestUrl]);
   const maxRedirects = 5;
   try {
@@ -658,17 +660,24 @@ async function ghRaw(path, token, options = {}) {
       } catch {
         throw new Error("GitHub API returned an invalid redirect URL.");
       }
+      const withinApiPath =
+        apiBasePath === "" ||
+        nextUrl.pathname === apiBasePath ||
+        nextUrl.pathname.startsWith(`${apiBasePath}/`);
+      const hasEncodedPathSeparator = /%(?:2f|5c)/i.test(nextUrl.pathname);
       // A redirect may change repository paths after a rename, but must never
-      // move credentials or trusted API responses to another origin or HTTP.
+      // move credentials or trusted API responses outside the configured API.
       if (
         nextUrl.protocol !== "https:" ||
         nextUrl.origin !== apiOrigin ||
+        !withinApiPath ||
+        hasEncodedPathSeparator ||
         nextUrl.username ||
         nextUrl.password ||
         nextUrl.hash
       ) {
         throw new Error(
-          "GitHub API redirect must remain on the configured HTTPS origin.",
+          "GitHub API redirect must remain within the configured HTTPS API base path.",
         );
       }
       const nextHref = nextUrl.href;
@@ -1319,8 +1328,24 @@ async function readSignatures(token) {
     throw e;
   }
 
+  if (
+    !meta ||
+    typeof meta !== "object" ||
+    Array.isArray(meta) ||
+    meta.type !== "file"
+  ) {
+    throw new Error(
+      "GitHub Contents API did not return a file object for the signatures file.",
+    );
+  }
+  if (typeof meta.sha !== "string" || meta.sha.length === 0) {
+    throw new Error(
+      "GitHub Contents API did not return a blob SHA for the signatures file.",
+    );
+  }
+
   let text;
-  if (meta.content && meta.encoding === "base64") {
+  if (typeof meta.content === "string" && meta.encoding === "base64") {
     text = Buffer.from(meta.content, "base64").toString("utf8");
   } else {
     const blob = await gh(sigBlobApiPath(meta.sha), token);

@@ -43,12 +43,18 @@ async function test(name, fn) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function res(status, jsonBody, headers = {}) {
+  if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
     headers: { get: (h) => headers[h.toLowerCase()] || null },
   };
+}
+function isContentsFileResponse(status, body) {
+  return status === 200 && body && typeof body.sha === "string" &&
+    typeof body.content === "string" && typeof body.encoding === "string" &&
+    !("type" in body);
 }
 
 // Counts requests in flight and remembers the order they started in.

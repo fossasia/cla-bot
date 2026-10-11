@@ -306,6 +306,7 @@ function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
             JSON.stringify(signaturesState.data),
           ).toString("base64");
           return send(200, {
+            type: "file",
             sha: signaturesState.sha,
             content,
             encoding: "base64",
@@ -474,7 +475,7 @@ function baseEnv(apiUrl) {
         GITHUB_EVENT_PATH: eventFile,
       });
       assert.strictEqual(code, 1, stderr);
-      assert.match(stderr, /redirect must remain on the configured HTTPS origin/i);
+      assert.match(stderr, /redirect must remain within the configured HTTPS API base path/i);
       assert.ok(api.requestsSeen.length > 0);
       assert.strictEqual(
         target.requestsSeen.length,

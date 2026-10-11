@@ -39,12 +39,18 @@ async function test(name, fn) {
 }
 
 function res(status, jsonBody, headers = {}) {
+  if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
   return {
     ok: status >= 200 && status < 300,
     status,
     text: async () => (jsonBody === null ? "" : JSON.stringify(jsonBody)),
     headers: { get: (name) => headers[name.toLowerCase()] || null },
   };
+}
+function isContentsFileResponse(status, body) {
+  return status === 200 && body && typeof body.sha === "string" &&
+    typeof body.content === "string" && typeof body.encoding === "string" &&
+    !("type" in body);
 }
 function b64(obj) {
   return Buffer.from(JSON.stringify(obj)).toString("base64");
@@ -3679,6 +3685,7 @@ function makeFakeGitHub({
     const comments = [];
 
     function res(status, jsonBody) {
+      if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
       return {
         ok: status >= 200 && status < 300,
         status,
@@ -3822,6 +3829,7 @@ function makeFakeGitHub({
     let sigSha = "sig-sha-0";
 
     function res(status, jsonBody) {
+      if (isContentsFileResponse(status, jsonBody)) jsonBody = { type: "file", ...jsonBody };
       return {
         ok: status >= 200 && status < 300,
         status,

@@ -94,6 +94,7 @@ function installFakeContentsApi({ owner, repo }) {
       const f = files.get(key);
       if (!f) return fakeResponse(404, { message: "Not Found" });
       return fakeResponse(200, {
+        type: "file",
         sha: f.sha,
         content: Buffer.from(f.text).toString("base64"),
         encoding: "base64",
@@ -611,6 +612,7 @@ const INVALID_PATHS = [
         seen.push({ url, accept: opts.headers && opts.headers.Accept });
         if (seen.length === 1) {
           return fakeResponse(200, {
+            type: "file",
             sha: blobSha,
             content: "",
             encoding: "none",
