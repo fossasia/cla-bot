@@ -15,10 +15,11 @@ const SCRIPT = path.join(REPO_ROOT, "src", "cla-bot.js");
 const LOOPBACK_FETCH_PRELOAD = `--import=data:text/javascript;base64,${Buffer.from(
   `const nativeFetch = globalThis.fetch;
 globalThis.fetch = (input, options) => {
-  const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+  const isRequest = input instanceof Request;
+  const url = new URL(isRequest ? input.url : input);
   if (url.protocol === "https:" && url.hostname === "127.0.0.1") {
     url.protocol = "http:";
-    return nativeFetch(url, options);
+    return nativeFetch(isRequest ? new Request(url, input) : url, options);
   }
   return nativeFetch(input, options);
 };`,
@@ -146,6 +147,34 @@ function runScript(env, { timeoutMs = 10000 } = {}) {
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`script did not exit within ${timeoutMs}ms`));
+    }, timeoutMs);
+    child.stdout.on("data", (d) => (stdout += d));
+    child.stderr.on("data", (d) => (stderr += d));
+    child.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr });
+    });
+  });
+}
+
+function runNodeSource(source, { timeoutMs = 10000 } = {}) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["-e", source], {
+      cwd: REPO_ROOT,
+      env: {
+        ...process.env,
+        NODE_OPTIONS: LOOPBACK_FETCH_PRELOAD,
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`inline Node process did not exit within ${timeoutMs}ms`));
     }, timeoutMs);
     child.stdout.on("data", (d) => (stdout += d));
     child.stderr.on("data", (d) => (stderr += d));
@@ -456,6 +485,63 @@ function baseEnv(apiUrl) {
       await api.close();
       await target.close();
       fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("the loopback fetch bridge preserves Request method, headers, and body", async () => {
+    let received;
+    let redirectFollowed = false;
+    const server = http.createServer((req, res) => {
+      if (req.url !== "/request") {
+        redirectFollowed = true;
+        res.end("redirect followed");
+        return;
+      }
+      const chunks = [];
+      req.on("data", (chunk) => chunks.push(chunk));
+      req.on("end", () => {
+        received = {
+          method: req.method,
+          header: req.headers["x-bridge-test"],
+          body: Buffer.concat(chunks).toString("utf8"),
+        };
+        res.statusCode = 307;
+        res.setHeader("Location", "/redirect-target");
+        res.end();
+      });
+    });
+    await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const requestUrl = `https://127.0.0.1:${server.address().port}/request`;
+      const source = `(async () => {
+        const request = new Request(${JSON.stringify(requestUrl)}, {
+          method: "POST",
+          headers: { "X-Bridge-Test": "preserved" },
+          body: "request-body",
+          redirect: "manual",
+        });
+        const response = await fetch(request);
+        console.log(JSON.stringify({
+          status: response.status,
+          location: response.headers.get("location"),
+        }));
+      })().catch((error) => { console.error(error); process.exitCode = 1; });`;
+      const result = await runNodeSource(source);
+      assert.strictEqual(result.code, 0, result.stderr);
+      assert.deepStrictEqual(JSON.parse(result.stdout), {
+        status: 307,
+        location: "/redirect-target",
+      });
+      assert.deepStrictEqual(received, {
+        method: "POST",
+        header: "preserved",
+        body: "request-body",
+      });
+      assert.strictEqual(redirectFollowed, false);
+    } finally {
+      await new Promise((resolve, reject) =>
+        server.close((error) => (error ? reject(error) : resolve())),
+      );
     }
   });
 

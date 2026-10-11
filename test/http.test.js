@@ -283,6 +283,127 @@ function fakeResponse(status, jsonBody, headers = {}) {
     global.fetch = originalFetch;
   });
 
+  await test("ghRaw rejects malformed, looping, and excessive redirects", async () => {
+    const originalFetch = global.fetch;
+    try {
+      global.fetch = async () =>
+        fakeResponse(302, null, { location: "http://[" });
+      await assert.rejects(
+        ghRaw("/repos/owner/repo", "tok"),
+        /invalid redirect URL/,
+      );
+
+      global.fetch = async () =>
+        fakeResponse(301, null, {
+          location: "https://api.github.com/repos/owner/repo",
+        });
+      await assert.rejects(
+        ghRaw("/repos/owner/repo", "tok"),
+        /redirect loop/,
+      );
+
+      let calls = 0;
+      global.fetch = async () => {
+        calls += 1;
+        return fakeResponse(301, null, {
+          location: `https://api.github.com/repos/owner/repo/${calls}`,
+        });
+      };
+      await assert.rejects(
+        ghRaw("/repos/owner/repo", "tok"),
+        /exceeded the redirect limit/,
+      );
+      assert.strictEqual(calls, 6, "the redirect limit bounds network calls");
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  await test("ghRaw drains same-origin redirect responses and handles 303 method rules", async () => {
+    const originalFetch = global.fetch;
+    try {
+      let cancelCalls = 0;
+      let calls = 0;
+      const postHeaders = {
+        "Content-Encoding": "identity",
+        "content-language": "en",
+        "content-length": "4",
+        "Content-Location": "/old",
+        "content-type": "application/json",
+        "X-Keep": "yes",
+      };
+      global.fetch = async (_url, options) => {
+        calls += 1;
+        if (calls === 1) {
+          return {
+            ...fakeResponse(303, null, {
+              location: "https://api.github.com/repos/owner/new",
+            }),
+            body: { cancel: async () => { cancelCalls += 1; } },
+          };
+        }
+        assert.strictEqual(options.method, "GET");
+        assert.strictEqual(options.body, undefined);
+        assert.strictEqual(options.headers["X-Keep"], "yes");
+        for (const key of Object.keys(options.headers)) {
+          assert.ok(
+            !["content-encoding", "content-language", "content-length", "content-location", "content-type"].includes(key.toLowerCase()),
+            `${key} should be removed when a redirect changes POST to GET`,
+          );
+        }
+        return fakeResponse(200, { ok: true });
+      };
+      await ghRaw("/repos/owner/old", "tok", {
+        method: "POST",
+        body: "data",
+        headers: postHeaders,
+      });
+      assert.strictEqual(cancelCalls, 1);
+
+      for (const method of ["GET", "HEAD"]) {
+        calls = 0;
+        global.fetch = async (_url, options) => {
+          calls += 1;
+          if (calls === 1) {
+            assert.strictEqual(options.method, method);
+            return fakeResponse(303, null, {
+              location: "https://api.github.com/repos/owner/new",
+            });
+          }
+          assert.strictEqual(options.method, method);
+          return fakeResponse(200, null);
+        };
+        await ghRaw("/repos/owner/old", "tok", { method });
+        assert.strictEqual(calls, 2);
+      }
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  await test("ghRaw converts POST to GET on a 302 redirect", async () => {
+    const originalFetch = global.fetch;
+    const requests = [];
+    global.fetch = async (url, options) => {
+      requests.push({ url: String(url), options });
+      return requests.length === 1
+        ? fakeResponse(302, null, {
+            location: "https://api.github.com/repos/new-owner/new-repo",
+          })
+        : fakeResponse(200, { moved: true });
+    };
+    try {
+      await ghRaw("/repos/old-owner/old-repo", "tok", {
+        method: "POST",
+        body: "payload",
+      });
+      assert.strictEqual(requests[1].options.method, "GET");
+      assert.strictEqual(requests[1].options.body, undefined);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   await test("ghRaw preserves write method and body across GitHub 307 redirects", async () => {
     const originalFetch = global.fetch;
     const requests = [];
@@ -316,6 +437,19 @@ function fakeResponse(status, jsonBody, headers = {}) {
     const { sha, data } = await readSignatures("tok");
     assert.strictEqual(sha, null);
     assert.deepStrictEqual(data, { version: 1, signatures: [] });
+  });
+
+  await test("readSignatures refuses blob fallback metadata without a valid SHA", async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return fakeResponse(200, { content: "", encoding: "none" });
+    };
+    await assert.rejects(
+      readSignatures("tok"),
+      /metadata is missing a valid Git blob SHA/,
+    );
+    assert.strictEqual(calls, 1, "invalid metadata must not trigger a blob request");
   });
 
   await test("readSignatures correctly decodes an existing base64 file", async () => {
@@ -2169,6 +2303,29 @@ function fakeResponse(status, jsonBody, headers = {}) {
       2,
       "a non-base64 encoding must trigger a second Git Blobs API request",
     );
+  });
+
+  await test("readSignatures rejects a blob response with invalid base64 content", async () => {
+    let calls = 0;
+    global.fetch = async () => {
+      calls += 1;
+      return calls === 1
+        ? fakeResponse(200, {
+            sha: FALLBACK_BLOB_SHA,
+            content: "",
+            encoding: "none",
+          })
+        : fakeResponse(200, {
+            sha: FALLBACK_BLOB_SHA,
+            content: 123,
+            encoding: "base64",
+          });
+    };
+    await assert.rejects(
+      readSignatures("tok"),
+      /did not return base64 content for the signatures file blob/,
+    );
+    assert.strictEqual(calls, 2);
   });
 
   await test("readSignatures propagates a non-404, non-transient error (e.g. a permissions 403) on the initial read immediately, without retrying and without treating it as 'file doesn't exist yet'", async () => {

@@ -14,10 +14,11 @@ const SRC = path.resolve(__dirname, "../src/cla-bot.js");
 const LOOPBACK_FETCH_PRELOAD = `--import=data:text/javascript;base64,${Buffer.from(
   `const nativeFetch = globalThis.fetch;
 globalThis.fetch = (input, options) => {
-  const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+  const isRequest = input instanceof Request;
+  const url = new URL(isRequest ? input.url : input);
   if (url.protocol === "https:" && url.hostname === "127.0.0.1") {
     url.protocol = "http:";
-    return nativeFetch(url, options);
+    return nativeFetch(isRequest ? new Request(url, input) : url, options);
   }
   return nativeFetch(input, options);
 };`,
