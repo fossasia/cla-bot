@@ -275,7 +275,7 @@ function listActionDependencies(actionYml) {
     const separator = target.indexOf("@");
     const name = separator === -1 ? "" : target.slice(0, separator);
     const ref = separator === -1 ? "" : target.slice(separator + 1);
-    if (!name || !FULL_SHA_PATTERN.test(ref ?? "")) {
+    if (!name || !FULL_SHA_PATTERN.test(ref)) {
       throw new Error(
         `action.yml uses "${target}", which is not pinned to a full commit SHA; refusing to describe a mutable dependency.`,
       );
