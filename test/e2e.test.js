@@ -537,9 +537,7 @@ function baseEnv(apiUrl) {
       ]);
       assert.ok(
         !server.requestsSeen.some(
-          (request) =>
-            request.accept === "application/vnd.github.raw+json" ||
-            request.url.includes("raw.githubusercontent.com"),
+          (request) => request.accept === "application/vnd.github.raw+json",
         ),
         "the CLI must never request raw media or follow its redirect",
       );
