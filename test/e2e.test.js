@@ -256,7 +256,11 @@ function buildChildEnv(overrides) {
 // what a later GET returns in the same run - otherwise a test could see
 // "a write happened" and pass even if that write was never actually
 // persisted or read back correctly by the rest of the flow.
-function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
+function startFakeGitHub({
+  authorAlreadySigned,
+  redirectTo,
+  largeSignatures = false,
+}) {
   const requestsSeen = [];
   const statusesSeen = [];
   let signaturesState = {
@@ -270,7 +274,11 @@ function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
     let rawBody = "";
     req.on("data", (c) => (rawBody += c));
     req.on("end", () => {
-      requestsSeen.push({ method: req.method, url: req.url });
+      requestsSeen.push({
+        method: req.method,
+        url: req.url,
+        accept: req.headers.accept,
+      });
       if (redirectTo) {
         res.writeHead(302, { Location: redirectTo });
         res.end();
@@ -303,6 +311,22 @@ function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
       }
       if (req.url.includes("/contents/signatures/cla.json")) {
         if (req.method === "GET") {
+          if (req.headers.accept === "application/vnd.github.raw+json") {
+            res.writeHead(302, {
+              Location:
+                "https://raw.githubusercontent.com/fossasia/cla-signatures/signatures/cla.json",
+            });
+            res.end();
+            return;
+          }
+          if (largeSignatures) {
+            return send(200, {
+              type: "file",
+              sha: signaturesState.sha,
+              content: "",
+              encoding: "none",
+            });
+          }
           const content = Buffer.from(
             JSON.stringify(signaturesState.data),
           ).toString("base64");
@@ -335,6 +359,18 @@ function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
           signaturesState = { sha: newSha, data: newData };
           return send(200, { content: { sha: newSha } });
         }
+      }
+      if (
+        req.url ===
+        `/repos/fossasia/cla-signatures/git/blobs/${signaturesState.sha}`
+      ) {
+        return send(200, {
+          sha: signaturesState.sha,
+          content: Buffer.from(JSON.stringify(signaturesState.data)).toString(
+            "base64",
+          ),
+          encoding: "base64",
+        });
       }
       if (req.url.includes("/statuses/")) {
         let payload = {};
@@ -450,6 +486,62 @@ function baseEnv(apiUrl) {
         server.statusesSeen[0].sha,
         "e2e-head-sha",
         "the status must be posted against the PR's actual head sha",
+      );
+    } finally {
+      await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("large signature store end-to-end uses Contents metadata then Git Blobs only, never raw media", async () => {
+    const server = await startFakeGitHub({
+      authorAlreadySigned: true,
+      largeSignatures: true,
+    });
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "e2e-base-sha" },
+      },
+    });
+    try {
+      const { code, stderr } = await runScript({
+        ...baseEnv(server.url),
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(
+        code,
+        0,
+        `expected the large-file check to succeed, got ${code}. stderr:\n${stderr}`,
+      );
+
+      const signatureRequests = server.requestsSeen.filter(
+        (request) =>
+          request.url.includes("/contents/signatures/cla.json") ||
+          request.url.includes("/git/blobs/"),
+      );
+      assert.deepStrictEqual(signatureRequests, [
+        {
+          method: "GET",
+          url: "/repos/fossasia/cla-signatures/contents/signatures/cla.json",
+          accept: "application/vnd.github.object+json",
+        },
+        {
+          method: "GET",
+          url: `/repos/fossasia/cla-signatures/git/blobs/${testGitSha("sig-sha-0")}`,
+          accept: "application/vnd.github+json",
+        },
+      ]);
+      assert.ok(
+        !server.requestsSeen.some(
+          (request) =>
+            request.accept === "application/vnd.github.raw+json" ||
+            request.url.includes("raw.githubusercontent.com"),
+        ),
+        "the CLI must never request raw media or follow its redirect",
       );
     } finally {
       await server.close();

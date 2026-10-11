@@ -546,6 +546,20 @@ test("validateConfig accepts a well-formed config (baseline sanity check for the
   assertConfigOK(VALID_BASE_CONFIG);
 });
 
+test("validateConfig accepts HTTPS server origins independently from a GHES API prefix", () => {
+  for (const serverUrl of [
+    "https://github.example",
+    "https://github.example/",
+    "https://github.example:443",
+  ]) {
+    assertConfigOK({
+      ...VALID_BASE_CONFIG,
+      GITHUB_SERVER_URL: serverUrl,
+      GITHUB_API_URL: "https://github.example/api/v3",
+    });
+  }
+});
+
 test("validateConfig accepts the documented GITHUB_TOKEN fallback when both App credentials are empty", () => {
   assertConfigOK({
     ...VALID_BASE_CONFIG,

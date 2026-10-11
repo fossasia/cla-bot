@@ -244,6 +244,9 @@ function makeFakeGitHub({
       ["https://github.com", "https://github.com/fossasia/testrepo/pull/42#issuecomment-123"],
       ["https://ghe.example.test", "https://ghe.example.test/fossasia/testrepo/pull/42#issuecomment-123"],
       ["https://ghe.example.test/", "https://ghe.example.test/fossasia/testrepo/pull/42#issuecomment-123"],
+      ["https://github.example", "https://github.example/fossasia/testrepo/pull/42#issuecomment-123"],
+      ["https://github.example/", "https://github.example/fossasia/testrepo/pull/42#issuecomment-123"],
+      ["https://github.example:443", "https://github.example/fossasia/testrepo/pull/42#issuecomment-123"],
     ]) {
       assert.strictEqual(buildCommentUrl(42, 123, serverUrl), expected);
     }
