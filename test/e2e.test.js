@@ -9,6 +9,20 @@ const path = require("node:path");
 
 const REPO_ROOT = path.join(__dirname, "..");
 const SCRIPT = path.join(REPO_ROOT, "src", "cla-bot.js");
+// Keep the local HTTP test server usable with HTTPS-only API validation. Embed
+// this test-only fetch bridge in NODE_OPTIONS so CI needs no extra preload
+// file to be checked in or external TLS tooling.
+const LOOPBACK_FETCH_PRELOAD = `--import=data:text/javascript;base64,${Buffer.from(
+  `const nativeFetch = globalThis.fetch;
+globalThis.fetch = (input, options) => {
+  const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+  if (url.protocol === "https:" && url.hostname === "127.0.0.1") {
+    url.protocol = "http:";
+    return nativeFetch(url, options);
+  }
+  return nativeFetch(input, options);
+};`,
+).toString("base64")}`;
 
 // Keep test files in a private temporary directory.
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-e2e-"));
@@ -186,7 +200,7 @@ function buildChildEnv(overrides) {
   }
   const eventPath = overrides.GITHUB_EVENT_PATH;
   const childEnv = { ...env, ...overrides };
-  childEnv.NODE_OPTIONS = `--require=${path.join(__dirname, "helpers/https-loopback-fetch.js")}`;
+  childEnv.NODE_OPTIONS = LOOPBACK_FETCH_PRELOAD;
   if (eventPath && fs.existsSync(eventPath)) {
     try {
       const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));

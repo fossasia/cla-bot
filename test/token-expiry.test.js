@@ -9,6 +9,19 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const SRC = path.resolve(__dirname, "../src/cla-bot.js");
+// Embed the loopback-only HTTPS-to-HTTP test bridge so child processes do not
+// depend on an additional preload file being present in a CI checkout.
+const LOOPBACK_FETCH_PRELOAD = `--import=data:text/javascript;base64,${Buffer.from(
+  `const nativeFetch = globalThis.fetch;
+globalThis.fetch = (input, options) => {
+  const url = new URL(typeof input === "string" || input instanceof URL ? input : input.url);
+  if (url.protocol === "https:" && url.hostname === "127.0.0.1") {
+    url.protocol = "http:";
+    return nativeFetch(url, options);
+  }
+  return nativeFetch(input, options);
+};`,
+).toString("base64")}`;
 // fs.mkdtempSync (unlike a hand-built "pid + Date.now()" path in the shared,
 // world-writable os.tmpdir()) creates a directory with an unguessable name
 // and owner-only permissions (0o700 on POSIX), so no other local user can
@@ -910,7 +923,7 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
           HOME: process.env.HOME || TMP_DIR,
           ...BASE_ENV,
           GITHUB_API_URL: `https://127.0.0.1:${server.address().port}`,
-          NODE_OPTIONS: `--require=${path.join(__dirname, "helpers/https-loopback-fetch.js")}`,
+          NODE_OPTIONS: LOOPBACK_FETCH_PRELOAD,
           GITHUB_EVENT_NAME: "issue_comment",
           GITHUB_EVENT_PATH: eventPath,
           CLA_BOT_EVENT_PR_NUMBER: "1",
