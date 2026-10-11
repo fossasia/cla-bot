@@ -3321,6 +3321,103 @@ function makeFakeGitHub({
     );
   });
 
+  const MALFORMED_PR_SNAPSHOTS = [
+    {
+      label: "missing head",
+      body: { base: { sha: "base-sha-fixture" } },
+      invalidPath: ".head.sha",
+    },
+    {
+      label: "null head",
+      body: { head: null, base: { sha: "base-sha-fixture" } },
+      invalidPath: ".head.sha",
+    },
+    {
+      label: "head without sha",
+      body: { head: {}, base: { sha: "base-sha-fixture" } },
+      invalidPath: ".head.sha",
+    },
+    {
+      label: "head with null sha",
+      body: { head: { sha: null }, base: { sha: "base-sha-fixture" } },
+      invalidPath: ".head.sha",
+    },
+    {
+      label: "missing base",
+      body: { head: { sha: "head-sha-fixture" } },
+      invalidPath: ".base.sha",
+    },
+    {
+      label: "null base",
+      body: { head: { sha: "head-sha-fixture" }, base: null },
+      invalidPath: ".base.sha",
+    },
+    {
+      label: "base without sha",
+      body: { head: { sha: "head-sha-fixture" }, base: {} },
+      invalidPath: ".base.sha",
+    },
+    {
+      label: "base with null sha",
+      body: { head: { sha: "head-sha-fixture" }, base: { sha: null } },
+      invalidPath: ".base.sha",
+    },
+    { label: "null PR body", body: null, invalidPath: ".head.sha" },
+    { label: "empty PR body", body: {}, invalidPath: ".head.sha" },
+    { label: "array PR body", body: [], invalidPath: ".head.sha" },
+    { label: "string PR body", body: "unexpected", invalidPath: ".head.sha" },
+  ];
+
+  for (const { label, body, invalidPath } of MALFORMED_PR_SNAPSHOTS) {
+    await test(`checkPR reports a controlled ${invalidPath} validation error for a GET /pulls/{n} response with ${label}, before publishing anything`, async () => {
+      const gh = makeFakeGitHub({
+        commits: [],
+        initialSignatures: { version: 1, signatures: [] },
+      });
+      const innerFetch = gh.fetch;
+      global.fetch = async (url, opts) => {
+        if (url.includes("/pulls/1") && !url.includes("/commits")) {
+          // JSON.stringify(null) is "null", while the shared response helper
+          // treats null as an empty body. Preserve the actual API JSON shape.
+          return {
+            ok: true,
+            status: 200,
+            text: async () => JSON.stringify(body),
+            headers: { get: () => null },
+          };
+        }
+        return innerFetch(url, opts);
+      };
+
+      await assert.rejects(
+        () => checkPR(1),
+        (err) => {
+          assert.ok(
+            !(err instanceof TypeError),
+            `expected controlled validation error, got TypeError: ${err.message}`,
+          );
+          assert.match(err.message, /expected a valid commit SHA/);
+          assert.ok(
+            err.message.includes(`(.${invalidPath.slice(1)})`),
+            `expected error to identify ${invalidPath}, got: ${err.message}`,
+          );
+          return true;
+        },
+      );
+
+      assert.strictEqual(
+        gh.statuses.length,
+        0,
+        "no status should be posted for a malformed fetched PR snapshot",
+      );
+      assert.strictEqual(
+        gh.comments.length,
+        0,
+        "no comment should be posted for a malformed fetched PR snapshot",
+      );
+    });
+  }
+
   await test("checkPR validates the sha it fetches itself from GET /pulls/{n} (defense-in-depth for API-sourced data, not just the webhook file) and stops before posting any status or comment", async () => {
     const gh = makeFakeGitHub({
       commits: [],
