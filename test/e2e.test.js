@@ -565,6 +565,11 @@ function baseEnv(apiUrl) {
         "not a URL",
         "file:///tmp",
         "https://user:secret@example.com",
+        "https://github.example/api/something",
+        "https://github.example?query=value",
+        "https://github.example#fragment",
+        "https://github.example?",
+        "https://github.example#",
       ]) {
         const { code, stderr } = await runScript({
           ...baseEnv(server.url),

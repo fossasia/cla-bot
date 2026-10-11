@@ -600,10 +600,17 @@ test("validateConfig rejects an invalid GITHUB_SERVER_URL before processing even
     "file:///tmp",
     "http://github.example.com",
     "https://user:secret@example.com",
+    "https://github.example.com/api/something",
+    "https://github.example.com?query=value",
+    "https://github.example.com#fragment",
+    "https://github.example.com?",
+    "https://github.example.com#",
+    "https://github.example.com/path/..",
+    "https://github.example.com\\api",
   ]) {
     assertConfigFails(
       { ...VALID_BASE_CONFIG, GITHUB_SERVER_URL: value },
-      "GITHUB_SERVER_URL must be an HTTPS URL without credentials",
+      "GITHUB_SERVER_URL must be an HTTPS URL without credentials, path, query, or fragment",
     );
   }
 });

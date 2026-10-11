@@ -174,14 +174,44 @@ function assertValidEventPRNumber(value, context) {
 }
 
 function parseGitHubServerUrl(serverUrl) {
+  const errorMessage =
+    "GITHUB_SERVER_URL must be an HTTPS URL without credentials, path, query, or fragment";
+  if (
+    typeof serverUrl !== "string" ||
+    serverUrl.length === 0 ||
+    serverUrl.includes("?") ||
+    serverUrl.includes("#")
+  ) {
+    throw new Error(errorMessage);
+  }
+
   let server;
   try {
     server = new URL(serverUrl);
   } catch {
-    throw new Error("GITHUB_SERVER_URL must be an HTTPS URL without credentials");
+    throw new Error(errorMessage);
   }
-  if (server.protocol !== "https:" || server.username || server.password) {
-    throw new Error("GITHUB_SERVER_URL must be an HTTPS URL without credentials");
+
+  // GITHUB_SERVER_URL is an origin (for example https://github.com), unlike
+  // GITHUB_API_URL which may have a GHES API prefix. Check the raw path too,
+  // since URL parsing can normalize dot segments such as /path/.. to "/".
+  const authorityStart = serverUrl.indexOf("://") + 3;
+  const pathStart = serverUrl.indexOf("/", authorityStart);
+  const rawPath =
+    pathStart === -1
+      ? ""
+      : serverUrl.slice(pathStart).split(/[?#]/, 1)[0];
+  if (
+    server.protocol !== "https:" ||
+    !server.hostname ||
+    server.username ||
+    server.password ||
+    server.pathname !== "/" ||
+    (rawPath !== "" && rawPath !== "/") ||
+    server.search ||
+    server.hash
+  ) {
+    throw new Error(errorMessage);
   }
   return server;
 }

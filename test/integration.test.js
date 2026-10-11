@@ -249,17 +249,24 @@ function makeFakeGitHub({
     }
   });
 
-  await test("buildCommentUrl rejects non-HTTP schemes and server URLs with credentials", () => {
+  await test("buildCommentUrl rejects non-HTTPS, credentialed, and non-origin server URLs", () => {
     for (const serverUrl of [
       "not a URL",
       "file:///tmp",
       "https://user@example.com",
       "https://:password@example.com",
       "http://example.com",
+      "https://github.example/api/something",
+      "https://github.example?query=value",
+      "https://github.example#fragment",
+      "https://github.example?",
+      "https://github.example#",
+      "https://github.example/path/..",
+      "https://github.example\\api",
     ]) {
       assert.throws(
         () => buildCommentUrl(1, 123, serverUrl),
-        /GITHUB_SERVER_URL must be an HTTPS URL without credentials/,
+        /GITHUB_SERVER_URL must be an HTTPS URL without credentials, path, query, or fragment/,
         serverUrl,
       );
     }

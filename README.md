@@ -59,7 +59,9 @@ See [`SECURITY.md`](./SECURITY.md) for the security model and its limits.
 | `node-version` | No | `22` | Node.js version for self-hosted runners. |
 
 The action requires HTTPS for the CLA link and GitHub's `GITHUB_SERVER_URL` and
-`GITHUB_API_URL` environment values.
+`GITHUB_API_URL` environment values. `GITHUB_SERVER_URL` must be an HTTPS
+origin (optionally ending in `/`), without a path, query, or fragment;
+`GITHUB_API_URL` may include the API path used by GitHub Enterprise Server.
 
 ## Allowlist
 
