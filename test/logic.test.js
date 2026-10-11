@@ -613,6 +613,15 @@ test("validateConfig rejects a plain HTTP GITHUB_API_URL before processing event
     { ...VALID_BASE_CONFIG, GITHUB_API_URL: "http://github.example.com/api/v3" },
     "GITHUB_API_URL must be an absolute HTTPS URL",
   );
+  for (const value of [
+    "https://github.example.com/api/v3?",
+    "https://github.example.com/api/v3#",
+  ]) {
+    assertConfigFails(
+      { ...VALID_BASE_CONFIG, GITHUB_API_URL: value },
+      "GITHUB_API_URL must be an absolute HTTPS URL",
+    );
+  }
 });
 
 test("validateConfig rejects a SIG_OWNER that is not a valid GitHub login", () => {

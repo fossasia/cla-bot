@@ -1,6 +1,7 @@
 /** Runs the CLI in a child process against a local mock GitHub API. */
 
 const assert = require("node:assert");
+const http = require("node:http");
 const https = require("node:https");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
@@ -9,12 +10,7 @@ const path = require("node:path");
 
 const REPO_ROOT = path.join(__dirname, "..");
 const SCRIPT = path.join(REPO_ROOT, "src", "cla-bot.js");
-const LOCAL_API_KEY = fs.readFileSync(
-  path.join(__dirname, "fixtures/local-api-key.key"),
-);
-const LOCAL_API_CERT = fs.readFileSync(
-  path.join(__dirname, "fixtures/local-api-cert.crt"),
-);
+const LOCAL_TLS = require("./helpers/local-tls");
 
 // Keep test files in a private temporary directory.
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-e2e-"));
@@ -192,7 +188,7 @@ function buildChildEnv(overrides) {
   }
   const eventPath = overrides.GITHUB_EVENT_PATH;
   const childEnv = { ...env, ...overrides };
-  childEnv.NODE_EXTRA_CA_CERTS = path.join(__dirname, "fixtures/local-api-cert.crt");
+  childEnv.NODE_EXTRA_CA_CERTS = LOCAL_TLS.certPath;
   if (eventPath && fs.existsSync(eventPath)) {
     try {
       const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
@@ -218,7 +214,7 @@ function buildChildEnv(overrides) {
 // what a later GET returns in the same run - otherwise a test could see
 // "a write happened" and pass even if that write was never actually
 // persisted or read back correctly by the rest of the flow.
-function startFakeGitHub({ authorAlreadySigned }) {
+function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
   const requestsSeen = [];
   const statusesSeen = [];
   let signaturesState = {
@@ -228,11 +224,16 @@ function startFakeGitHub({ authorAlreadySigned }) {
       signatures: authorAlreadySigned ? [{ id: 42, login: "e2e-author" }] : [],
     },
   };
-  const server = https.createServer({ key: LOCAL_API_KEY, cert: LOCAL_API_CERT }, (req, res) => {
+  const server = https.createServer({ key: LOCAL_TLS.key, cert: LOCAL_TLS.cert }, (req, res) => {
     let rawBody = "";
     req.on("data", (c) => (rawBody += c));
     req.on("end", () => {
       requestsSeen.push({ method: req.method, url: req.url });
+      if (redirectTo) {
+        res.writeHead(302, { Location: redirectTo });
+        res.end();
+        return;
+      }
       const send = (status, obj) => {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(obj === null ? "" : JSON.stringify(obj));
@@ -336,6 +337,28 @@ function startFakeGitHub({ authorAlreadySigned }) {
   });
 }
 
+function startRedirectTarget({ secure }) {
+  const requestsSeen = [];
+  const respond = (req, res) => {
+    requestsSeen.push({ method: req.method, url: req.url });
+    // A convincing forged API response must never reach the bot.
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ version: 1, signatures: [{ id: 42, login: "e2e-author" }] }));
+  };
+  const server = secure
+    ? https.createServer({ key: LOCAL_TLS.key, cert: LOCAL_TLS.cert }, respond)
+    : http.createServer(respond);
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `${secure ? "https" : "http"}://127.0.0.1:${server.address().port}`,
+        requestsSeen,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
 function baseEnv(apiUrl) {
   return {
     GITHUB_API_URL: apiUrl,
@@ -389,6 +412,46 @@ function baseEnv(apiUrl) {
       );
     } finally {
       await server.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
+  await test("the CLI rejects HTTPS API redirects to HTTP and to another HTTPS origin", async () => {
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "e2e-base-sha" },
+      },
+    });
+    try {
+      for (const secure of [false, true]) {
+        const target = await startRedirectTarget({ secure });
+        const api = await startFakeGitHub({
+          authorAlreadySigned: true,
+          redirectTo: target.url,
+        });
+        try {
+          const { code, stderr } = await runScript({
+            ...baseEnv(api.url),
+            GITHUB_EVENT_NAME: "pull_request_target",
+            GITHUB_EVENT_PATH: eventFile,
+          });
+          assert.strictEqual(code, 1, stderr);
+          assert.match(stderr, /fetch failed/i);
+          assert.ok(api.requestsSeen.length > 0, "the configured HTTPS API was contacted");
+          assert.strictEqual(
+            target.requestsSeen.length,
+            0,
+            "fetch must not contact or accept the redirected API response",
+          );
+        } finally {
+          await api.close();
+          await target.close();
+        }
+      }
+    } finally {
       fs.unlinkSync(eventFile);
     }
   });

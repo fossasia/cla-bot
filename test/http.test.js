@@ -236,6 +236,24 @@ function fakeResponse(status, jsonBody, headers = {}) {
     }
   });
 
+  await test("ghRaw rejects redirects instead of trusting redirected API responses", async () => {
+    const originalFetch = global.fetch;
+    let calls = 0;
+    global.fetch = async (_url, options) => {
+      calls += 1;
+      assert.strictEqual(options.redirect, "error");
+      // Model fetch's redirect:error behavior: the redirect response is
+      // rejected before its destination or body can be trusted.
+      throw new TypeError("fetch failed: redirect mode is error");
+    };
+    try {
+      await assert.rejects(ghRaw("/repos/owner/repo", "tok"), /redirect mode is error/);
+      assert.strictEqual(calls, 1);
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   await test("readSignatures returns an empty store on 404 (file does not exist yet)", async () => {
     global.fetch = async () => fakeResponse(404, { message: "Not Found" });
     const { sha, data } = await readSignatures("tok");

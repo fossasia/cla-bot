@@ -190,6 +190,14 @@ function parseGitHubServerUrl(serverUrl) {
 
 function parseGitHubApiUrl(apiUrl) {
   try {
+    if (
+      typeof apiUrl !== "string" ||
+      apiUrl.length === 0 ||
+      apiUrl.includes("?") ||
+      apiUrl.includes("#")
+    ) {
+      throw new Error("invalid API base");
+    }
     const base = new URL(apiUrl);
     if (
       base.protocol !== "https:" ||
@@ -559,14 +567,6 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
   ) {
     reject();
   }
-  if (
-    typeof apiBase !== "string" ||
-    apiBase.length === 0 ||
-    apiBase.includes("?") ||
-    apiBase.includes("#")
-  ) {
-    rejectBase();
-  }
   const requestPath = path.split("?", 1)[0];
   for (const segment of requestPath.split("/")) {
     // The URL parser treats encoded dot segments as path navigation too.
@@ -613,6 +613,10 @@ async function ghRaw(path, token, options = {}) {
   try {
     const res = await fetch(requestUrl, {
       ...fetchOptions,
+      // API responses contain trusted signature and identity data. Do not
+      // let a server or intermediary redirect credentials or responses to a
+      // different origin, or downgrade the request to plaintext.
+      redirect: "error",
       signal: controller.signal,
       headers: {
         Authorization: `Bearer ${token}`,

@@ -9,8 +9,7 @@ const path = require("path");
 const { spawn } = require("child_process");
 
 const SRC = path.resolve(__dirname, "../src/cla-bot.js");
-const LOCAL_API_KEY = fs.readFileSync(path.join(__dirname, "fixtures/local-api-key.key"));
-const LOCAL_API_CERT = fs.readFileSync(path.join(__dirname, "fixtures/local-api-cert.crt"));
+const LOCAL_TLS = require("./helpers/local-tls");
 // fs.mkdtempSync (unlike a hand-built "pid + Date.now()" path in the shared,
 // world-writable os.tmpdir()) creates a directory with an unguessable name
 // and owner-only permissions (0o700 on POSIX), so no other local user can
@@ -881,7 +880,7 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
           gh.revoke("inst-tok-1");
         }
       };
-      const server = https.createServer({ key: LOCAL_API_KEY, cert: LOCAL_API_CERT }, (req, resp) => {
+      const server = https.createServer({ key: LOCAL_TLS.key, cert: LOCAL_TLS.cert }, (req, resp) => {
         let raw = "";
         req.on("data", (c) => (raw += c));
         req.on("end", () => {
@@ -912,7 +911,7 @@ const successStatuses = (s) => s.statuses.filter((x) => x.state === "success");
           HOME: process.env.HOME || TMP_DIR,
           ...BASE_ENV,
           GITHUB_API_URL: `https://127.0.0.1:${server.address().port}`,
-          NODE_EXTRA_CA_CERTS: path.join(__dirname, "fixtures/local-api-cert.crt"),
+          NODE_EXTRA_CA_CERTS: LOCAL_TLS.certPath,
           GITHUB_EVENT_NAME: "issue_comment",
           GITHUB_EVENT_PATH: eventPath,
           CLA_BOT_EVENT_PR_NUMBER: "1",
