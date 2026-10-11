@@ -76,11 +76,6 @@ function fakeResponse(status, jsonBody, headers = {}) {
         "/repos/owner/repo/issues/1",
         "https://ghe.example.test/api/v3/repos/owner/repo/issues/1",
       ],
-      [
-        "http://ghe.example.test/api/v3",
-        "/repos/owner/repo/issues/1",
-        "http://ghe.example.test/api/v3/repos/owner/repo/issues/1",
-      ],
     ];
     for (const [base, path, expected] of cases) {
       const url = buildSafeApiUrl(path, base);
@@ -138,6 +133,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
 
     for (const badBase of [
       "file:///tmp/api",
+      "http://ghe.example.test/api/v3",
       "https://user:secret@ghe.example.test/api/v3",
       "https://ghe.example.test/api/v3?query=1",
       "https://ghe.example.test/api/v3?",

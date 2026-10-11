@@ -534,6 +534,7 @@ const VALID_BASE_CONFIG = {
   SIG_REPO: "cla-signatures",
   SIG_PATH: "signatures/cla.json",
   CLA_DOCUMENT_URL: "https://example.com/CLA.md",
+  GITHUB_API_URL: "https://api.github.com",
   GITHUB_SERVER_URL: "https://github.com",
   // Explicitly empty: this file's process-wide ALLOWLIST (set at the top)
   // contains login entries, which make validateConfig() emit an advisory
@@ -575,9 +576,20 @@ test("validateConfig rejects a CLA_DOCUMENT_URL that is not a valid URL", () => 
   );
 });
 
-test("validateConfig rejects a non-http(s) CLA_DOCUMENT_URL (e.g. file://)", () => {
+test("validateConfig requires HTTPS for CLA_DOCUMENT_URL", () => {
+  assertConfigFails(
+    { ...VALID_BASE_CONFIG, CLA_DOCUMENT_URL: "http://example.com/CLA.md" },
+    "CLA_DOCUMENT_URL",
+  );
   assertConfigFails(
     { ...VALID_BASE_CONFIG, CLA_DOCUMENT_URL: "file:///etc/passwd" },
+    "CLA_DOCUMENT_URL",
+  );
+  assertConfigFails(
+    {
+      ...VALID_BASE_CONFIG,
+      CLA_DOCUMENT_URL: "https://user:password@example.com/CLA.md",
+    },
     "CLA_DOCUMENT_URL",
   );
 });
@@ -586,13 +598,21 @@ test("validateConfig rejects an invalid GITHUB_SERVER_URL before processing even
   for (const value of [
     "not a URL",
     "file:///tmp",
+    "http://github.example.com",
     "https://user:secret@example.com",
   ]) {
     assertConfigFails(
       { ...VALID_BASE_CONFIG, GITHUB_SERVER_URL: value },
-      "GITHUB_SERVER_URL must be an HTTP(S) URL without credentials",
+      "GITHUB_SERVER_URL must be an HTTPS URL without credentials",
     );
   }
+});
+
+test("validateConfig rejects a plain HTTP GITHUB_API_URL before processing events", () => {
+  assertConfigFails(
+    { ...VALID_BASE_CONFIG, GITHUB_API_URL: "http://github.example.com/api/v3" },
+    "GITHUB_API_URL must be an absolute HTTPS URL",
+  );
 });
 
 test("validateConfig rejects a SIG_OWNER that is not a valid GitHub login", () => {
@@ -743,10 +763,11 @@ test("validateConfig's SIG_REPO failure is ONE log line with the value JSON-quot
   assert.ok(!msg.includes("\n"), msg);
 });
 
-test("validateConfig's CLA_DOCUMENT_URL failures (not-a-URL, and non-http(s)) are ONE log line with the value JSON-quoted", () => {
+test("validateConfig's CLA_DOCUMENT_URL failures (not-a-URL, and non-HTTPS) are ONE log line with the value JSON-quoted", () => {
   for (const value of [
     "not a url\n::warning::pwned",
     "ftp://example.com/\n::warning::pwned",
+    "http://example.com/CLA.md\n::warning::pwned",
   ]) {
     const msg = captureConfigFailure({
       ...VALID_BASE_CONFIG,

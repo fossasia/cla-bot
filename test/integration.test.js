@@ -253,10 +253,11 @@ function makeFakeGitHub({
       "file:///tmp",
       "https://user@example.com",
       "https://:password@example.com",
+      "http://example.com",
     ]) {
       assert.throws(
         () => buildCommentUrl(1, 123, serverUrl),
-        /GITHUB_SERVER_URL must be an HTTP\(S\) URL without credentials/,
+        /GITHUB_SERVER_URL must be an HTTPS URL without credentials/,
         serverUrl,
       );
     }

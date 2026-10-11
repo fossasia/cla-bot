@@ -1,7 +1,7 @@
 /** Runs the CLI in a child process against a local mock GitHub API. */
 
 const assert = require("node:assert");
-const http = require("node:http");
+const https = require("node:https");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
@@ -9,6 +9,12 @@ const path = require("node:path");
 
 const REPO_ROOT = path.join(__dirname, "..");
 const SCRIPT = path.join(REPO_ROOT, "src", "cla-bot.js");
+const LOCAL_API_KEY = fs.readFileSync(
+  path.join(__dirname, "fixtures/local-api-key.key"),
+);
+const LOCAL_API_CERT = fs.readFileSync(
+  path.join(__dirname, "fixtures/local-api-cert.crt"),
+);
 
 // Keep test files in a private temporary directory.
 const TMP_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "cla-bot-e2e-"));
@@ -186,6 +192,7 @@ function buildChildEnv(overrides) {
   }
   const eventPath = overrides.GITHUB_EVENT_PATH;
   const childEnv = { ...env, ...overrides };
+  childEnv.NODE_EXTRA_CA_CERTS = path.join(__dirname, "fixtures/local-api-cert.crt");
   if (eventPath && fs.existsSync(eventPath)) {
     try {
       const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
@@ -221,7 +228,7 @@ function startFakeGitHub({ authorAlreadySigned }) {
       signatures: authorAlreadySigned ? [{ id: 42, login: "e2e-author" }] : [],
     },
   };
-  const server = http.createServer((req, res) => {
+  const server = https.createServer({ key: LOCAL_API_KEY, cert: LOCAL_API_CERT }, (req, res) => {
     let rawBody = "";
     req.on("data", (c) => (rawBody += c));
     req.on("end", () => {
@@ -319,7 +326,7 @@ function startFakeGitHub({ authorAlreadySigned }) {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
       resolve({
-        url: `http://127.0.0.1:${port}`,
+        url: `https://127.0.0.1:${port}`,
         requestsSeen,
         statusesSeen,
         getSignatures: () => signaturesState.data,
@@ -410,7 +417,7 @@ function baseEnv(apiUrl) {
           GITHUB_EVENT_PATH: eventFile,
         });
         assert.strictEqual(code, 1, `${value}: ${stderr}`);
-        assert.match(stderr, /GITHUB_SERVER_URL must be an HTTP\(S\) URL/);
+        assert.match(stderr, /GITHUB_SERVER_URL must be an HTTPS URL/);
       }
       assert.strictEqual(
         server.requestsSeen.length,
@@ -542,7 +549,7 @@ function baseEnv(apiUrl) {
 
   await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH does not exist", async () => {
     const { code, stderr } = await runScript({
-      ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+      ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
       GITHUB_EVENT_PATH: "/nonexistent/path/to/event.json",
     });
@@ -555,7 +562,7 @@ function baseEnv(apiUrl) {
 
   await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH is unset", async () => {
     const { code, stderr } = await runScript({
-      ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+      ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
       // GITHUB_EVENT_PATH deliberately omitted - buildChildEnv() defaults
       // it to "", so `!EVENT_PATH` is the true operand here, not
@@ -580,7 +587,7 @@ function baseEnv(apiUrl) {
     fs.writeFileSync(eventFile, "{ this is not valid json");
     try {
       const { code, stderr } = await runScript({
-        ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+        ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
         GITHUB_EVENT_NAME: "pull_request_target",
         GITHUB_EVENT_PATH: eventFile,
       });
@@ -636,7 +643,7 @@ function baseEnv(apiUrl) {
     );
     try {
       const { code, stderr } = await runScript({
-        ...baseEnv("http://127.0.0.1:1"),
+        ...baseEnv("https://127.0.0.1:1"),
         GITHUB_EVENT_NAME: "issue_comment",
         GITHUB_EVENT_PATH: eventFile,
       });
@@ -699,7 +706,7 @@ function baseEnv(apiUrl) {
         const child = spawn(process.execPath, ["-r", preload, SCRIPT], {
           cwd: REPO_ROOT,
           env: buildChildEnv({
-            ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+            ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
             GITHUB_EVENT_NAME: "pull_request_target",
             GITHUB_EVENT_PATH: eventFile,
           }),
@@ -1009,7 +1016,7 @@ function baseEnv(apiUrl) {
       const { code, stderr } = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [wrapper], {
           cwd: REPO_ROOT,
-          env: buildChildEnv(baseEnv("http://127.0.0.1:1")),
+          env: buildChildEnv(baseEnv("https://127.0.0.1:1")),
         });
         let stderrOut = "";
         child.stderr.on("data", (d) => (stderrOut += d));
@@ -1047,7 +1054,7 @@ function baseEnv(apiUrl) {
       const { code, stderr } = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [wrapper], {
           cwd: REPO_ROOT,
-          env: buildChildEnv(baseEnv("http://127.0.0.1:1")),
+          env: buildChildEnv(baseEnv("https://127.0.0.1:1")),
         });
         let stderrOut = "";
         child.stderr.on("data", (d) => (stderrOut += d));

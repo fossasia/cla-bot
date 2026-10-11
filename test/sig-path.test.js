@@ -799,7 +799,7 @@ const INVALID_PATHS = [
         ...BASE_ENV,
         // Nothing listens here: validateConfig() must fail first, so no
         // request should ever be attempted.
-        GITHUB_API_URL: "http://127.0.0.1:1",
+        GITHUB_API_URL: "https://127.0.0.1:1",
         GITHUB_EVENT_PATH: "",
         ...overrides,
       },
