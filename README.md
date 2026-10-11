@@ -51,12 +51,15 @@ See [`SECURITY.md`](./SECURITY.md) for the security model and its limits.
 | `signatures-owner` | Yes | | Owner of the signature repository. |
 | `signatures-repo` | Yes | | Private repository that stores signatures. |
 | `signatures-path` | No | `signatures/cla.json` | Signature file path. See `action.yml` for path rules. |
-| `cla-document-url` | Yes | | CLA shown to contributors. |
+| `cla-document-url` | Yes | | HTTPS URL of the CLA shown to contributors. |
 | `allowlist` | No | Empty | Numeric account ids that do not need to sign. |
 | `app-id` | No | Empty | Positive safe-integer decimal GitHub App id for signature writes. Set with `app-private-key`; leave both empty to use `github-token` (same-repository signatures only). |
 | `app-private-key` | No | Empty | App private key in PEM format, provided as a secret. Set with `app-id`. |
 | `require-verified-commits` | No | `false` | Require the author to match the verified committer. |
 | `node-version` | No | `22` | Node.js version for self-hosted runners. |
+
+The action requires HTTPS for the CLA link and GitHub's `GITHUB_SERVER_URL` and
+`GITHUB_API_URL` environment values.
 
 ## Allowlist
 

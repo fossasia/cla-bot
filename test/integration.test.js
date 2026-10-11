@@ -140,7 +140,7 @@ function makeFakeGitHub({
       if (method === "GET") {
         // Real GitHub always includes an `encoding` field alongside base64
         // `content` - readSignatures() checks it to know whether it got the
-        // real content inline (small file) or needs a raw-content fallback
+        // real content inline (small file) or needs a Git Blobs API fallback
         // (file over 1 MB). Test data here is always small.
         return res(200, {
           sha: state.sha,
@@ -253,10 +253,11 @@ function makeFakeGitHub({
       "file:///tmp",
       "https://user@example.com",
       "https://:password@example.com",
+      "http://example.com",
     ]) {
       assert.throws(
         () => buildCommentUrl(1, 123, serverUrl),
-        /GITHUB_SERVER_URL must be an HTTP\(S\) URL without credentials/,
+        /GITHUB_SERVER_URL must be an HTTPS URL without credentials/,
         serverUrl,
       );
     }

@@ -31,7 +31,7 @@ inputs:
     required: false
     default: "signatures/cla.json"
   cla-document-url:
-    description: "Full URL to the CLA text contributors must read before signing"
+    description: "HTTPS URL to the CLA text contributors must read before signing"
     required: true
   allowlist:
     description: >-

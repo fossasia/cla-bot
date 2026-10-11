@@ -12,6 +12,7 @@ process.env.SIG_APP_PRIVATE_KEY = require("crypto")
   .generateKeyPairSync("rsa", { modulusLength: 2048 })
   .privateKey.export({ type: "pkcs1", format: "pem" });
 const SIG_APP_ID_FOR_TESTS = process.env.SIG_APP_ID;
+const FALLBACK_BLOB_SHA = "a".repeat(40);
 
 const {
   readSignatures,
@@ -76,11 +77,6 @@ function fakeResponse(status, jsonBody, headers = {}) {
         "/repos/owner/repo/issues/1",
         "https://ghe.example.test/api/v3/repos/owner/repo/issues/1",
       ],
-      [
-        "http://ghe.example.test/api/v3",
-        "/repos/owner/repo/issues/1",
-        "http://ghe.example.test/api/v3/repos/owner/repo/issues/1",
-      ],
     ];
     for (const [base, path, expected] of cases) {
       const url = buildSafeApiUrl(path, base);
@@ -138,6 +134,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
 
     for (const badBase of [
       "file:///tmp/api",
+      "http://ghe.example.test/api/v3",
       "https://user:secret@ghe.example.test/api/v3",
       "https://ghe.example.test/api/v3?query=1",
       "https://ghe.example.test/api/v3?",
@@ -240,6 +237,21 @@ function fakeResponse(status, jsonBody, headers = {}) {
     }
   });
 
+  await test("ghRaw disables redirects on authenticated API requests", async () => {
+    const originalFetch = global.fetch;
+    let requestOptions;
+    global.fetch = async (_url, options) => {
+      requestOptions = options;
+      throw new TypeError("fetch rejected redirect");
+    };
+    try {
+      await assert.rejects(ghRaw("/repos/owner/repo", "tok"), /fetch rejected redirect/);
+      assert.strictEqual(requestOptions.redirect, "error");
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   await test("readSignatures returns an empty store on 404 (file does not exist yet)", async () => {
     global.fetch = async () => fakeResponse(404, { message: "Not Found" });
     const { sha, data } = await readSignatures("tok");
@@ -313,19 +325,23 @@ function fakeResponse(status, jsonBody, headers = {}) {
     }
   });
 
-  await test("readSignatures builds the index on the raw-media fallback path too (file over 1 MB)", async () => {
+  await test("readSignatures builds the index on the Git Blobs fallback path too (file over 1 MB)", async () => {
     const stored = { version: 1, signatures: [{ id: 11, login: "big" }] };
     global.fetch = async (url, opts) => {
       const accept = (opts.headers || {}).Accept;
       if (accept === "application/vnd.github.object+json") {
-        return fakeResponse(200, { sha: "big", content: "", encoding: "none" });
+        return fakeResponse(200, {
+          sha: FALLBACK_BLOB_SHA,
+          content: "",
+          encoding: "none",
+        });
       }
-      return {
-        ok: true,
-        status: 200,
-        text: async () => JSON.stringify(stored),
-        headers: { get: () => null },
-      };
+      assert.ok(String(url).endsWith(`/git/blobs/${FALLBACK_BLOB_SHA}`));
+      return fakeResponse(200, {
+        sha: FALLBACK_BLOB_SHA,
+        content: b64(stored),
+        encoding: "base64",
+      });
     };
     const { index } = await readSignatures("tok");
     assert.strictEqual(index.has(11), true);
@@ -967,13 +983,13 @@ function fakeResponse(status, jsonBody, headers = {}) {
     );
   });
 
-  await test("readSignatures falls back to a raw-media-type fetch when the file is too big for inline base64 content (over 1 MB)", async () => {
+  await test("readSignatures fetches large files by blob SHA without raw-media redirects", async () => {
     const stored = {
       version: 1,
       signatures: [{ login: "alice" }, { login: "bob" }],
     };
     let sawObjectRequest = false;
-    let sawRawRequest = false;
+    let sawBlobRequest = false;
     global.fetch = async (url, opts) => {
       const accept = (opts.headers || {}).Accept;
       if (accept === "application/vnd.github.object+json") {
@@ -981,35 +997,32 @@ function fakeResponse(status, jsonBody, headers = {}) {
         // GitHub's documented behavior for files over 1 MB under the
         // 'object' media type: content is empty and encoding is 'none'.
         return fakeResponse(200, {
-          sha: "big-file-sha",
+          sha: FALLBACK_BLOB_SHA,
           content: "",
           encoding: "none",
         });
       }
-      if (accept === "application/vnd.github.raw+json") {
-        sawRawRequest = true;
-        // The raw media type returns the file's bytes directly, not
-        // wrapped in a JSON envelope.
-        return {
-          ok: true,
-          status: 200,
-          text: async () => JSON.stringify(stored),
-          headers: { get: () => null },
-        };
+      if (String(url).endsWith(`/git/blobs/${FALLBACK_BLOB_SHA}`)) {
+        sawBlobRequest = true;
+        return fakeResponse(200, {
+          sha: FALLBACK_BLOB_SHA,
+          content: b64(stored),
+          encoding: "base64",
+        });
       }
       throw new Error(`unexpected Accept header: ${accept}`);
     };
 
     const { sha, data } = await readSignatures("tok");
-    assert.strictEqual(sha, "big-file-sha");
+    assert.strictEqual(sha, FALLBACK_BLOB_SHA);
     assert.deepStrictEqual(data, stored);
     assert.ok(
       sawObjectRequest,
       "must request metadata via the object media type first",
     );
     assert.ok(
-      sawRawRequest,
-      "must fall back to a raw-content fetch when content comes back empty",
+      sawBlobRequest,
+      "must fetch an omitted content body through the Git Blobs API",
     );
   });
 
@@ -1033,7 +1046,7 @@ function fakeResponse(status, jsonBody, headers = {}) {
     assert.strictEqual(
       fetchCallCount,
       1,
-      "a small file must not trigger a second raw-content request",
+      "a small file must not trigger a second Git Blobs API request",
     );
   });
 
@@ -2068,32 +2081,34 @@ function fakeResponse(status, jsonBody, headers = {}) {
   // initial read, and the isFirstWriteRace FALSE branch (a 422 that isn't
   // actually about a missing sha).
   // ===========================================================================
-  await test("readSignatures falls back to a second, raw-media-type fetch when the metadata response has content but a non-base64 encoding", async () => {
+  await test("readSignatures fetches a blob when metadata content is not base64", async () => {
     let getCount = 0;
-    global.fetch = async () => {
+    global.fetch = async (url) => {
       getCount += 1;
       if (getCount === 1) {
         // Some encoding other than "base64" (or content present but the
         // field simply isn't populated the expected way) - the base64
         // fast path must not be taken here.
         return fakeResponse(200, {
-          sha: "s1",
+          sha: FALLBACK_BLOB_SHA,
           content: "irrelevant-because-encoding-is-wrong",
           encoding: "none",
         });
       }
+      assert.ok(String(url).endsWith(`/git/blobs/${FALLBACK_BLOB_SHA}`));
       return fakeResponse(200, {
-        version: 1,
-        signatures: [{ login: "via-raw-fallback" }],
+        sha: FALLBACK_BLOB_SHA,
+        content: b64({ version: 1, signatures: [{ login: "via-blob-fallback" }] }),
+        encoding: "base64",
       });
     };
     const { sha, data } = await readSignatures("tok");
-    assert.strictEqual(sha, "s1");
-    assert.deepStrictEqual(data.signatures, [{ login: "via-raw-fallback" }]);
+    assert.strictEqual(sha, FALLBACK_BLOB_SHA);
+    assert.deepStrictEqual(data.signatures, [{ login: "via-blob-fallback" }]);
     assert.strictEqual(
       getCount,
       2,
-      "a non-base64 encoding must trigger the second, raw-media-type request, just like a too-large file does",
+      "a non-base64 encoding must trigger a second Git Blobs API request",
     );
   });
 

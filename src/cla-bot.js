@@ -178,14 +178,40 @@ function parseGitHubServerUrl(serverUrl) {
   try {
     server = new URL(serverUrl);
   } catch {
-    throw new Error(
-      "GITHUB_SERVER_URL must be an HTTP(S) URL without credentials",
-    );
+    throw new Error("GITHUB_SERVER_URL must be an HTTPS URL without credentials");
   }
-  if (!/^https?:$/.test(server.protocol) || server.username || server.password) {
-    throw new Error("GITHUB_SERVER_URL must be an HTTP(S) URL without credentials");
+  if (server.protocol !== "https:" || server.username || server.password) {
+    throw new Error("GITHUB_SERVER_URL must be an HTTPS URL without credentials");
   }
   return server;
+}
+
+function parseGitHubApiUrl(apiUrl) {
+  try {
+    if (
+      typeof apiUrl !== "string" ||
+      apiUrl.length === 0 ||
+      apiUrl.includes("?") ||
+      apiUrl.includes("#")
+    ) {
+      throw new Error("invalid API base");
+    }
+    const base = new URL(apiUrl);
+    if (
+      base.protocol !== "https:" ||
+      base.username ||
+      base.password ||
+      base.search ||
+      base.hash
+    ) {
+      throw new Error("invalid API base");
+    }
+    return base;
+  } catch {
+    throw new Error(
+      "GITHUB_API_URL must be an absolute HTTPS URL without credentials, query, or fragment.",
+    );
+  }
 }
 
 function buildCommentUrl(prNumber, commentId, serverUrl = GITHUB_SERVER_URL) {
@@ -376,6 +402,18 @@ function sigContentsApiPath() {
   return `${sigRepoBasePath()}/contents/${encodeRepoPath(SIG_PATH)}`;
 }
 
+function sigBlobApiPath(blobSha) {
+  if (
+    typeof blobSha !== "string" ||
+    !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/i.test(blobSha)
+  ) {
+    throw new Error(
+      "Signatures file metadata is missing a valid Git blob SHA; refusing to fetch its content.",
+    );
+  }
+  return `${sigRepoBasePath()}/git/blobs/${blobSha}`;
+}
+
 function validateConfig() {
   for (const [name, val] of [
     ["GITHUB_TOKEN", GITHUB_TOKEN],
@@ -388,6 +426,11 @@ function validateConfig() {
 
   try {
     parseGitHubServerUrl(GITHUB_SERVER_URL);
+  } catch (error) {
+    fail(error.message);
+  }
+  try {
+    parseGitHubApiUrl(GITHUB_API);
   } catch (error) {
     fail(error.message);
   }
@@ -416,16 +459,21 @@ function validateConfig() {
       `SIG_PATH ${JSON.stringify(SIG_PATH)} is not a valid path within the signatures repo: ${sigPathProblem}.`,
     );
   }
+  let claDocumentUrl;
   try {
-    const parsed = new URL(CLA_DOCUMENT_URL);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      fail(
-        `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} must be an http(s) URL.`,
-      );
-    }
+    claDocumentUrl = new URL(CLA_DOCUMENT_URL);
   } catch {
     fail(
       `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} is not a valid URL.`,
+    );
+  }
+  if (
+    claDocumentUrl.protocol !== "https:" ||
+    claDocumentUrl.username ||
+    claDocumentUrl.password
+  ) {
+    fail(
+      `CLA_DOCUMENT_URL ${JSON.stringify(CLA_DOCUMENT_URL)} must be an HTTPS URL without credentials.`,
     );
   }
   // Say so when normalization changed the value.
@@ -516,7 +564,7 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
   };
   const rejectBase = () => {
     throw new Error(
-      "GITHUB_API_URL must be an absolute HTTP(S) URL without credentials, query, or fragment.",
+      "GITHUB_API_URL must be an absolute HTTPS URL without credentials, query, or fragment.",
     );
   };
   if (
@@ -529,14 +577,6 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
   ) {
     reject();
   }
-  if (
-    typeof apiBase !== "string" ||
-    apiBase.length === 0 ||
-    apiBase.includes("?") ||
-    apiBase.includes("#")
-  ) {
-    rejectBase();
-  }
   const requestPath = path.split("?", 1)[0];
   for (const segment of requestPath.split("/")) {
     // The URL parser treats encoded dot segments as path navigation too.
@@ -546,17 +586,8 @@ function buildSafeApiUrl(path, apiBase = GITHUB_API) {
 
   let base;
   try {
-    base = new URL(apiBase);
+    base = parseGitHubApiUrl(apiBase);
   } catch {
-    rejectBase();
-  }
-  if (
-    (base.protocol !== "http:" && base.protocol !== "https:") ||
-    base.username ||
-    base.password ||
-    base.search ||
-    base.hash
-  ) {
     rejectBase();
   }
 
@@ -592,6 +623,10 @@ async function ghRaw(path, token, options = {}) {
   try {
     const res = await fetch(requestUrl, {
       ...fetchOptions,
+      // Do not follow responses outside the authenticated API origin. Large
+      // signature files use the Git Blobs API below, so raw-media redirects
+      // are unnecessary here.
+      redirect: "error",
       signal: controller.signal,
       headers: {
         Authorization: `Bearer ${token}`,
@@ -623,8 +658,6 @@ async function ghRaw(path, token, options = {}) {
       err.retryAfter = Number(res.headers.get("retry-after")) || null;
       throw err;
     }
-    // Raw media-type requests (see readSignatures) return plain text.
-    if (options.raw) return text;
     const jsonText = options.preserveUnsafeIds
       ? preserveUnsafeJsonIds(text)
       : text;
@@ -1204,10 +1237,9 @@ async function readSignatures(token) {
   // surfaces as a config error and is never mistaken for the 404 below.
   const contentsPath = sigContentsApiPath();
   try {
-    // The 'object' media type works up to 100 MB (the default format is only
-    // reliable under 1 MB) and still returns the sha needed for
-    // compare-and-swap writes. Files up to 1 MB come with their content.
-    // Larger ones come back empty and are fetched with the 'raw' media type.
+    // The object media type returns the sha needed for compare-and-swap
+    // writes. Larger files may omit content; fetch those by sha through the
+    // Git Blobs API, which returns base64 JSON without a raw-media redirect.
     const meta = await gh(contentsPath, token, {
       headers: { Accept: "application/vnd.github.object+json" },
     });
@@ -1216,10 +1248,13 @@ async function readSignatures(token) {
     if (meta.content && meta.encoding === "base64") {
       text = Buffer.from(meta.content, "base64").toString("utf8");
     } else {
-      text = await gh(contentsPath, token, {
-        headers: { Accept: "application/vnd.github.raw+json" },
-        raw: true,
-      });
+      const blob = await gh(sigBlobApiPath(meta.sha), token);
+      if (blob.encoding !== "base64" || typeof blob.content !== "string") {
+        throw new Error(
+          "GitHub did not return base64 content for the signatures file blob.",
+        );
+      }
+      text = Buffer.from(blob.content, "base64").toString("utf8");
     }
 
     const data = JSON.parse(text);

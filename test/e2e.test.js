@@ -186,6 +186,7 @@ function buildChildEnv(overrides) {
   }
   const eventPath = overrides.GITHUB_EVENT_PATH;
   const childEnv = { ...env, ...overrides };
+  childEnv.NODE_OPTIONS = `--require=${path.join(__dirname, "helpers/https-loopback-fetch.js")}`;
   if (eventPath && fs.existsSync(eventPath)) {
     try {
       const event = JSON.parse(fs.readFileSync(eventPath, "utf8"));
@@ -211,7 +212,7 @@ function buildChildEnv(overrides) {
 // what a later GET returns in the same run - otherwise a test could see
 // "a write happened" and pass even if that write was never actually
 // persisted or read back correctly by the rest of the flow.
-function startFakeGitHub({ authorAlreadySigned }) {
+function startFakeGitHub({ authorAlreadySigned, redirectTo }) {
   const requestsSeen = [];
   const statusesSeen = [];
   let signaturesState = {
@@ -226,6 +227,11 @@ function startFakeGitHub({ authorAlreadySigned }) {
     req.on("data", (c) => (rawBody += c));
     req.on("end", () => {
       requestsSeen.push({ method: req.method, url: req.url });
+      if (redirectTo) {
+        res.writeHead(302, { Location: redirectTo });
+        res.end();
+        return;
+      }
       const send = (status, obj) => {
         res.writeHead(status, { "Content-Type": "application/json" });
         res.end(obj === null ? "" : JSON.stringify(obj));
@@ -319,10 +325,28 @@ function startFakeGitHub({ authorAlreadySigned }) {
     server.listen(0, "127.0.0.1", () => {
       const { port } = server.address();
       resolve({
-        url: `http://127.0.0.1:${port}`,
+        url: `https://127.0.0.1:${port}`,
         requestsSeen,
         statusesSeen,
         getSignatures: () => signaturesState.data,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+function startRedirectTarget() {
+  const requestsSeen = [];
+  const server = http.createServer((req, res) => {
+    requestsSeen.push({ method: req.method, url: req.url });
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ version: 1, signatures: [{ id: 42, login: "e2e-author" }] }));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        requestsSeen,
         close: () => new Promise((r) => server.close(r)),
       });
     });
@@ -386,6 +410,41 @@ function baseEnv(apiUrl) {
     }
   });
 
+  await test("the CLI refuses an HTTP redirect from the configured HTTPS API", async () => {
+    const target = await startRedirectTarget();
+    const api = await startFakeGitHub({
+      authorAlreadySigned: true,
+      redirectTo: target.url,
+    });
+    const eventFile = writeTempEventFile({
+      action: "opened",
+      pull_request: {
+        number: 1,
+        head: { sha: "e2e-head-sha" },
+        base: { sha: "e2e-base-sha" },
+      },
+    });
+    try {
+      const { code, stderr } = await runScript({
+        ...baseEnv(api.url),
+        GITHUB_EVENT_NAME: "pull_request_target",
+        GITHUB_EVENT_PATH: eventFile,
+      });
+      assert.strictEqual(code, 1, stderr);
+      assert.match(stderr, /fetch failed/i);
+      assert.ok(api.requestsSeen.length > 0);
+      assert.strictEqual(
+        target.requestsSeen.length,
+        0,
+        "fetch must reject the redirect before contacting its HTTP target",
+      );
+    } finally {
+      await api.close();
+      await target.close();
+      fs.unlinkSync(eventFile);
+    }
+  });
+
   await test("main() rejects invalid GITHUB_SERVER_URL values before making API requests", async () => {
     const server = await startFakeGitHub({ authorAlreadySigned: true });
     const eventFile = writeTempEventFile({
@@ -410,7 +469,7 @@ function baseEnv(apiUrl) {
           GITHUB_EVENT_PATH: eventFile,
         });
         assert.strictEqual(code, 1, `${value}: ${stderr}`);
-        assert.match(stderr, /GITHUB_SERVER_URL must be an HTTP\(S\) URL/);
+        assert.match(stderr, /GITHUB_SERVER_URL must be an HTTPS URL/);
       }
       assert.strictEqual(
         server.requestsSeen.length,
@@ -542,7 +601,7 @@ function baseEnv(apiUrl) {
 
   await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH does not exist", async () => {
     const { code, stderr } = await runScript({
-      ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+      ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
       GITHUB_EVENT_PATH: "/nonexistent/path/to/event.json",
     });
@@ -555,7 +614,7 @@ function baseEnv(apiUrl) {
 
   await test("the CLI entrypoint fails loudly when GITHUB_EVENT_PATH is unset", async () => {
     const { code, stderr } = await runScript({
-      ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+      ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
       GITHUB_EVENT_NAME: "pull_request_target",
       // GITHUB_EVENT_PATH deliberately omitted - buildChildEnv() defaults
       // it to "", so `!EVENT_PATH` is the true operand here, not
@@ -580,7 +639,7 @@ function baseEnv(apiUrl) {
     fs.writeFileSync(eventFile, "{ this is not valid json");
     try {
       const { code, stderr } = await runScript({
-        ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+        ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
         GITHUB_EVENT_NAME: "pull_request_target",
         GITHUB_EVENT_PATH: eventFile,
       });
@@ -636,7 +695,7 @@ function baseEnv(apiUrl) {
     );
     try {
       const { code, stderr } = await runScript({
-        ...baseEnv("http://127.0.0.1:1"),
+        ...baseEnv("https://127.0.0.1:1"),
         GITHUB_EVENT_NAME: "issue_comment",
         GITHUB_EVENT_PATH: eventFile,
       });
@@ -699,7 +758,7 @@ function baseEnv(apiUrl) {
         const child = spawn(process.execPath, ["-r", preload, SCRIPT], {
           cwd: REPO_ROOT,
           env: buildChildEnv({
-            ...baseEnv("http://127.0.0.1:1"), // unused - fails before any network call
+            ...baseEnv("https://127.0.0.1:1"), // unused - fails before any network call
             GITHUB_EVENT_NAME: "pull_request_target",
             GITHUB_EVENT_PATH: eventFile,
           }),
@@ -1009,7 +1068,7 @@ function baseEnv(apiUrl) {
       const { code, stderr } = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [wrapper], {
           cwd: REPO_ROOT,
-          env: buildChildEnv(baseEnv("http://127.0.0.1:1")),
+          env: buildChildEnv(baseEnv("https://127.0.0.1:1")),
         });
         let stderrOut = "";
         child.stderr.on("data", (d) => (stderrOut += d));
@@ -1047,7 +1106,7 @@ function baseEnv(apiUrl) {
       const { code, stderr } = await new Promise((resolve, reject) => {
         const child = spawn(process.execPath, [wrapper], {
           cwd: REPO_ROOT,
-          env: buildChildEnv(baseEnv("http://127.0.0.1:1")),
+          env: buildChildEnv(baseEnv("https://127.0.0.1:1")),
         });
         let stderrOut = "";
         child.stderr.on("data", (d) => (stderrOut += d));
