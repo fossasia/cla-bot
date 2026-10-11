@@ -2268,11 +2268,11 @@ async function fetchPRSnapshot(prNumber) {
     GITHUB_TOKEN,
   );
   const headSha = assertValidSha(
-    pr.head.sha,
+    pr?.head?.sha,
     `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.head.sha)`,
   );
   const baseSha = assertValidSha(
-    pr.base.sha,
+    pr?.base?.sha,
     `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.base.sha)`,
   );
   return { headSha, baseSha };
