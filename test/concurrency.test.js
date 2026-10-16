@@ -474,6 +474,10 @@ const linkTo = (path, last) =>
           });
           return res(201, {});
         }
+        // No other open PR shares this head in these tests.
+        if (/\/commits\/[0-9a-f]+\/pulls$/.test(path.split("?")[0])) {
+          return res(200, []);
+        }
         throw new Error(`Unhandled mock request: ${method} ${path}`);
       });
     };

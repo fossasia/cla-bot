@@ -91,6 +91,10 @@ function installMockGitHub({ commits, signatures = [], usersById = {} }) {
       state.statuses.push(JSON.parse(opts.body));
       return res(201, {});
     }
+    // No other open PR shares this head in these tests.
+    if (pathname.includes("/pulls") && pathname.includes("/commits/")) {
+      return res(200, []);
+    }
     // Bare GET /user (bot identity) is left unhandled on purpose, same as the
     // other suites: resolveBotLogin() swallows it and falls back to the
     // default github-actions[bot].

@@ -397,6 +397,9 @@ function startFakeGitHub({
       if (/\/user$/.test(req.url)) {
         return send(404, { message: "Not Found" }); // forces the default bot-login fallback
       }
+      if (/\/commits\/[^/]+\/pulls/.test(req.url)) {
+        return send(200, []); // no other open PR shares this head here
+      }
       // Anything unexpected: fail loudly so a broken assumption in this
       // fake server is obvious rather than silently hanging the child.
       return send(500, {

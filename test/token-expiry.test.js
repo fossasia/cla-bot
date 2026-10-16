@@ -249,6 +249,9 @@ function makeAppGitHub({
     if (/\/user(?:\?|$)/.test(p)) {
       return { status: 404, body: { message: "Not Found" } };
     }
+    if (/\/commits\/[^/]+\/pulls/.test(p)) {
+      return { status: 200, body: [] }; // no other open PR shares this head here
+    }
     throw new Error(`fake GitHub: unhandled ${method} ${p}`);
   };
   s.fetch = async (url, opts = {}) => {
