@@ -88,6 +88,7 @@ function makeFakeGitHub({
     comments: [],
     statuses: [],
     lockCalls: [],
+    siblingLookups: [],
     lockShouldFail,
   };
 
@@ -231,6 +232,12 @@ function makeFakeGitHub({
         }
         return res(204, null);
       }
+    }
+    // No other open PR shares this head in these tests.
+    if (url.includes("/pulls") && url.includes("/commits/")) {
+      const sha = url.match(/\/commits\/([^/]+)\/pulls/)[1];
+      state.siblingLookups.push(sha);
+      return res(200, []);
     }
     throw new Error(`Unhandled mock request: ${method} ${url}`);
   };
@@ -1443,7 +1450,7 @@ function makeFakeGitHub({
     );
   });
 
-  await test("handlePullRequestTarget does nothing when a 'closed' event reports the PR was NOT merged", async () => {
+  await test("handlePullRequestTarget does not lock or status-check a 'closed, not merged' PR itself, but does look for open siblings on its old head to recheck", async () => {
     const gh = makeFakeGitHub({
       commits: [],
       initialSignatures: { version: 1, signatures: [] },
@@ -1461,6 +1468,10 @@ function makeFakeGitHub({
       0,
       "a PR closed without merging must not be locked",
     );
+    // No sibling in this mock's universe, so there is nothing else to
+    // recheck or publish - but the lookup itself must still happen (see
+    // recheckOpenSiblingsOfOldHead()), not be skipped as a no-op.
+    assert.deepStrictEqual(gh.siblingLookups, ["head-sha-x"]);
     assert.strictEqual(gh.statuses.length, 0);
   });
 
@@ -3849,6 +3860,10 @@ function makeFakeGitHub({
       if (url.includes("/statuses/")) {
         return res(201, {});
       }
+      // No other open PR shares this head in these tests.
+      if (url.includes("/pulls") && url.includes("/commits/")) {
+        return res(200, []);
+      }
       throw new Error(`Unhandled mock request: ${method} ${url}`);
     };
 
@@ -3998,6 +4013,10 @@ function makeFakeGitHub({
       }
       if (url.includes("/statuses/")) {
         return res(201, {});
+      }
+      // No other open PR shares this head in these tests.
+      if (url.includes("/pulls") && url.includes("/commits/")) {
+        return res(200, []);
       }
       throw new Error(`Unhandled mock request: ${method} ${url}`);
     };

@@ -9,6 +9,9 @@
  * - Unresolved authors are flagged without exposing their email addresses.
  * - Statuses are checked against a fixed base/head pair and corrected if it
  *   changes during publication. Request budgets apply to the whole run.
+ * - A "success" is never published for a head SHA that another open PR
+ *   also uses as its head, unless that PR is clean too. See
+ *   findUncleanSiblingHead().
  *
  * See SECURITY.md for the limits and deployment requirements.
  */
@@ -587,6 +590,13 @@ function consumeGitHubTokenRequest(token, { emergency = false } = {}) {
     throw err;
   }
   store.remaining -= 1;
+}
+
+// How much GITHUB_TOKEN budget is left in the active event, or Infinity when
+// nothing is tracking one (a direct call/test outside runWithGitHubTokenRequestBudget).
+function remainingGitHubTokenRequestBudget() {
+  const store = _githubTokenRequestBudget.getStore();
+  return store ? store.remaining : Infinity;
 }
 
 function buildSafeApiUrl(path, apiBase = GITHUB_API) {
@@ -2261,7 +2271,7 @@ async function lockPR(prNumber) {
   }
 }
 
-// Reads the PR's current head and base SHA in one request.
+// Reads the PR's current head and base SHA (and state) in one request.
 async function fetchPRSnapshot(prNumber) {
   const pr = await ghRead(
     `/repos/${REPO_OWNER}/${REPO_NAME}/pulls/${encodeURIComponent(prNumber)}`,
@@ -2275,11 +2285,24 @@ async function fetchPRSnapshot(prNumber) {
     pr?.base?.sha,
     `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/pulls/${prNumber} (.base.sha)`,
   );
-  return { headSha, baseSha };
+  return { headSha, baseSha, state: pr?.state };
 }
 
 // Maximum pair evaluations when the PR changes during a check.
 const MAX_PAIR_ATTEMPTS = 3;
+
+// How many other PRs we'll actually check when several share one head SHA.
+// Realistically this is 0 or 1; the cap just stops a freak repo state from
+// turning one check into an unbounded number of API calls.
+const MAX_SIBLING_HEAD_PRS_CHECKED = 20;
+
+// Minimum event-wide GITHUB_TOKEN budget required before even starting one
+// more sibling's recovery recheck (see recheckOpenSiblingsOfOldHead()). A
+// single recheck can itself fan out into evaluating that sibling's own
+// siblings, so this is deliberately generous: better to leave some PRs for
+// the next event (or a manual `recheck`) than to spend most of the event's
+// budget partway through an unusually large shared-head cluster.
+const MIN_BUDGET_FOR_SIBLING_RECHECK = 100;
 
 // Evaluate the authors and signatures for one pair without publishing.
 // checkPR() passes the same lookup budget through every retry.
@@ -2308,6 +2331,161 @@ async function evaluatePair(
   return { authors, unresolved, missing };
 }
 
+// The listing endpoint below can list PRs that merely contain headSha deep
+// in their history, not just as their head, and (once merged) can span many
+// pages - so this always filters to state "open" and an exact head match,
+// and follows pagination rather than trusting a single page.
+//
+// Anything that stops us from fully confirming the matching set - a
+// malformed response, or more matches than we're willing to check one by
+// one - throws instead of returning a possibly-incomplete list. A "we
+// couldn't tell" here must never read the same as "we checked, there's
+// nothing": that's exactly how the original bug let a careless "success"
+// slip through.
+async function listOtherOpenPRsWithHead(prNumberToExclude, headSha) {
+  const label = `PRs sharing head ${headSha}`;
+  const matches = [];
+  let page = 1;
+  for (;;) {
+    assertWithinPageLimit(label, page);
+    const { data, link } = await ghRead(
+      `/repos/${REPO_OWNER}/${REPO_NAME}/commits/${encodeURIComponent(headSha)}/pulls?per_page=${LIST_PAGE_SIZE}&page=${page}`,
+      GITHUB_TOKEN,
+      { withLink: true },
+    );
+    if (!Array.isArray(data)) {
+      throw new Error(
+        `GitHub API response for GET /repos/${REPO_OWNER}/${REPO_NAME}/commits/${headSha}/pulls is not a list (page ${page}).`,
+      );
+    }
+    for (const p of data) {
+      if (
+        p &&
+        p.state === "open" &&
+        p.number !== prNumberToExclude &&
+        p.head?.sha === headSha
+      ) {
+        matches.push(p);
+      }
+    }
+    const hasNext = hasNextPage(link);
+    if (hasNext === false || (hasNext === null && data.length < LIST_PAGE_SIZE)) {
+      break;
+    }
+    page += 1;
+  }
+
+  if (matches.length > MAX_SIBLING_HEAD_PRS_CHECKED) {
+    // So many open PRs share this head that checking them all would be its
+    // own budget problem. Silently checking only the first handful and
+    // calling the rest clean would just move the original bug down a level,
+    // so treat "too many to check" the same as "found a problem".
+    throw new Error(
+      `${matches.length} other open PRs share head ${headSha} - too many to verify safely (cap ${MAX_SIBLING_HEAD_PRS_CHECKED}).`,
+    );
+  }
+  return matches;
+}
+
+// A commit status lives on the SHA, not on the PR - GitHub shows the same
+// "cla/fossasia" state to every PR whose head happens to be that SHA. That's
+// normally a non-issue, since two PRs almost never share a head commit. But
+// when they do (the same branch opened against two bases, a retarget that
+// lines up with another PR, etc.), each PR is compared against its own base
+// and can genuinely come out differently - one clean, one not. If the clean
+// one publishes "success" last, it quietly clears the other PR too.
+//
+// So before we write "success", check whether any other open PR has this
+// same head SHA, and if one of them isn't actually clean, treat that as a
+// reason to hold off rather than publish a result the other PR didn't earn.
+// Returns { blocker, checkedCandidates }: blocker is the first conflicting
+// PR's number, or null if there's none; checkedCandidates is how many other
+// PRs actually shared this head, which the caller uses to decide whether
+// this detour took long enough to be worth reconfirming its own result for
+// (see checkPRInner) - almost always zero, so almost always skipped.
+async function findUncleanSiblingHead(
+  prNumber,
+  pair,
+  knownSignatures,
+  lookupBudget,
+  knownOpenSiblings = null,
+) {
+  // A cache is only valid for the exact head it was built for - reusing it
+  // for any other head would silently miss that head's real siblings.
+  const candidates =
+    knownOpenSiblings && knownOpenSiblings.headSha === pair.headSha
+      ? knownOpenSiblings.candidates.filter((p) => p.number !== prNumber)
+      : await listOtherOpenPRsWithHead(prNumber, pair.headSha);
+
+  for (const candidate of candidates) {
+    // The listing is already a snapshot - it can be stale (closed,
+    // retargeted, or moved to a different head) by the time we get here.
+    // Always judge a candidate by its current state, never by what the
+    // listing said, whichever way that state cuts: a candidate the listing
+    // showed as dirty may have since closed or moved on just as easily as
+    // one it showed as clean may have since gone bad.
+    const current = await fetchPRSnapshot(candidate.number);
+    if (current.state !== "open" || current.headSha !== pair.headSha) {
+      continue; // no longer open, or no longer sharing this head - not a blocker
+    }
+    const result = await evaluatePair(
+      { baseSha: current.baseSha, headSha: pair.headSha },
+      knownSignatures,
+      lookupBudget,
+    );
+    if (result.missing.length || result.unresolved.length) {
+      return { blocker: candidate.number, checkedCandidates: candidates.length };
+    }
+  }
+  return { blocker: null, checkedCandidates: candidates.length };
+}
+
+// Best-effort recovery: when a PR stops using a head SHA (it closes without
+// merging, or it synchronizes onto a new commit), any other open PR that
+// still shares that old head SHA may have been held at "failure" only
+// because of this one. Give those PRs a chance to pick up a correct result
+// on their own, instead of leaving them stuck until someone notices and
+// comments `recheck`. Never throws - a failed recovery attempt here should
+// not take down the event handling that triggered it, and there is nothing
+// more drastic to fall back to than leaving the status as it already is.
+async function recheckOpenSiblingsOfOldHead(prNumber, oldHeadSha) {
+  let siblings;
+  try {
+    siblings = await listOtherOpenPRsWithHead(prNumber, oldHeadSha);
+  } catch (err) {
+    console.error(
+      `Could not look up other open PRs sharing head ${oldHeadSha} after PR #${prNumber} stopped using it: ${err.message}`,
+    );
+    return;
+  }
+  for (const sibling of siblings) {
+    if (remainingGitHubTokenRequestBudget() < MIN_BUDGET_FOR_SIBLING_RECHECK) {
+      console.error(
+        `Stopping sibling recovery after head ${oldHeadSha} was freed up by PR #${prNumber}: not enough request budget left this event to safely recheck PR #${sibling.number} (and possibly more after it). A later event or a manual \`recheck\` comment will pick up the rest.`,
+      );
+      break;
+    }
+    try {
+      // No headSha/eventBaseSha given on purpose: let checkPR() read this
+      // PR's own current pair fresh, the same as a real webhook event on it
+      // would, rather than us assuming anything about its current state.
+      // knownOpenSiblings reuses the listing just above instead of each of
+      // these rechecks re-fetching the same "who shares this head" answer -
+      // only if that sibling turns out to still be on oldHeadSha, which its
+      // own fresh pair read (not this cache) is what decides.
+      await checkPR(sibling.number, null, {
+        quietIfNeverFlagged: true,
+        knownOpenSiblings: { headSha: oldHeadSha, candidates: siblings },
+        extraCautious: true,
+      });
+    } catch (err) {
+      console.error(
+        `Could not recheck PR #${sibling.number} after head ${oldHeadSha} was freed up by PR #${prNumber}: ${err.message}`,
+      );
+    }
+  }
+}
+
 // Best-effort failure status. Log recovery errors so they do not hide the
 // original failure.
 async function failClosedStatus(headSha, description) {
@@ -2329,9 +2507,34 @@ async function failClosedStatus(headSha, description) {
 async function publishEvaluation(
   prNumber,
   evaluation,
-  { quietIfNeverFlagged, signer, statusOnly, onStatusPublished },
+  {
+    quietIfNeverFlagged,
+    signer,
+    statusOnly,
+    sharedHeadBlocker,
+    onStatusPublished,
+  },
 ) {
   const { authors, unresolved, missing, headSha } = evaluation;
+
+  if (missing.length === 0 && unresolved.length === 0 && sharedHeadBlocker) {
+    // This PR is clean, but it shares its head commit with another open PR
+    // that isn't. GitHub only shows one status per commit, so writing
+    // "success" here would clear that other PR too - hold this one at
+    // "failure" instead until the two are no longer tangled together.
+    await setStatus(
+      headSha,
+      "failure",
+      `This commit is also the head of PR #${sharedHeadBlocker}, which hasn't fully signed the CLA yet`,
+    );
+    if (onStatusPublished) onStatusPublished();
+    if (statusOnly) return;
+    await postComment(
+      prNumber,
+      `${PENDING_MARKER}\nEvery contributor on this PR has signed the CLA. However, this exact commit is also the head of #${sharedHeadBlocker}, which hasn't finished signing yet - GitHub can only show one CLA check result per commit, so this stays pending until that PR is resolved too (or this branch moves to a new commit). Comment \`recheck\` once it is.`,
+    );
+    return;
+  }
 
   if (missing.length === 0 && unresolved.length === 0) {
     await setStatus(
@@ -2423,6 +2626,21 @@ async function checkPR(
     statusOnly = false,
     knownSignatures = null,
     eventBaseSha = null,
+    // Internal only, not part of the action's public contract (checkPR() is
+    // exported for tests, same as everything else here): a sibling listing
+    // the caller already fetched for this exact head SHA, reused instead of
+    // listOtherOpenPRsWithHead() re-fetching the same thing. See
+    // recheckOpenSiblingsOfOldHead(), its only source.
+    knownOpenSiblings = null,
+    // Internal only, same as knownOpenSiblings. Set by
+    // recheckOpenSiblingsOfOldHead(): this call reaches a PR from outside
+    // its own event (and so outside its own per-PR concurrency group,
+    // unlike every other caller here), which means it can genuinely race a
+    // directly-triggered check for the same PR. Reconfirm right before
+    // every publish, not just when a sibling check made one worth doing,
+    // so a slower, staler evaluation can never overwrite a result a faster,
+    // fresher one already published.
+    extraCautious = false,
   } = {},
 ) {
   assertValidPRNumber(prNumber, "checkPR(prNumber)");
@@ -2444,6 +2662,8 @@ async function checkPR(
           knownSignatures,
           eventBaseSha,
           lookupBudget,
+          knownOpenSiblings,
+          extraCautious,
         }),
       ),
   );
@@ -2452,7 +2672,16 @@ async function checkPR(
 async function checkPRInner(
   prNumber,
   headSha,
-  { quietIfNeverFlagged, signer, statusOnly, knownSignatures, eventBaseSha, lookupBudget },
+  {
+    quietIfNeverFlagged,
+    signer,
+    statusOnly,
+    knownSignatures,
+    eventBaseSha,
+    lookupBudget,
+    knownOpenSiblings,
+    extraCautious,
+  },
 ) {
 
   // Pin one base/head pair for the comparison. Recheck it before and after
@@ -2484,7 +2713,7 @@ async function checkPRInner(
     // checking it here too would be redundant - the loop can only ever end
     // either by running out of attempts or by that `break`.
     for (let attempt = 1; attempt <= MAX_PAIR_ATTEMPTS; attempt++) {
-      const result = await evaluatePair(pair, knownSignatures, lookupBudget);
+      let result = await evaluatePair(pair, knownSignatures, lookupBudget);
 
       // Recheck the pair before publishing. A moved head is handled by its
       // event; a moved base is evaluated again here.
@@ -2503,6 +2732,67 @@ async function checkPRInner(
         continue;
       }
 
+      let isClean = result.missing.length === 0 && result.unresolved.length === 0;
+
+      // This call reaches outside its own per-PR concurrency group (see
+      // extraCautious above), so it can race a directly-triggered,
+      // properly-serialized check for the same PR - one of them could have
+      // just published a newer result. Reconfirm before deciding anything
+      // else below, so a dirty-to-clean (or clean-to-dirty) transition is
+      // caught before it would otherwise be missed - in particular, before
+      // deciding whether the sibling check just below even applies.
+      if (extraCautious) {
+        result = await evaluatePair(pair, knownSignatures, lookupBudget);
+        isClean = result.missing.length === 0 && result.unresolved.length === 0;
+      }
+
+      // About to call this clean. One last check: make sure no other open PR
+      // with this same head commit is relying on a dirtier result - see
+      // findUncleanSiblingHead(). If that check itself fails, we genuinely
+      // don't know whether it's safe to call this clean, so don't let
+      // whatever status already sits on this SHA stand unconfirmed - fail
+      // closed before surfacing the error, the same as any other step here.
+      let sharedHeadBlocker = null;
+      if (isClean) {
+        let siblingCheck;
+        try {
+          siblingCheck = await findUncleanSiblingHead(
+            prNumber,
+            pair,
+            knownSignatures,
+            lookupBudget,
+            knownOpenSiblings,
+          );
+        } catch (siblingErr) {
+          await failClosedStatus(
+            pair.headSha,
+            "Could not confirm this commit isn't also the head of another open PR that hasn't fully signed the CLA yet; comment `recheck` to try again.",
+          );
+          throw siblingErr;
+        }
+        sharedHeadBlocker = siblingCheck.blocker;
+
+        // findUncleanSiblingHead() above can itself take real work once this
+        // head is actually shared - listing and evaluating up to
+        // MAX_SIBLING_HEAD_PRS_CHECKED other PRs - and during that detour
+        // this PR's OWN authors/signatures could have moved on (a signing
+        // comment lands, for instance). Re-confirm this PR's own result is
+        // still accurate right before publishing it, same spirit as the
+        // pair recheck just above: a verdict that went stale on the way to
+        // being published must not be published as if it were still
+        // current. Skipped when there was nothing to share this head with
+        // and this call isn't extraCautious - the overwhelmingly common
+        // case - since that detour took one quick request and cost no
+        // meaningful time to go stale during.
+        if (extraCautious || siblingCheck.checkedCandidates > 0) {
+          result = await evaluatePair(pair, knownSignatures, lookupBudget);
+          isClean = result.missing.length === 0 && result.unresolved.length === 0;
+          if (!isClean) {
+            sharedHeadBlocker = null; // moot once this PR's own result isn't clean
+          }
+        }
+      }
+
       // No API can publish conditionally on the PR pair, so check once more
       // after publishing. A change after that read waits for another event.
       await publishEvaluation(
@@ -2512,12 +2802,36 @@ async function checkPRInner(
           quietIfNeverFlagged,
           signer,
           statusOnly,
+          sharedHeadBlocker,
           onStatusPublished: () => {
             everPublished = true;
             lastPublishedHeadSha = pair.headSha;
           },
         },
       );
+
+      if (isClean && !sharedHeadBlocker) {
+        // We just wrote "success". Nothing can make that write and the
+        // sibling check atomic, so look once more: a sibling PR opening,
+        // retargeting onto a dirty base, or turning dirty in that narrow
+        // window would leave an unearned "success" standing on this SHA. A
+        // failure here is handled by the catch below like any other
+        // post-publish step - everPublished is already set, so it still
+        // fails closed, just with the generic message instead of a second,
+        // more specific write.
+        const { blocker: lateBlocker } = await findUncleanSiblingHead(
+          prNumber,
+          pair,
+          knownSignatures,
+          lookupBudget,
+        );
+        if (lateBlocker) {
+          await failClosedStatus(
+            pair.headSha,
+            `This commit is also the head of PR #${lateBlocker}, which hasn't fully signed the CLA yet`,
+          );
+        }
+      }
 
       const afterPublish = await fetchPRSnapshot(prNumber);
       if (pinnedHead && afterPublish.headSha !== pinnedHead) {
@@ -2736,6 +3050,17 @@ async function handlePullRequestTargetInner(payload, identifiers) {
     await lockPR(prNumber);
     return;
   }
+  if (payload.action === "closed") {
+    // Closed without merging. This PR no longer has an open status to
+    // maintain, but it may have been the reason another open PR sharing its
+    // head SHA was held at "failure" - see recheckOpenSiblingsOfOldHead().
+    const headSha = assertValidSha(
+      identifiers.headSha,
+      "pull_request_target payload pull_request.head.sha",
+    );
+    await recheckOpenSiblingsOfOldHead(prNumber, headSha);
+    return;
+  }
   // Handle only base edits. Title and body edits do not change the comparison.
   const isGenuineRetarget =
     payload.action === "edited" && payload.changes && payload.changes.base;
@@ -2757,6 +3082,18 @@ async function handlePullRequestTargetInner(payload, identifiers) {
       quietIfNeverFlagged: true,
       eventBaseSha: baseSha,
     });
+
+    // A synchronize moves this PR off its old head SHA entirely (unlike a
+    // retarget, which keeps the same head). If another open PR is still
+    // sitting on that old SHA, it may have been held at "failure" only
+    // because of this one - give it a chance to recover automatically.
+    if (
+      payload.action === "synchronize" &&
+      typeof payload.before === "string" &&
+      payload.before !== headSha
+    ) {
+      await recheckOpenSiblingsOfOldHead(prNumber, payload.before);
+    }
   }
 }
 
@@ -2843,6 +3180,7 @@ module.exports = {
   MAX_GITHUB_TOKEN_REQUESTS_PER_RUN,
   GITHUB_TOKEN_EMERGENCY_RESERVE,
   runWithGitHubTokenRequestBudget,
+  remainingGitHubTokenRequestBudget,
   fail,
   getExistingBotComments,
   pendingIsNewerThanSuccess,

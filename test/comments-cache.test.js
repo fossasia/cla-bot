@@ -502,6 +502,10 @@ const MARKER = "<!-- fossasia-cla-bot:v1 -->";
         state.statuses.push(JSON.parse(opts.body));
         return res(201, {});
       }
+      // No other open PR shares this head in these tests.
+      if (url.includes("/pulls") && url.includes("/commits/")) {
+        return res(200, []);
+      }
       throw new Error(`Unhandled mock request: ${method} ${url}`);
     };
     return state;
